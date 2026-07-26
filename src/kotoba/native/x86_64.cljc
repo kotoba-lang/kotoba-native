@@ -380,7 +380,7 @@
 ;; MULTI-LAYER, not just single-layer, guarantee: frontend's own tag
 ;; declaration check, this backend's own re-derived ordinal lookup,
 ;; `kotoba.verifier`'s independent re-derivation, AND -- unique to
-;; this repository's native track -- `kotoba.artifact.signing/sign` and
+;; this repository's native track -- `kotoba.verifier.signing/sign` and
 ;; `signing/verify` BOTH unconditionally re-run the full verifier before
 ;; producing or trusting a signature, so even a hand-crafted artifact
 ;; bypassing `frontend/analyze` cannot reach real execution with a
