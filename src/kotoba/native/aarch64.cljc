@@ -523,6 +523,20 @@
         (let [body-code (emit-expr body env d)]
           (vec (concat code body-code (pop-n (- d depth)))))))))
 
+;; The declared function names of the program being emitted. This backend's
+;; `emit-expr` takes only env and depth, so the set rides a binding rather than
+;; threading a ctx map through every arm.
+(def ^:dynamic *function-names* #{})
+
+;; See the x86-64 backend: a record crossing a function boundary is boxed into a
+;; pair chain, which is one word and uses only the arena contract this backend
+;; already has. Both directions are source rewrites into existing forms.
+(defn- boxed-record-chain [field-exprs]
+  (reduce (fn [rest-chain v] (list 'pair v rest-chain)) 0 (reverse field-exprs)))
+
+(defn- boxed-record-projection [handle-form field-index]
+  (list 'pair-first (nth (iterate (fn [f] (list 'pair-second f)) handle-form) field-index)))
+
 (defn- emit-record-get-of-new [type value-form field env depth]
   ;; See the x86-64 backend: a record we already know has each scalar field in
   ;; its own slot, so the projection is an ordinary depth-relative read.
@@ -539,7 +553,15 @@
           (throw (ex-info "a record-valued projection may only appear as the operand of record-get"
                           {:phase :aarch64 :type type :field field})))
         (emit-expr child env depth)))
-    (emit-record-get-of-new-construction type value-form field env depth)))
+    (if (and (seq? value-form) (symbol? (first value-form))
+             (contains? *function-names* (first value-form)))
+      (let [fields (nth type 2)
+            field-index (first (keep-indexed (fn [i [n _]] (when (= n field) i)) fields))]
+        (when (nil? field-index)
+          (throw (ex-info "record-get references an undeclared field"
+                          {:phase :aarch64 :type type :field field})))
+        (emit-expr (boxed-record-projection value-form field-index) env depth))
+      (emit-record-get-of-new-construction type value-form field env depth))))
 
 (defn- emit-record-get-of-new-construction [type value-form field env depth]
   (when-not (seq? value-form)
@@ -983,11 +1005,14 @@
         (= op 'kernel-load-u32) (emit-kernel-load-u32 args 512 env depth)
         :else (emit-call op args env depth)))))
 
-(defn- emit-function [{:keys [name params body]}]
+(defn- emit-function [{:keys [name params body result]}]
   (when (> (count params) 5)
     (throw (ex-info "AArch64 fuel ABI supports at most five integer parameters"
                     {:phase :aarch64 :function name :arity (count params)})))
-  (let [n (count params) register-frame (* 16 (quot (+ n 1) 2))
+  (let [body (if (and (record-new-binding body) (vector? result) (= :record (first result)))
+               (boxed-record-chain (vec (drop 2 body)))
+               body)
+        n (count params) register-frame (* 16 (quot (+ n 1) 2))
         save-frame (when (pos? register-frame)
                      (concat (sub-sp register-frame)
                              (mapcat (fn [i] (str-sp (+ 19 i) (* 8 i))) (range n))))
@@ -1069,7 +1094,8 @@
 
 (defn emit-program [kir]
   (let [exported-names (set (or (:exports kir) (map :name (:functions kir))))
-        token-bodies (mapv (fn [f] [f (emit-function f)]) (:functions kir))
+        token-bodies (binding [*function-names* (set (map :name (:functions kir)))]
+                       (mapv (fn [f] [f (emit-function f)]) (:functions kir)))
         offsets (loop [items token-bodies offset 0 out {}]
                   (if-let [[f body] (first items)]
                     (recur (next items) (+ offset (code-size body)) (assoc out (:name f) offset)) out))

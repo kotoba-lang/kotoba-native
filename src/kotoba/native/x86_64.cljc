@@ -578,6 +578,29 @@
           (vec (concat code body-code
                        (when (pos? slots) (concat [0x48 0x81 0xc4] (le32 (* 8 slots)))))))))))
 
+
+;; A record that CROSSES A FUNCTION BOUNDARY is the one shape flattening cannot
+;; reach: a record is N slots and a function returns one word. It is boxed into
+;; a pair chain -- pair(f0, pair(f1, ... pair(fN-1, 0))) -- which is one word,
+;; and which needs no new primitive, no ABI change and no loader change: `pair`,
+;; `pair-first` and `pair-second` are the arena contract this backend has had
+;; since ADR 0062's own bounded-pair work.
+;;
+;; Both directions are source rewrites into forms this backend already emits, so
+;; nothing new is encoded: the callee's `record-new` becomes the chain, and the
+;; caller's projection becomes a walk of it.
+;;
+;; This costs arena cells, which are bounded at 4,096 per execution with no
+;; collection. That is not a regression: a record could not cross a boundary at
+;; all before, so no program that compiles today gains an allocation. It IS a
+;; property of the new shape, and the reason ADR 0062 chose slots for the shapes
+;; that do not need to escape -- those keep using slots and allocate nothing.
+(defn- boxed-record-chain [field-exprs]
+  (reduce (fn [rest-chain v] (list 'pair v rest-chain)) 0 (reverse field-exprs)))
+
+(defn- boxed-record-projection [handle-form field-index]
+  (list 'pair-first (nth (iterate (fn [f] (list 'pair-second f)) handle-form) field-index)))
+
 (defn- emit-record-get-of-new [type value-form field env ctx]
   ;; A record we already know -- bound by `let`, or selected out of one by an
   ;; earlier projection -- has each of its scalar fields in its own slot, so the
@@ -599,7 +622,16 @@
           (throw (ex-info "a record-valued projection may only appear as the operand of record-get"
                           {:phase :x86-64 :type type :field field})))
         (emit-expr child env ctx)))
-    (emit-record-get-of-new-construction type value-form field env ctx)))
+    (if (and (seq? value-form) (symbol? (first value-form))
+             (contains? (:function-names ctx) (first value-form)))
+      ;; The operand is a call, so the record arrived boxed: walk the chain.
+      (let [fields (nth type 2)
+            field-index (first (keep-indexed (fn [i [n _]] (when (= n field) i)) fields))]
+        (when (nil? field-index)
+          (throw (ex-info "record-get references an undeclared field"
+                          {:phase :x86-64 :type type :field field})))
+        (emit-expr (boxed-record-projection value-form field-index) env ctx))
+      (emit-record-get-of-new-construction type value-form field env ctx))))
 
 (defn- emit-record-get-of-new-construction [type value-form field env ctx]
   (when-not (seq? value-form)
@@ -1169,17 +1201,23 @@
 
         :else (emit-call op args env ctx)))))
 
-(defn- emit-function [{:keys [name params body]}]
+(defn- emit-function [{:keys [name params body result]} function-names]
   (when (> (count params) 5)
     (throw (ex-info "x86-64 fuel ABI supports at most five integer parameters"
                     {:phase :x86-64 :function name :arity (count params)})))
-  (let [n (count params)
+  (let [;; A function declared to return a record hands back the boxed chain.
+        body (if (and (record-new-binding body)
+                      (vector? result) (= :record (first result)))
+               (boxed-record-chain (vec (drop 2 body)))
+               body)
+        n (count params)
         pad? (even? n)
         env (zipmap params (range))
         prologue (concat fuel-charge (mapcat #(nth param-pushes %) (range n))
                          (when pad? [0x50]))
         expression (emit-expr body env {:param-count n :pad? pad? :temp-depth 0
-                                        :function-name name :tail? true})
+                                        :function-name name :tail? true
+                                        :function-names function-names})
         frame-bytes (* 8 (+ n (if pad? 1 0)))
         epilogue (concat [0x48 0x81 0xc4] (le32 frame-bytes) [0xc3])]
     {:tokens (vec (concat prologue expression epilogue))
@@ -1232,7 +1270,8 @@
 
 (defn emit-program [kir]
   (let [exported-names (set (or (:exports kir) (map :name (:functions kir))))
-        token-bodies (mapv (fn [f] [f (emit-function f)]) (:functions kir))
+        function-names (set (map :name (:functions kir)))
+        token-bodies (mapv (fn [f] [f (emit-function f function-names)]) (:functions kir))
         offsets (loop [items token-bodies offset 0 out {}]
                   (if-let [[f emitted] (first items)]
                     (recur (next items) (+ offset (code-size (:tokens emitted)))
