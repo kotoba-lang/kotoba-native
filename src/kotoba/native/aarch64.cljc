@@ -580,6 +580,25 @@
 ;; none match -- never special-cased away by a directly-nested `variant-
 ;; new`'s literal tag being statically known at that call site (see
 ;; `emit-variant-match-of-new` below).
+
+;; See the x86-64 backend for both helpers: slot width of a payload type, and
+;; describing an already-pushed slot region as a value of a given type.
+(defn- type-slot-width [t]
+  (if (and (vector? t) (= 3 (count t)) (= :record (first t)) (sequential? (nth t 2)))
+    (reduce + (map (comp type-slot-width second) (nth t 2)))
+    1))
+
+(defn- bind-over-slots [name type base env]
+  (if (and (vector? type) (= 3 (count type)) (= :record (first type)) (sequential? (nth type 2)))
+    (loop [fs (nth type 2) i 0 d base e env fm {}]
+      (if (seq fs)
+        (let [[fname ftype] (first fs)
+              child (symbol (str name "-" i))]
+          (recur (next fs) (inc i) (+ d (type-slot-width ftype))
+                 (bind-over-slots child ftype d e) (assoc fm fname child)))
+        (assoc e name {:record-type type :record-fields fm})))
+    (assoc env name {:let-depth base})))
+
 (defn- emit-variant-dispatch
   "Mirrors `backend/x86-64.cljc`'s own `emit-variant-dispatch` exactly, on
   this backend's own AArch64 instruction encodings and 16-byte let-slot
@@ -589,15 +608,23 @@
   [ordinal-expr payload-expr branch-specs env depth]
   (let [push-ordinal (vec (concat (emit-expr ordinal-expr env depth) (save-x0)))
         payload-depth (inc depth)
-        push-payload (vec (concat (emit-expr payload-expr env payload-depth) (save-x0)))
-        dispatch-depth (+ depth 2)
+        ;; Sized by the WIDEST declared case -- see the x86-64 backend for why
+        ;; the padding is not optional.
+        payload-slots (reduce max 1 (map #(type-slot-width (:payload-type %)) branch-specs))
+        [payload-code _ payload-end] (expand-binding (quote $variant-payload) payload-expr env depth payload-depth)
+        push-payload (vec (concat payload-code
+                                  (mapcat (fn [_] (concat (load-constant 0) (save-x0)))
+                                          (range (max 0 (- payload-slots (- payload-end payload-depth)))))))
+        dispatch-depth (+ depth 1 payload-slots)
         load-tag (load-let 0 depth dispatch-depth)
         n (count branch-specs)
         ;; add sp, sp, #32 -- drops the two synthetic 16-byte slots this
         ;; dispatch alone pushed, run at the end of EVERY case body.
-        cleanup (add-sp 32)
-        body-codes (mapv (fn [{:keys [binder body]}]
-                           (vec (emit-expr body (assoc env binder {:let-depth payload-depth}) dispatch-depth)))
+        cleanup (add-sp (* 16 (inc payload-slots)))
+        body-codes (mapv (fn [{:keys [binder body payload-type]}]
+                           (vec (emit-expr body
+                                           (bind-over-slots binder payload-type payload-depth env)
+                                           dispatch-depth)))
                          branch-specs)
         ;; Right-to-left fold, same reasoning as the x86-64 half: the last
         ;; case never needs a trailing branch, so its size is known first,
@@ -659,7 +686,9 @@
     (when-not (= (count cases) (count branches))
       (throw (ex-info "variant-match does not supply exactly one branch per declared case"
                       {:phase :aarch64 :type type})))
-    (let [branch-specs (mapv (fn [[_ binder body]] {:binder binder :body body}) branches)]
+    (let [branch-specs (mapv (fn [[case-tag case-payload-type] [_ binder body]]
+                               {:binder binder :body body :payload-type case-payload-type})
+                             cases branches)]
       (emit-variant-dispatch ordinal payload-expr branch-specs env depth))))
 
 (defn emit-expr [form env depth]
