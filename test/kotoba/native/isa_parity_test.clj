@@ -64,7 +64,8 @@
    [['b 'l 'i] '(kernel-load-u32 b l i)]
    [['b 'l 'i 'v] '(kernel-store-u8 b l i v)]
    [['b 'l 'i 'v] '(kernel-store-u8-4k b l i v)]
-   [['b 'l 'i 'v] '(kernel-store-u32 b l i v)]])
+   [['b 'l 'i 'v] '(kernel-store-u32 b l i v)]
+   [['b 'l 'o 's] '(kernel-subregion b l o s)]])
 
 (deftest every-portable-operator-emits-on-both-isas
   (doseq [[params body] portable]
@@ -324,3 +325,57 @@
              clojure.lang.ExceptionInfo #"undeclared field"
              (emit (rec-program (list 'let ['r (list 'record-new rec-type 1 2)]
                                       (list 'record-get rec-type 'r :nope))))))))))
+
+;; ---------------------------------------------------------------------------
+;; kernel-subregion encodes the checks it claims to.
+;;
+;; Emission parity above proves both backends produce SOMETHING for the op.
+;; For a bounds check that is not enough: a sequence that emitted the right
+;; number of bytes with a wrong branch displacement would pass parity and
+;; silently never trap. Kernel targets are linkable ELF objects rather than
+;; runnable processes, so there is no execute-and-observe available here the
+;; way there is for userland artifacts -- these assertions pin the exact
+;; encodings instead, and were derived by disassembling the emitted bytes
+;; (otool -tvV) rather than by reading them back out of the source.
+
+(defn- emitted [emit params body]
+  (let [program {:format :kotoba.kir/v3
+                 :functions [{:name 'main :params params :body body :result :i64}]}]
+    (mapv #(bit-and % 0xff) (:code (emit program)))))
+
+(defn- subsequence? [needle haystack]
+  (some #(= needle (subvec haystack % (min (count haystack) (+ % (count needle)))))
+        (range (inc (- (count haystack) (count needle))))))
+
+(deftest x86-64-kernel-subregion-encodes-its-checks
+  (let [code (emitted x86/emit-program '[b l o s] '(kernel-subregion b l o s))]
+    (is (subsequence?
+         [0x5f 0x59 0x5a                          ; pop rdi/rcx/rdx = offset/length/base
+          0x48 0x85 0xd2                          ; test rdx,rdx
+          0x0f 0x84 0x1b 0x00 0x00 0x00           ; jz  -> ud2 at +27
+          0x48 0x39 0xcf                          ; cmp rdi,rcx
+          0x0f 0x87 0x12 0x00 0x00 0x00           ; ja  -> ud2 at +18
+          0x48 0x29 0xf9                          ; sub rcx,rdi  (remaining)
+          0x48 0x39 0xc8                          ; cmp rax,rcx
+          0x0f 0x87 0x06 0x00 0x00 0x00           ; ja  -> ud2 at +6
+          0x48 0x8d 0x04 0x3a                     ; lea rax,[rdx+rdi]
+          0xeb 0x02 0x0f 0x0b]                    ; jmp +2 / ud2
+         code)
+        "every branch must land on the UD2, or the check never fires")))
+
+(deftest aarch64-kernel-subregion-encodes-its-checks
+  (let [code (emitted arm/emit-program '[b l o s] '(kernel-subregion b l o s))
+        word (fn [w] [(bit-and w 0xff) (bit-and (bit-shift-right w 8) 0xff)
+                      (bit-and (bit-shift-right w 16) 0xff) (bit-and (bit-shift-right w 24) 0xff)])]
+    (is (subsequence?
+         (vec (mapcat word [0xb4000101   ; cbz x1, +32   (null parent)
+                            0xeb02007f   ; cmp x3, x2    (offset vs length)
+                            0x540000c8   ; b.hi +24
+                            0xcb030044   ; sub x4, x2, x3 (remaining)
+                            0xeb0400bf   ; cmp x5, x4    (sublen vs remaining)
+                            0x54000068   ; b.hi +12
+                            0x8b030020   ; add x0, x1, x3
+                            0x14000002   ; b +8
+                            0xd4200000])) ; brk #0
+         code)
+        "every branch must land on the BRK, or the check never fires")))
