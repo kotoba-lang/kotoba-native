@@ -396,7 +396,11 @@
    ;; host-side (content comparison / pool allocation), so they need a new
    ;; offset each.
    'string-byte-length 72
-   'string=? 112 'string-concat 120})
+   'string=? 112 'string-concat 120
+   ;; General string-substring. The ascii-literal fast path above handles the
+   ;; literal case without a host call; every other shape needs one, because
+   ;; only the host can read the boundary bytes.
+   'string-substring 136})
 
 (defn- emit-heap-call [op args env depth]
   (let [offset (get heap-call-offsets op)
@@ -884,7 +888,8 @@
 
         (contains? '#{pair pair-first pair-second
                       kgraph-assert! kgraph-get kgraph-count kgraph-entity-at
-                      string-byte-length string=? string-concat} op)
+                      string-byte-length string=? string-concat
+                      string-substring} op)
         (emit-heap-call op args env depth)
         ;; Pure representation changes: the bits are already in x0.
         (contains? '#{f64-from-bits f64-to-bits} op)

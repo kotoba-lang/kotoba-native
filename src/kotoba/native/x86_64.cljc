@@ -257,7 +257,11 @@
    ;; A string value IS a pair(offset,length) handle -- string-byte-length
    ;; is exactly pair-second, no new host function needed.
    'string-byte-length 72
-   'string=? 112 'string-concat 120})
+   'string=? 112 'string-concat 120
+   ;; General string-substring. The ascii-literal fast path above handles the
+   ;; literal case without a host call; every other shape needs one, because
+   ;; only the host can read the boundary bytes.
+   'string-substring 136})
 
 (defn- emit-heap-call [op args env {:keys [temp-depth] :as ctx}]
   (let [ctx (assoc ctx :tail? false)
@@ -1027,7 +1031,8 @@
 
         (contains? '#{pair pair-first pair-second
                       kgraph-assert! kgraph-get kgraph-count kgraph-entity-at
-                      string-byte-length string=? string-concat} op)
+                      string-byte-length string=? string-concat
+                      string-substring} op)
         (emit-heap-call op args env ctx)
 
         (= op 'kernel-load-u8)
