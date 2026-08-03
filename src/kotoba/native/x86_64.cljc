@@ -1,8 +1,10 @@
 (ns kotoba.native.x86-64
-  ;; See `kotoba.wasm.core`'s ns form for why the whole
-  ;; `:require` clause (not just an item inside it) is behind the
-  ;; reader-conditional -- the `:clj` branch needs no requires at all.
-  #?(:cljs (:require [kotoba.kir.cljs-i64 :as i64])))
+  ;; `kotoba.native.peephole` is required on BOTH runtimes, so the reader
+  ;; conditional that used to wrap the whole `:require` (see
+  ;; `kotoba.wasm.core`'s ns form for that original reasoning -- the `:clj`
+  ;; branch needed no requires at all) now wraps only the cljs-only item.
+  (:require [kotoba.native.peephole :as peephole]
+            #?@(:cljs [[kotoba.kir.cljs-i64 :as i64]])))
 
 ;; `le32` only ever encodes small, non-negative, interpreter-internal
 ;; displacements/offsets/immediate operands in this file (stack disps,
@@ -77,13 +79,48 @@
 (defn- load-let [let-depth temp-depth]
   (into [0x48 0x8b 0x84 0x24] (le32 (* 8 (- temp-depth let-depth 1)))))
 
+;; The spill/reload window that both `emit-binary` and the n-ary arithmetic
+;; reduce place between the left operand's code and the operation itself:
+;;
+;;     push rax           ; spill left -- right's code targets rax too
+;;     <right operand>
+;;     mov rcx,rax        ; move right's result into the scratch register
+;;     pop rax            ; reload left
+;;
+(def ^:private binary-spill [0x50])
+(def ^:private binary-reload [0x48 0x89 0xc1 0x58])
+
+;; When the right operand is a compile-time constant, that whole round trip is
+;; unnecessary: there is nothing to protect rax from, because the constant can
+;; be materialized straight into the scratch register. `mov rcx,imm64`
+;; (REX.W B8+rcx) is the same ten bytes `mov rax,imm64` (REX.W B8+rax) would
+;; have taken, so the window shrinks by exactly the spill and reload -- which
+;; become canonical no-ops rather than shortening the window, because both
+;; backends bake branch displacements as plain bytes before any pass can run.
+;; `kotoba.native.peephole`'s namespace docstring explains why that makes size
+;; preservation mandatory rather than merely convenient.
+;;
+;; The window length is DERIVED from the replacement's own length rather than
+;; written as a literal 15: `mov rcx,imm64` and `mov rax,imm64` encode in the
+;; same width, so the replacement's length is exactly what the constant's code
+;; would have occupied on the unoptimized path. Should either encoding ever
+;; change, the two move together instead of drifting apart silently.
+(defn- emit-rhs-window [right env ctx]
+  (let [constant (peephole/constant-operand right)]
+    (if (some? constant)
+      (let [replacement (into [0x48 0xb9] (le64 constant))]
+        (peephole/pad-to replacement
+                         (+ (count binary-spill) (count replacement) (count binary-reload))
+                         peephole/nop-x86-64))
+      (vec (concat binary-spill
+                   (emit-expr right env (update ctx :temp-depth inc))
+                   binary-reload)))))
+
 (defn- emit-binary [left right opcode env ctx]
   (let [ctx (assoc ctx :tail? false)]
     (vec (concat (emit-expr left env ctx)
-               [0x50]
-               (emit-expr right env (update ctx :temp-depth inc))
-               [0x48 0x89 0xc1 0x58]
-               opcode))))
+                 (emit-rhs-window right env ctx)
+                 opcode))))
 
 (defn- emit-tail-self-call [args env {:keys [param-count pad? temp-depth] :as ctx}]
   ;; All arguments are evaluated before any parameter slot is overwritten.
@@ -694,9 +731,8 @@
         (contains? '#{+ - * quot bit-xor bit-and bit-or} op)
         (let [ctx (assoc ctx :tail? false)]
           (reduce (fn [left-code right]
-                  (vec (concat left-code [0x50]
-                               (emit-expr right env (update ctx :temp-depth inc))
-                               [0x48 0x89 0xc1 0x58]
+                  (vec (concat left-code
+                               (emit-rhs-window right env ctx)
                                (case op + [0x48 0x01 0xc8] - [0x48 0x29 0xc8]
                                       * [0x48 0x0f 0xaf 0xc1]
                                       quot [0x48 0x99 0x48 0xf7 0xf9]

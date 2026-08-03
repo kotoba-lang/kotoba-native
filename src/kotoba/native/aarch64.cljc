@@ -1,7 +1,10 @@
 (ns kotoba.native.aarch64
-  ;; See `kotoba.wasm.core`'s ns form for why the whole
-  ;; `:require` clause is behind the reader-conditional.
-  #?(:cljs (:require [kotoba.kir.cljs-i64 :as i64])))
+  ;; `kotoba.native.peephole` is required on BOTH runtimes, so the reader
+  ;; conditional that used to wrap the whole `:require` (see
+  ;; `kotoba.wasm.core`'s ns form for that original reasoning) now wraps only
+  ;; the cljs-only item.
+  (:require [kotoba.native.peephole :as peephole]
+            #?@(:cljs [[kotoba.kir.cljs-i64 :as i64]])))
 
 ;; `u32le` only ever encodes a fully-constructed 32-bit ARM instruction
 ;; WORD (opcode bits + small operand fields, always in [0, 2^32)) -- never
@@ -117,9 +120,36 @@
 
 (declare emit-expr)
 
+;; The spill/reload window that both `emit-binary` and the n-ary arithmetic
+;; loop place between the left operand's code and the operation itself:
+;; `save-x0` claims a 16-byte stack slot and stores the left operand, the
+;; right operand's code then targets x0, and `restore-binary` moves that
+;; result into x1 before reloading the left operand and releasing the slot.
+;;
+;; When the right operand is a compile-time constant, none of that is needed:
+;; the constant can be materialized straight into x1, and `load-constant-reg`
+;; encodes into the same four instructions for any destination register, so
+;; the replacement occupies exactly what the constant's own code would have.
+;; What the window sheds is the entire stack round trip -- a stack-pointer
+;; decrement, a store, a load, a register move and an increment -- replaced by
+;; canonical `nop`s. See `kotoba.native.peephole`'s namespace docstring for
+;; why the length must be preserved rather than reclaimed.
+;;
+;; The window length is DERIVED from the surrounding encodings rather than
+;; written as a literal 36, so it cannot drift if any of them change.
+(defn- emit-rhs-window [right env depth]
+  (let [constant (peephole/constant-operand right)]
+    (if (some? constant)
+      (let [replacement (load-constant-reg 1 constant)]
+        (peephole/pad-to replacement
+                         (+ (count (save-x0)) (count replacement) (count (restore-binary)))
+                         peephole/nop-aarch64))
+      (vec (concat (save-x0) (emit-expr right env (inc depth)) (restore-binary))))))
+
 (defn- emit-binary [left right operation env depth]
-  (vec (concat (emit-expr left env depth) (save-x0) (emit-expr right env (inc depth))
-               (restore-binary) operation)))
+  (vec (concat (emit-expr left env depth)
+               (emit-rhs-window right env depth)
+               operation)))
 
 (defn- emit-call [op args env depth]
   (when (> (count args) 5)
@@ -635,8 +665,8 @@
         (loop [remaining (rest args) left-code (emit-expr (first args) env depth)]
           (if-let [right (first remaining)]
             (recur (next remaining)
-                   (vec (concat left-code (save-x0) (emit-expr right env (inc depth))
-                                (restore-binary)
+                   (vec (concat left-code
+                                (emit-rhs-window right env depth)
                                 (case op + (insn 0x8b010000) - (insn 0xcb010000)
                                        * (insn 0x9b017c00) quot signed-division))))
             left-code))
