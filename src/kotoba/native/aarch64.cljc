@@ -270,6 +270,47 @@
         (branch 8)                           ; b skip
         (insn 0xd4200000))))                 ; trap: brk ; skip:
 
+;; `(kernel-subregion base length offset sublen)` -> base+offset, trapping
+;; unless the sub-window fits inside the parent window.
+;;
+;; The load/store bounds check constrains an index within a DECLARED length,
+;; and both the base and that length are supplied by the caller. So narrowing
+;; a region by hand -- `(fnv (+ base object-offset) object-length)`, the shape
+;; six aiueos objects use -- produced a window nothing had checked: the
+;; frontend's provenance rule keeps the root traceable, but the offset and the
+;; new length were free. This primitive makes the derivation itself checked,
+;; so a correct entry window implies every window derived from it is correct.
+;;
+;; Overflow-free by construction: `offset > length` traps first, so
+;; `length - offset` cannot underflow, and `sublen` is then compared against
+;; that remainder rather than against `offset + sublen` (which could wrap for
+;; a hostile pair). Unsigned comparisons throughout, so a negative i64 arrives
+;; as a huge unsigned value and trips the same check rather than sneaking
+;; under a signed one.
+;;
+;; Byte layout from the first branch, for the displacements below:
+;;   +0 cbz x1,trap  +4 cmp x3,x2  +8 b.hi trap  +12 sub x4,x2,x3
+;;   +16 cmp x5,x4   +20 b.hi trap +24 add x0,x1,x3  +28 b skip  +32 brk  +36 skip
+(defn- emit-kernel-subregion [[base length offset sublen] env depth]
+  (vec (concat
+        (emit-expr base env depth) (save-x0)
+        (emit-expr length env (+ depth 1)) (save-x0)
+        (emit-expr offset env (+ depth 2)) (save-x0)
+        (emit-expr sublen env (+ depth 3))   ; x0 = sublen
+        (mov-reg 5 0)                        ; x5 = sublen
+        (ldr-sp 3 0) (add-sp 16)             ; x3 = offset
+        (ldr-sp 2 0) (add-sp 16)             ; x2 = length
+        (ldr-sp 1 0) (add-sp 16)             ; x1 = base
+        (cbz-reg 1 32)                       ; cbz x1, trap   (null parent)
+        (insn 0xeb02007f)                    ; cmp x3, x2     (offset vs length)
+        (b-cond cond-hi 24)                  ; b.hi trap      (offset > length)
+        (insn 0xcb030044)                    ; sub x4, x2, x3 (remaining = length-offset)
+        (insn 0xeb0400bf)                    ; cmp x5, x4     (sublen vs remaining)
+        (b-cond cond-hi 12)                  ; b.hi trap
+        (insn 0x8b030020)                    ; add x0, x1, x3 (result = base+offset)
+        (branch 8)                           ; b skip
+        (insn 0xd4200000))))                 ; trap: brk ; skip:
+
 ;; 32-bit MMIO (virtio registers are u32). Same bounds discipline, but the
 ;; 4-byte access must fit: index+4 <= length. Byte layout from the first branch:
 ;;   +0 cmp x2,x4  +4 b.hi trap  +8 cbz x1,trap  +12 add x5,x3,#4  +16 cmp x5,x2
@@ -904,6 +945,7 @@
         (let [[left right] args cset ({'= 0x9a9f17e0 '< 0x9a9fa7e0 '> 0x9a9fd7e0
                                       '<= 0x9a9fc7e0 '>= 0x9a9fb7e0} op)]
           (emit-binary left right (concat (insn 0xeb01001f) (insn cset)) env depth))
+        (= op 'kernel-subregion) (emit-kernel-subregion args env depth)
         (= op 'kernel-store-u8) (emit-kernel-store-u8 args 512 env depth)
         (= op 'kernel-store-u8-4k) (emit-kernel-store-u8 args 4096 env depth)
         (= op 'kernel-load-u8) (emit-kernel-load-u8 args 512 env depth)
