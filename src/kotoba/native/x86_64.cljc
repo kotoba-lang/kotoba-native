@@ -261,7 +261,9 @@
    ;; General string-substring. The ascii-literal fast path above handles the
    ;; literal case without a host call; every other shape needs one, because
    ;; only the host can read the boundary bytes.
-   'string-substring 136})
+   'string-substring 136
+   ;; string-code-point-at: scalar result, so nothing is allocated at all.
+   'string-code-point-at 144})
 
 (defn- emit-heap-call [op args env {:keys [temp-depth] :as ctx}]
   (let [ctx (assoc ctx :tail? false)
@@ -1032,7 +1034,7 @@
         (contains? '#{pair pair-first pair-second
                       kgraph-assert! kgraph-get kgraph-count kgraph-entity-at
                       string-byte-length string=? string-concat
-                      string-substring} op)
+                      string-substring string-code-point-at} op)
         (emit-heap-call op args env ctx)
 
         (= op 'kernel-load-u8)
