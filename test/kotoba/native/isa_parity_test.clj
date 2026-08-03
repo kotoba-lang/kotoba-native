@@ -379,3 +379,43 @@
                             0xd4200000])) ; brk #0
          code)
         "every branch must land on the BRK, or the check never fires")))
+;; A nested record is flattened, not represented
+;; ---------------------------------------------------------------------------
+
+(def ^:private inner '[:record :t/s [[:a :i64] [:b :i64]]])
+(def ^:private outer '[:record :t/n [[:i [:record :t/s [[:a :i64] [:b :i64]]]] [:m :i64]]])
+
+(deftest a-nested-record-flattens-into-the-enclosing-slots
+  ;; ADR 0062's property -- a record has no independent runtime representation
+  ;; -- is kept, not traded away: a field that is itself a record expands into
+  ;; the enclosing record's own slots, recursively. A chained projection then
+  ;; needs no intermediate value at all.
+  (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
+    (testing label
+      (doseq [[why body]
+              [["outer field of a let-bound nested record"
+                (list 'let ['r (list 'record-new outer (list 'record-new inner 1 2) 9)]
+                      (list 'record-get outer 'r :m))]
+               ["chained into the inner record"
+                (list 'let ['r (list 'record-new outer (list 'record-new inner 1 2) 9)]
+                      (list 'record-get inner (list 'record-get outer 'r :i) :b))]
+               ["chained plus a sibling read"
+                (list 'let ['r (list 'record-new outer (list 'record-new inner 4 5) 6)]
+                      (list '+ (list 'record-get inner (list 'record-get outer 'r :i) :a)
+                            (list 'record-get outer 'r :m)))]
+               ["construction, outer field"
+                (list 'record-get outer (list 'record-new outer (list 'record-new inner 1 2) 7) :m)]]]
+        (is (seq (:code (emit (program [] body)))) why)
+        (is (= (emit (program [] body)) (emit (program [] body)))
+            (str why " must be reproducible"))))))
+
+(deftest a-record-valued-projection-is-not-a-value
+  ;; Selecting a record-typed field yields a record, which is only meaningful as
+  ;; the operand of a further projection. Anywhere else there is no word to
+  ;; produce, so it must be refused rather than loading one of the slots.
+  (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
+    (testing label
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"record-valued projection may only appear"
+           (emit (program [] (list 'let ['r (list 'record-new outer (list 'record-new inner 1 2) 9)]
+                                   (list 'record-get outer 'r :i)))))))))
