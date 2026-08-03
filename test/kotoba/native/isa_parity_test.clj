@@ -465,3 +465,48 @@
       (testing label
         (is (seq (:code (emit (program [] body)))))
         (is (= (emit (program [] body)) (emit (program [] body))))))))
+
+;; ---------------------------------------------------------------------------
+;; A record crossing a function boundary
+;; ---------------------------------------------------------------------------
+
+(def ^:private pair-rec '[:record :t/s [[:a :i64] [:b :i64]]])
+
+(defn- boundary-program [body]
+  {:format :kotoba.kir/v4 :exports ['main]
+   :functions [{:name 'mk :params [] :result pair-rec
+                :body (list 'record-new pair-rec 11 22)}
+               {:name 'main :params [] :body body}]})
+
+(deftest a-record-crosses-a-function-boundary-boxed
+  ;; The one shape flattening cannot reach: a record is N slots and a function
+  ;; returns one word, so it is boxed into a pair chain -- one word, built from
+  ;; the arena primitives this backend has had since ADR 0062's bounded-pair
+  ;; work. No new primitive, no ABI change, no loader change.
+  (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
+    (testing label
+      (doseq [[why body] [["first field" (list 'record-get pair-rec '(mk) :a)]
+                          ["second field" (list 'record-get pair-rec '(mk) :b)]
+                          ["both" (list '+ (list 'record-get pair-rec '(mk) :a)
+                                        (list 'record-get pair-rec '(mk) :b))]]]
+        (is (seq (:code (emit (boundary-program body)))) why)
+        (is (= (emit (boundary-program body)) (emit (boundary-program body)))
+            (str why " must be reproducible"))))))
+
+(deftest slot-backed-records-still-allocate-nothing
+  ;; Boxing is confined to the boundary. A record that does not escape keeps
+  ;; using slots, so no program that compiled before gains an arena allocation
+  ;; -- which is what makes this non-regressive despite the arena being bounded
+  ;; and uncollected.
+  (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
+    (testing label
+      (let [slot-only (program [] (list 'let ['r (list 'record-new pair-rec 1 2)]
+                                        (list 'record-get pair-rec 'r :a)))
+            code (:code (emit slot-only))
+            ;; pair_new is the arena call at context offset 56; a slot-backed
+            ;; record must not reach it.
+            calls-pair (if (= label "x86-64")
+                         (some #(= [0x41 0xff 0x51 56] %) (partition 4 1 code))
+                         (some #(= [0x38 0x40 0x40 0xf9] %) (partition 4 1 code)))]
+        (is (seq code))
+        (is (not calls-pair) "a non-escaping record must allocate nothing")))))
