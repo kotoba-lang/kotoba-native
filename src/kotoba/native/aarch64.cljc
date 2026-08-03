@@ -722,6 +722,38 @@
         ;; base, same Rm placement, opcode field 001000/001010/001001.
         ;; ASRV for `i64-shift-right` and LSRV for `u64-shift-right`, matching
         ;; `kotoba.kir`'s `i64-shr`/`u64-shr`.
+        ;; `i32-operations` -- see the x86-64 backend's own comment for why
+        ;; these need no new value representation: there is no `:i32` type,
+        ;; only i64 words with 32-bit wrapping, and the sole difference is
+        ;; that `i32-*` results are SIGN-extended from bit 31 while `u32-*`
+        ;; results are ZERO-extended.
+        ;;
+        ;; AArch64 gives the unsigned half for free the same way x86-64 does:
+        ;; writing a `w` register zeroes the upper 32 bits, so a `w`-form
+        ;; operation is already `u32-wrap`ped. The signed forms need one
+        ;; `sxtw x0, w0` after. Every encoding below is the `sf=0` sibling of
+        ;; the 64-bit form used a few lines down, so the two move together.
+        (and (= op 'i32-wrap) (= 1 (count args)))
+        (vec (concat (emit-expr (first args) env depth) (insn 0x93407c00)))  ; sxtw x0,w0
+
+        (and (= op 'u32-wrap) (= 1 (count args)))
+        (vec (concat (emit-expr (first args) env depth) (insn 0x2a0003e0)))  ; mov w0,w0
+
+        (contains? '#{i32-wrapping-add i32-wrapping-mul i32-xor
+                      i32-shift-left i32-shift-right u32-shift-right} op)
+        (let [[left right] args
+              sxtw (insn 0x93407c00)]
+          (vec (concat (emit-expr left env depth)
+                       (emit-rhs-window right env depth)
+                       (case op
+                         i32-wrapping-add (concat (insn 0x0b010000) sxtw)  ; add w0,w0,w1
+                         i32-wrapping-mul (concat (insn 0x1b017c00) sxtw)  ; mul w0,w0,w1
+                         i32-xor (concat (insn 0x4a010000) sxtw)           ; eor w0,w0,w1
+                         i32-shift-left (concat (insn 0x1ac12000) sxtw)    ; lslv w0,w0,w1
+                         i32-shift-right (concat (insn 0x1ac12800) sxtw)   ; asrv w0,w0,w1
+                         ;; logical: the w-form write already zero-extends
+                         u32-shift-right (insn 0x1ac12400)))))             ; lsrv w0,w0,w1
+
         (contains? '#{i64-shift-left i64-shift-right u64-shift-right} op)
         (let [[value count-form] args]
           (vec (concat (emit-expr value env depth)

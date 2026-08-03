@@ -862,6 +862,48 @@
         ;; `u64-shr` (`unsigned-bit-shift-right`). Swapping them would produce
         ;; an artifact whose sealed oracle value disagrees with its own code for
         ;; every negative operand.
+        ;; `kotoba.compiler.frontend`'s `i32-operations`. There is no `:i32`
+        ;; value type -- `kotoba.kir` has exactly one mention of `:i32` and it
+        ;; is a trap keyword -- so these are ordinary i64 words carrying
+        ;; 32-bit wrapping semantics, and they need no new representation,
+        ;; no ABI change and no host call. Only the normalization differs:
+        ;; every `i32-*` result is SIGN-extended from bit 31 (`kotoba.kir`'s
+        ;; helpers go through `unchecked-int` / `i32-wrap`), while `u32-*`
+        ;; results are ZERO-extended (`u32-wrap`).
+        ;;
+        ;; That falls out of the ISA almost for free here: a 32-bit operation
+        ;; on x86-64 already zero-extends its result into the full register,
+        ;; so the unsigned forms need nothing after them, and the signed forms
+        ;; need exactly one `movsxd rax,eax`.
+        ;;
+        ;; Shift counts ride the ordinary binary window into rcx, and CL is
+        ;; its low byte. No masking is emitted: the frontend admits an i32
+        ;; shift count only as an integer literal in [0,31], so the hardware's
+        ;; own mod-32 truncation of CL is unreachable -- the same argument the
+        ;; i64 shifts above make with [0,63].
+        (and (= op 'i32-wrap) (= 1 (count args)))
+        (vec (concat (emit-expr (first args) env (assoc ctx :tail? false))
+                     [0x48 0x63 0xc0]))                    ; movsxd rax,eax
+
+        (and (= op 'u32-wrap) (= 1 (count args)))
+        (vec (concat (emit-expr (first args) env (assoc ctx :tail? false))
+                     [0x89 0xc0]))                         ; mov eax,eax (zero-extends)
+
+        (contains? '#{i32-wrapping-add i32-wrapping-mul i32-xor
+                      i32-shift-left i32-shift-right u32-shift-right} op)
+        (let [ctx (assoc ctx :tail? false)
+              [left right] args]
+          (vec (concat (emit-expr left env ctx)
+                       (emit-rhs-window right env ctx)
+                       (case op
+                         i32-wrapping-add [0x01 0xc8 0x48 0x63 0xc0]      ; add eax,ecx ; movsxd
+                         i32-wrapping-mul [0x0f 0xaf 0xc1 0x48 0x63 0xc0] ; imul eax,ecx ; movsxd
+                         i32-xor [0x31 0xc8 0x48 0x63 0xc0]               ; xor eax,ecx ; movsxd
+                         i32-shift-left [0xd3 0xe0 0x48 0x63 0xc0]        ; shl eax,cl ; movsxd
+                         i32-shift-right [0xd3 0xf8 0x48 0x63 0xc0]       ; sar eax,cl ; movsxd
+                         ;; logical: the 32-bit shift already zero-extends
+                         u32-shift-right [0xd3 0xe8]))))                  ; shr eax,cl
+
         (contains? '#{i64-shift-left i64-shift-right u64-shift-right} op)
         (let [ctx (assoc ctx :tail? false)
               [value count-form] args]
