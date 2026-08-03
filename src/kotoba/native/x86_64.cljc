@@ -661,6 +661,28 @@
 ;; producing or trusting a signature, so even a hand-crafted artifact
 ;; bypassing `frontend/analyze` cannot reach real execution with a
 ;; discriminant the type system did not itself validate).
+
+;; How many slots a payload of this type occupies once flattened -- a record is
+;; its fields transitively, anything else is one word.
+(defn- type-slot-width [t]
+  (if (and (vector? t) (= 3 (count t)) (= :record (first t)) (sequential? (nth t 2)))
+    (reduce + (map (comp type-slot-width second) (nth t 2)))
+    1))
+
+;; Describe a region of already-pushed slots starting at `base` as a value of
+;; `type`. The dispatch pushed the slots; this only names them, so a record case
+;; sees a record and a scalar case sees a word.
+(defn- bind-over-slots [name type base env]
+  (if (and (vector? type) (= 3 (count type)) (= :record (first type)) (sequential? (nth type 2)))
+    (loop [fs (nth type 2) i 0 d base e env fm {}]
+      (if (seq fs)
+        (let [[fname ftype] (first fs)
+              child (symbol (str name "-" i))]
+          (recur (next fs) (inc i) (+ d (type-slot-width ftype))
+                 (bind-over-slots child ftype d e) (assoc fm fname child)))
+        (assoc e name {:record-type type :record-fields fm})))
+    (assoc env name {:let-depth base})))
+
 (defn- emit-variant-dispatch
   "ORDINAL-EXPR and PAYLOAD-EXPR are ordinary KIR expressions (ORDINAL-EXPR
   is normally a compile-time-computed plain integer, but nothing here
@@ -675,20 +697,31 @@
   (let [tail-ctx (assoc ctx :tail? false)
         push-ordinal (vec (concat (emit-expr ordinal-expr env tail-ctx) [0x50]))
         payload-depth (inc temp-depth)
-        push-payload (vec (concat (emit-expr payload-expr env (assoc tail-ctx :temp-depth payload-depth))
-                                  [0x50]))
-        dispatch-depth (+ temp-depth 2)
+        ;; The payload region is sized by the WIDEST declared case, not by the
+        ;; constructed one. Only the constructed case is materialised, but every
+        ;; branch is still emitted, and a branch whose declared payload is wider
+        ;; would otherwise name slots that were never pushed -- emitting a load
+        ;; whose displacement runs off the frame. Unreachable, but not something
+        ;; to emit; padding makes it structurally impossible.
+        payload-slots (reduce max 1 (map #(type-slot-width (:payload-type %)) branch-specs))
+        [payload-code _ payload-end] (expand-binding '$variant-payload payload-expr env tail-ctx payload-depth)
+        push-payload (vec (concat payload-code
+                                  (mapcat (fn [_] (concat (into [0x48 0xb8] (le64 0)) [0x50]))
+                                          (range (max 0 (- payload-slots (- payload-end payload-depth)))))))
+        dispatch-depth (+ temp-depth 1 payload-slots)
         load-tag (load-let temp-depth dispatch-depth)
         n (count branch-specs)
         body-ctx (assoc ctx :temp-depth dispatch-depth)
-        ;; add rsp, 16 -- drops the two synthetic slots this dispatch alone
-        ;; pushed, run at the end of EVERY case body before falling through
-        ;; to whatever follows this whole construct (mirrors `emit-let`'s own
+        ;; add rsp, N -- drops the ordinal slot and the payload region this
+        ;; dispatch alone pushed, run at the end of EVERY case body before
+        ;; falling through to whatever follows (mirrors `emit-let`'s own
         ;; final pop, just deferred until after the SELECTED branch runs
         ;; instead of after a single body expression).
-        cleanup [0x48 0x81 0xc4 0x10 0x00 0x00 0x00]
-        body-codes (mapv (fn [{:keys [binder body]}]
-                           (vec (emit-expr body (assoc env binder {:let-depth payload-depth}) body-ctx)))
+        cleanup (vec (concat [0x48 0x81 0xc4] (le32 (* 8 (inc payload-slots)))))
+        body-codes (mapv (fn [{:keys [binder body payload-type]}]
+                           (vec (emit-expr body
+                                           (bind-over-slots binder payload-type payload-depth env)
+                                           body-ctx)))
                          branch-specs)
         ;; Build the final per-case bodies right-to-left: the LAST case never
         ;; needs a trailing jump (nothing follows it but whatever comes after
@@ -752,7 +785,9 @@
     (when-not (= (count cases) (count branches))
       (throw (ex-info "variant-match does not supply exactly one branch per declared case"
                       {:phase :x86-64 :type type})))
-    (let [branch-specs (mapv (fn [[_ binder body]] {:binder binder :body body}) branches)]
+    (let [branch-specs (mapv (fn [[case-tag case-payload-type] [_ binder body]]
+                               {:binder binder :body body :payload-type case-payload-type})
+                             cases branches)]
       (emit-variant-dispatch ordinal payload-expr branch-specs env ctx))))
 
 (defn emit-expr [form env {:keys [param-count pad? temp-depth] :as ctx}]

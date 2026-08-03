@@ -419,3 +419,49 @@
            clojure.lang.ExceptionInfo #"record-valued projection may only appear"
            (emit (program [] (list 'let ['r (list 'record-new outer (list 'record-new inner 1 2) 9)]
                                    (list 'record-get outer 'r :i)))))))))
+
+;; ---------------------------------------------------------------------------
+;; A variant whose case payload is a record
+;; ---------------------------------------------------------------------------
+
+(def ^:private wall '[:record :kotoba.clock/wall [[:unix-millis :i64] [:observation-sequence :i64]]])
+(def ^:private clock-error '[:record :kotoba.clock/error [[:code :keyword] [:message :string]]])
+(def ^:private clock-result
+  '[:variant :kotoba.clock/result
+    [[:wall [:record :kotoba.clock/wall [[:unix-millis :i64] [:observation-sequence :i64]]]]
+     [:error [:record :kotoba.clock/error [[:code :keyword] [:message :string]]]]]])
+
+(deftest a-variant-case-payload-may-be-a-record
+  ;; These are clock-v1's own declared shapes, not a reduction of them. The
+  ;; payload flattens into the dispatch's slots exactly as a record field
+  ;; flattens into its enclosing record's.
+  (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
+    (testing label
+      (doseq [[why body]
+              [["wall case, project a field"
+                (list 'variant-match clock-result
+                      (list 'variant-new clock-result :wall (list 'record-new wall 123 4))
+                      [[:wall 'p (list 'record-get wall 'p :unix-millis)] [:error 'p 0]])]
+               ["error case, project the string field"
+                (list 'variant-match clock-result
+                      (list 'variant-new clock-result :error (list 'record-new clock-error :timeout "slow"))
+                      [[:wall 'p 0] [:error 'p (list 'string-byte-length (list 'record-get clock-error 'p :message))]])]]]
+        (is (seq (:code (emit (program [] body)))) why)
+        (is (= (emit (program [] body)) (emit (program [] body)))
+            (str why " must be reproducible"))))))
+
+(deftest the-payload-region-is-sized-by-the-widest-case
+  ;; Only the constructed case is materialised, but every branch is emitted. A
+  ;; branch whose declared payload is wider than the constructed one must still
+  ;; describe slots that exist -- otherwise it emits a load running off the
+  ;; frame, unreachable but wrong. Constructing the NARROW case of a variant
+  ;; whose other case is wider is the shape that would expose it.
+  (let [mixed '[:variant :t/m [[:small :i64]
+                               [:big [:record :t/b [[:a :i64] [:b :i64] [:c :i64]]]]]]
+        big '[:record :t/b [[:a :i64] [:b :i64] [:c :i64]]]
+        body (list 'variant-match mixed (list 'variant-new mixed :small 5)
+                   [[:small 'p 'p] [:big 'p (list 'record-get big 'p :c)]])]
+    (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
+      (testing label
+        (is (seq (:code (emit (program [] body)))))
+        (is (= (emit (program [] body)) (emit (program [] body))))))))
