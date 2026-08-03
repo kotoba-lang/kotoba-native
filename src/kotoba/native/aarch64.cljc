@@ -700,14 +700,27 @@
                      fmov-d0-x0 (insn (f64-unary-ops op)) fmov-x0-d0))
         (and (= op '-) (= 1 (count args)))
         (vec (concat (emit-expr (first args) env depth) (insn 0xcb0003e0)))
-        (contains? '#{+ - * quot} op)
+        ;; `bit-and`/`bit-or`/`bit-xor` are portable integer arithmetic, not an
+        ;; ISA-specific facility: `kotoba.compiler.frontend` admits them for
+        ;; every native target and `kotoba.native.x86-64` has always emitted
+        ;; them (AND/OR/XOR r/m64,r64). Their absence here was a silent gap --
+        ;; they fell through to `emit-call`, were looked up as user functions,
+        ;; and died in `finalize`. These are the logical (shifted-register)
+        ;; encodings with Rm=x1, Rn=x0, Rd=x0, the same operand placement the
+        ;; add/sub/mul cases beside them already use; `mov-reg`'s own
+        ;; `0xaa0003e0` is this ORR base with Rn=xzr, which cross-checks the
+        ;; opcode bits.
+        (contains? '#{+ - * quot bit-and bit-or bit-xor} op)
         (loop [remaining (rest args) left-code (emit-expr (first args) env depth)]
           (if-let [right (first remaining)]
             (recur (next remaining)
                    (vec (concat left-code
                                 (emit-rhs-window right env depth)
                                 (case op + (insn 0x8b010000) - (insn 0xcb010000)
-                                       * (insn 0x9b017c00) quot signed-division))))
+                                       * (insn 0x9b017c00) quot signed-division
+                                       bit-and (insn 0x8a010000)
+                                       bit-or (insn 0xaa010000)
+                                       bit-xor (insn 0xca010000)))))
             left-code))
         (contains? '#{= < > <= >=} op)
         (let [[left right] args cset ({'= 0x9a9f17e0 '< 0x9a9fa7e0 '> 0x9a9fd7e0
@@ -745,10 +758,19 @@
     (if-let [token (first remaining)]
       (cond
         (and (map? token) (:call token))
+        ;; The unknown-target guard must run BEFORE `displacement` is computed.
+        ;; It used to be bound alongside `target` in this same `let`, which made
+        ;; the guard unreachable: `(- nil absolute)` threw a bare
+        ;; NullPointerException first, so an unresolvable call surfaced as an
+        ;; opaque host exception instead of this namespace's own diagnosable
+        ;; `ex-info` -- the exact failure `kotoba.native.x86-64/finalize` has
+        ;; always reported cleanly. Any operator this backend does not implement
+        ;; reaches here through `emit-call`, so the ISA-parity gaps this commit
+        ;; also closes were each surfacing as that same opaque NPE.
         (let [absolute (+ function-offset position) target (get offsets (:call token))
+              _ (when-not target
+                  (throw (ex-info "unknown AArch64 call target" {:target (:call token)})))
               displacement (- target absolute)]
-          (when-not target
-            (throw (ex-info "unknown AArch64 call target" {:target (:call token)})))
           (when-not (zero? (mod displacement 4))
             (throw (ex-info "unaligned AArch64 BL target" {:target (:call token)})))
           (recur (next remaining) (+ position 4)
