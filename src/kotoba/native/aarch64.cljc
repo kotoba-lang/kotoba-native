@@ -143,6 +143,15 @@
   {'f64-add 0x1e612800 'f64-sub 0x1e613800 'f64-mul 0x1e610800
    'f64-div 0x1e611800 'f64-max 0x1e614800 'f64-min 0x1e615800})
 
+;; FCMP D0, D1 (0x1e612000) then CSET. The condition for each is the one that
+;; is FALSE when the compare is unordered, which is what makes NaN never equal
+;; and never ordered-less/greater: FCMP sets N=0 Z=0 C=1 V=1 for unordered, so
+;; EQ/MI/LS/GT/GE all fail there and VS alone succeeds. eq/gt/ge reuse the very
+;; CSET encodings this file's integer `=`/`>`/`>=` already emit.
+(def ^:private f64-compare-ops
+  {'f64-eq 0x9a9f17e0 'f64-lt 0x9a9f57e0 'f64-le 0x9a9f87e0
+   'f64-gt 0x9a9fd7e0 'f64-ge 0x9a9fb7e0 'f64-unordered 0x9a9f77e0})
+
 (def ^:private f64-unary-ops
   {'f64-abs 0x1e60c000 'f64-neg 0x1e614000 'f64-sqrt 0x1e61c000})
 
@@ -896,6 +905,11 @@
         ;; Pure representation changes: the bits are already in x0.
         (contains? '#{f64-from-bits f64-to-bits} op)
         (emit-expr (first args) env depth)
+        (contains? f64-compare-ops op)
+        (emit-binary (first args) (second args)
+                     (concat fmov-d0-x0 fmov-d1-x1 (insn 0x1e612000)
+                             (insn (f64-compare-ops op)))
+                     env depth)
         (contains? f64-binary-ops op)
         (emit-binary (first args) (second args)
                      (concat fmov-d0-x0 fmov-d1-x1

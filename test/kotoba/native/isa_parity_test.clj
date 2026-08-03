@@ -240,21 +240,50 @@
       (is (= (emit substring-program) (emit substring-program))
           "emission must be reproducible"))))
 
-(deftest a-non-ascii-or-non-literal-operand-is-reported-as-unimplemented
-  ;; The slice is deliberately narrow. Everything outside it -- a pool string, a
-  ;; computed string, a literal with a multi-byte code point -- has offsets that
-  ;; are not provably code-point boundaries at compile time, and verifying them
-  ;; needs a byte read the emitted code cannot perform. Those must fall through
-  ;; and SAY they are unimplemented rather than emit something unchecked.
+(deftest a-non-ascii-or-non-literal-operand-now-reaches-the-host
+  ;; This used to assert these shapes were REJECTED as unimplemented, on the
+  ;; grounds that checking their offsets needs a byte read the emitted code
+  ;; cannot perform. That read is now exactly what the loader's
+  ;; `string_substring` at context offset 136 does, so they emit. The
+  ;; all-ASCII literal above still compiles to pure pair arithmetic and never
+  ;; calls it -- that is the property worth keeping, and the reason the fast
+  ;; path was not simply deleted.
   (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
     (testing label
-      (doseq [[why body] [["multi-byte literal" '(string-substring "aé" 0 1)]
+      (doseq [[why body] [["multi-byte literal" '(string-substring "a\u00e9" 0 1)]
                           ["computed string" '(string-substring (string-concat "a" "b") 0 1)]]]
-        (let [thrown (try (emit (program [] body)) nil
-                          (catch clojure.lang.ExceptionInfo e e))]
-          (is (some? thrown) (str why " must be rejected"))
-          (is (= "operation not implemented on this backend" (ex-message thrown)) why)
-          (is (= 'string-substring (:operation (ex-data thrown))) why))))))
+        (is (seq (:code (emit (program [] (list 'string-byte-length body))))) why)))))
+
+;; ---------------------------------------------------------------------------
+;; host-call displacement
+;; ---------------------------------------------------------------------------
+
+(deftest a-host-call-past-disp8-uses-the-long-displacement
+  ;; `call qword ptr [r9+disp8]` takes a SIGNED byte, so a context offset above
+  ;; 127 silently becomes negative -- 136 reads as -120 and calls whatever sits
+  ;; there. AArch64 cannot hit this at all (its LDR immediate is a 12-bit
+  ;; scaled field, good to 32760), and the only hardware here is AArch64, so
+  ;; every execution test passed while x86-64 was wrong. It shipped twice
+  ;; before this test existed. The check is over the TABLE, not one call site,
+  ;; so the next offset added past 127 is covered without anyone remembering.
+  (doseq [[op offset] @#'x86/heap-call-offsets]
+    (when (> offset 127)
+      (let [body (case op
+                   string-substring '(string-substring (string-concat "a" "b") 0 1)
+                   string-code-point-at '(string-code-point-at (string-concat "a" "b") 0)
+                   nil)]
+        (when body
+          (let [bytes (mapv #(bit-and (int %) 0xff)
+                            (:code (x86/emit-program
+                                    (program [] (list 'string-byte-length body)))))
+                windows (fn [n] (map vec (partition n 1 bytes)))]
+            (testing (str op " at offset " offset)
+              (is (not-any? #(= % [0x41 0xff 0x51 (bit-and offset 0xff)]) (windows 4))
+                  "must not encode a >127 offset as a signed disp8")
+              (is (some #(= % (vec (concat [0x41 0xff 0x91]
+                                           [(bit-and offset 0xff) 0x00 0x00 0x00])))
+                        (windows 7))
+                  "must call through the disp32 form"))))))))
 
 (deftest the-range-check-and-its-trap-are-emitted
   ;; Defence in depth, and not reachable through the ordinary pipeline: for a

@@ -93,6 +93,25 @@
    'f64-mul [0xf2 0x0f 0x59 0xc1] 'f64-div [0xf2 0x0f 0x5e 0xc1]
    'f64-max [0xf2 0x0f 0x5f 0xc1] 'f64-min [0xf2 0x0f 0x5d 0xc1]})
 
+;; UCOMISD sets ZF=PF=CF=1 when either operand is NaN, so a NaN-safe ordered
+;; test must be one that reads CF=0 or ZF=0: `seta` (CF=0 and ZF=0) and `setae`
+;; (CF=0) both fail on unordered. `setb`/`setbe` would SUCCEED there, which is
+;; why lt/le swap the operands and reuse seta/setae rather than using them.
+;; Equality additionally needs PF=0, since unordered also sets ZF.
+(def ^:private ucomisd-xmm0-xmm1 [0x66 0x0f 0x2e 0xc1])
+(def ^:private ucomisd-xmm1-xmm0 [0x66 0x0f 0x2e 0xc8])
+(def ^:private movzx-rax-al [0x48 0x0f 0xb6 0xc0])
+
+(def ^:private f64-compare-ops
+  {'f64-gt (vec (concat ucomisd-xmm0-xmm1 [0x0f 0x97 0xc0] movzx-rax-al))
+   'f64-ge (vec (concat ucomisd-xmm0-xmm1 [0x0f 0x93 0xc0] movzx-rax-al))
+   'f64-lt (vec (concat ucomisd-xmm1-xmm0 [0x0f 0x97 0xc0] movzx-rax-al))
+   'f64-le (vec (concat ucomisd-xmm1-xmm0 [0x0f 0x93 0xc0] movzx-rax-al))
+   'f64-unordered (vec (concat ucomisd-xmm0-xmm1 [0x0f 0x9a 0xc0] movzx-rax-al))
+   ;; sete al; setnp cl; and al, cl
+   'f64-eq (vec (concat ucomisd-xmm0-xmm1 [0x0f 0x94 0xc0 0x0f 0x9b 0xc1 0x20 0xc8]
+                        movzx-rax-al))})
+
 (def ^:private f64-unary-ops
   {'f64-sqrt (vec (concat movq-rax-xmm0 [0xf2 0x0f 0x51 0xc0] movq-xmm0-rax))
    'f64-neg [0x48 0x0f 0xba 0xf8 0x3f]
@@ -282,7 +301,17 @@
         pops (mapcat #(nth arg-pops (inc %)) (reverse (range argc)))
         align? (even? temp-depth)]
     (vec (concat values pops [0x41 0x51] (when align? [0x50])
-                 [0x4c 0x89 0xcf 0x41 0xff 0x51 offset]
+                 [0x4c 0x89 0xcf]
+                 ;; `call qword ptr [r9+disp]`. The disp8 form (ModRM 0x51)
+                 ;; takes a SIGNED byte, so an offset above 127 silently
+                 ;; becomes negative and calls the wrong slot -- 136 reads as
+                 ;; -120. Offsets past 127 therefore take the disp32 form
+                 ;; (ModRM 0x91), which is what the typed-cap-call path at
+                 ;; offset 128 already uses. Offsets at or below 127 keep the
+                 ;; shorter encoding, byte for byte as before.
+                 (if (<= offset 127)
+                   [0x41 0xff 0x51 offset]
+                   (concat [0x41 0xff 0x91] (le32 offset)))
                  (when align? [0x48 0x83 0xc4 0x08]) [0x41 0x59]))))
 
 (defn- emit-kernel-load-u8 [[base length index] maximum env {:keys [temp-depth] :as ctx}]
@@ -1079,6 +1108,10 @@
 
         (contains? '#{f64-from-bits f64-to-bits} op)
         (emit-expr (first args) env ctx)
+        (contains? f64-compare-ops op)
+        (emit-binary (first args) (second args)
+                     (vec (concat movq-rax-xmm0 movq-rcx-xmm1 (f64-compare-ops op)))
+                     env ctx)
         (contains? f64-binary-ops op)
         (emit-binary (first args) (second args)
                      (vec (concat movq-rax-xmm0 movq-rcx-xmm1
