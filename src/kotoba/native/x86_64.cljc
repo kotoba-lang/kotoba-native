@@ -845,6 +845,23 @@
         ;;
         ;; NOT r/m64 shares the group-3 opcode with the NEG just above it,
         ;; differing only in the ModRM reg field (/2 vs /3).
+        ;; `bool-not` decodes the same way `kotoba.kir/kotoba-false?` does:
+        ;; zero is false, anything else is true. Testing against zero rather
+        ;; than flipping bit 0 is what makes that true for ANY word, not only
+        ;; a canonical 0/1 -- and it is the same test/setcc/movzx tail every
+        ;; comparison in this file already emits, so the two agree by
+        ;; construction.
+        ;;
+        ;; kotoba-kir a28ea11 fixed that decoding in the interpreter, where
+        ;; `bool-not` had been a bare `(not value)` and so returned false for
+        ;; every input. Implementing it here before that would have meant
+        ;; matching a broken oracle.
+        (and (= op 'bool-not) (= 1 (count args)))
+        (vec (concat (emit-expr (first args) env (assoc ctx :tail? false))
+                     [0x48 0x85 0xc0          ; test rax,rax
+                      0x0f 0x94 0xc0          ; sete al
+                      0x48 0x0f 0xb6 0xc0]))  ; movzx eax,al
+
         (and (= op 'bit-not) (= 1 (count args)))
         (vec (concat (emit-expr (first args) env (assoc ctx :tail? false)) [0x48 0xf7 0xd0]))
 

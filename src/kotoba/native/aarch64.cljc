@@ -707,6 +707,14 @@
         ;;
         ;; MVN is ORN with Rn=xzr, exactly as `mov-reg` is ORR with Rn=xzr:
         ;; 0xaa000000 (ORR) | 0x200000 (N) | Rm=x0 | Rn=xzr | Rd=x0.
+        ;; See the x86-64 backend's comment: zero is false, anything else is
+        ;; true, matching `kotoba.kir/kotoba-false?`. `cset x0, eq` is the same
+        ;; encoding this file's `=` comparison already uses, so the two agree.
+        (and (= op 'bool-not) (= 1 (count args)))
+        (vec (concat (emit-expr (first args) env depth)
+                     (insn 0xf100001f)     ; subs xzr,x0,#0
+                     (insn 0x9a9f17e0)))   ; cset x0,eq
+
         (and (= op 'bit-not) (= 1 (count args)))
         (vec (concat (emit-expr (first args) env depth) (insn 0xaa2003e0)))
 
