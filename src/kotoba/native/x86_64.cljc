@@ -318,6 +318,61 @@
          0x88 0x04 0x3a                         ; mov byte [rdx+rdi],al
          0xeb 0x02 0x0f 0x0b]))))               ; skip UD2 / trap
 
+;; `kernel-load-u32`/`kernel-store-u32` are `kotoba.compiler.frontend`'s
+;; `kernel-memory-operations` -- the portable half of the kernel surface, as
+;; opposed to `kernel-privileged-operations` (cr2/cr3/invlpg/cli/sti/hlt/pause/
+;; out), which name x86 facilities AArch64 has no counterpart for and are
+;; legitimately x86-only. Both u32 forms already existed on AArch64; their
+;; absence here meant a program the frontend admitted for
+;; `x86_64-aiueos-kernel-v1` was rejected only much later, by `finalize`, as an
+;; "unknown call target".
+;;
+;; The checks mirror `emit-kernel-load-u8` exactly -- profile maximum, non-null
+;; base, in-range index -- with ONE deliberate difference matching AArch64's
+;; own `bounds-check-u32`: a four-byte access needs `index + 4 <= length`, not
+;; `index < length`, so the last three bytes of a buffer cannot be read or
+;; written past. `lea` computes `index + 4` without disturbing the index, and
+;; the comparison is unsigned (`ja`), so an index near 2^64 wraps into the trap
+;; rather than out of it.
+;;
+;; Every `rel32` below is the distance from the end of its own jump to the UD2,
+;; recomputed for this body's instruction lengths rather than copied from the
+;; u8 forms, whose displacements differ because their move encodings do.
+(defn- emit-kernel-load-u32 [[base length index] maximum env {:keys [temp-depth] :as ctx}]
+  (let [ctx (assoc ctx :tail? false)]
+    (vec (concat
+        (emit-expr base env ctx) [0x50]
+        (emit-expr length env (update ctx :temp-depth inc)) [0x50]
+        (emit-expr index env (update ctx :temp-depth + 2))
+        [0x59 0x5a                              ; rcx=length, rdx=base
+         0x48 0x81 0xf9] (le32 maximum)          ; cmp rcx,maximum
+        [0x0f 0x87 0x1b 0x00 0x00 0x00         ; ja trap
+         0x48 0x85 0xd2                         ; test rdx,rdx
+         0x0f 0x84 0x12 0x00 0x00 0x00         ; jz trap
+         0x48 0x8d 0x70 0x04                    ; lea rsi,[rax+4]
+         0x48 0x39 0xce                         ; cmp rsi,rcx
+         0x0f 0x87 0x05 0x00 0x00 0x00         ; ja trap  (index+4 > length)
+         0x8b 0x04 0x02                         ; mov eax,dword [rdx+rax]
+         0xeb 0x02 0x0f 0x0b]))))               ; skip UD2 / trap
+
+(defn- emit-kernel-store-u32 [[base length index value] maximum env {:keys [temp-depth] :as ctx}]
+  (let [ctx (assoc ctx :tail? false)]
+    (vec (concat
+        (emit-expr base env ctx) [0x50]
+        (emit-expr length env (update ctx :temp-depth inc)) [0x50]
+        (emit-expr index env (update ctx :temp-depth + 2)) [0x50]
+        (emit-expr value env (update ctx :temp-depth + 3))
+        [0x5f 0x59 0x5a                         ; rdi=index, rcx=length, rdx=base
+         0x48 0x81 0xf9] (le32 maximum)          ; cmp rcx,maximum
+        [0x0f 0x87 0x1b 0x00 0x00 0x00         ; ja trap
+         0x48 0x85 0xd2                         ; test rdx,rdx
+         0x0f 0x84 0x12 0x00 0x00 0x00         ; jz trap
+         0x48 0x8d 0x77 0x04                    ; lea rsi,[rdi+4]
+         0x48 0x39 0xce                         ; cmp rsi,rcx
+         0x0f 0x87 0x05 0x00 0x00 0x00         ; ja trap  (index+4 > length)
+         0x89 0x04 0x3a                         ; mov dword [rdx+rdi],eax
+         0xeb 0x02 0x0f 0x0b]))))               ; skip UD2 / trap
+
 (defn- emit-kernel-out [[port value] width env {:keys [temp-depth] :as ctx}]
   (let [ctx (assoc ctx :tail? false)]
     (vec (concat (emit-expr port env ctx) [0x50]
@@ -745,6 +800,14 @@
 
         (= op 'kernel-store-u8-4k)
         (emit-kernel-store-u8 args 4096 env ctx)
+
+        ;; Same 512-byte profile maximum `kotoba.native.aarch64`'s own u32
+        ;; dispatch uses, so the two ISAs admit the identical buffer bound.
+        (= op 'kernel-load-u32)
+        (emit-kernel-load-u32 args 512 env ctx)
+
+        (= op 'kernel-store-u32)
+        (emit-kernel-store-u32 args 512 env ctx)
 
         (= op 'kernel-boot-info) [0x49 0x8b 0x41 0x50]
         (= op 'kernel-read-cr2) [0x0f 0x20 0xd0]
