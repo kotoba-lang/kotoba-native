@@ -220,6 +220,8 @@
   (insn (bit-or 0xf100001f (bit-shift-left (bit-and imm12 0xfff) 10) (bit-shift-left rn 5))))
 (def ^:private cond-hi 8)     ; unsigned length > maximum
 (def ^:private cond-hs 2)     ; unsigned index >= length
+(def ^:private cond-lt 11)    ; signed <
+(def ^:private cond-gt 12)    ; signed >
 
 (defn- bounds-check [maximum]
   ;; Precondition: x1=base, x2=length, x3=index. The caller appends a two-insn
@@ -389,6 +391,41 @@
                  (sub-sp 16) (str-sp 7 0)
                  (mov-reg 0 7) (ldr-context 16 56) (insn 0xd63f0200) ; call pair_new
                  (ldr-sp 7 0) (add-sp 16)))))
+
+
+;; See the x86-64 backend's own comment for why this slice needs no host
+;; callback and no ABI change: an all-ASCII literal makes every byte offset a
+;; code-point boundary, so `kotoba.kir`'s boundary rule is discharged at compile
+;; time and only a range check and one pair construction remain at runtime.
+(defn- ascii-literal? [form]
+  (and (string? form) (every? #(< % 0x80) (map #(bit-and (int %) 0xff) (utf8-bytes form)))))
+
+(defn- emit-string-substring-of-ascii-literal [content start-form end-form env depth]
+  (let [length (count (utf8-bytes content))
+        operands (concat (emit-expr start-form env depth) (save-x0)
+                         (emit-expr end-form env (inc depth)) (save-x0)
+                         [{:string-literal content}]   ; x0 = literal byte offset
+                         (restore-to 2)                ; x2 = end
+                         (restore-to 1))               ; x1 = start
+        bound (load-constant-reg 3 length)
+        success (vec (concat (insn 0xcb010042)         ; sub x2,x2,x1  -> end-start
+                             (insn 0x8b010001)         ; add x1,x0,x1  -> offset+start
+                             (sub-sp 16) (str-sp 7 0)
+                             (mov-reg 0 7) (ldr-context 16 56) (insn 0xd63f0200)
+                             (ldr-sp 7 0) (add-sp 16)
+                             (branch 8)))              ; skip the trap
+        ;; Distances are derived from the measured blocks, never written out.
+        n-bound (count bound)
+        s (count success)
+        trap-at (+ 4 4 4 4 n-bound 4 4 s)]
+    (vec (concat operands
+                 (cmp-imm 1 0) (b-cond cond-lt (- trap-at 4))    ; cmp x1,#0 ; b.lt  (start < 0)
+                 (insn 0xeb01005f) (b-cond cond-lt (- trap-at 12))   ; cmp x2,x1 ; b.lt  (end < start)
+                 bound
+                 (insn 0xeb03005f)
+                 (b-cond cond-gt (- trap-at (+ 16 n-bound 4)))       ; cmp x2,x3 ; b.gt  (end > length)
+                 success
+                 (insn 0xd4200000)))))                               ; trap: BRK
 
 (defn- emit-let [bindings body env depth]
   ;; Genuinely sequential: each binding's value is evaluated exactly once, in
@@ -683,6 +720,10 @@
         (= op 'variant-new)
         (throw (ex-info "variant-new is only supported as the direct operand of a matching variant-match on the native backend"
                         {:phase :aarch64}))
+        (and (= op 'string-substring) (= 3 (count args))
+             (ascii-literal? (first args)))
+        (emit-string-substring-of-ascii-literal (first args) (second args) (nth args 2) env depth)
+
         (contains? '#{pair pair-first pair-second
                       kgraph-assert! kgraph-get kgraph-count kgraph-entity-at
                       string-byte-length string=? string-concat} op)
