@@ -783,6 +783,28 @@
                  save-frame params-to-saved expression restore-frame
                  (insn 0xa8c17bfd) (insn 0xd65f03c0))))) ; ldp fp,lr,[sp],#16; ret
 
+;; A call target that does not resolve is an OPERATOR this backend has not
+;; implemented -- not a typo, and not a missing function.
+;;
+;; Both routes into this backend prove that before emission. `kotoba.compiler.
+;; frontend` rejects a call to a name it does not know with "operation has no
+;; admitted lowering" (`:phase :subset`), and `kotoba.verifier`, which treats
+;; KIR as hostile, rejects any operation outside its own signature table before
+;; re-emitting. So by the time a `{:call op}` token exists, `op` is either a
+;; function declared in this very program -- and every declared function is in
+;; `offsets`, because `emit-program` builds it from `(:functions kir)` -- or an
+;; operation the frontend admitted and this file's `emit-expr` has no case for.
+;;
+;; Saying "unknown call target" therefore reported the one thing it could not
+;; be. Every operator missing from a backend surfaced as though the program had
+;; called a function that does not exist, which is how `bit-and`/`bit-or`/
+;; `bit-xor`, `kernel-load-u32`/`kernel-store-u32` and the whole i64 family each
+;; sat unnoticed until someone went looking. The 11 x86-only privileged
+;; operations still land here on AArch64 by design, and now say so.
+(defn- unimplemented-operation! [op]
+  (throw (ex-info "operation not implemented on this backend"
+                  {:phase :aarch64 :backend :aarch64-kotoba-v1 :operation op})))
+
 (defn- finalize [tokens function-offset offsets literal-offsets]
   (loop [remaining tokens position 0 out []]
     (if-let [token (first remaining)]
@@ -798,8 +820,7 @@
         ;; reaches here through `emit-call`, so the ISA-parity gaps this commit
         ;; also closes were each surfacing as that same opaque NPE.
         (let [absolute (+ function-offset position) target (get offsets (:call token))
-              _ (when-not target
-                  (throw (ex-info "unknown AArch64 call target" {:target (:call token)})))
+              _ (when-not target (unimplemented-operation! (:call token)))
               displacement (- target absolute)]
           (when-not (zero? (mod displacement 4))
             (throw (ex-info "unaligned AArch64 BL target" {:target (:call token)})))

@@ -111,22 +111,43 @@
 ;; The silence that let the gaps accumulate
 ;; ---------------------------------------------------------------------------
 
-(deftest an-unresolvable-operator-is-diagnosable-on-both-isas
-  ;; Both backends route an unrecognized operator to `emit-call`, so an
-  ;; unimplemented operator is indistinguishable from a call to a function that
-  ;; does not exist. That is acceptable ONLY if the resulting failure names the
-  ;; target. On AArch64 it did not: the guard sat behind an eager
-  ;; `(- nil absolute)` and threw a bare NullPointerException instead.
-  (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
+(deftest an-unimplemented-operator-says-so-on-both-isas
+  ;; Both backends route an unrecognized operator to `emit-call`, so at the
+  ;; point of failure an unimplemented operator looks exactly like a call to a
+  ;; function that does not exist. It cannot BE one: the frontend rejects an
+  ;; unknown name with "operation has no admitted lowering" before KIR exists,
+  ;; the verifier rejects any operation outside its own signature table before
+  ;; re-emitting, and `emit-program` puts every declared function into
+  ;; `offsets`. So the diagnostic can state the only remaining possibility --
+  ;; and must, because "unknown call target" named the one thing it could not
+  ;; be, which is how every missing operator so far stayed hidden.
+  (doseq [[label emit phase] [["x86-64" x86/emit-program :x86-64]
+                              ["AArch64" arm/emit-program :aarch64]]]
     (testing label
       (let [thrown (try (emit (program [] '(no-such-operator)))
                         (catch Throwable e e))]
         (is (instance? clojure.lang.ExceptionInfo thrown)
-            (str label " must reject an unresolvable target with ex-info, got "
+            (str label " must reject with ex-info, got "
                  (some-> thrown class .getSimpleName)))
-        (is (re-find #"unknown .* call target" (ex-message thrown)))
-        (is (= 'no-such-operator (:target (ex-data thrown)))
-            "the diagnostic must name the target that could not be resolved")))))
+        (is (= "operation not implemented on this backend" (ex-message thrown)))
+        (is (= 'no-such-operator (:operation (ex-data thrown)))
+            "the diagnostic must name the operation")
+        (is (= phase (:phase (ex-data thrown)))
+            "the phase must be this backend, matching its other throws")))))
+
+(deftest the-x86-only-privileged-surface-reports-itself-as-unimplemented
+  ;; The load-bearing case. These are real operators the frontend admits, that
+  ;; x86-64 implements and AArch64 deliberately does not. Before this, asking
+  ;; for one on AArch64 said the program had called a function that does not
+  ;; exist. Now it names the operator, which is what makes the intentional
+  ;; asymmetry legible instead of looking like a broken program.
+  (doseq [[params body] x86-only]
+    (let [thrown (try (arm/emit-program (program params body)) nil
+                      (catch clojure.lang.ExceptionInfo e e))]
+      (is (some? thrown) (str body " must be rejected on AArch64"))
+      (is (= "operation not implemented on this backend" (ex-message thrown)))
+      (is (= (first body) (:operation (ex-data thrown)))
+          (str "the diagnostic must name " (first body))))))
 
 ;; ---------------------------------------------------------------------------
 ;; The u32 bound is four bytes wider than the u8 bound
