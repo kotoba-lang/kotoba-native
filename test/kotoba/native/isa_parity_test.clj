@@ -54,6 +54,10 @@
    ;; An earlier draft of this list included them and failed symmetrically on
    ;; both ISAs -- which is the correct answer to the wrong question. Only
    ;; operators that survive into KIR belong here.
+   [['a] '(bit-not a)]
+   [['a] '(i64-shift-left a 3)]
+   [['a] '(i64-shift-right a 3)]
+   [['a] '(u64-shift-right a 3)]
    [['b 'l 'i] '(kernel-load-u8 b l i)]
    [['b 'l 'i] '(kernel-load-u8-4k b l i)]
    [['b 'l 'i] '(kernel-load-u8-16k b l i)]
@@ -168,3 +172,34 @@
       (when (emits? emit params body)
         (is (= (emit (program params body)) (emit (program params body)))
             (str "emission of " body " must be reproducible"))))))
+
+;; ---------------------------------------------------------------------------
+;; i64 bit operations -- exact encodings
+;; ---------------------------------------------------------------------------
+
+(deftest i64-operations-use-the-documented-encodings
+  (testing "x86-64"
+    (let [code #(:code (x86/emit-program (program '[a] %)))]
+      ;; not rax -- group 3 /2, sharing its opcode with the neg (/3) beside it
+      (is (some #(= [0x48 0xf7 0xd0] %) (partition 3 1 (code '(bit-not a)))))
+      ;; shl/sar/shr rax,cl -- the count arrives in rcx, whose low byte is CL
+      (is (some #(= [0x48 0xd3 0xe0] %) (partition 3 1 (code '(i64-shift-left a 3)))))
+      (is (some #(= [0x48 0xd3 0xf8] %) (partition 3 1 (code '(i64-shift-right a 3)))))
+      (is (some #(= [0x48 0xd3 0xe8] %) (partition 3 1 (code '(u64-shift-right a 3)))))))
+  (testing "AArch64"
+    (let [code #(:code (arm/emit-program (program '[a] %)))
+          word (fn [w] (mapv #(bit-and (unsigned-bit-shift-right w (* 8 %)) 0xff) (range 4)))]
+      (is (some #(= (word 0xaa2003e0) %) (partition 4 1 (code '(bit-not a)))))
+      (is (some #(= (word 0x9ac12000) %) (partition 4 1 (code '(i64-shift-left a 3)))))
+      (is (some #(= (word 0x9ac12800) %) (partition 4 1 (code '(i64-shift-right a 3)))))
+      (is (some #(= (word 0x9ac12400) %) (partition 4 1 (code '(u64-shift-right a 3))))))))
+
+(deftest arithmetic-and-logical-right-shifts-are-not-interchanged
+  ;; `i64-shift-right` is arithmetic and `u64-shift-right` is logical, matching
+  ;; `kotoba.kir`'s own `i64-shr`/`u64-shr`. Swapping them would seal an oracle
+  ;; value that disagrees with the emitted code for every negative operand, so
+  ;; assert the two differ rather than only that each is present.
+  (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
+    (testing label
+      (is (not= (:code (emit (program '[a] '(i64-shift-right a 3))))
+                (:code (emit (program '[a] '(u64-shift-right a 3)))))))))
