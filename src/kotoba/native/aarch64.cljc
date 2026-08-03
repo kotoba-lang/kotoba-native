@@ -695,6 +695,22 @@
     ;; and throw.
     (boolean? form) (load-constant (if form 1 0))
     (string? form) (emit-string-literal form)
+
+;; A keyword is carried as the same one-word `pair(offset,length)` handle a
+    ;; string is, over its PRINTED text (`:z` -> the four bytes `:z`), which is
+    ;; the representation `kotoba.wasm.core` already chose for keyword literals.
+    ;; It needs nothing the string literal path does not already have, and that
+    ;; is what makes `:keyword` a one-word field type the gate can admit.
+    ;;
+    ;; A keyword and the string of the same text are therefore indistinguishable
+    ;; at runtime here. That is safe because the frontend types them apart long
+    ;; before this point -- a keyword cannot reach a position expecting a string
+    ;; -- and this backend has no descriptor to carry the distinction in.
+    ;;
+    ;; This admits keyword VALUES, not keyword OPERATIONS: `keyword-name` and
+    ;; `keyword-from-string` would need a general substring and concatenation
+    ;; over a runtime handle, and are not implemented.
+    (keyword? form) (emit-string-literal (str form))
     (symbol? form)
     (let [binding (get env form)]
       ;; See the x86-64 backend: a record binding is not a value, and reaching
