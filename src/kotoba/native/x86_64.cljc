@@ -298,6 +298,45 @@
          0x0f 0xb6 0x04 0x02                    ; movzx eax,byte [rdx+rax]
          0xeb 0x02 0x0f 0x0b]))))               ; skip UD2 / trap
 
+;; `(kernel-subregion base length offset sublen)` -> base+offset, trapping
+;; unless the sub-window fits inside the parent window.
+;;
+;; The load/store checks above constrain an index within a DECLARED length,
+;; and the caller supplies both that base and that length. Narrowing a region
+;; by hand -- `(fnv (+ base object-offset) object-length)`, the shape six
+;; aiueos objects use -- therefore produced a window nothing had checked. This
+;; makes the derivation itself checked, so a correct entry window implies
+;; every window derived from it is correct.
+;;
+;; Overflow-free by construction, and without a scratch register: `offset >
+;; length` traps first, so `sub rcx,rdi` (length is dead after that compare)
+;; cannot underflow, and `sublen` is compared against that remainder instead
+;; of against `offset + sublen`, which a hostile pair could wrap. Every
+;; comparison is unsigned (`ja`), so a negative i64 arrives as a huge unsigned
+;; value and trips the check rather than passing a signed one.
+;;
+;; Displacements, from the end of each jump to the UD2 at +36:
+;;   +0  test rdx,rdx   +3  jz  (+27)   +9  cmp rdi,rcx  +12 ja (+18)
+;;   +18 sub rcx,rdi    +21 cmp rax,rcx +24 ja (+6)      +30 lea rax,[rdx+rdi]
+;;   +34 jmp +2         +36 ud2         +38 skip
+(defn- emit-kernel-subregion [[base length offset sublen] env {:keys [temp-depth] :as ctx}]
+  (let [ctx (assoc ctx :tail? false)]
+    (vec (concat
+        (emit-expr base env ctx) [0x50]
+        (emit-expr length env (update ctx :temp-depth inc)) [0x50]
+        (emit-expr offset env (update ctx :temp-depth + 2)) [0x50]
+        (emit-expr sublen env (update ctx :temp-depth + 3))
+        [0x5f 0x59 0x5a                         ; rdi=offset, rcx=length, rdx=base
+         0x48 0x85 0xd2                         ; test rdx,rdx   (null parent)
+         0x0f 0x84 0x1b 0x00 0x00 0x00         ; jz trap
+         0x48 0x39 0xcf                         ; cmp rdi,rcx    (offset vs length)
+         0x0f 0x87 0x12 0x00 0x00 0x00         ; ja trap
+         0x48 0x29 0xf9                         ; sub rcx,rdi    (remaining)
+         0x48 0x39 0xc8                         ; cmp rax,rcx    (sublen vs remaining)
+         0x0f 0x87 0x06 0x00 0x00 0x00         ; ja trap
+         0x48 0x8d 0x04 0x3a                    ; lea rax,[rdx+rdi]
+         0xeb 0x02 0x0f 0x0b]))))               ; skip UD2 / trap
+
 (defn- emit-kernel-store-u8 [[base length index value] maximum env {:keys [temp-depth] :as ctx}]
   ;; Evaluate once and perform the same null/length/index checks as load-u8.
   ;; AL is stored only after every check succeeds; RAX remains the expression
@@ -929,6 +968,9 @@
 
         (= op 'kernel-load-u8-16k)
         (emit-kernel-load-u8 args 16384 env ctx)
+
+        (= op 'kernel-subregion)
+        (emit-kernel-subregion args env ctx)
 
         (= op 'kernel-store-u8)
         (emit-kernel-store-u8 args 512 env ctx)
