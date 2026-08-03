@@ -271,3 +271,56 @@
     (testing "AArch64 does the same and ends in BRK"
       (is (some #(= (word 0xeb01005f) %) (partition 4 1 a)) "cmp x2,x1")
       (is (some #(= (word 0xd4200000) %) (partition 4 1 a)) "BRK"))))
+
+;; ---------------------------------------------------------------------------
+;; A let-bound record (ADR 0062's named remaining gap)
+;; ---------------------------------------------------------------------------
+
+(def ^:private rec-type '[:record :t/p [[:a :i64] [:b :i64]]])
+
+(defn- rec-program [body] (program [] body))
+
+(deftest a-let-bound-record-emits-on-both-isas
+  ;; ADR 0062 gave the record no independent runtime representation: a
+  ;; record-get directly over a matching record-new is rewritten into the very
+  ;; let-slot machinery an ordinary multi-binding let already uses. A LET-BOUND
+  ;; record needs the same thing, only reaching the body instead of being
+  ;; consumed on the spot -- so one binding becomes one binding PER FIELD, and
+  ;; every slot count and depth-relative load stays what it already was.
+  (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
+    (testing label
+      (doseq [[why body]
+              [["single projection"
+                (list 'let ['r (list 'record-new rec-type 11 22)]
+                      (list 'record-get rec-type 'r :a))]
+               ["read twice -- the gap ADR 0062 names"
+                (list 'let ['r (list 'record-new rec-type 11 22)]
+                      (list '+ (list 'record-get rec-type 'r :a)
+                            (list 'record-get rec-type 'r :b)))]
+               ["mixed with scalar bindings"
+                (list 'let ['x 5 'r (list 'record-new rec-type 1 2) 'y 3]
+                      (list '+ 'x (list '+ 'y (list 'record-get rec-type 'r :b))))]]]
+        (is (seq (:code (emit (rec-program body)))) why)
+        (is (= (emit (rec-program body)) (emit (rec-program body)))
+            (str why " must be reproducible"))))))
+
+(deftest a-record-binding-is-not-a-value
+  ;; The record still never exists as a value: `r` alone is not a word, so a
+  ;; bare reference must be refused rather than loading one of its slots.
+  (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
+    (testing label
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (emit (rec-program (list 'let ['r (list 'record-new rec-type 1 2)] 'r))))))))
+
+(deftest a-projection-must-match-the-schema-it-was-bound-with
+  (let [other '[:record :t/q [[:a :i64] [:b :i64]]]]
+    (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
+      (testing label
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo #"identical to the schema its operand was bound with"
+             (emit (rec-program (list 'let ['r (list 'record-new rec-type 1 2)]
+                                      (list 'record-get other 'r :a))))))
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo #"undeclared field"
+             (emit (rec-program (list 'let ['r (list 'record-new rec-type 1 2)]
+                                      (list 'record-get rec-type 'r :nope))))))))))

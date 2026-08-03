@@ -427,6 +427,20 @@
                  success
                  (insn 0xd4200000)))))                               ; trap: BRK
 
+(declare emit-record-get-of-new-construction)
+
+(defn- record-new-binding [value]
+  (when (and (seq? value) (= 'record-new (first value)))
+    (let [[_ type & field-exprs] value]
+      ;; Structural only, matching what `emit-record-get-of-new` itself checks:
+      ;; whether the FIELD TYPES are ones this backend can carry was already
+      ;; decided by `kotoba.kir/only-native-word-typed-features?` before lowering
+      ;; produced this HIR, so re-deriving it here would duplicate that gate.
+      (when (and (vector? type) (= :record (first type)) (= 3 (count type))
+                 (sequential? (nth type 2))
+                 (= (count (nth type 2)) (count field-exprs)))
+        [type (vec field-exprs)]))))
+
 (defn- emit-let [bindings body env depth]
   ;; Genuinely sequential: each binding's value is evaluated exactly once, in
   ;; source order, and pushed onto its own 16-byte stack slot before the next
@@ -436,13 +450,31 @@
   ;; binding referenced from inside an `if` branch still runs unconditionally
   ;; before the branch is chosen (ADR-2607198300 follow-up).
   (let [pairs (partition 2 bindings)]
-    (loop [remaining pairs d depth env env code []]
+    ;; See the x86-64 backend: `slots` is tracked apart from the binding count
+    ;; because a record binding occupies one slot PER FIELD.
+    (loop [remaining pairs d depth env env code [] slots 0]
       (if-let [[name value] (first remaining)]
-        (recur (next remaining) (inc d)
-               (assoc env name {:let-depth d})
-               (concat code (emit-expr value env d) (save-x0)))
+        (if-let [[type field-exprs] (record-new-binding value)]
+          (let [fields (nth type 2)
+                n (count fields)
+                syn (mapv #(symbol (str "$" name "-field-" %)) (range n))
+                fcode (loop [fs field-exprs dd d out []]
+                        (if-let [f (first fs)]
+                          (recur (next fs) (inc dd)
+                                 (concat out (emit-expr f env dd) (save-x0)))
+                          out))]
+            (recur (next remaining) (+ d n)
+                   (assoc (reduce (fn [e [i sym]] (assoc e sym {:let-depth (+ d i)}))
+                                  env (map-indexed vector syn))
+                          name {:record-type type
+                                :record-fields (zipmap (map first fields) syn)})
+                   (concat code fcode) (+ slots n)))
+          (recur (next remaining) (inc d)
+                 (assoc env name {:let-depth d})
+                 (concat code (emit-expr value env d) (save-x0))
+                 (inc slots)))
         (let [body-code (emit-expr body env d)]
-          (vec (concat code body-code (pop-n (count pairs)))))))))
+          (vec (concat code body-code (pop-n slots))))))))
 
 ;; A native scalar record has NO independent runtime representation at all --
 ;; no pointer, no heap-arena allocation (unlike `pair`, which IS heap-backed
@@ -456,7 +488,36 @@
 ;; stack slot per field (this backend's own `let` slot size), read back via
 ;; the same depth-relative `load-let` arithmetic already proven correct by
 ;; every existing `let` test.
+
+;; A `let` binding whose value constructs a record this backend can carry.
+;;
+;; ADR 0062 gave the record no independent runtime representation: a
+;; `record-get` directly over a matching `record-new` is rewritten into the very
+;; `let` slot machinery an ordinary multi-binding `let` already uses, one word
+;; per field. That is also exactly what a LET-BOUND record needs -- the fields
+;; simply have to reach the body instead of being consumed on the spot -- so
+;; this is an expansion, not a second representation: one binding becomes one
+;; binding PER FIELD, under synthetic names, and the record's own name maps to
+;; those names rather than to a slot.
+;;
+;; Consequently every slot count, every depth-relative load and the whole
+;; cleanup path stay exactly what they already were, and a record still never
+;; exists as a value: `r` alone is not a word, which `emit-expr` rejects.
 (defn- emit-record-get-of-new [type value-form field env depth]
+  ;; See the x86-64 backend: a let-bound record's fields already occupy their
+  ;; own slots, so the projection is an ordinary depth-relative read.
+  (if-let [field-names (and (symbol? value-form) (:record-fields (get env value-form)))]
+    (let [bound (get env value-form)]
+      (when-not (= type (:record-type bound))
+        (throw (ex-info "record-get's schema must be identical to the schema its operand was bound with"
+                        {:phase :aarch64 :expected type :actual (:record-type bound)})))
+      (if-let [syn (get field-names field)]
+        (emit-expr syn env depth)
+        (throw (ex-info "record-get references an undeclared field"
+                        {:phase :aarch64 :type type :field field}))))
+    (emit-record-get-of-new-construction type value-form field env depth)))
+
+(defn- emit-record-get-of-new-construction [type value-form field env depth]
   (when-not (seq? value-form)
     (throw (ex-info "record-get is only supported directly over a matching record-new construction on the native backend"
                     {:phase :aarch64 :type type})))
@@ -595,6 +656,12 @@
     (string? form) (emit-string-literal form)
     (symbol? form)
     (let [binding (get env form)]
+      ;; See the x86-64 backend: a record binding is not a value, and reaching
+      ;; `load-let` with its nil `:let-depth` would only produce a
+      ;; NullPointerException, naming nothing.
+      (when (:record-fields binding)
+        (throw (ex-info "a record-valued binding may only appear as the operand of record-get"
+                        {:phase :aarch64 :binding form})))
       (if (map? binding)
         (load-let 0 (:let-depth binding) depth)
         (mov-reg 0 (+ 19 binding))))
