@@ -402,6 +402,65 @@
                  (when align? [0x48 0x83 0xc4 0x08])
                  [0x41 0x59]))))
 
+
+;; `string-substring` restricted to a literal whose bytes are all ASCII.
+;;
+;; `kotoba.kir`'s contract is byte-offset based BUT requires both offsets to be
+;; code-point boundaries, trapping otherwise. Verifying that in general needs a
+;; byte read from the string's region -- and emitted code can address neither
+;; the code/literal region nor the runtime string pool, both of which the loader
+;; owns behind `resolve_string_bytes`. A general implementation therefore needs
+;; a new context callback, which changes the sealed, measured runtime identity.
+;;
+;; This slice needs none of that. When the operand is a literal whose bytes are
+;; all < 0x80, EVERY byte offset is a code-point boundary, so the boundary rule
+;; is discharged at compile time. What remains at runtime is a range check and
+;; one pair construction -- `pair(offset + start, end - start)` -- because a
+;; string value already IS a pair(offset,length) handle and a literal's offset
+;; is non-negative, addressing the code+literal region directly.
+;;
+;; It is deliberately narrow in the same way the native record and variant
+;; slices are, and it is what `string-from-i64` needs: that operation desugars
+;; to a recursive helper whose whole body is a substring of the ASCII literal
+;; "0123456789" at runtime indices.
+;;
+;; Anything else -- a pool string, a non-ASCII literal, a computed string --
+;; falls through to `emit-call` and is reported as not implemented on this
+;; backend, which is accurate and fail-closed.
+(defn- ascii-literal? [form]
+  (and (string? form) (every? #(< % 0x80) (map #(bit-and (int %) 0xff) (utf8-bytes form)))))
+
+(defn- emit-string-substring-of-ascii-literal
+  [content start-form end-form env {:keys [temp-depth] :as ctx}]
+  (let [ctx (assoc ctx :tail? false)
+        length (count (utf8-bytes content))
+        align? (even? temp-depth)
+        operands (concat (emit-expr start-form env ctx) [0x50]
+                         (emit-expr end-form env (update ctx :temp-depth inc)) [0x50]
+                         [{:string-literal content}]      ; rax = literal byte offset
+                         [0x59 0x5a])                     ; pop rcx=end ; pop rdx=start
+        success (vec (concat [0x48 0x01 0xd0]             ; add rax,rdx  -> offset+start
+                             [0x48 0x29 0xd1]             ; sub rcx,rdx  -> end-start
+                             [0x48 0x89 0xc6]             ; mov rsi,rax
+                             [0x48 0x89 0xca]             ; mov rdx,rcx
+                             [0x41 0x51] (when align? [0x50])
+                             [0x4c 0x89 0xcf 0x41 0xff 0x51 56]   ; mov rdi,r9 ; call [r9+56]
+                             (when align? [0x48 0x83 0xc4 0x08])
+                             [0x41 0x59]
+                             [0xeb 0x02]))                ; jmp over the trap
+        ;; Every jump below targets the trailing UD2. Its distance is derived
+        ;; from the success block's measured length rather than written out, so
+        ;; a change there cannot silently leave a jump pointing into the middle
+        ;; of an instruction.
+        s (count success)]
+    (vec (concat operands
+                 [0x48 0x85 0xd2] [0x0f 0x88] (le32 (+ 22 s))   ; test rdx,rdx ; js trap (start < 0)
+                 [0x48 0x39 0xd1] [0x0f 0x8c] (le32 (+ 13 s))   ; cmp rcx,rdx  ; jl trap (end < start)
+                 [0x48 0x81 0xf9] (le32 length)
+                 [0x0f 0x8f] (le32 s)                           ; cmp rcx,len  ; jg trap (end > length)
+                 success
+                 [0x0f 0x0b]))))                                ; trap: UD2
+
 (defn- emit-let [bindings body env {:keys [temp-depth] :as ctx}]
   ;; Genuinely sequential: each binding's value is evaluated exactly once, in
   ;; source order, and pushed onto its own 8-byte stack slot before the next
@@ -780,6 +839,12 @@
         (= op 'variant-new)
         (throw (ex-info "variant-new is only supported as the direct operand of a matching variant-match on the native backend"
                         {:phase :x86-64}))
+
+        ;; See `emit-string-substring-of-ascii-literal`. Any other shape falls
+        ;; through and is reported as not implemented on this backend.
+        (and (= op 'string-substring) (= 3 (count args))
+             (ascii-literal? (first args)))
+        (emit-string-substring-of-ascii-literal (first args) (second args) (nth args 2) env ctx)
 
         (contains? '#{pair pair-first pair-second
                       kgraph-assert! kgraph-get kgraph-count kgraph-entity-at

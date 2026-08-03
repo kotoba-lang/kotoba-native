@@ -224,3 +224,50 @@
     (testing label
       (is (not= (:code (emit (program '[a] '(i64-shift-right a 3))))
                 (:code (emit (program '[a] '(u64-shift-right a 3)))))))))
+
+;; ---------------------------------------------------------------------------
+;; string-substring over an all-ASCII literal
+;; ---------------------------------------------------------------------------
+
+(def ^:private substring-program
+  (program '[n] '(string-byte-length (string-substring "0123456789" n (+ n 1)))))
+
+(deftest an-ascii-literal-substring-emits-on-both-isas
+  (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
+    (testing label
+      (is (seq (:code (emit substring-program))))
+      (is (= (emit substring-program) (emit substring-program))
+          "emission must be reproducible"))))
+
+(deftest a-non-ascii-or-non-literal-operand-is-reported-as-unimplemented
+  ;; The slice is deliberately narrow. Everything outside it -- a pool string, a
+  ;; computed string, a literal with a multi-byte code point -- has offsets that
+  ;; are not provably code-point boundaries at compile time, and verifying them
+  ;; needs a byte read the emitted code cannot perform. Those must fall through
+  ;; and SAY they are unimplemented rather than emit something unchecked.
+  (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
+    (testing label
+      (doseq [[why body] [["multi-byte literal" '(string-substring "aé" 0 1)]
+                          ["computed string" '(string-substring (string-concat "a" "b") 0 1)]]]
+        (let [thrown (try (emit (program [] body)) nil
+                          (catch clojure.lang.ExceptionInfo e e))]
+          (is (some? thrown) (str why " must be rejected"))
+          (is (= "operation not implemented on this backend" (ex-message thrown)) why)
+          (is (= 'string-substring (:operation (ex-data thrown))) why))))))
+
+(deftest the-range-check-and-its-trap-are-emitted
+  ;; Defence in depth, and not reachable through the ordinary pipeline: for a
+  ;; pure entry the constant-folding oracle evaluates the substring at compile
+  ;; time and rejects an out-of-range index as :phase :value long before the
+  ;; emitted check could fire -- the same property ADR 0063 records for the
+  ;; variant dispatch trap. So the check is asserted structurally.
+  (let [x (:code (x86/emit-program substring-program))
+        a (:code (arm/emit-program substring-program))
+        word (fn [w] (mapv #(bit-and (unsigned-bit-shift-right w (* 8 %)) 0xff) (range 4)))]
+    (testing "x86-64 tests the start, orders the bounds, and ends in UD2"
+      (is (some #(= [0x48 0x85 0xd2] %) (partition 3 1 x)) "test rdx,rdx")
+      (is (some #(= [0x48 0x39 0xd1] %) (partition 3 1 x)) "cmp rcx,rdx")
+      (is (some #(= [0x0f 0x0b] %) (partition 2 1 x)) "UD2"))
+    (testing "AArch64 does the same and ends in BRK"
+      (is (some #(= (word 0xeb01005f) %) (partition 4 1 a)) "cmp x2,x1")
+      (is (some #(= (word 0xd4200000) %) (partition 4 1 a)) "BRK"))))
