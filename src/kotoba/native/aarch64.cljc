@@ -905,6 +905,21 @@
         ;; Pure representation changes: the bits are already in x0.
         (contains? '#{f64-from-bits f64-to-bits} op)
         (emit-expr (first args) env depth)
+        ;; A keyword is carried as a pair(offset,length) over its PRINTED
+        ;; text, colon included, so its NAME is the substring past that colon
+        ;; and building one from a string is a concatenation with it. Both
+        ;; were listed as unimplemented for want of a general substring over a
+        ;; runtime handle -- which the loader's string_substring now provides.
+        ;; The subject is bound first: it is evaluated once, because the
+        ;; operand may be a call and the oracle evaluates it once.
+        (and (= op 'keyword-name) (= 1 (count args)))
+        (emit-expr (list 'let ['kotoba$keyword-subject (first args)]
+                         (list 'string-substring 'kotoba$keyword-subject 1
+                               (list 'string-byte-length
+                                     'kotoba$keyword-subject)))
+                   env depth)
+        (and (= op 'keyword-from-string) (= 1 (count args)))
+        (emit-expr (list 'string-concat ":" (first args)) env depth)
         (contains? f64-compare-ops op)
         (emit-binary (first args) (second args)
                      (concat fmov-d0-x0 fmov-d1-x1 (insn 0x1e612000)
