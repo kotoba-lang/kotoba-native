@@ -63,6 +63,41 @@
         (and (map? token) (:string-literal token)) 10
         :else 1))
 (defn- code-size [tokens] (reduce + (map token-size tokens)))
+
+;; ── f64 ──────────────────────────────────────────────────────────────────
+;;
+;; Same representation choice as the AArch64 backend: an f64 lives in the
+;; ordinary integer register and stack slot as its IEEE-754 bit pattern, so
+;; `f64-from-bits` and `f64-to-bits` emit nothing and f64 literals reuse the
+;; existing constant path (the frontend already lowers them to
+;; `(f64-from-bits <i64>)`).
+;;
+;; `emit-binary` leaves lhs in rax and rhs in rcx, so arithmetic is: move
+;; both into the SSE bank, operate, move the result back.
+;;
+;; `f64-neg` and `f64-abs` do NOT go through SSE. x86 has no scalar fneg or
+;; fabs — the usual trick is xorpd/andpd against a mask, which needs a
+;; constant pool this backend does not have. Flipping or clearing the sign
+;; bit with `btc`/`btr` in the integer register is the same operation, is
+;; exactly what AArch64's FNEG/FABS do (both are bit operations that raise no
+;; exception, NaN included), and keeps the two backends bit-identical.
+;;
+;; Every encoding below was checked against `clang -target x86_64-apple-macos`.
+
+(def ^:private movq-rax-xmm0 [0x66 0x48 0x0f 0x6e 0xc0])
+(def ^:private movq-rcx-xmm1 [0x66 0x48 0x0f 0x6e 0xc9])
+(def ^:private movq-xmm0-rax [0x66 0x48 0x0f 0x7e 0xc0])
+
+(def ^:private f64-binary-ops
+  {'f64-add [0xf2 0x0f 0x58 0xc1] 'f64-sub [0xf2 0x0f 0x5c 0xc1]
+   'f64-mul [0xf2 0x0f 0x59 0xc1] 'f64-div [0xf2 0x0f 0x5e 0xc1]
+   'f64-max [0xf2 0x0f 0x5f 0xc1] 'f64-min [0xf2 0x0f 0x5d 0xc1]})
+
+(def ^:private f64-unary-ops
+  {'f64-sqrt (vec (concat movq-rax-xmm0 [0xf2 0x0f 0x51 0xc0] movq-xmm0-rax))
+   'f64-neg [0x48 0x0f 0xba 0xf8 0x3f]
+   'f64-abs [0x48 0x0f 0xba 0xf0 0x3f]})
+
 (declare emit-expr)
 
 (defn- load-param [param-index param-count pad? temp-depth]
@@ -725,6 +760,16 @@
         (= op 'kernel-out-u8) (emit-kernel-out args 8 env ctx)
         (= op 'kernel-out-u32) (emit-kernel-out args 32 env ctx)
 
+        (contains? '#{f64-from-bits f64-to-bits} op)
+        (emit-expr (first args) env ctx)
+        (contains? f64-binary-ops op)
+        (emit-binary (first args) (second args)
+                     (vec (concat movq-rax-xmm0 movq-rcx-xmm1
+                                  (f64-binary-ops op) movq-xmm0-rax))
+                     env ctx)
+        (contains? f64-unary-ops op)
+        (vec (concat (emit-expr (first args) env (assoc ctx :tail? false))
+                     (f64-unary-ops op)))
         (and (= op '-) (= 1 (count args)))
         (vec (concat (emit-expr (first args) env (assoc ctx :tail? false)) [0x48 0xf7 0xd8]))
 

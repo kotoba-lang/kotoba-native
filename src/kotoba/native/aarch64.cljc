@@ -118,6 +118,34 @@
   (ldr-sp reg (* 16 (- current-depth let-depth 1))))
 (defn- pop-n [n] (when (pos? n) (add-sp (* 16 n))))
 
+
+;; ── f64 ──────────────────────────────────────────────────────────────────
+;;
+;; An f64 value lives in the same integer register and the same 16-byte stack
+;; slot as everything else on this backend, as its IEEE-754 bit pattern. That
+;; is what makes `f64-from-bits` and `f64-to-bits` **identities** here: they
+;; are representation changes the wasm backend genuinely needs, because its
+;; operand stack is typed, and this one does not. It also means f64 literals
+;; need no new constant path — the frontend already lowers them to
+;; `(f64-from-bits <i64>)`, and the existing movz/movk sequence loads the
+;; pattern unchanged.
+;;
+;; Arithmetic is the only place the value has to become a real double, so the
+;; sequence is: move into the FP bank, operate, move back. Every encoding
+;; below was checked against `clang -target arm64-apple-macos` rather than
+;; derived from the manual and trusted.
+
+(def ^:private fmov-d0-x0 (insn 0x9e670000))
+(def ^:private fmov-d1-x1 (insn 0x9e670021))
+(def ^:private fmov-x0-d0 (insn 0x9e660000))
+
+(def ^:private f64-binary-ops
+  {'f64-add 0x1e612800 'f64-sub 0x1e613800 'f64-mul 0x1e610800
+   'f64-div 0x1e611800 'f64-max 0x1e614800 'f64-min 0x1e615800})
+
+(def ^:private f64-unary-ops
+  {'f64-abs 0x1e60c000 'f64-neg 0x1e614000 'f64-sqrt 0x1e61c000})
+
 (declare emit-expr)
 
 ;; The spill/reload window that both `emit-binary` and the n-ary arithmetic
@@ -659,6 +687,17 @@
                       kgraph-assert! kgraph-get kgraph-count kgraph-entity-at
                       string-byte-length string=? string-concat} op)
         (emit-heap-call op args env depth)
+        ;; Pure representation changes: the bits are already in x0.
+        (contains? '#{f64-from-bits f64-to-bits} op)
+        (emit-expr (first args) env depth)
+        (contains? f64-binary-ops op)
+        (emit-binary (first args) (second args)
+                     (concat fmov-d0-x0 fmov-d1-x1
+                             (insn (f64-binary-ops op)) fmov-x0-d0)
+                     env depth)
+        (contains? f64-unary-ops op)
+        (vec (concat (emit-expr (first args) env depth)
+                     fmov-d0-x0 (insn (f64-unary-ops op)) fmov-x0-d0))
         (and (= op '-) (= 1 (count args)))
         (vec (concat (emit-expr (first args) env depth) (insn 0xcb0003e0)))
         (contains? '#{+ - * quot} op)
