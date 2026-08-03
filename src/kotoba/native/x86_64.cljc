@@ -911,6 +911,14 @@
     {:tokens (vec (concat prologue expression epilogue))
      :expression-start (count prologue)}))
 
+;; See `kotoba.native.aarch64/unimplemented-operation!` for why an unresolved
+;; call target can only be an unimplemented operator: both the frontend and the
+;; verifier prove every call target exists before emission, and `emit-program`
+;; puts every declared function into `offsets`.
+(defn- unimplemented-operation! [op]
+  (throw (ex-info "operation not implemented on this backend"
+                  {:phase :x86-64 :backend :x86_64-kotoba-v1 :operation op})))
+
 (defn- finalize [tokens function-offset expression-offset offsets literal-offsets]
   (loop [remaining tokens position 0 out []]
     (if-let [token (first remaining)]
@@ -918,8 +926,7 @@
         (and (map? token) (:call token))
         (let [absolute (+ function-offset position)
               target (get offsets (:call token))]
-          (when-not target
-            (throw (ex-info "unknown x86-64 call target" {:target (:call token)})))
+          (when-not target (unimplemented-operation! (:call token)))
           (recur (next remaining) (+ position 5)
                  (into out (concat [0xe8] (le32 (- target (+ absolute 5)))))))
 
