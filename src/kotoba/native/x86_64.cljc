@@ -836,6 +836,42 @@
         (and (= op '-) (= 1 (count args)))
         (vec (concat (emit-expr (first args) env (assoc ctx :tail? false)) [0x48 0xf7 0xd8]))
 
+        ;; `kotoba.compiler.frontend`'s `i64-operations`. Admitted for every
+        ;; native target, implemented in `kotoba.kir`'s evaluator (so the
+        ;; compile-time oracle already agrees), and until now missing from both
+        ;; backends -- which meant they reached `emit-call` and were reported as
+        ;; an "unknown call target", as though the program had called a function
+        ;; that does not exist.
+        ;;
+        ;; NOT r/m64 shares the group-3 opcode with the NEG just above it,
+        ;; differing only in the ModRM reg field (/2 vs /3).
+        (and (= op 'bit-not) (= 1 (count args)))
+        (vec (concat (emit-expr (first args) env (assoc ctx :tail? false)) [0x48 0xf7 0xd0]))
+
+        ;; The shift count rides the ordinary binary window, so it arrives in
+        ;; rcx -- and CL, which the variable-count shift group reads, is that
+        ;; register's low byte. No masking or range check is emitted: the
+        ;; frontend admits the count only as an integer literal in [0,63]
+        ;; (`i64 shift count must be an integer literal in [0,63]`), so the
+        ;; hardware's own mod-64 truncation of CL is unreachable. That literal
+        ;; also means `emit-rhs-window` always takes its constant path here,
+        ;; materializing the count straight into rcx.
+        ;;
+        ;; `i64-shift-right` is ARITHMETIC and `u64-shift-right` is LOGICAL,
+        ;; matching `kotoba.kir`'s own `i64-shr` (`bit-shift-right`) and
+        ;; `u64-shr` (`unsigned-bit-shift-right`). Swapping them would produce
+        ;; an artifact whose sealed oracle value disagrees with its own code for
+        ;; every negative operand.
+        (contains? '#{i64-shift-left i64-shift-right u64-shift-right} op)
+        (let [ctx (assoc ctx :tail? false)
+              [value count-form] args]
+          (vec (concat (emit-expr value env ctx)
+                       (emit-rhs-window count-form env ctx)
+                       (case op
+                         i64-shift-left [0x48 0xd3 0xe0]    ; shl rax,cl
+                         i64-shift-right [0x48 0xd3 0xf8]   ; sar rax,cl
+                         u64-shift-right [0x48 0xd3 0xe8])))) ; shr rax,cl
+
         (contains? '#{+ - * quot bit-xor bit-and bit-or} op)
         (let [ctx (assoc ctx :tail? false)]
           (reduce (fn [left-code right]

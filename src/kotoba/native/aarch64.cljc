@@ -700,6 +700,36 @@
                      fmov-d0-x0 (insn (f64-unary-ops op)) fmov-x0-d0))
         (and (= op '-) (= 1 (count args)))
         (vec (concat (emit-expr (first args) env depth) (insn 0xcb0003e0)))
+
+        ;; `kotoba.compiler.frontend`'s `i64-operations` -- see the x86-64
+        ;; backend's own comment for why these were previously reported as an
+        ;; "unknown call target" rather than as unimplemented.
+        ;;
+        ;; MVN is ORN with Rn=xzr, exactly as `mov-reg` is ORR with Rn=xzr:
+        ;; 0xaa000000 (ORR) | 0x200000 (N) | Rm=x0 | Rn=xzr | Rd=x0.
+        (and (= op 'bit-not) (= 1 (count args)))
+        (vec (concat (emit-expr (first args) env depth) (insn 0xaa2003e0)))
+
+        ;; The count rides the ordinary binary window and so arrives in x1, the
+        ;; register the variable-shift group reads. No range check is emitted:
+        ;; the frontend admits the count only as an integer literal in [0,63],
+        ;; so LSLV/ASRV/LSRV's own mod-64 truncation is unreachable -- the same
+        ;; reasoning, and the same reachable range, as the x86-64 CL path, which
+        ;; is what makes the two ISAs agree without either masking explicitly.
+        ;;
+        ;; Data-processing (2 source), Rm=x1 / Rn=x0 / Rd=x0, cross-checked
+        ;; against `signed-division`'s own SDIV `0x9ac10c00` in this file: same
+        ;; base, same Rm placement, opcode field 001000/001010/001001.
+        ;; ASRV for `i64-shift-right` and LSRV for `u64-shift-right`, matching
+        ;; `kotoba.kir`'s `i64-shr`/`u64-shr`.
+        (contains? '#{i64-shift-left i64-shift-right u64-shift-right} op)
+        (let [[value count-form] args]
+          (vec (concat (emit-expr value env depth)
+                       (emit-rhs-window count-form env depth)
+                       (case op
+                         i64-shift-left (insn 0x9ac12000)    ; lslv x0,x0,x1
+                         i64-shift-right (insn 0x9ac12800)   ; asrv x0,x0,x1
+                         u64-shift-right (insn 0x9ac12400))))) ; lsrv x0,x0,x1
         ;; `bit-and`/`bit-or`/`bit-xor` are portable integer arithmetic, not an
         ;; ISA-specific facility: `kotoba.compiler.frontend` admits them for
         ;; every native target and `kotoba.native.x86-64` has always emitted
