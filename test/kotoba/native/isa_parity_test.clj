@@ -65,7 +65,26 @@
    [['b 'l 'i 'v] '(kernel-store-u8 b l i v)]
    [['b 'l 'i 'v] '(kernel-store-u8-4k b l i v)]
    [['b 'l 'i 'v] '(kernel-store-u32 b l i v)]
-   [['b 'l 'o 's] '(kernel-subregion b l o s)]])
+   [['b 'l 'o 's] '(kernel-subregion b l o s)]
+   ;; vector-i64 and vector-f64. Both families lower to the same six host
+   ;; calls, so a gap on one ISA would be a gap on every one of the fourteen
+   ;; operators at once -- exactly the failure this namespace exists to make
+   ;; loud.
+   [[] '(vector-new)]
+   [['a 'b] '(vector-new a b)]
+   [['v] '(vector-count v)]
+   [['v 'i] '(vector-at v i)]
+   [['v 'i 'd] '(vector-get v i d)]
+   [['v 'i 'x] '(vector-assoc v i x)]
+   [['v 'x] '(vector-conj v x)]
+   [['v 'n] '(vector-drop v n)]
+   [[] '(vector-f64-new)]
+   [['v] '(vector-f64-count v)]
+   [['v 'i] '(vector-f64-at v i)]
+   [['v 'i 'd] '(vector-f64-get v i d)]
+   [['v 'i 'x] '(vector-f64-assoc v i x)]
+   [['v 'x] '(vector-f64-conj v x)]
+   [['v 'n] '(vector-f64-drop v n)]])
 
 (deftest every-portable-operator-emits-on-both-isas
   (doseq [[params body] portable]

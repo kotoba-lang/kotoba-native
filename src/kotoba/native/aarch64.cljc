@@ -411,7 +411,31 @@
    ;; only the host can read the boundary bytes.
    'string-substring 136
    ;; string-code-point-at: scalar result, so nothing is allocated at all.
-   'string-code-point-at 144})
+   'string-code-point-at 144
+   ;; vector-i64 (ADR-2608030300's parity gap). A vector VALUE is a one-word
+   ;; handle into the host's vector table, exactly as a pair value is -- so
+   ;; every operation is an ordinary context call and this backend needs no
+   ;; new value representation, no new register discipline, and no new
+   ;; instruction encoding. The host owns bounds, capacity and copying;
+   ;; `vector-new-empty` is not a KIR operation but this lowering's own
+   ;; construction primitive (see `vector-new` in emit-expr). All six offsets
+   ;; stay inside LDR's unsigned-offset imm12 range (8 * 4095), the same
+   ;; range `ldr-context` already encodes for every offset above.
+   'vector-new-empty 152 'vector-conj 160 'vector-count 168
+   'vector-at 176 'vector-assoc 184 'vector-drop 192})
+
+;; `vector-f64-*` is the SAME host table. A native f64 is already an i64 word
+;; carrying an IEEE-754 bit pattern (ADR-2608030300: "no new value
+;; representation, only i64 words"), so an f64 vector is a vector of those
+;; words and needs no second arena, no second set of offsets, and no element
+;; tagging. The two KIR op families stay distinct because the reference
+;; interpreter validates their elements differently; below this line they are
+;; one operation each.
+(def ^:private vector-op-aliases
+  '{vector-f64-new vector-new vector-f64-conj vector-conj
+    vector-f64-count vector-count vector-f64-at vector-at
+    vector-f64-assoc vector-assoc vector-f64-drop vector-drop
+    vector-f64-get vector-get})
 
 (defn- emit-heap-call [op args env depth]
   (let [offset (get heap-call-offsets op)
@@ -897,10 +921,46 @@
              (ascii-literal? (first args)))
         (emit-string-substring-of-ascii-literal (first args) (second args) (nth args 2) env depth)
 
+        ;; An f64 vector operation IS the i64 one (see vector-op-aliases):
+        ;; rewrite the head and re-dispatch, so there is exactly one lowering
+        ;; per operation rather than two that must be kept in step.
+        (contains? vector-op-aliases op)
+        (emit-expr (cons (get vector-op-aliases op) args) env depth)
+
+        ;; KIR's vector-new is variadic; the context ABI is not. The arity is
+        ;; static, so this expands to an empty vector plus one conj per
+        ;; element -- and because each conj extends the arena region the
+        ;; previous one just wrote, the host takes its copy-free append path
+        ;; throughout, making construction linear rather than quadratic.
+        (= op 'vector-new)
+        (emit-expr (reduce (fn [acc item] (list 'vector-conj acc item))
+                           (list 'vector-new-empty)
+                           args)
+                   env depth)
+
+        ;; vector-get is vector-at plus a total fallback, so it must not trap.
+        ;; Both operands are bound first: the reference interpreter evaluates
+        ;; each exactly once, and the index is read twice below. The fallback
+        ;; appears once, so nesting cannot duplicate code exponentially.
+        (= op 'vector-get)
+        (let [[items-form index-form fallback-form] args
+              items '__native_vector_get_items
+              index '__native_vector_get_index]
+          (emit-let [items items-form]
+                    (list 'let [index index-form]
+                          (list 'if (list 'if (list '< index 0)
+                                          0
+                                          (list '< index (list 'vector-count items)))
+                                (list 'vector-at items index)
+                                fallback-form))
+                    env depth))
+
         (contains? '#{pair pair-first pair-second
                       kgraph-assert! kgraph-get kgraph-count kgraph-entity-at
                       string-byte-length string=? string-concat
-                      string-substring string-code-point-at} op)
+                      string-substring string-code-point-at
+                      vector-new-empty vector-conj vector-count
+                      vector-at vector-assoc vector-drop} op)
         (emit-heap-call op args env depth)
         ;; Pure representation changes: the bits are already in x0.
         (contains? '#{f64-from-bits f64-to-bits} op)
