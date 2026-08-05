@@ -822,15 +822,22 @@
             ;;
             ;; A `let` SLOT holding a boxed handle -- `(let [ends (mk x)]
             ;; (record-get … ends :hi0))`, which is how murakumo's plan cores
-            ;; read a multi-field result -- is the same one word and would need
-            ;; only `(not (:record-fields (get env value-form)))` here. It is
-            ;; deliberately NOT admitted: `kotoba.verifier` independently
-            ;; requires a projection's operand to be a directly-nested
-            ;; `record-new` or a parameter (verifier.cljc `record-get`, "runtime
-            ;; KIR record projection rejected"), so a backend that emitted it
-            ;; could never be reached through the compiler pipeline and nothing
-            ;; would ever execute the path. See docs/adr/0001.
-            (and (symbol? value-form) (not (map? (get env value-form)))
+            ;; read a multi-field result -- is the SAME one word arriving by a
+            ;; different route, so it walks the same chain. `expand-binding`
+            ;; gives a slot `{:let-depth d}` and a FLATTENED record binding
+            ;; `{:record-fields …}`; only the latter has its fields in separate
+            ;; slots and is resolved above, so `:record-fields` (rather than
+            ;; `map?`) is what distinguishes "this name is a word" from "this
+            ;; name is N words". A parameter's bare index is a word too, and
+            ;; both reach the same walk.
+            ;;
+            ;; This was held back one release (docs/adr/0001): `kotoba.verifier`
+            ;; independently required a projection's operand to be a nested
+            ;; `record-new` or a parameter, so an emitted path for a let slot
+            ;; could not be reached through the compiler pipeline and nothing
+            ;; would ever have executed it. kotoba-verifier ADR 0004 admits the
+            ;; shape, so it is now reachable and executed on both ISAs.
+            (and (symbol? value-form) (not (:record-fields (get env value-form)))
                  (contains? env value-form)))
       (let [fields (nth type 2)
             field-index (first (keep-indexed (fn [i [n _]] (when (= n field) i)) fields))]
