@@ -681,6 +681,58 @@
 (defn- boxed-record-projection [handle-form field-index]
   (list 'pair-first (nth (iterate (fn [f] (list 'pair-second f)) handle-form) field-index)))
 
+;; The record NAME a declared result denotes, or nil.
+;;
+;; A signature's result reaches a backend in either of two spellings, and both
+;; name the same record. `[:record :t/r [[:a :i64] ...]]` is the expanded form.
+;; `[:ref :t/r]` is the schema reference the source wrote, which survives into
+;; KIR unexpanded ON PURPOSE: expanding a reference in a SIGNATURE moved the
+;; `:kir-sha256` of every module that used one, on every target including its
+;; Wasm bytes, so `lower` leaves signatures alone and expands references only
+;; inside expressions (a `record-new`/`record-get` therefore always carries the
+;; expanded `[:record …]`). Reading only the expanded spelling here is why a
+;; murakumo core that declares its record results by reference -- which is how
+;; they are written throughout -- could not return a record at all.
+(defn- record-result-name [result]
+  (when (and (vector? result) (<= 2 (count result))
+             (contains? #{:record :ref} (first result)))
+    (second result)))
+
+;; Box a `record-new` that is in TAIL position of a function declared to return
+;; that record. Boxing is the same ADR 0062 pair chain a record result has always
+;; crossed on; the only thing added here is REACHING the construction.
+;;
+;; Tail position is not a syntactic property of the outermost form. It propagates
+;; into both branches of an `if`, into the body (never a binding's value) of a
+;; `let`, and into the last subexpression of a `do` -- exactly the positions
+;; `emit-expr` hands its own `:tail?` down to, so this rewrite and codegen agree
+;; about where a function's value is produced. Everything else -- a call, a
+;; parameter, a projection -- is already a one-word handle and is left alone.
+;;
+;; The record-new's own name must equal the declared result's, because that is
+;; the only local evidence that this construction is the one the signature
+;; promised: a `[:ref :t/r]` result carries no field list to compare against.
+;; A mismatch is left unrewritten and fails loudly downstream rather than being
+;; boxed into a shape the caller will walk with the wrong field count.
+(defn- box-record-tails [form record-name]
+  (if-let [[type field-exprs] (record-new-binding form)]
+    (if (= (second type) record-name) (boxed-record-chain field-exprs) form)
+    (cond
+      (and (seq? form) (= 'if (first form)) (= 4 (count form)))
+      (let [[_ test then else] form]
+        (list 'if test
+              (box-record-tails then record-name)
+              (box-record-tails else record-name)))
+
+      (and (seq? form) (= 'let (first form)) (= 3 (count form)))
+      (list 'let (second form) (box-record-tails (nth form 2) record-name))
+
+      (and (seq? form) (= 'do (first form)) (seq (rest form)))
+      (let [args (vec (rest form))]
+        (list* 'do (conj (pop args) (box-record-tails (peek args) record-name))))
+
+      :else form)))
+
 (defn- emit-record-get-of-new [type value-form field env ctx]
   ;; A record we already know -- bound by `let`, or selected out of one by an
   ;; earlier projection -- has each of its scalar fields in its own slot, so the
@@ -713,6 +765,17 @@
             ;; against this schema upstream. It needs no new representation: the
             ;; word loads through `load-param` like any other, and the walk below
             ;; is the same one the call path already uses.
+            ;;
+            ;; A `let` SLOT holding a boxed handle -- `(let [ends (mk x)]
+            ;; (record-get … ends :hi0))`, which is how murakumo's plan cores
+            ;; read a multi-field result -- is the same one word and would need
+            ;; only `(not (:record-fields (get env value-form)))` here. It is
+            ;; deliberately NOT admitted: `kotoba.verifier` independently
+            ;; requires a projection's operand to be a directly-nested
+            ;; `record-new` or a parameter (verifier.cljc `record-get`, "runtime
+            ;; KIR record projection rejected"), so a backend that emitted it
+            ;; could never be reached through the compiler pipeline and nothing
+            ;; would ever execute the path. See docs/adr/0001.
             (and (symbol? value-form) (not (map? (get env value-form)))
                  (contains? env value-form)))
       (let [fields (nth type 2)
@@ -1351,10 +1414,10 @@
   (when (> (count params) 5)
     (throw (ex-info "x86-64 fuel ABI supports at most five integer parameters"
                     {:phase :x86-64 :function name :arity (count params)})))
-  (let [;; A function declared to return a record hands back the boxed chain.
-        body (if (and (record-new-binding body)
-                      (vector? result) (= :record (first result)))
-               (boxed-record-chain (vec (drop 2 body)))
+  (let [;; A function declared to return a record hands back the boxed chain,
+        ;; from wherever in the body the construction actually sits.
+        body (if-let [record-name (record-result-name result)]
+               (box-record-tails body record-name)
                body)
         n (count params)
         pad? (even? n)

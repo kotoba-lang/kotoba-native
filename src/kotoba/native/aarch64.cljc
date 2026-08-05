@@ -596,6 +596,35 @@
 (defn- boxed-record-projection [handle-form field-index]
   (list 'pair-first (nth (iterate (fn [f] (list 'pair-second f)) handle-form) field-index)))
 
+;; See the x86-64 backend's `record-result-name` and `box-record-tails`: a
+;; declared result reaches a backend either expanded (`[:record :t/r [...]]`) or
+;; as the unexpanded schema reference (`[:ref :t/r]`), and a `record-new` is in
+;; tail position through `if`, `let` and `do` -- the same positions this
+;; backend's own `emit-expr` produces a function's value from.
+(defn- record-result-name [result]
+  (when (and (vector? result) (<= 2 (count result))
+             (contains? #{:record :ref} (first result)))
+    (second result)))
+
+(defn- box-record-tails [form record-name]
+  (if-let [[type field-exprs] (record-new-binding form)]
+    (if (= (second type) record-name) (boxed-record-chain field-exprs) form)
+    (cond
+      (and (seq? form) (= 'if (first form)) (= 4 (count form)))
+      (let [[_ test then else] form]
+        (list 'if test
+              (box-record-tails then record-name)
+              (box-record-tails else record-name)))
+
+      (and (seq? form) (= 'let (first form)) (= 3 (count form)))
+      (list 'let (second form) (box-record-tails (nth form 2) record-name))
+
+      (and (seq? form) (= 'do (first form)) (seq (rest form)))
+      (let [args (vec (rest form))]
+        (list* 'do (conj (pop args) (box-record-tails (peek args) record-name))))
+
+      :else form)))
+
 (defn- emit-record-get-of-new [type value-form field env depth]
   ;; See the x86-64 backend: a record we already know has each scalar field in
   ;; its own slot, so the projection is an ordinary depth-relative read.
@@ -619,7 +648,10 @@
             ;; word. `env` binds a parameter to its bare index, not the
             ;; `{:record-fields …}` map a flattened `let` binding gets, so a
             ;; symbol resolving to a non-map binding here is precisely a
-            ;; parameter. See the x86-64 backend for the full reasoning.
+            ;; parameter. A `let` slot holding a boxed handle is the same one
+            ;; word but is deliberately not admitted -- see the x86-64 backend
+            ;; and docs/adr/0001 for why (kotoba.verifier rejects it, so
+            ;; nothing could reach the emitted path).
             (and (symbol? value-form) (not (map? (get env value-form)))
                  (contains? env value-form)))
       (let [fields (nth type 2)
@@ -1133,8 +1165,8 @@
   (when (> (count params) 5)
     (throw (ex-info "AArch64 fuel ABI supports at most five integer parameters"
                     {:phase :aarch64 :function name :arity (count params)})))
-  (let [body (if (and (record-new-binding body) (vector? result) (= :record (first result)))
-               (boxed-record-chain (vec (drop 2 body)))
+  (let [body (if-let [record-name (record-result-name result)]
+               (box-record-tails body record-name)
                body)
         n (count params) register-frame (* 16 (quot (+ n 1) 2))
         save-frame (when (pos? register-frame)
