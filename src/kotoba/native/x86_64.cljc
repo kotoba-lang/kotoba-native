@@ -4,6 +4,7 @@
   ;; `kotoba.wasm.core`'s ns form for that original reasoning -- the `:clj`
   ;; branch needed no requires at all) now wraps only the cljs-only item.
   (:require [kotoba.native.peephole :as peephole]
+            [kotoba.native.string-search :as string-search]
             #?@(:cljs [[kotoba.kir.cljs-i64 :as i64]])))
 
 ;; `le32` only ever encodes small, non-negative, interpreter-internal
@@ -1178,6 +1179,19 @@
              (ascii-literal? (first args)))
         (emit-string-substring-of-ascii-literal (first args) (second args) (nth args 2) env ctx)
 
+        ;; The two string SEARCH operations. `kotoba.native.string-search`
+        ;; explains why they are a source rewrite over the four string
+        ;; callbacks this backend already has rather than a fifth one at a new
+        ;; context offset, and why the scan walks code points instead of
+        ;; bytes. Both ISAs consume the identical rewrite from that namespace,
+        ;; so a divergence between them would have to be in the shared
+        ;; operations underneath, not in the search itself.
+        (and (= op 'string-contains?) (= 2 (count args)))
+        (emit-expr (string-search/lower-contains args) env ctx)
+
+        (and (= op 'string-replace-all) (= 3 (count args)))
+        (emit-expr (string-search/lower-replace-all args) env ctx)
+
         ;; An f64 vector operation IS the i64 one (see vector-op-aliases):
         ;; rewrite the head and re-dispatch, so there is exactly one lowering
         ;; per operation rather than two that must be kept in step.
@@ -1478,9 +1492,15 @@
               (:string-literal token))))
 
 (defn emit-program [kir]
-  (let [exported-names (set (or (:exports kir) (map :name (:functions kir))))
-        function-names (set (map :name (:functions kir)))
-        token-bodies (mapv (fn [f] [f (emit-function f function-names)]) (:functions kir))
+  (let [;; Export set from the DECLARED functions, before the search helpers
+        ;; are appended: a program's public surface must not change because it
+        ;; searched a string. (`:exports` is usually absent, in which case
+        ;; every declared function is exported -- which is exactly why this
+        ;; has to be read first.)
+        exported-names (set (or (:exports kir) (map :name (:functions kir))))
+        functions (string-search/augment-functions (:functions kir))
+        function-names (set (map :name functions))
+        token-bodies (mapv (fn [f] [f (emit-function f function-names)]) functions)
         offsets (loop [items token-bodies offset 0 out {}]
                   (if-let [[f emitted] (first items)]
                     (recur (next items) (+ offset (code-size (:tokens emitted)))

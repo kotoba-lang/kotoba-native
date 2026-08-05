@@ -14,6 +14,23 @@ checkable from outside.
 - `kotoba.native.aarch64`
 - `kotoba.native.elf64`
 - `kotoba.native.peephole`
+- `kotoba.native.string-search`
+
+## String search
+
+`string-contains?` and `string-replace-all` are the one operator family whose
+lowering lives in neither backend: both consume the SAME rewrite, from
+`kotoba.native.string-search`, because the property under test is that one
+program produces one value on both ISAs and two copies could drift while both
+stayed green.
+
+They lower entirely out of the four string callbacks the context ABI already
+has — `string=?`, `string-concat`, `string-substring`, `string-code-point-at` —
+so they cost no ABI bump, no loader change and no new value representation. The
+scan walks CODE POINTS rather than bytes because `string-substring` traps on an
+offset that splits one, and a trap cannot be caught; and the three helper
+functions it needs are appended to the program by `emit-program`, only when a
+body actually reaches one, and never exported. See ADR 0002.
 
 ## Optimization
 
