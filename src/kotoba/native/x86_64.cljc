@@ -118,6 +118,8 @@
    'f64-abs [0x48 0x0f 0xba 0xf0 0x3f]})
 
 (declare emit-expr)
+(declare record-new-binding)
+(declare boxed-record-chain)
 
 (defn- load-param [param-index param-count pad? temp-depth]
   (let [disp (* 8 (+ (if pad? 1 0) (- param-count 1 param-index) temp-depth))]
@@ -198,8 +200,29 @@
     (vec (concat values anchor (le32 (* argc 8)) stores fuel-charge
                  [{:tail-self true}]))))
 
+;; The caller's half of the record-parameter boundary. A record is N slots and
+;; the ABI passes one word, so an argument that denotes a record is boxed into
+;; the same `pair` chain a record RESULT has crossed on since ADR 0062 -- as a
+;; source rewrite into forms this backend already emits, not a new encoding.
+;;
+;; Two shapes can denote a record here. A literal `record-new` boxes its field
+;; expressions directly. A `let`-bound record was FLATTENED into one slot per
+;; field, so it is re-boxed from those slots, in declared field order -- reading
+;; each child binding by name, which `emit-expr` resolves exactly as it would
+;; anywhere else. Anything else (a call's result, a parameter) is already a
+;; one-word handle and passes through untouched.
+(defn- box-record-argument [arg env]
+  (cond
+    (record-new-binding arg) (boxed-record-chain (vec (drop 2 arg)))
+    (and (symbol? arg) (:record-fields (get env arg)))
+    (let [{:keys [record-type record-fields]} (get env arg)]
+      (boxed-record-chain (mapv (fn [[field-name _]] (get record-fields field-name))
+                                (nth record-type 2))))
+    :else arg))
+
 (defn- emit-call [op args env {:keys [temp-depth function-name tail?] :as ctx}]
-  (let [argc (count args)]
+  (let [args (mapv #(box-record-argument % env) args)
+        argc (count args)]
     (when (> argc 5)
       (throw (ex-info "x86-64 fuel ABI supports at most five arguments"
                       {:phase :x86-64 :function op :arity argc})))
@@ -679,9 +702,19 @@
           (throw (ex-info "a record-valued projection may only appear as the operand of record-get"
                           {:phase :x86-64 :type type :field field})))
         (emit-expr child env ctx)))
-    (if (and (seq? value-form) (symbol? (first value-form))
-             (contains? (:function-names ctx) (first value-form)))
-      ;; The operand is a call, so the record arrived boxed: walk the chain.
+    (if (or (and (seq? value-form) (symbol? (first value-form))
+                 (contains? (:function-names ctx) (first value-form)))
+            ;; A PARAMETER holding a record arrived boxed for the same reason a
+            ;; call's result does: the caller had N slots and the ABI has one
+            ;; word. `env` binds a parameter to its bare index (not the
+            ;; `{:record-fields …}` map a flattened `let` binding gets), so a
+            ;; symbol that resolves to a non-map binding here is precisely a
+            ;; parameter -- and a record-typed one, since `record-get` type-checked
+            ;; against this schema upstream. It needs no new representation: the
+            ;; word loads through `load-param` like any other, and the walk below
+            ;; is the same one the call path already uses.
+            (and (symbol? value-form) (not (map? (get env value-form)))
+                 (contains? env value-form)))
       (let [fields (nth type 2)
             field-index (first (keep-indexed (fn [i [n _]] (when (= n field) i)) fields))]
         (when (nil? field-index)
