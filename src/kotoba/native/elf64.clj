@@ -60,7 +60,12 @@
    ;; duplicated inside each validator; the reply admission is the decision that
    ;; a received datagram is the one that was asked for.
    'aiueos-ipv4-checksum {:arity 2 :symbol "kotoba_aiueos_ipv4_checksum"}
-   'aiueos-ipv4-icmp-reply-valid {:arity 5 :symbol "kotoba_aiueos_ipv4_icmp_reply_valid"}})
+   'aiueos-ipv4-icmp-reply-valid {:arity 5 :symbol "kotoba_aiueos_ipv4_icmp_reply_valid"}
+   ;; TCP. The checksum is separate from the segment admission because it needs
+   ;; the IPv4 pseudo-header -- source, destination, protocol and TCP length --
+   ;; which the admission would otherwise have to take on trust from C.
+   'aiueos-tcp-checksum-ok {:arity 4 :symbol "kotoba_aiueos_tcp_checksum_ok"}
+   'aiueos-tcp-segment-valid {:arity 5 :symbol "kotoba_aiueos_tcp_segment_valid"}})
 
 (defn- le [n width]
   (mapv #(bit-and (unsigned-bit-shift-right (long n) (* 8 %)) 0xff)
