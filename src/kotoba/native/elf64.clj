@@ -88,7 +88,21 @@
    ;; The checksum walks a table (up to 64 KiB), so it needs a fuel replenish;
    ;; the header check is a handful of comparisons and does not.
    'aiueos-acpi-checksum-ok {:arity 2 :symbol "kotoba_aiueos_acpi_checksum_ok"}
-   'aiueos-acpi-table-valid {:arity 4 :symbol "kotoba_aiueos_acpi_table_valid"}})
+   'aiueos-acpi-table-valid {:arity 4 :symbol "kotoba_aiueos_acpi_table_valid"}
+   ;; VT-d admission. vtd.c was the last kernel file with no decision moved out,
+   ;; and one of its decisions is security-relevant: the IOTLB register offset is
+   ;; DERIVED from a hardware-reported ECAP field and then bounds-checked, so an
+   ;; unbounded value would address outside the 4 KiB register window. Deriving
+   ;; an offset from untrusted input is a judgement, not a register write.
+   ;;
+   ;; That derivation is also where signedness bites. `(ecap >> 8) & 0x3ff` must
+   ;; mask BEFORE dividing: `quot` truncates toward zero where `>>` floors, and
+   ;; the C masks after shifting so sign-extended high bits are discarded rather
+   ;; than folded down. Measured -- with ecap = 0xffff_ffff_ffff_ffff the
+   ;; divide-first form yields offset 8 and ADMITS where the C refuses.
+   ;;
+   ;; A handful of bit tests -- no walk, 1 fuel per call, so no replenish tier.
+   'aiueos-vtd-admit {:arity 5 :symbol "kotoba_aiueos_vtd_admit"}})
 
 (defn- le [n width]
   (mapv #(bit-and (unsigned-bit-shift-right (long n) (* 8 %)) 0xff)
