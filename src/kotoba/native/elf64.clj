@@ -81,7 +81,14 @@
    ;; directory slots and writes PTEs -- but WHETHER a physical range may be
    ;; mapped at all is a decision, and it was the last one still living in
    ;; paging.c's mechanism.
-   'aiueos-mmio-map-admit {:arity 2 :symbol "kotoba_aiueos_mmio_map_admit"}})
+   'aiueos-mmio-map-admit {:arity 2 :symbol "kotoba_aiueos_mmio_map_admit"}
+   ;; ACPI table admission. These tables are FIRMWARE-supplied input the kernel
+   ;; otherwise takes on trust, and acpi.c was the largest file with no decision
+   ;; moved out of it at all -- every checksum and bound was still C.
+   ;; The checksum walks a table (up to 64 KiB), so it needs a fuel replenish;
+   ;; the header check is a handful of comparisons and does not.
+   'aiueos-acpi-checksum-ok {:arity 2 :symbol "kotoba_aiueos_acpi_checksum_ok"}
+   'aiueos-acpi-table-valid {:arity 4 :symbol "kotoba_aiueos_acpi_table_valid"}})
 
 (defn- le [n width]
   (mapv #(bit-and (unsigned-bit-shift-right (long n) (* 8 %)) 0xff)
@@ -386,7 +393,22 @@
                                     aiueos-ipv4-checksum
                                     aiueos-ipv4-icmp-reply-valid
                                     aiueos-tcp-checksum-ok
-                                    aiueos-tcp-segment-valid} object-entry)
+                                    aiueos-tcp-segment-valid
+                                    ;; The bounded-load primitives top out at
+                                    ;; 16384, so that is the largest table this
+                                    ;; can admit -- not 64 KiB, as an earlier
+                                    ;; version of this comment claimed.
+                                    ;;
+                                    ;; 4096 is sufficient only because the object
+                                    ;; walks EIGHT bytes per recursive step: the
+                                    ;; natural one-byte shape costs N+2 fuel and
+                                    ;; would `ud2` on a 4 KiB table, four times
+                                    ;; over at the 16 KiB ceiling. Measured from
+                                    ;; the disassembly, worst case is 2056 at
+                                    ;; N=16383. Changing that step size without
+                                    ;; changing this tier reintroduces a
+                                    ;; size-dependent trap.
+                                    aiueos-acpi-checksum-ok} object-entry)
           bounded-memory? (or sha-fuel? rsa-fuel? context-fuel? high-fuel? (contains? '#{aiueos-fnv1a aiueos-journal-record-valid
                                         aiueos-object-transaction-valid aiueos-object-transaction-route
                                         aiueos-mutable-object-valid
@@ -424,7 +446,11 @@
                                         ;; counter to zero and hit the `ud2`
                                         ;; every prologue guards with.
                                         aiueos-pci-config-read
-                                        aiueos-pci-config-write} object-entry))
+                                        aiueos-pci-config-write
+                                        ;; Header check only -- a few comparisons,
+                                        ;; no walk. The checksum sits in the 4096
+                                        ;; tier below because it walks the table.
+                                        aiueos-acpi-table-valid} object-entry))
           replenish (when bounded-memory?
                       (cond
                         rsa-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000
