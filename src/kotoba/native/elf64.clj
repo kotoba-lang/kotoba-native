@@ -43,6 +43,10 @@
    'aiueos-app-lookup-plan {:arity 5 :symbol "kotoba_aiueos_app_lookup_plan"}
    'aiueos-user-elf-valid {:arity 2 :symbol "kotoba_aiueos_user_elf_valid"}
    'aiueos-user-context-build {:arity 4 :symbol "kotoba_aiueos_user_context_build"}
+   ;; The kernel-selector twin of user-context-build: same interrupt frame,
+   ;; entered by iret into a C function rather than into ring 3, so no user
+   ;; stack argument and CS/SS are the kernel selectors.
+   'aiueos-kernel-context-build {:arity 3 :symbol "kotoba_aiueos_kernel_context_build"}
    'aiueos-page-mapping-plan {:arity 5 :symbol "kotoba_aiueos_page_mapping_plan"}
    'aiueos-process-create-plan {:arity 5 :symbol "kotoba_aiueos_process_create_plan"}
    'aiueos-process-teardown-plan {:arity 5 :symbol "kotoba_aiueos_process_teardown_plan"}
@@ -425,7 +429,9 @@
           ;; unexpected-vector (vector 6 is `ud2`).
           rsa-fuel? (contains? '#{aiueos-rsa2048-sha256-verify aiueos-x25519}
                                object-entry)
-          context-fuel? (= 'aiueos-user-context-build object-entry)
+          context-fuel? (contains? '#{aiueos-user-context-build
+                                     aiueos-kernel-context-build}
+                                   object-entry)
           ;; 4096 rather than the plain 1024, because each of these walks a
           ;; whole frame: a checksum over a 1500-byte Ethernet payload is ~750
           ;; recursive calls at one fuel apiece, and `tcp-segment-valid` runs two
@@ -463,6 +469,7 @@
                                         aiueos-app-lookup-plan
                                         aiueos-user-elf-valid
                                         aiueos-user-context-build
+                                        aiueos-kernel-context-build
                                         aiueos-process-create-plan
                                         aiueos-task-slot-plan
                                         aiueos-scheduler-dispatch-plan
