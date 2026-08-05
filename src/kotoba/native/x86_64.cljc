@@ -179,6 +179,43 @@
                  (emit-rhs-window right env ctx)
                  opcode))))
 
+;; Every call shape on this backend -- a self tail call, an ordinary call, and
+;; a host context call -- begins the same way: evaluate each argument
+;; left-to-right and push it, so that a nested call's own temporaries cannot
+;; clobber an argument already computed. That walk lives here ONCE, because the
+;; three copies it replaced were not identical for long enough to be safe: each
+;; was written as
+;;
+;;     (if-let [arg (first remaining)] …)
+;;
+;; and `if-let` tests the BOUND VALUE, not the sequence. An argument whose KIR
+;; form is the literal `false` is a perfectly ordinary `:bool` value here (see
+;; `emit-expr`: it is the i64 word 0), but it made `if-let` take the else
+;; branch -- so that argument AND EVERY ARGUMENT AFTER IT was silently not
+;; emitted, while the caller still popped the full arity from `argc`. The
+;; result was a program that assembled cleanly, was shorter by exactly the
+;; missing pushes, and ran off its own stack (SIGSEGV via the tail-self path,
+;; SIGILL via the ordinary one). `nil` cannot appear here for the same reason
+;; `false` can -- KIR has no nil argument form -- so nothing was ever relying
+;; on the truthiness test to terminate the loop early; it terminated on the
+;; empty sequence, and `(seq remaining)` says exactly that.
+;;
+;; The AArch64 backend was never affected: it walks arguments with `mapcat`,
+;; which has no truthiness test to get wrong. That is not a representation
+;; difference between the two backends -- both carry a `:bool` as an i64 word
+;; -- it is a difference in how the loop was written, which is why the fix is
+;; here and not in any value encoding.
+(defn- emit-pushed-arguments
+  "Each argument evaluated in order and pushed, starting at TEMP-DEPTH."
+  [args env ctx temp-depth]
+  (loop [remaining args depth temp-depth out []]
+    (if (seq remaining)
+      (recur (next remaining) (inc depth)
+             (into out (concat (emit-expr (first remaining) env
+                                          (assoc ctx :tail? false :temp-depth depth))
+                               [0x50])))
+      out)))
+
 (defn- emit-tail-self-call [args env {:keys [param-count pad? temp-depth] :as ctx}]
   ;; All arguments are evaluated before any parameter slot is overwritten.
   ;; r11 then anchors the existing function frame while the temporary values
@@ -186,12 +223,7 @@
   ;; fuel here preserves ordinary call semantics; the final jump re-enters
   ;; the expression body without growing the native stack.
   (let [argc (count args)
-        values (loop [remaining args depth temp-depth out []]
-                 (if-let [arg (first remaining)]
-                   (recur (next remaining) (inc depth)
-                          (into out (concat (emit-expr arg env (assoc ctx :tail? false :temp-depth depth))
-                                            [0x50])))
-                   out))
+        values (emit-pushed-arguments args env ctx temp-depth)
         anchor [0x4c 0x8d 0x9c 0x24] ; lea r11,[rsp+argc*8]
         stores (mapcat (fn [param-index]
                          (let [disp (* 8 (+ (if pad? 1 0)
@@ -239,16 +271,13 @@
     ;; `:tail? true` but no longer at the function's own baseline depth.
     (if (and tail? (= op function-name) (zero? temp-depth))
       (emit-tail-self-call args env ctx)
-      (loop [remaining args depth temp-depth out []]
-      (if-let [arg (first remaining)]
-        (recur (next remaining) (inc depth)
-               (into out (concat (emit-expr arg env (assoc ctx :tail? false :temp-depth depth)) [0x50])))
-        (let [pops (mapcat #(nth arg-pops %) (reverse (range argc)))
-              ;; SysV requires rsp%16==0 immediately before CALL. The fixed
-              ;; function frame is aligned; expression temporaries may flip it.
-              align? (odd? temp-depth)]
-          (vec (concat out pops (when align? [0x50]) [{:call op}]
-                       (when align? [0x48 0x83 0xc4 0x08])))))))))
+      (let [values (emit-pushed-arguments args env ctx temp-depth)
+            pops (mapcat #(nth arg-pops %) (reverse (range argc)))
+            ;; SysV requires rsp%16==0 immediately before CALL. The fixed
+            ;; function frame is aligned; expression temporaries may flip it.
+            align? (odd? temp-depth)]
+        (vec (concat values pops (when align? [0x50]) [{:call op}]
+                     (when align? [0x48 0x83 0xc4 0x08])))))))
 
 ;; `cap-id` arrives as an arbitrary `.kotoba` VALUE straight from the KIR
 ;; effect (`cap-call`'s first arg), which on cljs is a `bigint` (see
@@ -339,11 +368,7 @@
         ;; index 0 = rdi, reserved below for the context pointer moved from
         ;; r9) -- net stack effect is zero, so `align?` still reads the
         ;; original (pre-call) temp-depth exactly like the pair-only version.
-        values (loop [remaining args depth temp-depth out []]
-                 (if-let [arg (first remaining)]
-                   (recur (next remaining) (inc depth)
-                          (into out (concat (emit-expr arg env (assoc ctx :temp-depth depth)) [0x50])))
-                   out))
+        values (emit-pushed-arguments args env ctx temp-depth)
         pops (mapcat #(nth arg-pops (inc %)) (reverse (range argc)))
         align? (even? temp-depth)]
     (vec (concat values pops [0x41 0x51] (when align? [0x50])
