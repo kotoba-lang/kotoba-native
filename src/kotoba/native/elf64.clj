@@ -123,7 +123,16 @@
    ;; handoff (ADR-0028). Firmware-dependent correctness, now the OS's own.
    ;; The vector bases are validated rather than trusted: remapping onto the CPU
    ;; exception range is how IRQ0 masqueraded as #DF and stayed opaque.
-   'aiueos-pic-disable {:arity 2 :symbol "kotoba_aiueos_pic_disable"}})
+   'aiueos-pic-disable {:arity 2 :symbol "kotoba_aiueos_pic_disable"}
+   ;; CPU feature detection. Six cpuid sites in the kernel, asking three
+   ;; different questions -- and only two of them are feature tests. The knowledge
+   ;; of WHICH leaf and WHICH bit answers a question is the decision; leaving it
+   ;; as magic numbers at a C call site is what these replace.
+   'aiueos-cpu-feature-nx {:arity 0 :symbol "kotoba_aiueos_cpu_feature_nx"}
+   'aiueos-cpu-feature-syscall {:arity 0 :symbol "kotoba_aiueos_cpu_feature_syscall"}
+   ;; NOT a feature test: leaf 1 EBX 31:24 is the initial APIC ID, which pci.c
+   ;; uses as the MSI-X message destination.
+   'aiueos-cpu-apic-id {:arity 0 :symbol "kotoba_aiueos_cpu_apic_id"}})
 
 (defn- le [n width]
   (mapv #(bit-and (unsigned-bit-shift-right (long n) (* 8 %)) 0xff)
