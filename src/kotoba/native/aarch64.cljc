@@ -647,13 +647,14 @@
             ;; A PARAMETER holding a record arrived boxed for the same reason a
             ;; call's result does: the caller had N slots and the ABI has one
             ;; word. `env` binds a parameter to its bare index, not the
-            ;; `{:record-fields …}` map a flattened `let` binding gets, so a
-            ;; symbol resolving to a non-map binding here is precisely a
-            ;; parameter. A `let` slot holding a boxed handle is the same one
-            ;; word but is deliberately not admitted -- see the x86-64 backend
-            ;; and docs/adr/0001 for why (kotoba.verifier rejects it, so
-            ;; nothing could reach the emitted path).
-            (and (symbol? value-form) (not (map? (get env value-form)))
+            ;; `{:record-fields …}` map a flattened `let` binding gets. A `let`
+            ;; SLOT holding a boxed handle is the same one word arriving by a
+            ;; different route and walks the same chain, so what distinguishes
+            ;; "this name is a word" from "this name is N words" is
+            ;; `:record-fields`, not `map?` -- see the x86-64 backend and
+            ;; docs/adr/0004. Held back one release because kotoba.verifier
+            ;; rejected the shape; its ADR 0004 admits it.
+            (and (symbol? value-form) (not (:record-fields (get env value-form)))
                  (contains? env value-form)))
       (let [fields (nth type 2)
             field-index (first (keep-indexed (fn [i [n _]] (when (= n field) i)) fields))]

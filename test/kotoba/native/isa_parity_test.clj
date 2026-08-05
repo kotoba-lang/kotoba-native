@@ -678,3 +678,154 @@
         (is (thrown-with-msg?
              clojure.lang.ExceptionInfo #"record-new is only supported"
              (emit (mk-program tail-ref (list 'record-new other 1 2 3) :a))))))))
+
+;; ---------------------------------------------------------------------------
+;; A projection over a `let`-bound boxed handle (ADR 0004).
+;;
+;; `(let [ends (mk x)] (record-get … ends :hi0))` is how murakumo's plan cores
+;; read a multi-field result. The handle is ONE WORD -- the same pair chain a
+;; record result has crossed on since ADR 0062 -- so the projection is the same
+;; chain walk a projection over a call or a parameter already emitted. What had
+;; to change is only which env shapes reach that walk: `:record-fields` (a
+;; FLATTENED record, N slots, resolved above) rather than `map?` (which also
+;; excluded an ordinary `{:let-depth d}` slot holding a word).
+;;
+;; Every assertion below is byte-for-byte against the HAND-WRITTEN walk, not
+;; "it emits". A chain walked to the wrong depth still returns a plausible i64,
+;; so an emission-only check could not tell `:a` from `:b`.
+
+(defn- handle-program
+  "`mk` returns a record boxed; `main`'s BODY reads it back."
+  [body]
+  {:format :kotoba.kir/v4 :exports ['main]
+   :functions [{:name 'mk :params [] :result pair-rec
+                :body (list 'record-new pair-rec 11 22)}
+               {:name 'main :params [] :body body}]})
+
+;; The chain walk written out by hand: field i is `pair-first` after i
+;; `pair-second`s. This is the oracle -- it uses only primitives both backends
+;; emitted before this change.
+(defn- chain-walk [handle index]
+  (list 'pair-first (nth (iterate (fn [f] (list 'pair-second f)) handle) index)))
+
+(def ^:private handle-field-index {:a 0 :b 1})
+
+(deftest a-let-bound-boxed-handle-projects-as-the-chain-walk-on-both-isas
+  (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
+    (testing label
+      ;; Fields are selected on purpose, not uniformly: reading `:a` is what a
+      ;; walk of depth zero returns whether or not the depth is computed, so a
+      ;; row that only ever read the first field passes even when the walk is
+      ;; wrong.
+      (doseq [field [:a :b]]
+        (let [i (handle-field-index field)
+              projected (list 'let ['h '(mk)] (list 'record-get pair-rec 'h field))
+              walked (list 'let ['h '(mk)] (chain-walk 'h i))]
+          (is (seq (:code (emit (handle-program projected)))) (str field))
+          (is (= (:code (emit (handle-program projected)))
+                 (:code (emit (handle-program walked))))
+              (str field " must emit exactly the hand-written chain walk")))))))
+
+(deftest a-let-bound-handle-projected-twice-reads-two-different-depths
+  ;; Both fields in one body, subtracted rather than added: 11 - 22 and
+  ;; 22 - 11 differ, so an emitter that read the same slot twice, or read the
+  ;; two in the wrong order, cannot produce these bytes.
+  (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
+    (testing label
+      (let [projected (list 'let ['h '(mk)]
+                            (list '- (list 'record-get pair-rec 'h :a)
+                                  (list 'record-get pair-rec 'h :b)))
+            walked (list 'let ['h '(mk)]
+                         (list '- (chain-walk 'h 0) (chain-walk 'h 1)))
+            reversed (list 'let ['h '(mk)]
+                           (list '- (chain-walk 'h 1) (chain-walk 'h 0)))]
+        (is (= (:code (emit (handle-program projected)))
+               (:code (emit (handle-program walked)))))
+        ;; The falsifier for the row above: if the two projections were
+        ;; interchangeable, this would also match, and the row would prove
+        ;; nothing about depth.
+        (is (not= (:code (emit (handle-program projected)))
+                  (:code (emit (handle-program reversed))))
+            "a depth-swapped walk must NOT emit the same bytes")))))
+
+(deftest a-handle-forwarded-through-a-let-is-still-one-word
+  ;; A handle rebound to another name is still a word: the second binding is an
+  ;; ordinary slot holding the same chain, so the projection is the same walk
+  ;; one binding deeper. This is the shape a helper produces when it names an
+  ;; intermediate result before reading it.
+  (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
+    (testing label
+      (doseq [field [:a :b]]
+        (let [i (handle-field-index field)
+              projected (list 'let ['h '(mk)]
+                              (list 'let ['g 'h] (list 'record-get pair-rec 'g field)))
+              walked (list 'let ['h '(mk)]
+                           (list 'let ['g 'h] (chain-walk 'g i)))]
+          (is (= (:code (emit (handle-program projected)))
+                 (:code (emit (handle-program walked))))
+              (str field " forwarded")))))))
+
+(def ^:private opt-rec
+  '[:record :t/o [[:m [:option :i64]] [:x :i64]]])
+
+(deftest a-let-bound-handle-with-an-option-field-projects-identically
+  ;; An `[:option T]` field is one word like every other admissible field, so
+  ;; it occupies exactly one link of the chain. A backend that sized it
+  ;; differently would shift `:x` and this row would diverge from the walk.
+  (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
+    (testing label
+      (let [prog (fn [body]
+                   {:format :kotoba.kir/v4 :exports ['main]
+                    :functions [{:name 'mko :params [] :result opt-rec
+                                 :body (list 'record-new opt-rec
+                                             (list 'option-some-of [:option :i64] 5) 9)}
+                                {:name 'main :params [] :body body}]})]
+        (doseq [[field i] [[:m 0] [:x 1]]]
+          (is (= (:code (emit (prog (list 'let ['h '(mko)]
+                                          (list 'record-get opt-rec 'h field)))))
+                 (:code (emit (prog (list 'let ['h '(mko)] (chain-walk 'h i))))))
+              (str field " over an option-bearing record")))))))
+
+(deftest a-flattened-let-bound-record-is-still-read-from-its-slots
+  ;; The regression guard for widening `map?` to `:record-fields`. A `let`-bound
+  ;; `record-new` is FLATTENED into one slot per field and must keep being
+  ;; resolved that way -- if it fell through to the chain walk it would read the
+  ;; arena at an address that is really an i64 field value.
+  (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
+    (testing label
+      (doseq [field [:a :b]]
+        (let [flattened (program [] (list 'let ['r (list 'record-new pair-rec 11 22)]
+                                          (list 'record-get pair-rec 'r field)))
+              ;; A slot read of a literal is just that literal pushed and read
+              ;; back; the chain walk would have to call pair_new. Comparing
+              ;; against the walk over the SAME binding is the sharp form.
+              walked (program [] (list 'let ['r (list 'record-new pair-rec 11 22)]
+                                       (chain-walk 'r (handle-field-index field))))]
+          (is (seq (:code (emit flattened))) (str field))
+          ;; The walked spelling is not even emittable here -- `r` is N slots,
+          ;; not a word -- which is precisely the distinction being preserved.
+          (is (thrown? clojure.lang.ExceptionInfo (emit walked))
+              (str field ": a flattened record binding is not a word"))))))
+
+  ;; And the flattened read must not have become a chain walk: the pair-chain
+  ;; spelling of the same VALUE goes through the arena, so its byte count
+  ;; differs. Comparing against the pre-existing slot-only expectation keeps
+  ;; `slot-backed-records-still-allocate-nothing` honest from this side too.
+  (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
+    (testing (str label " / no arena call appears")
+      (let [flattened (program [] (list 'let ['r (list 'record-new pair-rec 11 22)]
+                                        (list 'record-get pair-rec 'r :b)))
+            boxed (handle-program (list 'let ['h '(mk)]
+                                        (list 'record-get pair-rec 'h :b)))]
+        (is (not= (:code (emit flattened)) (:code (emit boxed))))))))
+
+(deftest a-projection-over-a-let-bound-handle-still-checks-its-field
+  ;; Widening which env shapes reach the walk must not widen WHAT may be
+  ;; projected: an undeclared field has no index, so there is no depth to walk
+  ;; to, and that is still a loud failure rather than depth zero.
+  (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
+    (testing label
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"undeclared field"
+           (emit (handle-program (list 'let ['h '(mk)]
+                                       (list 'record-get pair-rec 'h :nope)))))))))
