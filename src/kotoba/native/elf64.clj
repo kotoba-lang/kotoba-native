@@ -116,7 +116,14 @@
    ;; wrong points a vector at the wrong address -- which is a silent, exploitable
    ;; failure rather than a crash. Writes the 16-byte descriptor into a
    ;; caller-owned region, like aiueos-user-context-build.
-   'aiueos-idt-gate-build {:arity 5 :symbol "kotoba_aiueos_idt_gate_build"}})
+   'aiueos-idt-gate-build {:arity 5 :symbol "kotoba_aiueos_idt_gate_build"}
+   ;; Legacy 8259 shutdown. Pure port I/O, so it is expressible only because
+   ;; kernel-out-u8 exists -- and it closes a latent bug in the UEFI path, which
+   ;; never masked the PIC and is green only because OVMF happens to do it before
+   ;; handoff (ADR-0028). Firmware-dependent correctness, now the OS's own.
+   ;; The vector bases are validated rather than trusted: remapping onto the CPU
+   ;; exception range is how IRQ0 masqueraded as #DF and stayed opaque.
+   'aiueos-pic-disable {:arity 2 :symbol "kotoba_aiueos_pic_disable"}})
 
 (defn- le [n width]
   (mapv #(bit-and (unsigned-bit-shift-right (long n) (* 8 %)) 0xff)
