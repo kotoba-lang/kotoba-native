@@ -115,7 +115,13 @@
    [[] '(kernel-hlt)]
    [[] '(kernel-pause)]
    [['p 'v] '(kernel-out-u8 p v)]
-   [['p 'v] '(kernel-out-u32 p v)]])
+   [['p 'v] '(kernel-out-u32 p v)]
+   ;; The port READS take only the port. `in`/`out` are one x86 facility, so
+   ;; the reads are x86-only for the same reason the writes are -- AArch64
+   ;; reaches devices through memory-mapped loads, which is a different
+   ;; operator, not a translation of this one.
+   [['p] '(kernel-in-u8 p)]
+   [['p] '(kernel-in-u32 p)]])
 
 (deftest privileged-x86-operators-are-x86-only-by-design
   (doseq [[params body] x86-only]
