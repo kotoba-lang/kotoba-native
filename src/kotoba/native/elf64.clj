@@ -65,7 +65,13 @@
    ;; the IPv4 pseudo-header -- source, destination, protocol and TCP length --
    ;; which the admission would otherwise have to take on trust from C.
    'aiueos-tcp-checksum-ok {:arity 4 :symbol "kotoba_aiueos_tcp_checksum_ok"}
-   'aiueos-tcp-segment-valid {:arity 5 :symbol "kotoba_aiueos_tcp_segment_valid"}})
+   'aiueos-tcp-segment-valid {:arity 5 :symbol "kotoba_aiueos_tcp_segment_valid"}
+   ;; PCI configuration space, the first MECHANISM to move out of C rather than
+   ;; another decision. It is expressible only because `kernel-in-u32` now
+   ;; exists: config access is a write to 0xCF8 followed by a READ of 0xCFC, and
+   ;; with write-only port I/O the read half had no encoding at all.
+   'aiueos-pci-config-read {:arity 4 :symbol "kotoba_aiueos_pci_config_read"}
+   'aiueos-pci-config-write {:arity 5 :symbol "kotoba_aiueos_pci_config_write"}})
 
 (defn- le [n width]
   (mapv #(bit-and (unsigned-bit-shift-right (long n) (* 8 %)) 0xff)
@@ -352,8 +358,18 @@
     (let [sha-fuel? (= 'aiueos-sha256 object-entry)
           rsa-fuel? (= 'aiueos-rsa2048-sha256-verify object-entry)
           context-fuel? (= 'aiueos-user-context-build object-entry)
+          ;; 4096 rather than the plain 1024, because each of these walks a
+          ;; whole frame: a checksum over a 1500-byte Ethernet payload is ~750
+          ;; recursive calls at one fuel apiece, and `tcp-segment-valid` runs two
+          ;; of them (IPv4 header, then the segment). 1024 would clear a small
+          ;; frame and trap on a full one -- exactly the size-dependent failure
+          ;; that looks like a protocol bug.
           high-fuel? (contains? '#{aiueos-user-object-journal-build
-                                    aiueos-user-object-journal-valid} object-entry)
+                                    aiueos-user-object-journal-valid
+                                    aiueos-ipv4-checksum
+                                    aiueos-ipv4-icmp-reply-valid
+                                    aiueos-tcp-checksum-ok
+                                    aiueos-tcp-segment-valid} object-entry)
           bounded-memory? (or sha-fuel? rsa-fuel? context-fuel? high-fuel? (contains? '#{aiueos-fnv1a aiueos-journal-record-valid
                                         aiueos-object-transaction-valid aiueos-object-transaction-route
                                         aiueos-mutable-object-valid
@@ -369,7 +385,29 @@
                                         aiueos-scheduler-dispatch-plan
                                         aiueos-task-exit-route
                                         aiueos-user-object-journal-value
-                                        aiueos-service-registry-state} object-entry))
+                                        aiueos-service-registry-state
+                                        ;; Network and PCI. Every object below
+                                        ;; walks a buffer or is called thousands
+                                        ;; of times, and an object OUTSIDE this
+                                        ;; set gets no replenish at all -- it
+                                        ;; spends from whatever the shared .data
+                                        ;; context happens to hold, which starts
+                                        ;; at 512 for the whole boot.
+                                        ;;
+                                        ;; The IPv4/TCP objects worked anyway,
+                                        ;; and only by accident: they run after
+                                        ;; catalog admission, which calls
+                                        ;; aiueos-sha256 and sets the shared
+                                        ;; counter to 10,000,000. They were
+                                        ;; riding another object's replenish.
+                                        ;; PCI config read is what exposed it --
+                                        ;; enumeration probes 256 buses x 32
+                                        ;; devices = 8192 times, BEFORE anything
+                                        ;; replenishes, so it would have run the
+                                        ;; counter to zero and hit the `ud2`
+                                        ;; every prologue guards with.
+                                        aiueos-pci-config-read
+                                        aiueos-pci-config-write} object-entry))
           replenish (when bounded-memory?
                       (cond
                         rsa-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000
