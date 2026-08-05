@@ -4,6 +4,7 @@
   ;; `kotoba.wasm.core`'s ns form for that original reasoning) now wraps only
   ;; the cljs-only item.
   (:require [kotoba.native.peephole :as peephole]
+            [kotoba.native.string-search :as string-search]
             #?@(:cljs [[kotoba.kir.cljs-i64 :as i64]])))
 
 ;; `u32le` only ever encodes a fully-constructed 32-bit ARM instruction
@@ -981,6 +982,15 @@
              (ascii-literal? (first args)))
         (emit-string-substring-of-ascii-literal (first args) (second args) (nth args 2) env depth)
 
+        ;; The two string SEARCH operations. See `kotoba.native.string-search`;
+        ;; the rewrite is shared with the x86-64 backend rather than restated
+        ;; here, so the two ISAs cannot drift in their search semantics.
+        (and (= op 'string-contains?) (= 2 (count args)))
+        (emit-expr (string-search/lower-contains args) env depth)
+
+        (and (= op 'string-replace-all) (= 3 (count args)))
+        (emit-expr (string-search/lower-replace-all args) env depth)
+
         ;; An f64 vector operation IS the i64 one (see vector-op-aliases):
         ;; rewrite the head and re-dispatch, so there is exactly one lowering
         ;; per operation rather than two that must be kept in step.
@@ -1249,9 +1259,12 @@
               (:string-literal token))))
 
 (defn emit-program [kir]
-  (let [exported-names (set (or (:exports kir) (map :name (:functions kir))))
-        token-bodies (binding [*function-names* (set (map :name (:functions kir)))]
-                       (mapv (fn [f] [f (emit-function f)]) (:functions kir)))
+  (let [;; See the x86-64 backend's `emit-program`: the export set is read
+        ;; from the DECLARED functions, before the search helpers are appended.
+        exported-names (set (or (:exports kir) (map :name (:functions kir))))
+        functions (string-search/augment-functions (:functions kir))
+        token-bodies (binding [*function-names* (set (map :name functions))]
+                       (mapv (fn [f] [f (emit-function f)]) functions))
         offsets (loop [items token-bodies offset 0 out {}]
                   (if-let [[f body] (first items)]
                     (recur (next items) (+ offset (code-size body)) (assoc out (:name f) offset)) out))
