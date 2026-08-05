@@ -558,3 +558,117 @@
                          (some #(= [0x38 0x40 0x40 0xf9] %) (partition 4 1 code)))]
         (is (seq code))
         (is (not calls-pair) "a non-escaping record must allocate nothing")))))
+
+;; ---------------------------------------------------------------------------
+;; A record-new in TAIL position, wherever in the body it sits
+;; ---------------------------------------------------------------------------
+;;
+;; Boxing a record result used to require two things at once that nothing
+;; guaranteed: the construction had to be the OUTERMOST form of the body, and
+;; the declared result had to be the EXPANDED `[:record …]` spelling. Neither is
+;; how a real module is written.
+;;
+;; A schema reference survives into a KIR SIGNATURE unexpanded on purpose --
+;; expanding it moved the `:kir-sha256` of every module that used one, on every
+;; target -- so `[:ref :t/s]` is the spelling murakumo's cores actually carry,
+;; and a body is normally `(let [...] (if ... (record-new ...) ...))`.
+;;
+;; The rewrite therefore follows tail position through `if` (both branches),
+;; `let` (the body, never a binding's value) and `do` (the last subexpression) --
+;; the same positions `emit-expr` hands its own `:tail?` down to.
+
+(def ^:private tail-rec pair-rec)                     ; [:record :t/s [[:a :i64] [:b :i64]]]
+(def ^:private tail-ref '[:ref :t/s])
+
+(defn- mk-program
+  "A program whose `mk` returns a record built by BODY and whose `main`
+  projects FIELD out of the result."
+  [result body field]
+  {:format :kotoba.kir/v4 :exports ['main]
+   :functions [{:name 'mk :params [] :result result :body body}
+               {:name 'main :params []
+                :body (list 'record-get tail-rec '(mk) field)}]})
+
+(def ^:private boxed-chain
+  ;; What ADR 0062's boundary shape IS, written out: pair(11, pair(22, 0)).
+  ;; Every placement below must produce exactly this, in exactly this position.
+  '(pair 11 (pair 22 0)))
+
+(def ^:private tail-placements
+  [["outermost"        (list 'record-new tail-rec 11 22)                boxed-chain]
+   ["under a let"      (list 'let ['x 5] (list 'record-new tail-rec 11 22))
+                       (list 'let ['x 5] boxed-chain)]
+   ["under a do"       (list 'do 7 (list 'record-new tail-rec 11 22))
+                       (list 'do 7 boxed-chain)]
+   ["both if branches" (list 'if 1 (list 'record-new tail-rec 11 22)
+                            (list 'record-new tail-rec 11 22))
+                       (list 'if 1 boxed-chain boxed-chain)]
+   ;; murakumo's own shape: a guard returning a zero record, and the real one
+   ;; built at the bottom of a nested let.
+   ["let / if / let"   (list 'let ['t 1]
+                             (list 'if 't (list 'record-new tail-rec 11 22)
+                                   (list 'let ['u 2] (list 'record-new tail-rec 11 22))))
+                       (list 'let ['t 1]
+                             (list 'if 't boxed-chain
+                                   (list 'let ['u 2] boxed-chain)))]])
+
+(deftest a-record-result-is-boxed-from-any-tail-position-on-both-isas
+  (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
+    (testing label
+      (doseq [[why body already-boxed] tail-placements
+              ;; The two projections select DIFFERENT fields on purpose: a pair
+              ;; chain walked to the wrong depth still yields a plausible i64,
+              ;; so a table that only ever read `:a` could not see a rewrite
+              ;; that boxed the fields in the wrong order or the wrong place.
+              field [:a :b]]
+        (let [emitted (:code (emit (mk-program tail-rec body field)))]
+          (is (seq emitted) (str why " / " field))
+          ;; Not merely "it emits": it emits THE SAME BYTES as the body whose
+          ;; construction was already the pair chain. That is what makes this a
+          ;; rewrite into a shape both backends already executed, rather than a
+          ;; new encoding that happens to compile.
+          (is (= emitted (:code (emit (mk-program tail-rec already-boxed field))))
+              (str why " / " field
+                   " must emit exactly the pre-boxed body's code")))))))
+
+(deftest a-result-declared-by-schema-reference-boxes-identically
+  ;; `[:ref :t/s]` and `[:record :t/s [...]]` name the same record, and KIR
+  ;; leaves the reference unexpanded in a signature. Reading only the expanded
+  ;; spelling is why a murakumo core that declares its record results by
+  ;; reference -- which is how they are written throughout -- could not return
+  ;; a record at all.
+  (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
+    (testing label
+      (doseq [[why body _] tail-placements
+              field [:a :b]]
+        (is (= (:code (emit (mk-program tail-ref body field)))
+               (:code (emit (mk-program tail-rec body field))))
+            (str why " / " field " must not depend on which spelling declared it"))))))
+
+(deftest boxing-reaches-tail-positions-only
+  ;; A `record-new` that is NOT where the function's value comes from is still
+  ;; refused. Boxing every construction anywhere would silently give the record
+  ;; the runtime representation ADR 0062 declined to give it.
+  (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
+    (testing label
+      (doseq [[why body]
+              [["an arithmetic operand" (list '+ 1 (list 'record-new tail-rec 11 22))]
+               ;; A binding's VALUE is not a tail: it flattens into slots, and a
+               ;; bare record binding is not a word.
+               ["a let binding read as a value"
+                (list 'let ['r (list 'record-new tail-rec 11 22)] 'r)]]]
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (emit (mk-program tail-rec body :a)))
+            why)))))
+
+(deftest a-tail-record-new-must-name-the-declared-result
+  ;; `[:ref :t/s]` carries no field list, so the construction's own name is the
+  ;; only local evidence that it is the record the signature promised. A
+  ;; mismatch is left unboxed and fails loudly rather than being handed to a
+  ;; caller that will walk it with the wrong field count.
+  (let [other '[:record :t/other [[:a :i64] [:b :i64] [:c :i64]]]]
+    (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
+      (testing label
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo #"record-new is only supported"
+             (emit (mk-program tail-ref (list 'record-new other 1 2 3) :a))))))))
