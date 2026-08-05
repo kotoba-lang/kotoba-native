@@ -54,7 +54,13 @@
    ;; Network frame admission. The virtio-net driver owns the mechanism (queue
    ;; setup, DMA, doorbells); whether the bytes that came back are the reply it
    ;; asked for is a decision, and decisions are Kotoba objects here.
-   'aiueos-net-arp-reply-valid {:arity 3 :symbol "kotoba_aiueos_net_arp_reply_valid"}})
+   'aiueos-net-arp-reply-valid {:arity 3 :symbol "kotoba_aiueos_net_arp_reply_valid"}
+   ;; IPv4. The one's-complement checksum is a computation the header and every
+   ;; protocol above it share, so it is exported on its own rather than being
+   ;; duplicated inside each validator; the reply admission is the decision that
+   ;; a received datagram is the one that was asked for.
+   'aiueos-ipv4-checksum {:arity 2 :symbol "kotoba_aiueos_ipv4_checksum"}
+   'aiueos-ipv4-icmp-reply-valid {:arity 5 :symbol "kotoba_aiueos_ipv4_icmp_reply_valid"}})
 
 (defn- le [n width]
   (mapv #(bit-and (unsigned-bit-shift-right (long n) (* 8 %)) 0xff)
