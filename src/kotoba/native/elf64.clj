@@ -50,7 +50,11 @@
    'aiueos-scheduler-dispatch-plan {:arity 5 :symbol "kotoba_aiueos_scheduler_dispatch_plan"}
    'aiueos-task-exit-route {:arity 5 :symbol "kotoba_aiueos_task_exit_route"}
    'aiueos-service-task-transition {:arity 5 :symbol "kotoba_aiueos_service_task_transition"}
-   'aiueos-rsa2048-sha256-verify {:arity 5 :symbol "kotoba_aiueos_rsa2048_sha256_verify"}})
+   'aiueos-rsa2048-sha256-verify {:arity 5 :symbol "kotoba_aiueos_rsa2048_sha256_verify"}
+   ;; Network frame admission. The virtio-net driver owns the mechanism (queue
+   ;; setup, DMA, doorbells); whether the bytes that came back are the reply it
+   ;; asked for is a decision, and decisions are Kotoba objects here.
+   'aiueos-net-arp-reply-valid {:arity 3 :symbol "kotoba_aiueos_net_arp_reply_valid"}})
 
 (defn- le [n width]
   (mapv #(bit-and (unsigned-bit-shift-right (long n) (* 8 %)) 0xff)
