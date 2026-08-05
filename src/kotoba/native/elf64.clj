@@ -110,7 +110,13 @@
    ;; model-specific registers reachable at all becomes a reviewed list rather
    ;; than whatever a caller passes.
    'aiueos-msr-read {:arity 1 :symbol "kotoba_aiueos_msr_read"}
-   'aiueos-msr-write {:arity 2 :symbol "kotoba_aiueos_msr_write"}})
+   'aiueos-msr-write {:arity 2 :symbol "kotoba_aiueos_msr_write"}
+   ;; IDT gate construction. Splitting a 64-bit handler address across an
+   ;; interrupt descriptor's three offset fields is bit-packing, and getting it
+   ;; wrong points a vector at the wrong address -- which is a silent, exploitable
+   ;; failure rather than a crash. Writes the 16-byte descriptor into a
+   ;; caller-owned region, like aiueos-user-context-build.
+   'aiueos-idt-gate-build {:arity 5 :symbol "kotoba_aiueos_idt_gate_build"}})
 
 (defn- le [n width]
   (mapv #(bit-and (unsigned-bit-shift-right (long n) (* 8 %)) 0xff)
