@@ -102,7 +102,15 @@
    ;; divide-first form yields offset 8 and ADMITS where the C refuses.
    ;;
    ;; A handful of bit tests -- no walk, 1 fuel per call, so no replenish tier.
-   'aiueos-vtd-admit {:arity 5 :symbol "kotoba_aiueos_vtd_admit"}})
+   'aiueos-vtd-admit {:arity 5 :symbol "kotoba_aiueos_vtd_admit"}
+   ;; MSR access. This is MECHANISM moving out of C rather than another
+   ;; decision -- three files each carried their own read_msr/write_msr inline
+   ;; asm pair -- but it carries a decision with it: the object admits only the
+   ;; MSR indices this kernel has a reason to touch, so the set of
+   ;; model-specific registers reachable at all becomes a reviewed list rather
+   ;; than whatever a caller passes.
+   'aiueos-msr-read {:arity 1 :symbol "kotoba_aiueos_msr_read"}
+   'aiueos-msr-write {:arity 2 :symbol "kotoba_aiueos_msr_write"}})
 
 (defn- le [n width]
   (mapv #(bit-and (unsigned-bit-shift-right (long n) (* 8 %)) 0xff)
@@ -443,16 +451,26 @@
                                         ;; walks a buffer or is called thousands
                                         ;; of times, and an object OUTSIDE this
                                         ;; set gets no replenish at all -- it
-                                        ;; spends from whatever the shared .data
-                                        ;; context happens to hold, which starts
-                                        ;; at 512 for the whole boot.
+                                        ;; spends its OWN 512 for the whole boot.
                                         ;;
-                                        ;; The IPv4/TCP objects worked anyway,
-                                        ;; and only by accident: they run after
-                                        ;; catalog admission, which calls
-                                        ;; aiueos-sha256 and sets the shared
-                                        ;; counter to 10,000,000. They were
-                                        ;; riding another object's replenish.
+                                        ;; Per-object, not shared: in the .o path
+                                        ;; each object's `lea …,%r9` relocates
+                                        ;; `R_X86_64_PC32` against its own `.data`
+                                        ;; symbol, so every object carries a
+                                        ;; separate 80-byte context with its own
+                                        ;; 512. (The single shared context is the
+                                        ;; bootable-IMAGE path, which aiueos does
+                                        ;; not use for these.) An earlier version
+                                        ;; of this comment said the counter was
+                                        ;; shared and that the IPv4/TCP objects
+                                        ;; were riding aiueos-sha256's replenish.
+                                        ;; That was wrong, and wrong in the unsafe
+                                        ;; direction -- it makes a per-object
+                                        ;; budget look like neighbours top it up.
+                                        ;; They simply never exceeded their own
+                                        ;; 512, because every frame they had seen
+                                        ;; was small; a full 1500-byte frame is
+                                        ;; ~750 calls and would have trapped.
                                         ;; PCI config read is what exposed it --
                                         ;; enumeration probes 256 buses x 32
                                         ;; devices = 8192 times, BEFORE anything
