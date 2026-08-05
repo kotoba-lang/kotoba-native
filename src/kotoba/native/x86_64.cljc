@@ -441,7 +441,7 @@
 ;; `kernel-load-u32`/`kernel-store-u32` are `kotoba.compiler.frontend`'s
 ;; `kernel-memory-operations` -- the portable half of the kernel surface, as
 ;; opposed to `kernel-privileged-operations` (cr2/cr3/invlpg/cli/sti/hlt/pause/
-;; out), which name x86 facilities AArch64 has no counterpart for and are
+;; out/in), which name x86 facilities AArch64 has no counterpart for and are
 ;; legitimately x86-only. Both u32 forms already existed on AArch64; their
 ;; absence here meant a program the frontend admitted for
 ;; `x86_64-aiueos-kernel-v1` was rejected only much later, by `finalize`, as an
@@ -498,6 +498,34 @@
     (vec (concat (emit-expr port env ctx) [0x50]
                  (emit-expr value env (update ctx :temp-depth inc))
                  [0x5a] (if (= width 8) [0xee] [0xef])))))
+
+;; The READ half of port I/O, and the reason it exists: PCI configuration
+;; space is reached by writing an address to port 0xCF8 and then READING port
+;; 0xCFC. With `kernel-out-*` alone, that second step had no spelling in
+;; Kotoba, so PCI enumeration -- and with it every device driver -- could only
+;; live in C.
+;;
+;; One argument, so unlike `emit-kernel-out` nothing needs to be spilled: the
+;; port arrives in `rax` and is moved to `rdx`, whose low half `dx` is the only
+;; register `in` will take a dynamic port from. A port wider than 16 bits is
+;; truncated by the instruction, exactly as `out` already truncates it.
+;;
+;; The result is zero-extended to a full 64-bit i64, which is what the caller's
+;; `:i64` type promises:
+;;   * u8 -- `in al,dx` writes ONLY `al`, leaving bits 63:8 whatever the port
+;;     expression left in `rax`. `xor eax,eax` first clears all 64 bits (a
+;;     32-bit write zeroes 63:32), so the byte arrives clean.
+;;   * u32 -- `in eax,dx` writes `eax`, and a 32-bit write zeroes 63:32 by
+;;     itself. No clearing instruction is emitted, because emitting one into a
+;;     kernel would be a byte that does nothing.
+(defn- emit-kernel-in [[port] width env {:keys [temp-depth] :as ctx}]
+  (let [ctx (assoc ctx :tail? false)]
+    (vec (concat (emit-expr port env ctx)
+                 [0x48 0x89 0xc2]                        ; mov rdx,rax  (port -> dx)
+                 (if (= width 8)
+                   [0x31 0xc0                            ; xor eax,eax
+                    0xec]                                ; in al,dx
+                   [0xed])))))                           ; in eax,dx
 
 ;; A string VALUE is a pair(offset, length) handle -- offset addresses a
 ;; UTF-8 byte range either in the compiled artifact's own code+literal-data
@@ -1273,6 +1301,8 @@
         (= op 'kernel-pause) [0xf3 0x90 0x31 0xc0]
         (= op 'kernel-out-u8) (emit-kernel-out args 8 env ctx)
         (= op 'kernel-out-u32) (emit-kernel-out args 32 env ctx)
+        (= op 'kernel-in-u8) (emit-kernel-in args 8 env ctx)
+        (= op 'kernel-in-u32) (emit-kernel-in args 32 env ctx)
 
         (contains? '#{f64-from-bits f64-to-bits} op)
         (emit-expr (first args) env ctx)
