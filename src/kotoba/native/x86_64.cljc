@@ -552,6 +552,61 @@
                     0xec]                                ; in al,dx
                    [0xed])))))                           ; in eax,dx
 
+;; Model-specific registers. `rdmsr`/`wrmsr` both take the register index in
+;; `ecx`, and both carry the 64-bit value SPLIT across two 32-bit registers --
+;; high half in `edx`, low half in `eax`. That split is the only thing here
+;; that is not a transcription of `emit-kernel-in`, and it is the whole
+;; difficulty: an i64 in this backend is one register, so a read has to
+;; reassemble and a write has to take apart.
+;;
+;; Reassembly is `(edx << 32) | eax`, and it is exact rather than approximate
+;; because of a property of x86-64 that has to be relied on deliberately: a
+;; 32-bit destination write ZEROES bits 63:32 of the containing 64-bit
+;; register. `rdmsr` writes `eax` and `edx`, so after it `rax` is the low half
+;; zero-extended and `rdx` is the high half zero-extended -- no garbage in
+;; either upper half, and therefore no masking instruction needed before the
+;; shift. `shl rdx,32` then moves the high half into place with zeros below
+;; it, and `or` merges.
+;;
+;; That this is `or` over zero-extended halves, and not (say) a sign-extending
+;; move of `eax` followed by an add, is what makes an MSR with bit 63 set
+;; come out right. IA32_EFER is small, but IA32_APIC_BASE on a machine with
+;; more than 4 GiB of physical address space is not, and several MSRs are
+;; defined with bit 63 as an enable or lock. A sign-extended low half would
+;; have filled 63:32 with ones and then `or`ed the real high half into an
+;; already-saturated field: every such register would read back as -1's upper
+;; word, silently. The negative i64 that a bit-63 MSR produces is the correct
+;; result -- the bit pattern is exact, and `:i64` in this language is signed.
+(defn- emit-kernel-read-msr [[index] env {:keys [temp-depth] :as ctx}]
+  (let [ctx (assoc ctx :tail? false)]
+    (vec (concat (emit-expr index env ctx)
+                 [0x48 0x89 0xc1                         ; mov rcx,rax  (index -> ecx)
+                  0x0f 0x32                              ; rdmsr        -> edx:eax
+                  0x48 0xc1 0xe2 0x20                    ; shl rdx,32
+                  0x48 0x09 0xd0]))))                    ; or  rax,rdx
+
+;; The write direction, spilling its first operand exactly as `emit-kernel-out`
+;; does because it likewise has two: the index is pushed, the value is
+;; evaluated into `rax`, and the index is popped into `rcx` -- where `wrmsr`
+;; wants it -- after the value expression has finished clobbering registers.
+;;
+;; Taking the value apart needs no mask either, for the mirror-image reason:
+;; `wrmsr` READS only `eax` and `edx`, so the upper 32 bits of `rax` are
+;; ignored by the instruction and the low half needs no isolating. Only the
+;; high half has to be produced, by copying and shifting down.
+;;
+;; `rax` is left holding the value that was written, which is what
+;; `emit-kernel-out` leaves and therefore what a caller who binds the result
+;; of a kernel write already expects.
+(defn- emit-kernel-write-msr [[index value] env {:keys [temp-depth] :as ctx}]
+  (let [ctx (assoc ctx :tail? false)]
+    (vec (concat (emit-expr index env ctx) [0x50]        ; push index
+                 (emit-expr value env (update ctx :temp-depth inc))
+                 [0x59                                   ; pop rcx      (index -> ecx)
+                  0x48 0x89 0xc2                         ; mov rdx,rax
+                  0x48 0xc1 0xea 0x20                    ; shr rdx,32   (high half)
+                  0x0f 0x30]))))                         ; wrmsr        <- edx:eax
+
 ;; A string VALUE is a pair(offset, length) handle -- offset addresses a
 ;; UTF-8 byte range either in the compiled artifact's own code+literal-data
 ;; region (non-negative) or in the runtime string pool (negative, see
@@ -1335,6 +1390,8 @@
         (= op 'kernel-out-u32) (emit-kernel-out args 32 env ctx)
         (= op 'kernel-in-u8) (emit-kernel-in args 8 env ctx)
         (= op 'kernel-in-u32) (emit-kernel-in args 32 env ctx)
+        (= op 'kernel-read-msr) (emit-kernel-read-msr args env ctx)
+        (= op 'kernel-write-msr) (emit-kernel-write-msr args env ctx)
 
         (contains? '#{f64-from-bits f64-to-bits} op)
         (emit-expr (first args) env ctx)
