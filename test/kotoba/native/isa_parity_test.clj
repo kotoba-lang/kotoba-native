@@ -121,7 +121,16 @@
    ;; reaches devices through memory-mapped loads, which is a different
    ;; operator, not a translation of this one.
    [['p] '(kernel-in-u8 p)]
-   [['p] '(kernel-in-u32 p)]])
+   [['p] '(kernel-in-u32 p)]
+   ;; Model-specific registers. AArch64 has system registers reached by its
+   ;; OWN `msr`/`mrs` instructions -- the same two letters naming a completely
+   ;; different mechanism, with an encoded register name rather than a runtime
+   ;; index, and no EDX:EAX split because its GPRs are already 64-bit. So this
+   ;; is not a translation gap: an AArch64 system-register operator would take
+   ;; different arguments and is a decision for whoever needs one. Pinned here
+   ;; so the absence is asserted rather than merely true.
+   [['i] '(kernel-read-msr i)]
+   [['i 'v] '(kernel-write-msr i v)]])
 
 (deftest privileged-x86-operators-are-x86-only-by-design
   (doseq [[params body] x86-only]
