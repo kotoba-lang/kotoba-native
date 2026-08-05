@@ -71,7 +71,17 @@
    ;; exists: config access is a write to 0xCF8 followed by a READ of 0xCFC, and
    ;; with write-only port I/O the read half had no encoding at all.
    'aiueos-pci-config-read {:arity 4 :symbol "kotoba_aiueos_pci_config_read"}
-   'aiueos-pci-config-write {:arity 5 :symbol "kotoba_aiueos_pci_config_write"}})
+   'aiueos-pci-config-write {:arity 5 :symbol "kotoba_aiueos_pci_config_write"}
+   ;; X25519 (RFC 7748). Unlike every other object here it consumes a
+   ;; SECRET scalar, so its timing is a security property and not merely a
+   ;; performance one -- see the object's own header for what that does and
+   ;; does not guarantee in this subset.
+   'aiueos-x25519 {:arity 4 :symbol "kotoba_aiueos_x25519"}
+   ;; MMIO mapping admission. The page-table walk stays C -- it allocates
+   ;; directory slots and writes PTEs -- but WHETHER a physical range may be
+   ;; mapped at all is a decision, and it was the last one still living in
+   ;; paging.c's mechanism.
+   'aiueos-mmio-map-admit {:arity 2 :symbol "kotoba_aiueos_mmio_map_admit"}})
 
 (defn- le [n width]
   (mapv #(bit-and (unsigned-bit-shift-right (long n) (* 8 %)) 0xff)
@@ -356,7 +366,14 @@
     ;; lea r9,[rip+.data] (relocated); optionally replenish bounded-memory
     ;; fuel; sub rsp,8; call local Kotoba entry; add rsp,8; ret.
     (let [sha-fuel? (= 'aiueos-sha256 object-entry)
-          rsa-fuel? (= 'aiueos-rsa2048-sha256-verify object-entry)
+          ;; X25519 shares RSA's 250,000,000 tier: one scalar multiplication is
+          ;; 255 ladder steps of multi-limb field arithmetic, measured at
+          ;; 4,815,405 bounded-memory operations. Without a replenish it spends
+          ;; its 512 and hits the prologue `ud2` -- measured, not predicted:
+          ;; that is exactly how it failed, as AIUEOS_EXCEPTION_FAIL
+          ;; unexpected-vector (vector 6 is `ud2`).
+          rsa-fuel? (contains? '#{aiueos-rsa2048-sha256-verify aiueos-x25519}
+                               object-entry)
           context-fuel? (= 'aiueos-user-context-build object-entry)
           ;; 4096 rather than the plain 1024, because each of these walks a
           ;; whole frame: a checksum over a 1500-byte Ethernet payload is ~750
