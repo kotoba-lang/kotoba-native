@@ -156,6 +156,22 @@
   {'f64-abs 0x1e60c000 'f64-neg 0x1e614000 'f64-sqrt 0x1e61c000})
 
 (declare emit-expr)
+(declare record-new-binding)
+(declare boxed-record-chain)
+
+;; The caller's half of the record-parameter boundary; the x86-64 backend's
+;; `box-record-argument` carries the full reasoning. A literal `record-new`
+;; boxes its field expressions; a `let`-bound record was flattened into one slot
+;; per field and is re-boxed from those slots in declared field order; anything
+;; else is already a one-word handle and passes through.
+(defn- box-record-argument [arg env]
+  (cond
+    (record-new-binding arg) (boxed-record-chain (vec (drop 2 arg)))
+    (and (symbol? arg) (:record-fields (get env arg)))
+    (let [{:keys [record-type record-fields]} (get env arg)]
+      (boxed-record-chain (mapv (fn [[field-name _]] (get record-fields field-name))
+                                (nth record-type 2))))
+    :else arg))
 
 ;; The spill/reload window that both `emit-binary` and the n-ary arithmetic
 ;; loop place between the left operand's code and the operation itself:
@@ -192,7 +208,11 @@
   (when (> (count args) 5)
     (throw (ex-info "AArch64 fuel ABI supports at most five arguments"
                     {:phase :aarch64 :function op :arity (count args)})))
-  (let [saved (mapcat (fn [i a] (concat (emit-expr a env (+ depth i)) (save-x0)))
+  ;; See the x86-64 backend's `box-record-argument`: an argument denoting a
+  ;; record is boxed into the pair chain the callee's parameter expects, since
+  ;; a record is N slots and the ABI passes one word.
+  (let [args (mapv #(box-record-argument % env) args)
+        saved (mapcat (fn [i a] (concat (emit-expr a env (+ depth i)) (save-x0)))
                       (range) args)
         restored (mapcat #(restore-to %) (reverse (range (count args))))]
     (vec (concat saved restored [{:call op}]))))
@@ -592,8 +612,16 @@
           (throw (ex-info "a record-valued projection may only appear as the operand of record-get"
                           {:phase :aarch64 :type type :field field})))
         (emit-expr child env depth)))
-    (if (and (seq? value-form) (symbol? (first value-form))
-             (contains? *function-names* (first value-form)))
+    (if (or (and (seq? value-form) (symbol? (first value-form))
+                 (contains? *function-names* (first value-form)))
+            ;; A PARAMETER holding a record arrived boxed for the same reason a
+            ;; call's result does: the caller had N slots and the ABI has one
+            ;; word. `env` binds a parameter to its bare index, not the
+            ;; `{:record-fields …}` map a flattened `let` binding gets, so a
+            ;; symbol resolving to a non-map binding here is precisely a
+            ;; parameter. See the x86-64 backend for the full reasoning.
+            (and (symbol? value-form) (not (map? (get env value-form)))
+                 (contains? env value-form)))
       (let [fields (nth type 2)
             field-index (first (keep-indexed (fn [i [n _]] (when (= n field) i)) fields))]
         (when (nil? field-index)
