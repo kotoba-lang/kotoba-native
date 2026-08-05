@@ -607,6 +607,65 @@
                   0x48 0xc1 0xea 0x20                    ; shr rdx,32   (high half)
                   0x0f 0x30]))))                         ; wrmsr        <- edx:eax
 
+;; CPU feature detection. `cpuid` reads TWO inputs -- the leaf in `eax`, the
+;; subleaf in `ecx` -- and writes ALL FOUR of `eax`/`ebx`/`ecx`/`edx`. The
+;; language surface is four arity-2 primitives, one per result register, each
+;; executing its own `cpuid`; `which` selects the register to leave in `rax`.
+;;
+;; THE `rbx` PROBLEM, which is the only real difficulty here. `rbx` is
+;; callee-saved in SysV, and no other operator in this backend touches it --
+;; `cpuid` is the first instruction emitted here that does -- so
+;; `emit-function`'s prologue never saves it and never needed to. That is
+;; correct for every other operator and catastrophic for this
+;; one: `cpuid` writes `ebx` unconditionally, whether or not the caller asked
+;; for it, so a `(kernel-cpuid-eax ...)` that never mentions `ebx` would still
+;; return to the loader with the loader's `rbx` destroyed. The corruption
+;; surfaces wherever that C frame next reads its own saved register -- an
+;; arbitrary distance from the `cpuid`, in code that has nothing to do with
+;; feature detection. `push rbx` / `pop rbx` around the instruction is what
+;; makes all four primitives ABI-clean.
+;;
+;; The save is emitted AFTER both operand expressions, not before, and that
+;; ordering is deliberate: `ctx`'s `:temp-depth` is what keeps the stack
+;; 16-byte aligned at any `call` an operand might contain, and an extra
+;; unaccounted push before those expressions would flip that parity. Nothing
+;; between `push rbx` and `pop rbx` calls anything, so that stack slot needs no
+;; accounting; the sequence as a whole is stack-neutral (push leaf / pop leaf,
+;; push rbx / pop rbx), so nothing downstream sees it either.
+;;
+;; The result register is moved with a 32-BIT `mov` (`89 /r`), which is both
+;; the shortest encoding and the zero-extension: a 32-bit destination write
+;; zeroes bits 63:32 of the containing 64-bit register. `cpuid` itself writes
+;; the four 32-bit registers, so `rax`/`rbx`/`rcx`/`rdx` already hold their
+;; results zero-extended before anything is moved -- and `mov eax,ebx` then
+;; re-establishes the same property in `rax`. So NO MASK IS NEEDED anywhere,
+;; and every `cpuid` result arrives as a non-negative i64 in [0, 2^32).
+;; That matters for the comparison the aiueos NX probe actually makes: the
+;; maximum-extended-leaf check is `eax < 0x80000001`, and 0x80000001 read as a
+;; SIGNED 64-bit value is a large positive number only because the upper half
+;; is known zero. A sign-extended result would have made it negative and the
+;; check would have inverted.
+;;
+;; `-eax` emits no move at all: the result is already in `rax`. An explicit
+;; `mov eax,eax` would be a byte that does nothing, and `emit-kernel-in`
+;; already established that this backend does not emit those into a kernel.
+;; The move must precede `pop rbx`, which is only load-bearing for `-ebx` --
+;; restoring the caller's `rbx` first would discard the very value asked for.
+(defn- emit-kernel-cpuid [[leaf subleaf] which env {:keys [temp-depth] :as ctx}]
+  (let [ctx (assoc ctx :tail? false)]
+    (vec (concat (emit-expr leaf env ctx) [0x50]         ; push leaf
+                 (emit-expr subleaf env (update ctx :temp-depth inc))
+                 [0x48 0x89 0xc1                         ; mov rcx,rax  (subleaf -> ecx)
+                  0x58                                   ; pop rax      (leaf    -> eax)
+                  0x53                                   ; push rbx     (callee-saved)
+                  0x0f 0xa2]                             ; cpuid        -> eax,ebx,ecx,edx
+                 (case which                             ; 32-bit mov zero-extends
+                   :eax []                               ;   already in rax
+                   :ebx [0x89 0xd8]                      ;   mov eax,ebx
+                   :ecx [0x89 0xc8]                      ;   mov eax,ecx
+                   :edx [0x89 0xd0])                     ;   mov eax,edx
+                 [0x5b]))))                              ; pop rbx      (restore)
+
 ;; A string VALUE is a pair(offset, length) handle -- offset addresses a
 ;; UTF-8 byte range either in the compiled artifact's own code+literal-data
 ;; region (non-negative) or in the runtime string pool (negative, see
@@ -1392,6 +1451,10 @@
         (= op 'kernel-in-u32) (emit-kernel-in args 32 env ctx)
         (= op 'kernel-read-msr) (emit-kernel-read-msr args env ctx)
         (= op 'kernel-write-msr) (emit-kernel-write-msr args env ctx)
+        (= op 'kernel-cpuid-eax) (emit-kernel-cpuid args :eax env ctx)
+        (= op 'kernel-cpuid-ebx) (emit-kernel-cpuid args :ebx env ctx)
+        (= op 'kernel-cpuid-ecx) (emit-kernel-cpuid args :ecx env ctx)
+        (= op 'kernel-cpuid-edx) (emit-kernel-cpuid args :edx env ctx)
 
         (contains? '#{f64-from-bits f64-to-bits} op)
         (emit-expr (first args) env ctx)

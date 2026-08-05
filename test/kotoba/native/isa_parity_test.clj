@@ -130,7 +130,20 @@
    ;; different arguments and is a decision for whoever needs one. Pinned here
    ;; so the absence is asserted rather than merely true.
    [['i] '(kernel-read-msr i)]
-   [['i 'v] '(kernel-write-msr i v)]])
+   [['i 'v] '(kernel-write-msr i v)]
+   ;; CPU feature detection. AArch64 answers the same QUESTION -- what can this
+   ;; CPU do -- through an entirely different mechanism: `MRS` reads of NAMED
+   ;; system registers (ID_AA64PFR0_EL1 and its siblings), where the register
+   ;; is encoded in the instruction rather than passed at run time. There is no
+   ;; leaf, no subleaf, and nothing to pass, so an AArch64 feature-detection
+   ;; operator would take different arguments -- probably none -- and is a
+   ;; decision for whoever needs one, not a translation of these. Inventing an
+   ;; encoding here would be worse than the gap. Pinned so the absence is an
+   ;; assertion rather than silence.
+   [['l 's] '(kernel-cpuid-eax l s)]
+   [['l 's] '(kernel-cpuid-ebx l s)]
+   [['l 's] '(kernel-cpuid-ecx l s)]
+   [['l 's] '(kernel-cpuid-edx l s)]])
 
 (deftest privileged-x86-operators-are-x86-only-by-design
   (doseq [[params body] x86-only]
