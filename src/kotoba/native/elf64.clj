@@ -89,8 +89,8 @@
    ;; ACPI table admission. These tables are FIRMWARE-supplied input the kernel
    ;; otherwise takes on trust, and acpi.c was the largest file with no decision
    ;; moved out of it at all -- every checksum and bound was still C.
-   ;; The checksum walks a table (up to 64 KiB), so it needs a fuel replenish;
-   ;; the header check is a handful of comparisons and does not.
+   ;; The checksum walks a table, so it sits in the 4096 tier; the header check
+   ;; is a handful of comparisons and takes the 1024 default.
    'aiueos-acpi-checksum-ok {:arity 2 :symbol "kotoba_aiueos_acpi_checksum_ok"}
    'aiueos-acpi-table-valid {:arity 4 :symbol "kotoba_aiueos_acpi_table_valid"}
    ;; VT-d admission. vtd.c was the last kernel file with no decision moved out,
@@ -105,7 +105,7 @@
    ;; than folded down. Measured -- with ecap = 0xffff_ffff_ffff_ffff the
    ;; divide-first form yields offset 8 and ADMITS where the C refuses.
    ;;
-   ;; A handful of bit tests -- no walk, 1 fuel per call, so no replenish tier.
+   ;; A handful of bit tests -- no walk, so it takes the 1024 default tier.
    'aiueos-vtd-admit {:arity 5 :symbol "kotoba_aiueos_vtd_admit"}
    ;; MSR access. This is MECHANISM moving out of C rather than another
    ;; decision -- three files each carried their own read_msr/write_msr inline
@@ -418,8 +418,32 @@
     (when-not (and export (= (:arity export) (:arity contract)))
       (throw (ex-info "Kotoba kernel object entry has an invalid SysV arity"
                       {:entry object-entry :arity (:arity export)})))
-    ;; lea r9,[rip+.data] (relocated); optionally replenish bounded-memory
-    ;; fuel; sub rsp,8; call local Kotoba entry; add rsp,8; ret.
+    ;; lea r9,[rip+.data] (relocated); replenish this object's fuel; sub rsp,8;
+    ;; call local Kotoba entry; add rsp,8; ret.
+    ;;
+    ;; EVERY object replenishes, unconditionally. The tiers below choose HOW
+    ;; MUCH; they never choose WHETHER. That makes the budget per CALL, so an
+    ;; object's fuel bound constrains one invocation and nothing wider -- which
+    ;; is the only reading under which a fuel bound is a bound on work rather
+    ;; than a quota on how many times the kernel may ever ask.
+    ;;
+    ;; It used to be conditional, and being outside the set was never a policy
+    ;; anyone chose. 23 of the 57 shipped objects emitted no replenish at all
+    ;; and so decremented a single 512 across the WHOLE BOOT, after which the
+    ;; prologue `ud2` fires. Several of them scale with workload rather than
+    ;; with boot structure -- net-arp-reply-valid is charged per received frame,
+    ;; capability-plan per syscall dispatch, syscall-range-valid per LOG_WRITE,
+    ;; idt-gate-build once per gate against a 256-entry IDT -- so the ceiling is
+    ;; not merely low, it is reached by ordinary use and not by boot at all.
+    ;; A lifetime call cap is not a fuel bound; it is a delayed trap.
+    ;;
+    ;; The counter is per object, not shared: in the .o path each object's
+    ;; `lea …,%r9` relocates `R_X86_64_PC32` against its OWN `.data` symbol, so
+    ;; every object carries a separate 80-byte context whose second quadword is
+    ;; the 512 it starts life with. (The single shared context belongs to the
+    ;; bootable-IMAGE path, which aiueos does not use for these.) Neighbours
+    ;; never top each other up, and an earlier version of this comment claiming
+    ;; they did was wrong in the unsafe direction.
     (let [sha-fuel? (= 'aiueos-sha256 object-entry)
           ;; X25519 shares RSA's 250,000,000 tier: one scalar multiplication is
           ;; 255 ladder steps of multi-limb field arithmetic, measured at
@@ -459,66 +483,48 @@
                                     ;; changing this tier reintroduces a
                                     ;; size-dependent trap.
                                     aiueos-acpi-checksum-ok} object-entry)
-          bounded-memory? (or sha-fuel? rsa-fuel? context-fuel? high-fuel? (contains? '#{aiueos-fnv1a aiueos-journal-record-valid
-                                        aiueos-object-transaction-valid aiueos-object-transaction-route
-                                        aiueos-mutable-object-valid
-                                        aiueos-superblock-valid aiueos-journal-record-build
-                                        aiueos-mutable-object-build aiueos-copy-in
-                                        aiueos-digest-equal
-                                        aiueos-app-catalog-valid
-                                        aiueos-app-lookup-plan
-                                        aiueos-user-elf-valid
-                                        aiueos-user-context-build
-                                        aiueos-kernel-context-build
-                                        aiueos-process-create-plan
-                                        aiueos-task-slot-plan
-                                        aiueos-scheduler-dispatch-plan
-                                        aiueos-task-exit-route
-                                        aiueos-user-object-journal-value
-                                        aiueos-service-registry-state
-                                        ;; Network and PCI. Every object below
-                                        ;; walks a buffer or is called thousands
-                                        ;; of times, and an object OUTSIDE this
-                                        ;; set gets no replenish at all -- it
-                                        ;; spends its OWN 512 for the whole boot.
-                                        ;;
-                                        ;; Per-object, not shared: in the .o path
-                                        ;; each object's `lea …,%r9` relocates
-                                        ;; `R_X86_64_PC32` against its own `.data`
-                                        ;; symbol, so every object carries a
-                                        ;; separate 80-byte context with its own
-                                        ;; 512. (The single shared context is the
-                                        ;; bootable-IMAGE path, which aiueos does
-                                        ;; not use for these.) An earlier version
-                                        ;; of this comment said the counter was
-                                        ;; shared and that the IPv4/TCP objects
-                                        ;; were riding aiueos-sha256's replenish.
-                                        ;; That was wrong, and wrong in the unsafe
-                                        ;; direction -- it makes a per-object
-                                        ;; budget look like neighbours top it up.
-                                        ;; They simply never exceeded their own
-                                        ;; 512, because every frame they had seen
-                                        ;; was small; a full 1500-byte frame is
-                                        ;; ~750 calls and would have trapped.
-                                        ;; PCI config read is what exposed it --
-                                        ;; enumeration probes 256 buses x 32
-                                        ;; devices = 8192 times, BEFORE anything
-                                        ;; replenishes, so it would have run the
-                                        ;; counter to zero and hit the `ud2`
-                                        ;; every prologue guards with.
-                                        aiueos-pci-config-read
-                                        aiueos-pci-config-write
-                                        ;; Header check only -- a few comparisons,
-                                        ;; no walk. The checksum sits in the 4096
-                                        ;; tier below because it walks the table.
-                                        aiueos-acpi-table-valid} object-entry))
-          replenish (when bounded-memory?
-                      (cond
-                        rsa-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000
-                        sha-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
-                        context-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x01 0x00] ; 65,536
-                        high-fuel? [0x49 0xc7 0x41 0x08 0x00 0x10 0x00 0x00] ; 4096
-                        :else [0x49 0xc7 0x41 0x08 0x00 0x04 0x00 0x00])) ; 1024
+          ;; The tail of the cond. 1024 is the DEFAULT, not a membership: an
+          ;; object that names no tier is one whose worst legitimate call was
+          ;; measured well under 1024, not one nobody has looked at.
+          ;;
+          ;; Measured by execution, one call each, against the largest input the
+          ;; object's C callers can legitimately hand it -- flatten the `.o`,
+          ;; resolve its `.data` relocation, mmap, call, read the fuel word back
+          ;; out. Counting charge sites off a disassembly gets this wrong: each
+          ;; object carries TWO, and the second belongs to the unreachable
+          ;; `(defn main [] 0)`.
+          ;;
+          ;; Of the 23 objects that previously emitted no replenish, TWENTY-ONE
+          ;; cost exactly 1 fuel per call -- they are a single function whose
+          ;; body is a handful of comparisons, and the bounded load/store
+          ;; primitives they use are inlined rather than charged. The two that
+          ;; cost more:
+          ;;
+          ;;   net-arp-reply-valid       6   (two u16 helpers plus a u32 helper)
+          ;;   service-registry-build  135   (FNV over subregions of 16, 32 and
+          ;;                                  28 bytes, plus a 16-step field
+          ;;                                  writer -- every bound a compile-
+          ;;                                  time constant, so the cost does
+          ;;                                  not move with any argument)
+          ;;
+          ;; 135 against 1024 is a 7.6x margin, so nothing here needs promoting
+          ;; to 4096. Neither number moves with input size. net-arp-reply-valid
+          ;; reads nine FIXED offsets, all below 32, and uses `length` only in
+          ;; its 42..2048 guard -- measured identical at 42, at a full 1514-byte
+          ;; Ethernet frame, and at the object's own 2048 maximum.
+          ;; service-registry-build refuses any `length` other than 512.
+          ;;
+          ;; What the old default actually cost, walked down for real against
+          ;; the shipped 512: the 1-fuel objects trapped on call 513,
+          ;; net-arp-reply-valid on frame 86, and SERVICE-REGISTRY-BUILD ON ITS
+          ;; FOURTH CALL -- three service-registry journal writes per boot, and
+          ;; the fourth `ud2`s partway through leaving the sector half written.
+          replenish (cond
+                      rsa-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000
+                      sha-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
+                      context-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x01 0x00] ; 65,536
+                      high-fuel? [0x49 0xc7 0x41 0x08 0x00 0x10 0x00 0x00] ; 4096
+                      :else [0x49 0xc7 0x41 0x08 0x00 0x04 0x00 0x00]) ; 1024
           wrapper (vec (concat [0x4c 0x8d 0x0d 0 0 0 0] replenish
                                [0x48 0x83 0xec 0x08 0xe8]))
           call-end (+ (count wrapper) 4)
