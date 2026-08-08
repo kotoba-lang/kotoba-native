@@ -3,7 +3,8 @@
   ;; conditional that used to wrap the whole `:require` (see
   ;; `kotoba.wasm.core`'s ns form for that original reasoning -- the `:clj`
   ;; branch needed no requires at all) now wraps only the cljs-only item.
-  (:require [kotoba.native.peephole :as peephole]
+  (:require [kotoba.native.layout :as layout]
+            [kotoba.native.peephole :as peephole]
             [kotoba.native.string-search :as string-search]
             #?@(:cljs [[kotoba.kir.cljs-i64 :as i64]])))
 
@@ -55,12 +56,20 @@
 
 (def ^:private param-pushes [[0x57] [0x56] [0x52] [0x51] [0x41 0x50]])
 (def ^:private arg-pops [[0x5f] [0x5e] [0x5a] [0x59] [0x41 0x58]])
-(def ^:private fuel-charge
+(declare fresh-label)
+
+(defn- fuel-charge [counter]
   ;; context v2: fuel is qword [r9+8].
-  [0x49 0x83 0x79 0x08 0x00 0x75 0x02 0x0f 0x0b 0x49 0xff 0x49 0x08])
+  (let [present-label (fresh-label counter "fuel-present")]
+    (vec (concat [0x49 0x83 0x79 0x08 0x00]
+                 [(layout/relative-branch :x86-64/jne-rel8 present-label)]
+                 [0x0f 0x0b]
+                 [(layout/label present-label)]
+                 [0x49 0xff 0x49 0x08]))))
 
 (defn- token-size [token]
-  (cond (and (map? token) (or (:call token) (:tail-self token))) 5
+  (cond (some? (layout/token-size token)) (layout/token-size token)
+        (and (map? token) (or (:call token) (:tail-self token))) 5
         (and (map? token) (:string-literal token)) 10
         :else 1))
 (defn- code-size [tokens] (reduce + (map token-size tokens)))
@@ -122,6 +131,9 @@
 (declare record-new-binding)
 (declare boxed-record-chain)
 
+(defn- fresh-label [counter purpose]
+  (keyword "kotoba.mir.label" (str purpose "-" (swap! counter inc))))
+
 (defn- load-param [param-index param-count pad? temp-depth]
   (let [disp (* 8 (+ (if pad? 1 0) (- param-count 1 param-index) temp-depth))]
     (into [0x48 0x8b 0x84 0x24] (le32 disp))))
@@ -165,10 +177,7 @@
 (defn- emit-rhs-window [right env ctx]
   (let [constant (peephole/constant-operand right)]
     (if (some? constant)
-      (let [replacement (into [0x48 0xb9] (le64 constant))]
-        (peephole/pad-to replacement
-                         (+ (count binary-spill) (count replacement) (count binary-reload))
-                         peephole/nop-x86-64))
+      (into [0x48 0xb9] (le64 constant))
       (vec (concat binary-spill
                    (emit-expr right env (update ctx :temp-depth inc))
                    binary-reload)))))
@@ -230,7 +239,8 @@
                                               (- param-count 1 param-index)))]
                            (concat [0x58 0x49 0x89 0x83] (le32 disp))))
                        (reverse (range argc)))]
-    (vec (concat values anchor (le32 (* argc 8)) stores fuel-charge
+    (vec (concat values anchor (le32 (* argc 8)) stores
+                 (fuel-charge (:mir-label-counter ctx))
                  [{:tail-self true}]))))
 
 ;; The caller's half of the record-parameter boundary. A record is N slots and
@@ -289,7 +299,10 @@
 ;; ops throw ("Cannot mix BigInt and other types") when combined with a
 ;; plain-number operand like the literal `8` here, confirmed live.
 (defn- emit-cap-call [cap-id value env {:keys [temp-depth] :as ctx}]
-  (let [cap-id #?(:clj cap-id :cljs (js/Number cap-id))
+  (let [counter (or (:mir-label-counter ctx) (atom -1))
+        ctx (assoc ctx :mir-label-counter counter)
+        allowed-label (fresh-label counter "cap-allowed")
+        cap-id #?(:clj cap-id :cljs (js/Number cap-id))
         byte-offset (+ 16 (quot cap-id 8))
         mask (bit-shift-left 1 (mod cap-id 8))
         ;; Save context across the host ABI call. The fixed guest frame is
@@ -297,7 +310,10 @@
         ;; pushing r9.
         align? (even? temp-depth)]
     (vec (concat
-          [0x41 0xf6 0x41 byte-offset mask 0x75 0x02 0x0f 0x0b]
+          [0x41 0xf6 0x41 byte-offset mask]
+          [(layout/relative-branch :x86-64/jne-rel8 allowed-label)]
+          [0x0f 0x0b]
+          [(layout/label allowed-label)]
           (emit-expr value env (assoc ctx :tail? false))
           [0x48 0x89 0xc2 0x41 0x51]             ; rdx=value; push r9
           (when align? [0x50])
@@ -307,12 +323,18 @@
           [0x41 0x59]))))                         ; pop r9
 
 (defn- emit-typed-cap-call [cap-id kind value env {:keys [temp-depth] :as ctx}]
-  (let [cap-id #?(:clj cap-id :cljs (js/Number cap-id))
+  (let [counter (or (:mir-label-counter ctx) (atom -1))
+        ctx (assoc ctx :mir-label-counter counter)
+        allowed-label (fresh-label counter "typed-cap-allowed")
+        cap-id #?(:clj cap-id :cljs (js/Number cap-id))
         byte-offset (+ 16 (quot cap-id 8))
         mask (bit-shift-left 1 (mod cap-id 8))
         align? (even? temp-depth)]
     (vec (concat
-          [0x41 0xf6 0x41 byte-offset mask 0x75 0x02 0x0f 0x0b]
+          [0x41 0xf6 0x41 byte-offset mask]
+          [(layout/relative-branch :x86-64/jne-rel8 allowed-label)]
+          [0x0f 0x0b]
+          [(layout/label allowed-label)]
           (emit-expr value env (assoc ctx :tail? false))
           [0x49 0x89 0xc0 0x41 0x51]             ; r8=request; push r9
           (when align? [0x50])
@@ -389,20 +411,27 @@
   ;; Evaluate exactly once, then enforce a non-null base, an unsigned index
   ;; below length, and the operation profile's maximum transfer
   ;; bytes. Every violation reaches UD2 before memory is touched.
-  (let [ctx (assoc ctx :tail? false)]
+  (let [ctx (assoc ctx :tail? false)
+        counter (or (:mir-label-counter ctx) (atom -1))
+        ctx (assoc ctx :mir-label-counter counter)
+        trap-label (fresh-label counter "kernel-load-u8-trap")
+        end-label (fresh-label counter "kernel-load-u8-end")]
     (vec (concat
         (emit-expr base env ctx) [0x50]
         (emit-expr length env (update ctx :temp-depth inc)) [0x50]
         (emit-expr index env (update ctx :temp-depth + 2))
         [0x59 0x5a                              ; rcx=length, rdx=base
          0x48 0x81 0xf9] (le32 maximum)          ; cmp rcx,maximum
-        [0x0f 0x87 0x18 0x00 0x00 0x00         ; ja trap
-         0x48 0x85 0xd2                         ; test rdx,rdx
-         0x0f 0x84 0x0f 0x00 0x00 0x00         ; jz trap
-         0x48 0x39 0xc8                         ; cmp rax,rcx
-         0x0f 0x83 0x06 0x00 0x00 0x00         ; jae trap
-         0x0f 0xb6 0x04 0x02                    ; movzx eax,byte [rdx+rax]
-         0xeb 0x02 0x0f 0x0b]))))               ; skip UD2 / trap
+        [(layout/relative-branch :x86-64/ja-rel32 trap-label)]
+        [0x48 0x85 0xd2]
+        [(layout/relative-branch :x86-64/jz-rel32 trap-label)]
+        [0x48 0x39 0xc8]
+        [(layout/relative-branch :x86-64/jae-rel32 trap-label)]
+        [0x0f 0xb6 0x04 0x02]
+        [(layout/relative-branch :x86-64/jmp-rel8 end-label)
+         (layout/label trap-label)]
+        [0x0f 0x0b]
+        [(layout/label end-label)]))))
 
 ;; `(kernel-subregion base length offset sublen)` -> base+offset, trapping
 ;; unless the sub-window fits inside the parent window.
@@ -426,28 +455,37 @@
 ;;   +18 sub rcx,rdi    +21 cmp rax,rcx +24 ja (+6)      +30 lea rax,[rdx+rdi]
 ;;   +34 jmp +2         +36 ud2         +38 skip
 (defn- emit-kernel-subregion [[base length offset sublen] env {:keys [temp-depth] :as ctx}]
-  (let [ctx (assoc ctx :tail? false)]
+  (let [ctx (assoc ctx :tail? false)
+        counter (or (:mir-label-counter ctx) (atom -1))
+        ctx (assoc ctx :mir-label-counter counter)
+        trap-label (fresh-label counter "kernel-subregion-trap")
+        end-label (fresh-label counter "kernel-subregion-end")]
     (vec (concat
         (emit-expr base env ctx) [0x50]
         (emit-expr length env (update ctx :temp-depth inc)) [0x50]
         (emit-expr offset env (update ctx :temp-depth + 2)) [0x50]
         (emit-expr sublen env (update ctx :temp-depth + 3))
-        [0x5f 0x59 0x5a                         ; rdi=offset, rcx=length, rdx=base
-         0x48 0x85 0xd2                         ; test rdx,rdx   (null parent)
-         0x0f 0x84 0x1b 0x00 0x00 0x00         ; jz trap
-         0x48 0x39 0xcf                         ; cmp rdi,rcx    (offset vs length)
-         0x0f 0x87 0x12 0x00 0x00 0x00         ; ja trap
-         0x48 0x29 0xf9                         ; sub rcx,rdi    (remaining)
-         0x48 0x39 0xc8                         ; cmp rax,rcx    (sublen vs remaining)
-         0x0f 0x87 0x06 0x00 0x00 0x00         ; ja trap
-         0x48 0x8d 0x04 0x3a                    ; lea rax,[rdx+rdi]
-         0xeb 0x02 0x0f 0x0b]))))               ; skip UD2 / trap
+        [0x5f 0x59 0x5a 0x48 0x85 0xd2]
+        [(layout/relative-branch :x86-64/jz-rel32 trap-label)]
+        [0x48 0x39 0xcf]
+        [(layout/relative-branch :x86-64/ja-rel32 trap-label)]
+        [0x48 0x29 0xf9 0x48 0x39 0xc8]
+        [(layout/relative-branch :x86-64/ja-rel32 trap-label)]
+        [0x48 0x8d 0x04 0x3a]
+        [(layout/relative-branch :x86-64/jmp-rel8 end-label)
+         (layout/label trap-label)]
+        [0x0f 0x0b]
+        [(layout/label end-label)]))))
 
 (defn- emit-kernel-store-u8 [[base length index value] maximum env {:keys [temp-depth] :as ctx}]
   ;; Evaluate once and perform the same null/length/index checks as load-u8.
   ;; AL is stored only after every check succeeds; RAX remains the expression
   ;; result. Invalid writes trap before mutating memory.
-  (let [ctx (assoc ctx :tail? false)]
+  (let [ctx (assoc ctx :tail? false)
+        counter (or (:mir-label-counter ctx) (atom -1))
+        ctx (assoc ctx :mir-label-counter counter)
+        trap-label (fresh-label counter "kernel-store-u8-trap")
+        end-label (fresh-label counter "kernel-store-u8-end")]
     (vec (concat
         (emit-expr base env ctx) [0x50]
         (emit-expr length env (update ctx :temp-depth inc)) [0x50]
@@ -455,13 +493,16 @@
         (emit-expr value env (update ctx :temp-depth + 3))
         [0x5f 0x59 0x5a                         ; rdi=index, rcx=length, rdx=base
          0x48 0x81 0xf9] (le32 maximum)          ; cmp rcx,maximum
-        [0x0f 0x87 0x17 0x00 0x00 0x00         ; ja trap
-         0x48 0x85 0xd2                         ; test rdx,rdx
-         0x0f 0x84 0x0e 0x00 0x00 0x00         ; jz trap
-         0x48 0x39 0xcf                         ; cmp rdi,rcx
-         0x0f 0x83 0x05 0x00 0x00 0x00         ; jae trap
-         0x88 0x04 0x3a                         ; mov byte [rdx+rdi],al
-         0xeb 0x02 0x0f 0x0b]))))               ; skip UD2 / trap
+        [(layout/relative-branch :x86-64/ja-rel32 trap-label)]
+        [0x48 0x85 0xd2]
+        [(layout/relative-branch :x86-64/jz-rel32 trap-label)]
+        [0x48 0x39 0xcf]
+        [(layout/relative-branch :x86-64/jae-rel32 trap-label)]
+        [0x88 0x04 0x3a]
+        [(layout/relative-branch :x86-64/jmp-rel8 end-label)
+         (layout/label trap-label)]
+        [0x0f 0x0b]
+        [(layout/label end-label)]))))
 
 ;; `kernel-load-u32`/`kernel-store-u32` are `kotoba.compiler.frontend`'s
 ;; `kernel-memory-operations` -- the portable half of the kernel surface, as
@@ -484,24 +525,34 @@
 ;; recomputed for this body's instruction lengths rather than copied from the
 ;; u8 forms, whose displacements differ because their move encodings do.
 (defn- emit-kernel-load-u32 [[base length index] maximum env {:keys [temp-depth] :as ctx}]
-  (let [ctx (assoc ctx :tail? false)]
+  (let [ctx (assoc ctx :tail? false)
+        counter (or (:mir-label-counter ctx) (atom -1))
+        ctx (assoc ctx :mir-label-counter counter)
+        trap-label (fresh-label counter "kernel-load-u32-trap")
+        end-label (fresh-label counter "kernel-load-u32-end")]
     (vec (concat
         (emit-expr base env ctx) [0x50]
         (emit-expr length env (update ctx :temp-depth inc)) [0x50]
         (emit-expr index env (update ctx :temp-depth + 2))
         [0x59 0x5a                              ; rcx=length, rdx=base
          0x48 0x81 0xf9] (le32 maximum)          ; cmp rcx,maximum
-        [0x0f 0x87 0x1b 0x00 0x00 0x00         ; ja trap
-         0x48 0x85 0xd2                         ; test rdx,rdx
-         0x0f 0x84 0x12 0x00 0x00 0x00         ; jz trap
-         0x48 0x8d 0x70 0x04                    ; lea rsi,[rax+4]
-         0x48 0x39 0xce                         ; cmp rsi,rcx
-         0x0f 0x87 0x05 0x00 0x00 0x00         ; ja trap  (index+4 > length)
-         0x8b 0x04 0x02                         ; mov eax,dword [rdx+rax]
-         0xeb 0x02 0x0f 0x0b]))))               ; skip UD2 / trap
+        [(layout/relative-branch :x86-64/ja-rel32 trap-label)]
+        [0x48 0x85 0xd2]
+        [(layout/relative-branch :x86-64/jz-rel32 trap-label)]
+        [0x48 0x8d 0x70 0x04 0x48 0x39 0xce]
+        [(layout/relative-branch :x86-64/ja-rel32 trap-label)]
+        [0x8b 0x04 0x02]
+        [(layout/relative-branch :x86-64/jmp-rel8 end-label)
+         (layout/label trap-label)]
+        [0x0f 0x0b]
+        [(layout/label end-label)]))))
 
 (defn- emit-kernel-store-u32 [[base length index value] maximum env {:keys [temp-depth] :as ctx}]
-  (let [ctx (assoc ctx :tail? false)]
+  (let [ctx (assoc ctx :tail? false)
+        counter (or (:mir-label-counter ctx) (atom -1))
+        ctx (assoc ctx :mir-label-counter counter)
+        trap-label (fresh-label counter "kernel-store-u32-trap")
+        end-label (fresh-label counter "kernel-store-u32-end")]
     (vec (concat
         (emit-expr base env ctx) [0x50]
         (emit-expr length env (update ctx :temp-depth inc)) [0x50]
@@ -509,14 +560,16 @@
         (emit-expr value env (update ctx :temp-depth + 3))
         [0x5f 0x59 0x5a                         ; rdi=index, rcx=length, rdx=base
          0x48 0x81 0xf9] (le32 maximum)          ; cmp rcx,maximum
-        [0x0f 0x87 0x1b 0x00 0x00 0x00         ; ja trap
-         0x48 0x85 0xd2                         ; test rdx,rdx
-         0x0f 0x84 0x12 0x00 0x00 0x00         ; jz trap
-         0x48 0x8d 0x77 0x04                    ; lea rsi,[rdi+4]
-         0x48 0x39 0xce                         ; cmp rsi,rcx
-         0x0f 0x87 0x05 0x00 0x00 0x00         ; ja trap  (index+4 > length)
-         0x89 0x04 0x3a                         ; mov dword [rdx+rdi],eax
-         0xeb 0x02 0x0f 0x0b]))))               ; skip UD2 / trap
+        [(layout/relative-branch :x86-64/ja-rel32 trap-label)]
+        [0x48 0x85 0xd2]
+        [(layout/relative-branch :x86-64/jz-rel32 trap-label)]
+        [0x48 0x8d 0x77 0x04 0x48 0x39 0xce]
+        [(layout/relative-branch :x86-64/ja-rel32 trap-label)]
+        [0x89 0x04 0x3a]
+        [(layout/relative-branch :x86-64/jmp-rel8 end-label)
+         (layout/label trap-label)]
+        [0x0f 0x0b]
+        [(layout/label end-label)]))))
 
 (defn- emit-kernel-out [[port value] width env {:keys [temp-depth] :as ctx}]
   (let [ctx (assoc ctx :tail? false)]
@@ -720,6 +773,10 @@
 (defn- emit-string-substring-of-ascii-literal
   [content start-form end-form env {:keys [temp-depth] :as ctx}]
   (let [ctx (assoc ctx :tail? false)
+        counter (or (:mir-label-counter ctx) (atom -1))
+        ctx (assoc ctx :mir-label-counter counter)
+        trap-label (fresh-label counter "substring-trap")
+        end-label (fresh-label counter "substring-end")
         length (count (utf8-bytes content))
         align? (even? temp-depth)
         operands (concat (emit-expr start-form env ctx) [0x50]
@@ -733,20 +790,19 @@
                              [0x41 0x51] (when align? [0x50])
                              [0x4c 0x89 0xcf 0x41 0xff 0x51 56]   ; mov rdi,r9 ; call [r9+56]
                              (when align? [0x48 0x83 0xc4 0x08])
-                             [0x41 0x59]
-                             [0xeb 0x02]))                ; jmp over the trap
-        ;; Every jump below targets the trailing UD2. Its distance is derived
-        ;; from the success block's measured length rather than written out, so
-        ;; a change there cannot silently leave a jump pointing into the middle
-        ;; of an instruction.
-        s (count success)]
+                             [0x41 0x59]))]
     (vec (concat operands
-                 [0x48 0x85 0xd2] [0x0f 0x88] (le32 (+ 22 s))   ; test rdx,rdx ; js trap (start < 0)
-                 [0x48 0x39 0xd1] [0x0f 0x8c] (le32 (+ 13 s))   ; cmp rcx,rdx  ; jl trap (end < start)
+                 [0x48 0x85 0xd2]
+                 [(layout/relative-branch :x86-64/js-rel32 trap-label)]
+                 [0x48 0x39 0xd1]
+                 [(layout/relative-branch :x86-64/jl-rel32 trap-label)]
                  [0x48 0x81 0xf9] (le32 length)
-                 [0x0f 0x8f] (le32 s)                           ; cmp rcx,len  ; jg trap (end > length)
+                 [(layout/relative-branch :x86-64/jg-rel32 trap-label)]
                  success
-                 [0x0f 0x0b]))))                                ; trap: UD2
+                 [(layout/relative-branch :x86-64/jmp-rel8 end-label)
+                  (layout/label trap-label)]
+                 [0x0f 0x0b]
+                 [(layout/label end-label)]))))
 
 (declare emit-record-get-of-new-construction)
 
@@ -1054,7 +1110,9 @@
   ordered vector of `{:binder sym :body kir-form}`, one per declared case, in
   the SAME order as the discriminant ordinal each one corresponds to."
   [ordinal-expr payload-expr branch-specs env {:keys [temp-depth] :as ctx}]
-  (let [tail-ctx (assoc ctx :tail? false)
+  (let [counter (or (:mir-label-counter ctx) (atom -1))
+        ctx (assoc ctx :mir-label-counter counter)
+        tail-ctx (assoc ctx :tail? false)
         push-ordinal (vec (concat (emit-expr ordinal-expr env tail-ctx) [0x50]))
         payload-depth (inc temp-depth)
         ;; The payload region is sized by the WIDEST declared case, not by the
@@ -1071,6 +1129,8 @@
         dispatch-depth (+ temp-depth 1 payload-slots)
         load-tag (load-let temp-depth dispatch-depth)
         n (count branch-specs)
+        case-labels (mapv (fn [i] (fresh-label counter (str "variant-case-" i))) (range n))
+        end-label (fresh-label counter "variant-end")
         body-ctx (assoc ctx :temp-depth dispatch-depth)
         ;; add rsp, N -- drops the ordinal slot and the payload region this
         ;; dispatch alone pushed, run at the end of EVERY case body before
@@ -1083,37 +1143,24 @@
                                            (bind-over-slots binder payload-type payload-depth env)
                                            body-ctx)))
                          branch-specs)
-        ;; Build the final per-case bodies right-to-left: the LAST case never
-        ;; needs a trailing jump (nothing follows it but whatever comes after
-        ;; this whole dispatch), so its size is fixed first; each earlier
-        ;; case's own trailing `jmp` distance is exactly the total size of
-        ;; every case that will be laid out after it, which is already known
-        ;; once the fold reaches that case -- no forward-reference patching
-        ;; needed.
-        full-bodies
-        (vec (reverse
-              (reduce (fn [built body-code]
-                        (let [remaining (reduce + (map code-size built))]
-                          (conj built
-                                (if (empty? built)
-                                  (vec (concat body-code cleanup))
-                                  (vec (concat body-code cleanup [0xe9] (le32 remaining)))))))
-                      []
-                      (reverse body-codes))))
-        body-sizes (mapv code-size full-bodies)
-        body-start-offsets (reductions + 0 (butlast body-sizes))
         trap [0x0f 0x0b]                                  ; ud2
-        compare-entry-size 12                              ; cmp rax,imm32 (6) + je rel32 (6)
         compare-block
         (vec (mapcat
               (fn [i]
-                (let [remaining-compares (- n i 1)
-                      distance (+ (* remaining-compares compare-entry-size)
-                                  (count trap)
-                                  (nth body-start-offsets i))]
-                  (concat [0x48 0x3d] (le32 i) [0x0f 0x84] (le32 distance))))
-              (range n)))]
-    (vec (concat push-ordinal push-payload load-tag compare-block trap (apply concat full-bodies)))))
+                (concat [0x48 0x3d] (le32 i)
+                        [(layout/relative-branch :x86-64/jz-rel32
+                                                 (nth case-labels i))]))
+              (range n)))
+        body-blocks
+        (vec (mapcat
+              (fn [i body-code]
+                (concat [(layout/label (nth case-labels i))]
+                        body-code cleanup
+                        (when (< i (dec n))
+                          [(layout/relative-branch :x86-64/jmp-rel32 end-label)])))
+              (range n) body-codes))]
+    (vec (concat push-ordinal push-payload load-tag compare-block trap body-blocks
+                 [(layout/label end-label)]))))
 
 ;; The public-facing admitted shape, mirroring `emit-record-get-of-new`
 ;; exactly: `variant-match`'s value operand must be a DIRECTLY-nested,
@@ -1202,12 +1249,23 @@
 
         (= op 'if)
         (let [[test then else] args
+              ;; A direct emit-expr test may omit the function-owned counter;
+              ;; establish one here and thread the SAME counter into nested
+              ;; branches. emit-function supplies it for the normal path.
+              counter (or (:mir-label-counter ctx) (atom -1))
+              ctx (assoc ctx :mir-label-counter counter)
+              else-label (fresh-label counter "if-else")
+              end-label (fresh-label counter "if-end")
               test-code (emit-expr test env (assoc ctx :tail? false))
               then-code (emit-expr then env ctx)
               else-code (emit-expr else env ctx)]
           (vec (concat test-code [0x48 0x85 0xc0]
-                       [0x0f 0x84] (le32 (+ (code-size then-code) 5))
-                       then-code [0xe9] (le32 (code-size else-code)) else-code)))
+                       [(layout/relative-branch :x86-64/jz-rel32 else-label)]
+                       then-code
+                       [(layout/relative-branch :x86-64/jmp-rel32 end-label)
+                        (layout/label else-label)]
+                       else-code
+                       [(layout/label end-label)])))
 
         ;; `do`: emit each subexpression in order; each leaves its result in rax,
         ;; the next overwrites it, so only the last value survives while every
@@ -1618,11 +1676,13 @@
         n (count params)
         pad? (even? n)
         env (zipmap params (range))
-        prologue (concat fuel-charge (mapcat #(nth param-pushes %) (range n))
+        label-counter (atom -1)
+        prologue (concat (fuel-charge label-counter) (mapcat #(nth param-pushes %) (range n))
                          (when pad? [0x50]))
         expression (emit-expr body env {:param-count n :pad? pad? :temp-depth 0
                                         :function-name name :tail? true
-                                        :function-names function-names})
+                                        :function-names function-names
+                                        :mir-label-counter label-counter})
         frame-bytes (* 8 (+ n (if pad? 1 0)))
         epilogue (concat [0x48 0x81 0xc4] (le32 frame-bytes) [0xc3])]
     {:tokens (vec (concat prologue expression epilogue))
@@ -1637,30 +1697,39 @@
                   {:phase :x86-64 :backend :x86_64-kotoba-v1 :operation op})))
 
 (defn- finalize [tokens function-offset expression-offset offsets literal-offsets]
-  (loop [remaining tokens position 0 out []]
-    (if-let [token (first remaining)]
-      (cond
-        (and (map? token) (:call token))
-        (let [absolute (+ function-offset position)
-              target (get offsets (:call token))]
-          (when-not target (unimplemented-operation! (:call token)))
-          (recur (next remaining) (+ position 5)
-                 (into out (concat [0xe8] (le32 (- target (+ absolute 5)))))))
+  (let [labels (layout/label-offsets tokens token-size)]
+    (layout/resolve-tokens
+     tokens token-size labels
+     (fn [{:mir/keys [encoding]} displacement]
+       (case encoding
+         :x86-64/jz-rel32 (into [0x0f 0x84] (le32 displacement))
+         :x86-64/js-rel32 (into [0x0f 0x88] (le32 displacement))
+         :x86-64/jl-rel32 (into [0x0f 0x8c] (le32 displacement))
+         :x86-64/jg-rel32 (into [0x0f 0x8f] (le32 displacement))
+         :x86-64/ja-rel32 (into [0x0f 0x87] (le32 displacement))
+         :x86-64/jae-rel32 (into [0x0f 0x83] (le32 displacement))
+         :x86-64/jmp-rel32 (into [0xe9] (le32 displacement))
+         :x86-64/jmp-rel8 [0xeb (bit-and displacement 0xff)]
+         :x86-64/jne-rel8 [0x75 (bit-and displacement 0xff)]))
+     (fn [token position]
+       (cond
+         (and (map? token) (:call token))
+         (let [absolute (+ function-offset position)
+               target (get offsets (:call token))]
+           (when-not target (unimplemented-operation! (:call token)))
+           (into [0xe8] (le32 (- target (+ absolute 5)))))
 
-        (and (map? token) (:tail-self token))
-        (let [absolute (+ function-offset position)]
-          (recur (next remaining) (+ position 5)
-                 (into out (concat [0xe9] (le32 (- expression-offset (+ absolute 5)))))))
+         (and (map? token) (:tail-self token))
+         (let [absolute (+ function-offset position)]
+           (into [0xe9] (le32 (- expression-offset (+ absolute 5)))))
 
-        (and (map? token) (:string-literal token))
-        (let [content (:string-literal token) offset (get literal-offsets content)]
-          (when-not offset
-            (throw (ex-info "unknown x86-64 string literal" {:content content})))
-          (recur (next remaining) (+ position 10) (into out (into [0x48 0xb8] (le64 offset)))))
+         (and (map? token) (:string-literal token))
+         (let [content (:string-literal token) offset (get literal-offsets content)]
+           (when-not offset
+             (throw (ex-info "unknown x86-64 string literal" {:content content})))
+           (into [0x48 0xb8] (le64 offset)))
 
-        :else
-        (recur (next remaining) (inc position) (conj out token)))
-      out)))
+         :else [token])))))
 
 ;; Every distinct string literal's content used anywhere in the program,
 ;; collected once (order-preserving, first occurrence wins) so `finalize`
