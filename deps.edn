@@ -3,6 +3,12 @@
         io.github.kotoba-lang/kotoba-kir
         {:git/url "https://github.com/kotoba-lang/kotoba-kir.git"
          :git/sha "da24cae65e82f91352c5b96b0c58f21a52911277"}
+        io.github.kotoba-lang/kotoba-gmir
+        {:git/url "https://github.com/kotoba-lang/kotoba-gmir.git"
+         :git/sha "9d3ebc725ac9e6b4944f63735e6304e82f9f9b86"}
+        io.github.kotoba-lang/kotoba-mir
+        {:git/url "https://github.com/kotoba-lang/kotoba-mir.git"
+         :git/sha "a66e90ed0ddb7c10b38a907692d36730bf9c00d7"}
         io.github.kotoba-lang/artifact
         {:git/url "https://github.com/kotoba-lang/artifact.git"
          :git/sha "af43fc8fa43edb12361828e26456f75b12ab40be"}}

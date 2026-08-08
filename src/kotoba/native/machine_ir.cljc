@@ -5,155 +5,14 @@
   makes the missing layers explicit without pretending arbitrary KIR is already
   covered: the admitted integer/control subset is closed and every unknown op,
   use-before-definition, register exhaustion, or malformed label fails closed."
-  (:require [kotoba.native.layout :as layout]
+  (:require [kotoba.gmir :as gmir]
+            [kotoba.mir :as mir]
+            [kotoba.native.layout :as layout]
             #?(:cljs [kotoba.kir.cljs-i64 :as i64])))
-
-(def targets #{:x86-64 :aarch64})
-
-(def ^:private physical-registers
-  {:x86-64 [:x86-64/rax :x86-64/rcx :x86-64/rdx :x86-64/r8]
-   :aarch64 [:aarch64/x0 :aarch64/x1 :aarch64/x2 :aarch64/x3]})
-
-(defn vreg [n]
-  (when-not (and (integer? n) (not (neg? n)))
-    (throw (ex-info "virtual register index must be non-negative"
-                    {:phase :gmir :index n})))
-  (keyword "kotoba.gmir.vreg" (str n)))
-
-(defn- vreg? [x]
-  (and (keyword? x) (= "kotoba.gmir.vreg" (namespace x))))
-
-(defn- label? [x]
-  (and (keyword? x) (some? (namespace x))))
-
-(defn- i64-value? [x]
-  #?(:clj (and (integer? x)
-               (<= (bigint Long/MIN_VALUE) (bigint x) (bigint Long/MAX_VALUE)))
-     :cljs (try
-             (let [n (cond
-                       (i64/bigint-value? x) x
-                       (and (number? x) (js/Number.isSafeInteger x)) (js/BigInt x)
-                       :else nil)]
-               (and n (<= (js/BigInt "-9223372036854775808") n
-                           (js/BigInt "9223372036854775807"))))
-             (catch :default _ false))))
 
 (defn- reject! [phase problem instruction]
   (throw (ex-info (str "machine IR rejected: " (name problem))
                   {:phase phase :problem problem :instruction instruction})))
-
-(def ^:private gmir-keysets
-  {:gmir/argument #{:gmir/op :gmir/dst :gmir/index}
-   :gmir/constant #{:gmir/op :gmir/dst :gmir/value}
-   :gmir/add #{:gmir/op :gmir/dst :gmir/left :gmir/right}
-   :gmir/label #{:gmir/op :gmir/id}
-   :gmir/branch-zero #{:gmir/op :gmir/test :gmir/target}
-   :gmir/jump #{:gmir/op :gmir/target}
-   :gmir/return #{:gmir/op :gmir/value}})
-
-(defn validate-gmir!
-  "Validate and return a closed `{:gmir/version 1 :gmir/instructions [...]}`."
-  [program]
-  (when-not (and (map? program)
-                 (= #{:gmir/version :gmir/instructions} (set (keys program)))
-                 (= 1 (:gmir/version program))
-                 (vector? (:gmir/instructions program)))
-    (reject! :gmir :non-canonical-program program))
-  (doseq [instruction (:gmir/instructions program)]
-    (let [op (:gmir/op instruction)]
-      (when-not (= (get gmir-keysets op) (set (keys instruction)))
-        (reject! :gmir :non-canonical-instruction instruction))
-      (doseq [r (keep instruction [:gmir/dst :gmir/left :gmir/right
-                                    :gmir/test])]
-        (when-not (vreg? r)
-          (reject! :gmir :invalid-virtual-register instruction)))
-      (when (and (= op :gmir/return) (not (vreg? (:gmir/value instruction))))
-        (reject! :gmir :invalid-virtual-register instruction))
-      (when (and (= op :gmir/constant) (not (i64-value? (:gmir/value instruction))))
-        (reject! :gmir :constant-not-i64 instruction))
-      (when (and (= op :gmir/argument)
-                 (not (and (integer? (:gmir/index instruction))
-                           (not (neg? (:gmir/index instruction))))))
-        (reject! :gmir :argument-index-invalid instruction))
-      (when (contains? #{:gmir/label :gmir/branch-zero :gmir/jump} op)
-        (let [id (if (= op :gmir/label) (:gmir/id instruction) (:gmir/target instruction))]
-          (when-not (label? id) (reject! :gmir :invalid-label instruction))))))
-  program)
-
-(defn select-target
-  "Instruction-select the closed GMIR subset, preserving virtual registers."
-  [target program]
-  (when-not (contains? targets target)
-    (reject! :mir :unsupported-target {:target target}))
-  (validate-gmir! program)
-  {:mir/version 1
-   :mir/target target
-   :mir/instructions
-   (mapv (fn [instruction]
-           (reduce-kv (fn [out k v]
-                        (assoc out
-                               (case k
-                                 :gmir/op :mir/op
-                                 :gmir/dst :mir/dst
-                                 :gmir/index :mir/index
-                                 :gmir/value :mir/value
-                                 :gmir/left :mir/left
-                                 :gmir/right :mir/right
-                                 :gmir/id :mir/id
-                                 :gmir/test :mir/test
-                                 :gmir/target :mir/target)
-                               (if (= k :gmir/op)
-                                 (keyword "mir" (name v))
-                                 v)))
-                      {} instruction))
-         (:gmir/instructions program))})
-
-(defn- sources [instruction]
-  (keep instruction [:mir/left :mir/right :mir/test :mir/value]))
-
-(defn- last-uses [instructions]
-  (reduce-kv (fn [uses index instruction]
-               (reduce #(assoc %1 %2 index) uses (filter vreg? (sources instruction))))
-             {} instructions))
-
-(defn allocate-registers
-  "Deterministic minimal allocator for the pilot MIR subset.
-
-  It uses the target's ordered scratch set and frees a virtual register after
-  its last source use. Spilling is intentionally not implicit in v1."
-  [{:mir/keys [version target instructions] :as program}]
-  (when-not (and (= 1 version) (contains? targets target) (vector? instructions))
-    (reject! :regalloc :non-canonical-program program))
-  (let [last-use (last-uses instructions)
-        registers (get physical-registers target)]
-    (loop [index 0, remaining instructions, assigned {}, free registers, out []]
-      (if-let [instruction (first remaining)]
-        (let [srcs (filter vreg? (sources instruction))]
-          (doseq [source srcs]
-            (when-not (contains? assigned source)
-              (reject! :regalloc :use-before-definition instruction)))
-          (let [dst (:mir/dst instruction)
-                [assigned free]
-                (if (vreg? dst)
-                  (do
-                    (when (contains? assigned dst)
-                      (reject! :regalloc :multiple-definition instruction))
-                    (when-not (seq free)
-                      (reject! :regalloc :spill-required instruction))
-                    [(assoc assigned dst (first free)) (vec (rest free))])
-                  [assigned free])
-                allocated (reduce-kv
-                           (fn [m k v] (assoc m k (if (vreg? v) (get assigned v) v)))
-                           {} instruction)
-                expired (->> assigned keys
-                             (filter #(= index (get last-use %)))
-                             (sort-by str))
-                free (into free (map assigned expired))
-                assigned (apply dissoc assigned expired)]
-            (recur (inc index) (next remaining) assigned (vec free)
-                   (conj out allocated))))
-        {:mir/version 1 :mir/target target :mir/registers :physical
-         :mir/instructions out}))))
 
 (defn lower-mc
   "Lower allocated MIR to explicit MC instruction/layout data.
@@ -162,6 +21,7 @@
   same layout tokens used by production backends, so PC-relative values cannot
   be baked before final sizes are known."
   [{:mir/keys [target registers instructions] :as program}]
+  (mir/validate! program)
   (when-not (= :physical registers)
     (reject! :mc :registers-not-allocated program))
   {:mc/version 1
@@ -180,7 +40,7 @@
          instructions)})
 
 (defn compile-gmir [target program]
-  (->> program (select-target target) allocate-registers lower-mc))
+  (->> program (mir/select-target target) mir/allocate-registers lower-mc))
 
 ;; ── closed KIR expression -> GMIR pilot ─────────────────────────────────────
 
@@ -196,14 +56,14 @@
     (reject! :kir-to-gmir :invalid-parameters {:params params}))
   (let [next-reg (atom -1)
         next-label (atom -1)
-        fresh-reg #(vreg (swap! next-reg inc))
+        fresh-reg #(gmir/vreg (swap! next-reg inc))
         fresh-label (fn [stem]
                       (keyword "kotoba.gmir.label"
                                (str stem "-" (swap! next-label inc))))
         parameter-index (zipmap params (range))]
     (letfn [(value [form]
               (cond
-                (i64-value? form)
+                (gmir/i64-value? form)
                 (let [dst (fresh-reg)]
                   [[{:gmir/op :gmir/constant :gmir/dst dst :gmir/value form}] dst])
 
@@ -246,7 +106,7 @@
   every other already-supported expression remains on the legacy emitter."
   [params body]
   (let [parameters (set params)
-        atomic? #(or (i64-value? %) (contains? parameters %))
+        atomic? #(or (gmir/i64-value? %) (contains? parameters %))
         value? (fn [form]
                  (or (atomic? form)
                      (and (seq? form) (= '+ (first form)) (= 3 (count form))
@@ -359,7 +219,7 @@
 (defn encode-mc
   "Encode a closed allocated MC program into final machine bytes."
   [{:mc/keys [version target instructions] :as program}]
-  (when-not (and (= 1 version) (contains? targets target) (vector? instructions))
+  (when-not (and (= 1 version) (contains? mir/targets target) (vector? instructions))
     (reject! :mc-encode :non-canonical-program program))
   (let [tokens
         (vec (mapcat

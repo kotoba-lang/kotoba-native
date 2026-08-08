@@ -1,10 +1,11 @@
 (ns kotoba.native.machine-ir-test
   (:require [clojure.test :refer [deftest is testing]]
+            [kotoba.gmir :as gmir]
             [kotoba.native.machine-ir :as machine]))
 
-(def v0 (machine/vreg 0))
-(def v1 (machine/vreg 1))
-(def v2 (machine/vreg 2))
+(def v0 (gmir/vreg 0))
+(def v1 (gmir/vreg 1))
+(def v2 (gmir/vreg 2))
 
 (def program
   {:gmir/version 1

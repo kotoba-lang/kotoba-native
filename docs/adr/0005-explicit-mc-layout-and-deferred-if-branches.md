@@ -70,10 +70,11 @@ AArch64 uses the branch instruction's own address and requires four-byte-aligned
 `imm14`/`imm19`/`imm26`. Nested branches share one function-local deterministic
 label counter.
 
-Do not create `kotoba-mir` or `kotoba-gmir` repositories yet. The boundary must
-first be exercised inside `kotoba-native`; repository extraction happens only
-after the contract has more than one producer or consumer and changes less
-frequently than the backend implementation.
+The in-repository pilot satisfied the extraction gate. `kotoba-gmir` now owns
+the target-independent closed contract and `kotoba-mir` owns target selection,
+explicit allocation state, and deterministic register allocation.
+`kotoba-native` remains their first production consumer and owns KIR-to-GMIR
+lowering, MC/layout, byte encoding, and ELF emission.
 
 ## Consequences
 

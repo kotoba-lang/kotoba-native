@@ -69,13 +69,14 @@ The first variable-width rewrite reclaims the removed spill/reload bytes:
 x86-64 constant RHS materialization is 10 bytes and AArch64 is 16 bytes, with
 no architectural NOP padding. Final layout recomputes every affected branch.
 
-`kotoba.native.machine-ir` implements the first complete missing-middle slice:
-closed KIR integer/control expressions lower through GMIR, target MIR, virtual
-register allocation, fully encodable physical-register MC, final layout, and
-x86-64/AArch64 bytes. The bounded atomic-add/tail-if subset is selected by the
-production emitters and has cross-ISA real-process coverage. Unknown operations,
-use-before-definition, and required spills fail closed. Other KIR expression
-families remain on the established emitter and migrate incrementally.
+`kotoba-gmir` now owns the closed target-independent GMIR contract and
+`kotoba-mir` owns target selection plus explicit virtual/physical register
+state and deterministic allocation. `kotoba.native.machine-ir` consumes those
+contracts and owns only the bounded KIR-to-GMIR producer, physical MC lowering,
+layout, and x86-64/AArch64 encoding. The atomic-add/tail-if subset is selected
+by the production emitters and has cross-ISA real-process coverage. Other KIR
+expression families remain on the established emitter and migrate
+incrementally.
 
 ## Representations and identity
 
@@ -101,6 +102,8 @@ another codec.
 ## Depends on
 
 - `kotoba-lang/kotoba-kir`
+- `kotoba-lang/kotoba-gmir`
+- `kotoba-lang/kotoba-mir`
 - `kotoba-lang/artifact`
 
 ## Test
