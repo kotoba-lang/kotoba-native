@@ -3,7 +3,9 @@
   ;; conditional that used to wrap the whole `:require` (see
   ;; `kotoba.wasm.core`'s ns form for that original reasoning) now wraps only
   ;; the cljs-only item.
-  (:require [kotoba.native.peephole :as peephole]
+  (:require [kotoba.native.layout :as layout]
+            [kotoba.native.machine-ir :as machine-ir]
+            [kotoba.native.peephole :as peephole]
             [kotoba.native.string-search :as string-search]
             #?@(:cljs [[kotoba.kir.cljs-i64 :as i64]])))
 
@@ -74,19 +76,45 @@
 (defn- b-ne [byte-offset]
   (insn (bit-or 0x54000001 (bit-shift-left (bit-and (quot byte-offset 4) 0x7ffff) 5))))
 
-(def ^:private signed-division
-  (concat (insn 0xb5000041) (insn 0xd4200000)
-          (load-constant-reg 2 #?(:clj Long/MIN_VALUE :cljs i64/min-i64)) (insn 0xeb02001f) (b-ne 32)
-          (load-constant-reg 2 -1) (insn 0xeb02003f) (b-ne 8)
-          (insn 0xd4200000) (insn 0x9ac10c00)))
+(declare fresh-label)
+
+(defn- signed-division [env]
+  (let [counter (or (:mir-label-counter (meta env)) (atom -1))
+        divisor-ok (fresh-label counter "division-divisor-ok")
+        divide-label (fresh-label counter "division-execute")]
+    (vec (concat
+          [(layout/relative-branch :aarch64/cbnz-x1-imm19 divisor-ok)]
+          (insn 0xd4200000)
+          [(layout/label divisor-ok)]
+          (load-constant-reg 2 #?(:clj Long/MIN_VALUE :cljs i64/min-i64))
+          (insn 0xeb02001f)
+          [(layout/relative-branch :aarch64/b-ne-imm19 divide-label)]
+          (load-constant-reg 2 -1)
+          (insn 0xeb02003f)
+          [(layout/relative-branch :aarch64/b-ne-imm19 divide-label)]
+          (insn 0xd4200000)
+          [(layout/label divide-label)]
+          (insn 0x9ac10c00)))))
 
 (def ^:private fuel-charge
+  ;; Compatibility byte vector for the direct executor qualification helper.
+  (vec (concat (insn 0xf94004f0)
+               (insn 0xb5000050) ; cbnz x16, +8
+               (insn 0xd4200000)
+               (insn 0xd1000610) (insn 0xf90004f0))))
+
+(def ^:private fuel-charge-tokens
   ;; context v2: fuel is qword [x7,#8].
-  (concat (insn 0xf94004f0) (insn 0xb5000050) (insn 0xd4200000)
+  (concat (insn 0xf94004f0)
+          [(layout/relative-branch :aarch64/cbnz-x16-imm19
+                                   :kotoba.mir.label/fuel-present)]
+          (insn 0xd4200000)
+          [(layout/label :kotoba.mir.label/fuel-present)]
           (insn 0xd1000610) (insn 0xf90004f0)))
 
 (defn- token-size [token]
-  (cond (and (map? token) (:call token)) 4
+  (cond (some? (layout/token-size token)) (layout/token-size token)
+        (and (map? token) (:call token)) 4
         (and (map? token) (:string-literal token)) 16
         :else 1))
 (defn- code-size [tokens] (reduce + (map token-size tokens)))
@@ -105,6 +133,9 @@
   (insn (bit-or 0x14000000 (bit-and (quot byte-offset 4) 0x03ffffff))))
 (defn- cbz-x0 [byte-offset]
   (insn (bit-or 0xb4000000 (bit-shift-left (bit-and (quot byte-offset 4) 0x7ffff) 5))))
+
+(defn- fresh-label [counter purpose]
+  (keyword "kotoba.mir.label" (str purpose "-" (swap! counter inc))))
 
 ;; A `let`-bound value's own 16-byte-aligned stack slot, addressed relative
 ;; to the CURRENT depth (16-byte slots pushed since function entry) rather
@@ -157,6 +188,7 @@
   {'f64-abs 0x1e60c000 'f64-neg 0x1e614000 'f64-sqrt 0x1e61c000})
 
 (declare emit-expr)
+(declare finalize)
 (declare record-new-binding)
 (declare boxed-record-chain)
 
@@ -194,10 +226,7 @@
 (defn- emit-rhs-window [right env depth]
   (let [constant (peephole/constant-operand right)]
     (if (some? constant)
-      (let [replacement (load-constant-reg 1 constant)]
-        (peephole/pad-to replacement
-                         (+ (count (save-x0)) (count replacement) (count (restore-binary)))
-                         peephole/nop-aarch64))
+      (load-constant-reg 1 constant)
       (vec (concat (save-x0) (emit-expr right env (inc depth)) (restore-binary))))))
 
 (defn- emit-binary [left right operation env depth]
@@ -253,7 +282,7 @@
 (def ^:private cond-lt 11)    ; signed <
 (def ^:private cond-gt 12)    ; signed >
 
-(defn- bounds-check [maximum]
+(defn- bounds-check [maximum trap-label]
   ;; Precondition: x1=base, x2=length, x3=index. The caller appends a two-insn
   ;; access (add x1,x1,x3 ; strb/ldrb w0,[x1]), then `b skip`, then the `brk`
   ;; trap. Byte layout from this block's first branch:
@@ -261,10 +290,10 @@
   ;;   +20 add       +24 access    +28 b skip      +32 brk(trap)  +36 skip
   (concat (load-constant-reg 4 maximum)
           (insn 0xeb04005f)          ; cmp x2, x4  (length vs maximum)
-          (b-cond cond-hi 28)        ; b.hi trap
-          (cbz-reg 1 24)             ; cbz x1, trap
+          [(layout/relative-branch :aarch64/b-hi-imm19 trap-label)]
+          [(layout/relative-branch :aarch64/cbz-x1-imm19 trap-label)]
           (insn 0xeb02007f)          ; cmp x3, x2  (index vs length)
-          (b-cond cond-hs 16)))      ; b.hs trap
+          [(layout/relative-branch :aarch64/b-hs-imm19 trap-label)]))
 
 ;; NB: the access uses base-register addressing `strb/ldrb w0, [x1]` after
 ;; computing `x1 = base + index` (add x1,x1,x3). Register-offset addressing
@@ -272,7 +301,11 @@
 ;; that a device store/load triggers, so KVM cannot emulate it (it injects a
 ;; data abort instead of exiting) -- base-register addressing keeps ISV=1.
 (defn- emit-kernel-store-u8 [[base length index value] maximum env depth]
-  (vec (concat
+  (let [counter (or (:mir-label-counter (meta env)) (atom -1))
+        env (with-meta env (assoc (meta env) :mir-label-counter counter))
+        trap-label (fresh-label counter "kernel-store-u8-trap")
+        end-label (fresh-label counter "kernel-store-u8-end")]
+    (vec (concat
         (emit-expr base env depth) (save-x0)
         (emit-expr length env (+ depth 1)) (save-x0)
         (emit-expr index env (+ depth 2)) (save-x0)
@@ -280,25 +313,33 @@
         (ldr-sp 3 0) (add-sp 16)             ; x3 = index
         (ldr-sp 2 0) (add-sp 16)             ; x2 = length
         (ldr-sp 1 0) (add-sp 16)             ; x1 = base
-        (bounds-check maximum)
+        (bounds-check maximum trap-label)
         (insn 0x8b030021)                    ; add x1, x1, x3   (x1 = base+index)
         (insn 0x39000020)                    ; strb w0, [x1]
-        (branch 8)                           ; b skip
-        (insn 0xd4200000))))                 ; trap: brk ; skip:
+        [(layout/relative-branch :aarch64/b-imm26 end-label)
+         (layout/label trap-label)]
+        (insn 0xd4200000)
+        [(layout/label end-label)]))))
 
 (defn- emit-kernel-load-u8 [[base length index] maximum env depth]
-  (vec (concat
+  (let [counter (or (:mir-label-counter (meta env)) (atom -1))
+        env (with-meta env (assoc (meta env) :mir-label-counter counter))
+        trap-label (fresh-label counter "kernel-load-u8-trap")
+        end-label (fresh-label counter "kernel-load-u8-end")]
+    (vec (concat
         (emit-expr base env depth) (save-x0)
         (emit-expr length env (+ depth 1)) (save-x0)
         (emit-expr index env (+ depth 2))    ; x0 = index
         (mov-reg 3 0)                        ; x3 = index
         (ldr-sp 2 0) (add-sp 16)             ; x2 = length
         (ldr-sp 1 0) (add-sp 16)             ; x1 = base
-        (bounds-check maximum)
+        (bounds-check maximum trap-label)
         (insn 0x8b030021)                    ; add x1, x1, x3   (x1 = base+index)
         (insn 0x39400020)                    ; ldrb w0, [x1]  -> x0 = byte
-        (branch 8)                           ; b skip
-        (insn 0xd4200000))))                 ; trap: brk ; skip:
+        [(layout/relative-branch :aarch64/b-imm26 end-label)
+         (layout/label trap-label)]
+        (insn 0xd4200000)
+        [(layout/label end-label)]))))
 
 ;; `(kernel-subregion base length offset sublen)` -> base+offset, trapping
 ;; unless the sub-window fits inside the parent window.
@@ -322,7 +363,11 @@
 ;;   +0 cbz x1,trap  +4 cmp x3,x2  +8 b.hi trap  +12 sub x4,x2,x3
 ;;   +16 cmp x5,x4   +20 b.hi trap +24 add x0,x1,x3  +28 b skip  +32 brk  +36 skip
 (defn- emit-kernel-subregion [[base length offset sublen] env depth]
-  (vec (concat
+  (let [counter (or (:mir-label-counter (meta env)) (atom -1))
+        env (with-meta env (assoc (meta env) :mir-label-counter counter))
+        trap-label (fresh-label counter "kernel-subregion-trap")
+        end-label (fresh-label counter "kernel-subregion-end")]
+    (vec (concat
         (emit-expr base env depth) (save-x0)
         (emit-expr length env (+ depth 1)) (save-x0)
         (emit-expr offset env (+ depth 2)) (save-x0)
@@ -331,31 +376,37 @@
         (ldr-sp 3 0) (add-sp 16)             ; x3 = offset
         (ldr-sp 2 0) (add-sp 16)             ; x2 = length
         (ldr-sp 1 0) (add-sp 16)             ; x1 = base
-        (cbz-reg 1 32)                       ; cbz x1, trap   (null parent)
+        [(layout/relative-branch :aarch64/cbz-x1-imm19 trap-label)]
         (insn 0xeb02007f)                    ; cmp x3, x2     (offset vs length)
-        (b-cond cond-hi 24)                  ; b.hi trap      (offset > length)
+        [(layout/relative-branch :aarch64/b-hi-imm19 trap-label)]
         (insn 0xcb030044)                    ; sub x4, x2, x3 (remaining = length-offset)
         (insn 0xeb0400bf)                    ; cmp x5, x4     (sublen vs remaining)
-        (b-cond cond-hi 12)                  ; b.hi trap
+        [(layout/relative-branch :aarch64/b-hi-imm19 trap-label)]
         (insn 0x8b030020)                    ; add x0, x1, x3 (result = base+offset)
-        (branch 8)                           ; b skip
-        (insn 0xd4200000))))                 ; trap: brk ; skip:
+        [(layout/relative-branch :aarch64/b-imm26 end-label)
+         (layout/label trap-label)]
+        (insn 0xd4200000)
+        [(layout/label end-label)]))))
 
 ;; 32-bit MMIO (virtio registers are u32). Same bounds discipline, but the
 ;; 4-byte access must fit: index+4 <= length. Byte layout from the first branch:
 ;;   +0 cmp x2,x4  +4 b.hi trap  +8 cbz x1,trap  +12 add x5,x3,#4  +16 cmp x5,x2
 ;;   +20 b.hi trap +24 add x1,x1,x3 +28 access  +32 b skip  +36 brk(trap)  +40 skip
-(defn- bounds-check-u32 [maximum]
+(defn- bounds-check-u32 [maximum trap-label]
   (concat (load-constant-reg 4 maximum)
           (insn 0xeb04005f)          ; cmp x2, x4  (length vs maximum)
-          (b-cond cond-hi 32)        ; b.hi trap
-          (cbz-reg 1 28)             ; cbz x1, trap
+          [(layout/relative-branch :aarch64/b-hi-imm19 trap-label)]
+          [(layout/relative-branch :aarch64/cbz-x1-imm19 trap-label)]
           (insn 0x91001065)          ; add x5, x3, #4   (index + 4)
           (insn 0xeb0200bf)          ; cmp x5, x2       (index+4 vs length)
-          (b-cond cond-hi 16)))      ; b.hi trap  (index+4 > length)
+          [(layout/relative-branch :aarch64/b-hi-imm19 trap-label)]))
 
 (defn- emit-kernel-store-u32 [[base length index value] maximum env depth]
-  (vec (concat
+  (let [counter (or (:mir-label-counter (meta env)) (atom -1))
+        env (with-meta env (assoc (meta env) :mir-label-counter counter))
+        trap-label (fresh-label counter "kernel-store-u32-trap")
+        end-label (fresh-label counter "kernel-store-u32-end")]
+    (vec (concat
         (emit-expr base env depth) (save-x0)
         (emit-expr length env (+ depth 1)) (save-x0)
         (emit-expr index env (+ depth 2)) (save-x0)
@@ -363,25 +414,33 @@
         (ldr-sp 3 0) (add-sp 16)             ; x3 = index
         (ldr-sp 2 0) (add-sp 16)             ; x2 = length
         (ldr-sp 1 0) (add-sp 16)             ; x1 = base
-        (bounds-check-u32 maximum)
+        (bounds-check-u32 maximum trap-label)
         (insn 0x8b030021)                    ; add x1, x1, x3
         (insn 0xb9000020)                    ; str w0, [x1]
-        (branch 8)                           ; b skip
-        (insn 0xd4200000))))                 ; trap: brk ; skip:
+        [(layout/relative-branch :aarch64/b-imm26 end-label)
+         (layout/label trap-label)]
+        (insn 0xd4200000)
+        [(layout/label end-label)]))))
 
 (defn- emit-kernel-load-u32 [[base length index] maximum env depth]
-  (vec (concat
+  (let [counter (or (:mir-label-counter (meta env)) (atom -1))
+        env (with-meta env (assoc (meta env) :mir-label-counter counter))
+        trap-label (fresh-label counter "kernel-load-u32-trap")
+        end-label (fresh-label counter "kernel-load-u32-end")]
+    (vec (concat
         (emit-expr base env depth) (save-x0)
         (emit-expr length env (+ depth 1)) (save-x0)
         (emit-expr index env (+ depth 2))    ; x0 = index
         (mov-reg 3 0)                        ; x3 = index
         (ldr-sp 2 0) (add-sp 16)             ; x2 = length
         (ldr-sp 1 0) (add-sp 16)             ; x1 = base
-        (bounds-check-u32 maximum)
+        (bounds-check-u32 maximum trap-label)
         (insn 0x8b030021)                    ; add x1, x1, x3
         (insn 0xb9400020)                    ; ldr w0, [x1]  -> x0 = word
-        (branch 8)                           ; b skip
-        (insn 0xd4200000))))                 ; trap: brk ; skip:
+        [(layout/relative-branch :aarch64/b-imm26 end-label)
+         (layout/label trap-label)]
+        (insn 0xd4200000)
+        [(layout/label end-label)]))))
 
 ;; Same `cap-id`-is-a-cljs-`bigint` issue `kotoba.native.x86-64`'s
 ;; `emit-cap-call` documents at length -- coerced to a plain JS number once
@@ -389,11 +448,17 @@
 ;; through `quot`/`mod`/`*`, which throw when mixed with a plain-number
 ;; operand like the literal `64` here.
 (defn- emit-cap-call [cap-id value env depth]
-  (let [cap-id #?(:clj cap-id :cljs (js/Number cap-id))
+  (let [counter (or (:mir-label-counter (meta env)) (atom -1))
+        env (with-meta env (assoc (meta env) :mir-label-counter counter))
+        allowed-label (fresh-label counter "cap-allowed")
+        cap-id #?(:clj cap-id :cljs (js/Number cap-id))
         word-offset (+ 16 (* 8 (quot cap-id 64)))
         bit-index (mod cap-id 64)]
     (vec (concat
-          (ldr-context 16 word-offset) (tbnz 16 bit-index 8) (insn 0xd4200000)
+          (ldr-context 16 word-offset)
+          [(layout/relative-branch :aarch64/tbnz-imm14 allowed-label [16 bit-index])]
+          (insn 0xd4200000)
+          [(layout/label allowed-label)]
           (emit-expr value env depth)
           (mov-reg 2 0)                           ; x2=value
           (sub-sp 16) (str-sp 7 0)                ; preserve context
@@ -402,11 +467,17 @@
           (ldr-sp 7 0) (add-sp 16)))))
 
 (defn- emit-typed-cap-call [cap-id kind value env depth]
-  (let [cap-id #?(:clj cap-id :cljs (js/Number cap-id))
+  (let [counter (or (:mir-label-counter (meta env)) (atom -1))
+        env (with-meta env (assoc (meta env) :mir-label-counter counter))
+        allowed-label (fresh-label counter "typed-cap-allowed")
+        cap-id #?(:clj cap-id :cljs (js/Number cap-id))
         word-offset (+ 16 (* 8 (quot cap-id 64)))
         bit-index (mod cap-id 64)]
     (vec (concat
-          (ldr-context 16 word-offset) (tbnz 16 bit-index 8) (insn 0xd4200000)
+          (ldr-context 16 word-offset)
+          [(layout/relative-branch :aarch64/tbnz-imm14 allowed-label [16 bit-index])]
+          (insn 0xd4200000)
+          [(layout/label allowed-label)]
           (emit-expr value env depth)
           (mov-reg 4 0)                           ; x4=request handle
           (sub-sp 16) (str-sp 7 0)
@@ -502,7 +573,11 @@
   (and (string? form) (every? #(< % 0x80) (map #(bit-and (int %) 0xff) (utf8-bytes form)))))
 
 (defn- emit-string-substring-of-ascii-literal [content start-form end-form env depth]
-  (let [length (count (utf8-bytes content))
+  (let [counter (or (:mir-label-counter (meta env)) (atom -1))
+        env (with-meta env (assoc (meta env) :mir-label-counter counter))
+        trap-label (fresh-label counter "substring-trap")
+        end-label (fresh-label counter "substring-end")
+        length (count (utf8-bytes content))
         operands (concat (emit-expr start-form env depth) (save-x0)
                          (emit-expr end-form env (inc depth)) (save-x0)
                          [{:string-literal content}]   ; x0 = literal byte offset
@@ -513,20 +588,20 @@
                              (insn 0x8b010001)         ; add x1,x0,x1  -> offset+start
                              (sub-sp 16) (str-sp 7 0)
                              (mov-reg 0 7) (ldr-context 16 56) (insn 0xd63f0200)
-                             (ldr-sp 7 0) (add-sp 16)
-                             (branch 8)))              ; skip the trap
-        ;; Distances are derived from the measured blocks, never written out.
-        n-bound (count bound)
-        s (count success)
-        trap-at (+ 4 4 4 4 n-bound 4 4 s)]
+                             (ldr-sp 7 0) (add-sp 16)))]
     (vec (concat operands
-                 (cmp-imm 1 0) (b-cond cond-lt (- trap-at 4))    ; cmp x1,#0 ; b.lt  (start < 0)
-                 (insn 0xeb01005f) (b-cond cond-lt (- trap-at 12))   ; cmp x2,x1 ; b.lt  (end < start)
+                 (cmp-imm 1 0)
+                 [(layout/relative-branch :aarch64/b-lt-imm19 trap-label)]
+                 (insn 0xeb01005f)
+                 [(layout/relative-branch :aarch64/b-lt-imm19 trap-label)]
                  bound
                  (insn 0xeb03005f)
-                 (b-cond cond-gt (- trap-at (+ 16 n-bound 4)))       ; cmp x2,x3 ; b.gt  (end > length)
+                 [(layout/relative-branch :aarch64/b-gt-imm19 trap-label)]
                  success
-                 (insn 0xd4200000)))))                               ; trap: BRK
+                 [(layout/relative-branch :aarch64/b-imm26 end-label)
+                  (layout/label trap-label)]
+                 (insn 0xd4200000)
+                 [(layout/label end-label)]))))
 
 (declare emit-record-get-of-new-construction)
 
@@ -729,7 +804,10 @@
   why ORDINAL-EXPR is intentionally NOT restricted to a compiler-derived
   in-range value here)."
   [ordinal-expr payload-expr branch-specs env depth]
-  (let [push-ordinal (vec (concat (emit-expr ordinal-expr env depth) (save-x0)))
+  (let [resolve-locally? (nil? (:mir-label-counter (meta env)))
+        counter (or (:mir-label-counter (meta env)) (atom -1))
+        env (with-meta env (assoc (meta env) :mir-label-counter counter))
+        push-ordinal (vec (concat (emit-expr ordinal-expr env depth) (save-x0)))
         payload-depth (inc depth)
         ;; Sized by the WIDEST declared case -- see the x86-64 backend for why
         ;; the padding is not optional.
@@ -741,6 +819,8 @@
         dispatch-depth (+ depth 1 payload-slots)
         load-tag (load-let 0 depth dispatch-depth)
         n (count branch-specs)
+        case-labels (mapv (fn [i] (fresh-label counter (str "variant-case-" i))) (range n))
+        end-label (fresh-label counter "variant-end")
         ;; add sp, sp, #32 -- drops the two synthetic 16-byte slots this
         ;; dispatch alone pushed, run at the end of EVERY case body.
         cleanup (add-sp (* 16 (inc payload-slots)))
@@ -749,42 +829,25 @@
                                            (bind-over-slots binder payload-type payload-depth env)
                                            dispatch-depth)))
                          branch-specs)
-        ;; Right-to-left fold, same reasoning as the x86-64 half: the last
-        ;; case never needs a trailing branch, so its size is known first,
-        ;; and each earlier case's own trailing `b` distance is exactly the
-        ;; already-known total size of every case laid out after it. Unlike
-        ;; x86-64's `jmp rel32` (relative to the NEXT instruction), AArch64's
-        ;; `b`/`b.cond` immediate is relative to the BRANCH INSTRUCTION'S OWN
-        ;; address (confirmed against this file's own pre-existing `if` and
-        ;; `bounds-check` byte-layout comments/offsets) -- every offset here
-        ;; therefore adds this instruction's own 4-byte width on top of the
-        ;; byte count between the END of this instruction and its target.
-        full-bodies
-        (vec (reverse
-              (reduce (fn [built body-code]
-                        (let [remaining (reduce + (map code-size built))]
-                          (conj built
-                                (if (empty? built)
-                                  (vec (concat body-code cleanup))
-                                  (vec (concat body-code cleanup (branch (+ 4 remaining))))))))
-                      []
-                      (reverse body-codes))))
-        body-sizes (mapv code-size full-bodies)
-        body-start-offsets (reductions + 0 (butlast body-sizes))
         trap (insn 0xd4200000)                              ; brk #0
-        compare-entry-size 8                                 ; cmp-imm (4) + b.eq (4)
         compare-block
         (vec (mapcat
               (fn [i]
-                (let [remaining-compares (- n i 1)
-                      ;; +4: `b.eq`'s own self-relative width, see the
-                      ;; `full-bodies` comment above for why.
-                      distance (+ 4 (* remaining-compares compare-entry-size)
-                                  (count trap)
-                                  (nth body-start-offsets i))]
-                  (concat (cmp-imm 0 i) (b-cond 0 distance))))    ; cond-eq = 0
-              (range n)))]
-    (vec (concat push-ordinal push-payload load-tag compare-block trap (apply concat full-bodies)))))
+                (concat (cmp-imm 0 i)
+                        [(layout/relative-branch :aarch64/b-eq-imm19
+                                                 (nth case-labels i))]))
+              (range n)))
+        body-blocks
+        (vec (mapcat
+              (fn [i body-code]
+                (concat [(layout/label (nth case-labels i))]
+                        body-code cleanup
+                        (when (< i (dec n))
+                          [(layout/relative-branch :aarch64/b-imm26 end-label)])))
+              (range n) body-codes))]
+    (let [tokens (vec (concat push-ordinal push-payload load-tag compare-block trap body-blocks
+                              [(layout/label end-label)]))]
+      (if resolve-locally? (finalize tokens 0 {} {}) tokens))))
 
 ;; Mirrors `backend/x86-64.cljc/emit-variant-match-of-new` exactly: `value-
 ;; form` must be a directly-nested, same-schema `variant-new` -- a variant
@@ -815,7 +878,10 @@
       (emit-variant-dispatch ordinal payload-expr branch-specs env depth))))
 
 (defn emit-expr [form env depth]
-  (cond
+  (let [env (if (:mir-label-counter (meta env))
+              env
+              (with-meta env (assoc (meta env) :mir-label-counter (atom -1))))]
+    (cond
     ;; `integer?` alone does not reliably recognize a cljs `bigint` (see
     ;; `kotoba.kir.cljs-i64`'s own namespace docstring) -- mirrors
     ;; `kotoba.wasm.core`'s identical dispatch guard.
@@ -861,10 +927,21 @@
     (let [[op & args] form]
       (cond
         (= op 'if)
-        (let [[test then else] args test-code (emit-expr test env depth)
-              then-code (emit-expr then env depth) else-code (emit-expr else env depth)]
-          (vec (concat test-code (cbz-x0 (+ 8 (code-size then-code)))
-                       then-code (branch (+ 4 (code-size else-code))) else-code)))
+        (let [[test then else] args
+              counter (or (:mir-label-counter (meta env)) (atom -1))
+              env (with-meta env (assoc (meta env) :mir-label-counter counter))
+              else-label (fresh-label counter "if-else")
+              end-label (fresh-label counter "if-end")
+              test-code (emit-expr test env depth)
+              then-code (emit-expr then env depth)
+              else-code (emit-expr else env depth)]
+          (vec (concat test-code
+                       [(layout/relative-branch :aarch64/cbz-x0-imm19 else-label)]
+                       then-code
+                       [(layout/relative-branch :aarch64/b-imm26 end-label)
+                        (layout/label else-label)]
+                       else-code
+                       [(layout/label end-label)])))
         ;; `do`: emit each subexpression in order at the SAME depth (each is
         ;; self-contained -- net zero stack effect -- so no push/pop needed
         ;; between them); each leaves its result in x0, the next overwrites
@@ -1153,7 +1230,7 @@
                    (vec (concat left-code
                                 (emit-rhs-window right env depth)
                                 (case op + (insn 0x8b010000) - (insn 0xcb010000)
-                                       * (insn 0x9b017c00) quot signed-division
+                                       * (insn 0x9b017c00) quot (signed-division env)
                                        bit-and (insn 0x8a010000)
                                        bit-or (insn 0xaa010000)
                                        bit-xor (insn 0xca010000)))))
@@ -1170,16 +1247,22 @@
         (= op 'kernel-load-u8-16k) (emit-kernel-load-u8 args 16384 env depth)
         (= op 'kernel-store-u32) (emit-kernel-store-u32 args 512 env depth)
         (= op 'kernel-load-u32) (emit-kernel-load-u32 args 512 env depth)
-        :else (emit-call op args env depth)))))
+        :else (emit-call op args env depth))))))
 
 (defn- emit-function [{:keys [name params body result]}]
   (when (> (count params) 5)
     (throw (ex-info "AArch64 fuel ABI supports at most five integer parameters"
                     {:phase :aarch64 :function name :arity (count params)})))
-  (let [body (if-let [record-name (record-result-name result)]
+  (let [source-body body
+        body (if-let [record-name (record-result-name result)]
                (box-record-tails body record-name)
                body)
-        n (count params) register-frame (* 16 (quot (+ n 1) 2))
+        n (count params)]
+    (if (and (nil? result)
+             (machine-ir/pilot-expression? (vec params) source-body))
+      (vec (concat fuel-charge-tokens
+                   (machine-ir/compile-expression :aarch64 (vec params) source-body)))
+      (let [register-frame (* 16 (quot (+ n 1) 2))
         save-frame (when (pos? register-frame)
                      (concat (sub-sp register-frame)
                              (mapcat (fn [i] (str-sp (+ 19 i) (* 8 i))) (range n))))
@@ -1187,11 +1270,14 @@
                         (concat (mapcat (fn [i] (ldr-sp (+ 19 i) (* 8 i))) (range n))
                                 (add-sp register-frame)))
         params-to-saved (mapcat (fn [i] (mov-reg (+ 19 i) i)) (range n))
-        expression (emit-expr body (zipmap params (range)) 0)]
-    (vec (concat fuel-charge
+        expression (emit-expr body
+                              (with-meta (zipmap params (range))
+                                {:mir-label-counter (atom -1)})
+                              0)]
+        (vec (concat fuel-charge-tokens
                  (insn 0xa9bf7bfd) (insn 0x910003fd) ; stp fp,lr,[sp,#-16]!; mov fp,sp
                  save-frame params-to-saved expression restore-frame
-                 (insn 0xa8c17bfd) (insn 0xd65f03c0))))) ; ldp fp,lr,[sp],#16; ret
+                 (insn 0xa8c17bfd) (insn 0xd65f03c0))))))) ; ldp fp,lr,[sp],#16; ret
 
 ;; A call target that does not resolve is an OPERATOR this backend has not
 ;; implemented -- not a typo, and not a missing function.
@@ -1216,10 +1302,32 @@
                   {:phase :aarch64 :backend :aarch64-kotoba-v1 :operation op})))
 
 (defn- finalize [tokens function-offset offsets literal-offsets]
-  (loop [remaining tokens position 0 out []]
-    (if-let [token (first remaining)]
-      (cond
-        (and (map? token) (:call token))
+  (let [labels (layout/label-offsets tokens token-size)]
+    (layout/resolve-tokens
+     tokens token-size labels
+     (fn [{:mir/keys [encoding operands]} displacement]
+       (case encoding
+         :aarch64/cbz-x0-imm19 (cbz-x0 displacement)
+         :aarch64/cbz-x1-imm19 (cbz-reg 1 displacement)
+         :aarch64/cbz-imm19 (cbz-reg (first operands) displacement)
+         :aarch64/cbnz-x1-imm19
+         (insn (bit-or 0xb5000001
+                       (bit-shift-left (bit-and (quot displacement 4) 0x7ffff) 5)))
+         :aarch64/cbnz-x16-imm19
+         (insn (bit-or 0xb5000010
+                       (bit-shift-left (bit-and (quot displacement 4) 0x7ffff) 5)))
+         :aarch64/b-eq-imm19 (b-cond 0 displacement)
+         :aarch64/b-ne-imm19 (b-cond 1 displacement)
+         :aarch64/b-hi-imm19 (b-cond cond-hi displacement)
+         :aarch64/b-hs-imm19 (b-cond cond-hs displacement)
+         :aarch64/b-lt-imm19 (b-cond cond-lt displacement)
+         :aarch64/b-gt-imm19 (b-cond cond-gt displacement)
+         :aarch64/tbnz-imm14 (let [[reg bit-index] operands]
+                               (tbnz reg bit-index displacement))
+         :aarch64/b-imm26 (branch displacement)))
+     (fn [token position]
+       (cond
+         (and (map? token) (:call token))
         ;; The unknown-target guard must run BEFORE `displacement` is computed.
         ;; It used to be bound alongside `target` in this same `let`, which made
         ;; the guard unreachable: `(- nil absolute)` threw a bare
@@ -1234,19 +1342,16 @@
               displacement (- target absolute)]
           (when-not (zero? (mod displacement 4))
             (throw (ex-info "unaligned AArch64 BL target" {:target (:call token)})))
-          (recur (next remaining) (+ position 4)
-                 (into out (insn (bit-or 0x94000000
-                                         (bit-and (quot displacement 4) 0x03ffffff))))))
+          (insn (bit-or 0x94000000
+                        (bit-and (quot displacement 4) 0x03ffffff))))
 
-        (and (map? token) (:string-literal token))
+         (and (map? token) (:string-literal token))
         (let [content (:string-literal token) offset (get literal-offsets content)]
           (when-not offset
             (throw (ex-info "unknown AArch64 string literal" {:content content})))
-          (recur (next remaining) (+ position 16) (into out (load-constant-reg 0 offset))))
+          (load-constant-reg 0 offset))
 
-        :else
-        (recur (next remaining) (inc position) (conj out token)))
-      out)))
+         :else [token])))))
 
 ;; Every distinct string literal's content used anywhere in the program,
 ;; collected once (order-preserving, first occurrence wins) so `finalize`
