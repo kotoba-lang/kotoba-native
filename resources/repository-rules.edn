@@ -7,4 +7,7 @@
   :tier :t2
   :role :backend
   :must-not [:parse-kotoba-source :own-language-semantics :require-Rust-in-the-core-path]
-  :depends-on ["kotoba-lang/kotoba-kir" "kotoba-lang/artifact"]}}
+  :depends-on ["kotoba-lang/kotoba-kir"
+               "kotoba-lang/kotoba-gmir"
+               "kotoba-lang/kotoba-mir"
+               "kotoba-lang/artifact"]}}

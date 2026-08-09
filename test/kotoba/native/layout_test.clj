@@ -107,28 +107,27 @@
                                                  (fn [_ _] [0xe9])
                                                  (fn [token _] [token]))))))
 
-(deftest x86-if-retains-the-existing-byte-contract-through-layout
+(deftest x86-if-production-path-uses-gmir-mir-mc-layout
   (let [kir {:format :kotoba.kir/v4
              :exports ['main]
              :functions [{:name 'main :params ['p] :body '(if p 11 22)}]}
         code (:code (x86/emit-program kir))]
-    (is (= 64 (count code)))
-    (is (= 1 (count (filter #(= [0x0f 0x84 0x0f 0x00 0x00 0x00] %)
+    (is (= 53 (count code)))
+    (is (= 1 (count (filter #(= [0x0f 0x84 0x0e 0x00 0x00 0x00] %)
                             (partition 6 1 code))))
-        "jz still skips the ten-byte then arm and the five-byte trailing jmp")
-    (is (= 1 (count (filter #(= [0xe9 0x0a 0x00 0x00 0x00] %)
-                            (partition 5 1 code))))
-        "jmp still skips the ten-byte else arm")))
+        "jz uses final MC sizes to reach the returning else arm")
+    (is (not-any? #(= 0xe9 %) code)
+        "tail arms return directly, so the selected MC needs no end jump")))
 
-(deftest aarch64-if-retains-the-existing-byte-contract-through-layout
+(deftest aarch64-if-production-path-uses-gmir-mir-mc-layout
   (let [kir {:format :kotoba.kir/v4
              :exports ['main]
              :functions [{:name 'main :params ['p] :body '(if p 11 22)}]}
         code (:code (arm/emit-program kir))]
-    (is (= 100 (count code)))
-    (is (= 1 (count (filter #(= [0xc0 0x00 0x00 0xb4] %)
+    (is (= 72 (count code)))
+    (is (= 1 (count (filter #(= [0xe0 0x00 0x00 0xb4] %)
                             (partition 4 1 code))))
-        "cbz remains relative to its own address and skips then plus b")
-    (is (= 1 (count (filter #(= [0x05 0x00 0x00 0x14] %)
-                            (partition 4 1 code))))
-        "b remains relative to its own address and skips the else arm")))
+        "cbz x0 uses final MC sizes to reach the returning else arm")
+    (is (not-any? #(= [0x05 0x00 0x00 0x14] %)
+                  (partition 4 1 code))
+        "tail arms return directly, so no end branch is selected")))

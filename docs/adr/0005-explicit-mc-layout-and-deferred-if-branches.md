@@ -1,6 +1,6 @@
 # ADR 0005: Introduce an explicit MC/layout boundary and defer ordinary `if` branches
 
-**Status:** accepted and implemented  
+**Status:** accepted and implemented
 **Date:** 2026-08-08
 **Scope:** x86-64 and AArch64 intra-function branches and variable-width rewriting
 
@@ -47,8 +47,10 @@ Keep the identities distinct:
 - BuildCID identifies compiler, target, flags, and build dependencies;
 - ArtifactCID identifies the emitted Wasm/native artifact and descriptor.
 
-This native repository does not take ownership of the KIR DAG-CBOR codec.
-`kotoba-kir` owns semantic identity; `artifact` owns target artifact identity.
+This native repository does not take ownership of the KIR DAG-CBOR codec. The
+existing `kotoba-lang` language contract remains the single DefCID authority;
+`kotoba-kir` owns the checked IR model without defining a competing identity.
+`artifact` owns source, build, and target-artifact identity.
 
 Layout has two passes:
 
@@ -68,33 +70,40 @@ AArch64 uses the branch instruction's own address and requires four-byte-aligned
 `imm14`/`imm19`/`imm26`. Nested branches share one function-local deterministic
 label counter.
 
-Do not create `kotoba-mir` or `kotoba-gmir` repositories yet. The boundary must
-first be exercised inside `kotoba-native`; repository extraction happens only
-after the contract has more than one producer or consumer and changes less
-frequently than the backend implementation.
+The in-repository pilot satisfied the extraction gate. `kotoba-gmir` now owns
+the target-independent closed contract and `kotoba-mir` owns target selection,
+explicit allocation state, and deterministic register allocation.
+`kotoba-native` remains their first production consumer and owns KIR-to-GMIR
+lowering, MC/layout, byte encoding, and ELF emission.
 
 ## Consequences
 
 - x86-64 and AArch64 intra-function displacements are computed from final token
   sizes rather than from sizes embedded by expression emitters.
-- Repeated compilation remains deterministic and existing artifact bytes do
-  not change for this instruction family.
+- Repeated compilation remains deterministic. The initial branch-token
+  migration preserved artifact bytes; the later production GMIR/MIR slice
+  intentionally emits smaller code for its admitted functions.
 - Variant dispatch, kernel/string bounds, capability/fuel gates, division traps,
   and tail control flow now use label tokens. Calls remain final-pass relocation
   tokens rather than pre-laid bytes.
 - Peephole NOP padding has been removed. Constant RHS rewrites shrink their
   windows and the layout pass recomputes downstream branches.
-- Virtual registers, register allocation, and a target-independent GMIR remain
-  later layers; this ADR establishes the MC/layout seam they will feed.
+- `kotoba.native.machine-ir` now supplies a closed production slice with
+  target-independent GMIR, target MIR, virtual registers, deterministic
+  allocation, physical-register MC, and final byte encoding. Broader KIR
+  coverage and spilling remain incremental work rather than implicit fallback
+  inside this contract.
 
 ## Verification
 
-`layout_test.clj` fixes the following properties:
+The native layout and machine-IR tests fix the following properties:
 
 - forward and backward signed displacements;
 - displacement recomputation when an arm changes size;
 - fail-closed canonical token validation;
 - reserved-width enforcement;
-- byte-for-byte compatibility of both ordinary `if` pilots, including their
-  different PC-relative bases.
+- production tail-`if` encoding through both PC-relative bases;
 - branch-heavy parity after variable-width constant rewrites.
+
+The compiler's shared ISA harness separately executes the production slice in
+real x86-64 and AArch64 processes.

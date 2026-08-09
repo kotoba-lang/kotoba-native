@@ -13,6 +13,7 @@ checkable from outside.
 - `kotoba.native.x86-64`
 - `kotoba.native.aarch64`
 - `kotoba.native.elf64`
+- `kotoba.native.layout`
 - `kotoba.native.peephole`
 - `kotoba.native.string-search`
 
@@ -34,13 +35,28 @@ body actually reaches one, and never exported. See ADR 0002.
 
 ## Optimization
 
-Both backends bake intra-function branch displacements into plain bytes at
-emission time, so a rewriting pass that changed any byte *count* would
-silently invalidate every displacement spanning it — with nothing to catch it,
-because the token vector carries no instruction boundaries. `peephole`
-therefore rewrites **size-preservingly**: a replacement occupies exactly the
-window it replaces, padded with canonical architectural no-ops. What is
-reclaimed is memory traffic, not bytes.
+`kotoba.native.layout` is the first explicit MC/layout boundary. Its closed
+reference EDN projection uses qualified keys and qualified label IDs:
+
+```clojure
+{:mir/op :mir/label
+ :mir/id :kotoba.mir.label/if-end-1}
+
+{:mir/op :mir/relative-branch
+ :mir/encoding :x86-64/jz-rel32
+ :mir/target :kotoba.mir.label/if-else-0}
+```
+
+Layout is two-pass: labels receive byte offsets first, then every relative
+branch receives `target - (position + instruction-size)`. Duplicate labels,
+unknown targets, unknown encodings, non-qualified IDs, extra token keys, and
+encoder width drift all fail closed.
+
+All audited x86-64 and AArch64 intra-function branch families now use this
+boundary: ordinary conditionals, variant dispatch, kernel/string bounds,
+capability and fuel gates, signed-division traps, and tail control flow.
+Calls and tail-self relocation are resolved by the same final backend pass.
+No optimizer therefore depends on a displacement baked before final layout.
 
 The first rewrite materializes a constant right operand directly into the
 scratch register (`rcx` / `x1`), dropping the spill-and-reload round trip that
@@ -49,8 +65,33 @@ the KIR **form**, never on emitted bytes — matching byte patterns in an
 undelimited instruction stream would rewrite immediates that happen to spell
 an opcode.
 
-Reclaiming the padding, rather than preserving it, requires turning those
-baked displacements into deferred tokens first. That is a separate change.
+The first variable-width rewrite reclaims the removed spill/reload bytes:
+x86-64 constant RHS materialization is 10 bytes and AArch64 is 16 bytes, with
+no architectural NOP padding. Final layout recomputes every affected branch.
+
+`kotoba-gmir` now owns the closed target-independent GMIR contract and
+`kotoba-mir` owns target selection plus explicit virtual/physical register
+state and deterministic allocation. `kotoba.native.machine-ir` consumes those
+contracts and owns only the bounded KIR-to-GMIR producer, physical MC lowering,
+layout, and x86-64/AArch64 encoding. The atomic-add/tail-if subset is selected
+by the production emitters and has cross-ISA real-process coverage. Other KIR
+expression families remain on the established emitter and migrate
+incrementally.
+
+## Representations and identity
+
+The EDN maps above are the developer/reference notation for the abstract
+instruction data. They are not identity bytes and must never be hashed through
+`pr-str`. JSON may project the same abstract model for tooling, but is likewise
+not authoritative.
+
+Content identity is computed from normalized abstract values encoded as
+deterministic DAG-CBOR, with IPLD links for dependency CIDs. The implementation
+lives at the current authority boundary: the `kotoba-lang` language contract
+provides DefCID and `artifact` provides SourceCID, BuildCID, and ArtifactCID.
+`kotoba-kir` owns the checked IR model but does not introduce a second DefCID
+codec. This native repository consumes those contracts rather than defining
+another codec.
 
 ## Does not own
 
@@ -61,6 +102,8 @@ baked displacements into deferred tokens first. That is a separate change.
 ## Depends on
 
 - `kotoba-lang/kotoba-kir`
+- `kotoba-lang/kotoba-gmir`
+- `kotoba-lang/kotoba-mir`
 - `kotoba-lang/artifact`
 
 ## Test
