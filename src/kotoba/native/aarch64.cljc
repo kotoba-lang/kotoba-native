@@ -3,7 +3,7 @@
   ;; conditional that used to wrap the whole `:require` (see
   ;; `kotoba.wasm.core`'s ns form for that original reasoning) now wraps only
   ;; the cljs-only item.
-  (:require [kotoba.native.layout :as layout]
+  (:require [kotoba.codegen.layout :as layout]
             [kotoba.native.machine-ir :as machine-ir]
             [kotoba.native.peephole :as peephole]
             [kotoba.native.string-search :as string-search]
