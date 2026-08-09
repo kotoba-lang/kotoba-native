@@ -13,7 +13,6 @@ checkable from outside.
 - `kotoba.native.x86-64`
 - `kotoba.native.aarch64`
 - `kotoba.native.elf64` target layout, entry shims, and aiueos policy
-- `kotoba.native.layout`
 - `kotoba.native.peephole`
 - `kotoba.native.string-search`
 
@@ -35,7 +34,7 @@ body actually reaches one, and never exported. See ADR 0002.
 
 ## Optimization
 
-`kotoba.native.layout` is the first explicit MC/layout boundary. Its closed
+`kotoba.codegen.layout` is the explicit MC/layout boundary. Its closed
 reference EDN projection uses qualified keys and qualified label IDs:
 
 ```clojure
@@ -73,7 +72,8 @@ no architectural NOP padding. Final layout recomputes every affected branch.
 `kotoba-mir` owns target selection plus explicit virtual/physical register
 state and deterministic allocation. `kotoba.native.machine-ir` consumes those
 contracts and owns only the bounded KIR-to-GMIR producer, physical MC lowering,
-layout, and x86-64/AArch64 encoding. The atomic-add/tail-if subset is selected
+and x86-64/AArch64 encoding. Final layout is consumed from `kotoba-codegen`.
+The atomic-add/tail-if subset is selected
 by the production emitters and has cross-ISA real-process coverage. Other KIR
 expression families remain on the established emitter and migrate
 incrementally.
@@ -109,6 +109,7 @@ another codec.
 - `kotoba-lang/kotoba-kir`
 - `kotoba-lang/kotoba-gmir`
 - `kotoba-lang/kotoba-mir`
+- `kotoba-lang/kotoba-codegen`
 - `kotoba-lang/kotoba-object`
 - `kotoba-lang/artifact`
 

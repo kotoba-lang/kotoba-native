@@ -7,7 +7,7 @@
   use-before-definition, register exhaustion, or malformed label fails closed."
   (:require [kotoba.gmir :as gmir]
             [kotoba.mir :as mir]
-            [kotoba.native.layout :as layout]
+            [kotoba.codegen.layout :as layout]
             #?(:cljs [kotoba.kir.cljs-i64 :as i64])))
 
 (defn- reject! [phase problem instruction]

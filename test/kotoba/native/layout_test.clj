@@ -1,7 +1,7 @@
 (ns kotoba.native.layout-test
   (:require [clojure.test :refer [deftest is testing]]
             [kotoba.native.aarch64 :as arm]
-            [kotoba.native.layout :as layout]
+            [kotoba.codegen.layout :as layout]
             [kotoba.native.x86-64 :as x86]))
 
 (defn- le32 [n]

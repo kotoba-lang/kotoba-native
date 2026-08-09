@@ -1,6 +1,6 @@
 # ADR 0005: Introduce an explicit MC/layout boundary and defer ordinary `if` branches
 
-**Status:** accepted and implemented
+**Status:** accepted and implemented; layout ownership extracted by ADR-0007
 **Date:** 2026-08-08
 **Scope:** x86-64 and AArch64 intra-function branches and variable-width rewriting
 

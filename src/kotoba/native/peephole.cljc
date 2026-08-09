@@ -1,7 +1,7 @@
 (ns kotoba.native.peephole
   "Deterministic machine-level simplification shared by the native backends.
 
-  Every intra-function branch is a `kotoba.native.layout` token now, so a
+  Every intra-function branch is a `kotoba.codegen.layout` token now, so a
   rewrite may change instruction count: layout recomputes labels, relative
   displacements, function offsets, literal offsets, calls, and tail jumps only
   after the final token sizes are known. The former NOP-padding API has been
