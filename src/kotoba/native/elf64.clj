@@ -1,5 +1,6 @@
 (ns kotoba.native.elf64
-  (:require [kotoba.artifact.core :as artifact]))
+  (:require [kotoba.artifact.core :as artifact]
+            [kotoba.object.elf64 :as object-elf]))
 
 (def ^:private kernel-target :x86_64-aiueos-kernel-v1)
 (def ^:private user-target :x86_64-aiueos-user-v1)
@@ -139,44 +140,46 @@
    'aiueos-cpu-apic-id {:arity 0 :symbol "kotoba_aiueos_cpu_apic_id"}})
 
 (defn- le [n width]
-  (mapv #(bit-and (unsigned-bit-shift-right (long n) (* 8 %)) 0xff)
-        (range width)))
+  (object-elf/little-endian n width))
 
 (defn- padded [bytes size]
-  (when (> (count bytes) size)
-    (throw (ex-info "ELF64 region exceeds its allocation"
-                    {:size size :actual (count bytes)})))
-  (into (vec bytes) (repeat (- size (count bytes)) 0)))
-
-(def ^:private em-x86-64 0x3e)
-(def ^:private em-aarch64 0xb7)
+  (object-elf/pad-to bytes size))
 
 (defn- elf-header*
   [machine entry program-header-count section-offset section-count]
-  (vec (concat
-        [0x7f 0x45 0x4c 0x46 2 1 1 0] (repeat 8 0)
-        (le 2 2)                         ; ET_EXEC
-        (le machine 2)                   ; EM_X86_64 / EM_AARCH64
-        (le 1 4)
-        (le entry 8)
-        (le 64 8)                        ; program headers follow ELF header
-        (le section-offset 8)
-        (le 0 4)
-        (le 64 2) (le 56 2) (le program-header-count 2)
-        (le 64 2) (le section-count 2) (le 3 2)))) ; .shstrtab index
+  (object-elf/encode-header
+   {:type :executable
+    :machine machine
+    :entry entry
+    :program-header-offset 64
+    :program-header-count program-header-count
+    :section-header-offset section-offset
+    :section-header-count section-count
+    :section-name-index 3}))
 
 (defn- elf-header [entry program-header-count section-offset section-count]
-  (elf-header* em-x86-64 entry program-header-count section-offset section-count))
+  (elf-header* :x86-64 entry program-header-count section-offset section-count))
 
 (defn- program-header [flags offset address file-size memory-size]
-  (vec (concat (le 1 4) (le flags 4)     ; PT_LOAD
-               (le offset 8) (le address 8) (le address 8)
-               (le file-size 8) (le memory-size 8) (le page-size 8))))
+  (object-elf/encode-program-header
+   {:type :load
+    :flags flags
+    :offset offset
+    :virtual-address address
+    :physical-address address
+    :file-size file-size
+    :memory-size memory-size
+    :alignment page-size}))
 
 (defn- section-header [name type flags address offset size alignment]
-  (vec (concat (le name 4) (le type 4) (le flags 8) (le address 8)
-               (le offset 8) (le size 8) (le 0 4) (le 0 4)
-               (le alignment 8) (le 0 8))))
+  (object-elf/encode-section-header
+   {:name-offset name
+    :type type
+    :flags flags
+    :address address
+    :offset offset
+    :size size
+    :alignment alignment}))
 
 (defn- entry-shim [main-address context-address]
   ;; Preserve the loader's SysV rdi boot-info pointer in context+80, then
@@ -318,7 +321,7 @@
                     (section-header 1 1 0x6 entry-address text-offset (count text) 16)
                     (section-header 7 1 0x3 context-address kernel-data-offset kernel-image-context-size 8)
                     (section-header 13 3 0 0 names-offset (count names) 1)]
-          header (elf-header* em-aarch64 entry-address 2 section-offset (count sections))
+          header (elf-header* :aarch64 entry-address 2 section-offset (count sections))
           phdrs (concat (program-header 0x5 text-offset entry-address (count text) (count text))
                         (program-header 0x6 kernel-data-offset context-address
                                         kernel-image-context-size kernel-image-context-size))
@@ -381,18 +384,28 @@
        :bytes (vec (concat before-sections (mapcat identity sections)))})))
 
 (defn- rela [offset symbol type addend]
-  (vec (concat (le offset 8)
-               (le (bit-or (bit-shift-left symbol 32) type) 8)
-               (le addend 8))))
+  (object-elf/encode-rela
+   {:offset offset :symbol-index symbol :type type :addend addend}))
 
 (defn- symbol-entry [name info section value size]
-  (vec (concat (le name 4) [info 0] (le section 2)
-               (le value 8) (le size 8))))
+  (object-elf/encode-symbol
+   {:name-offset name
+    :info info
+    :section-index section
+    :value value
+    :size size}))
 
 (defn- reloc-section-header [name type flags offset size link info alignment entry-size]
-  (vec (concat (le name 4) (le type 4) (le flags 8) (le 0 8)
-               (le offset 8) (le size 8) (le link 4) (le info 4)
-               (le alignment 8) (le entry-size 8))))
+  (object-elf/encode-section-header
+   {:name-offset name
+    :type type
+    :flags flags
+    :offset offset
+    :size size
+    :link link
+    :info info
+    :alignment alignment
+    :entry-size entry-size}))
 
 (defn package-kernel-object
   "Emit a linkable x86-64 ET_REL object whose public SysV probe calls the
@@ -558,11 +571,12 @@
           shstr-off (+ strtab-off (count strtab))
           section-off (+ shstr-off (count shstr-bytes)
                          (mod (- 8 (mod (+ shstr-off (count shstr-bytes)) 8)) 8))
-          header (vec (concat
-                       [0x7f 0x45 0x4c 0x46 2 1 1 0] (repeat 8 0)
-                       (le 1 2) (le 0x3e 2) (le 1 4) ; ET_REL, EM_X86_64
-                       (le 0 8) (le 0 8) (le section-off 8) (le 0 4)
-                       (le 64 2) (le 0 2) (le 0 2) (le 64 2) (le 7 2) (le 6 2)))
+          header (object-elf/encode-header
+                  {:type :relocatable
+                   :machine :x86-64
+                   :section-header-offset section-off
+                   :section-header-count 7
+                   :section-name-index 6})
           sections [(vec (repeat 64 0))
                     (reloc-section-header 1 1 0x6 text-off (count text) 0 0 16 0)
                     (reloc-section-header 7 1 0x3 data-off (count context) 0 0 8 0)

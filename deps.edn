@@ -9,6 +9,9 @@
         io.github.kotoba-lang/kotoba-mir
         {:git/url "https://github.com/kotoba-lang/kotoba-mir.git"
          :git/sha "158fe1e0d3fc90c78b3968176b6e0d20e237f6da"}
+        io.github.kotoba-lang/kotoba-object
+        {:git/url "https://github.com/kotoba-lang/kotoba-object.git"
+         :git/sha "76bfdc66ca0b54df69246e2884179bdecefe41e0"}
         io.github.kotoba-lang/artifact
         {:git/url "https://github.com/kotoba-lang/artifact.git"
          :git/sha "af43fc8fa43edb12361828e26456f75b12ab40be"}}

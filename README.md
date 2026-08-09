@@ -12,7 +12,7 @@ checkable from outside.
 
 - `kotoba.native.x86-64`
 - `kotoba.native.aarch64`
-- `kotoba.native.elf64`
+- `kotoba.native.elf64` target layout, entry shims, and aiueos policy
 - `kotoba.native.layout`
 - `kotoba.native.peephole`
 - `kotoba.native.string-search`
@@ -78,6 +78,11 @@ by the production emitters and has cross-ISA real-process coverage. Other KIR
 expression families remain on the established emitter and migrate
 incrementally.
 
+`kotoba-object` owns the target-neutral ELF64 record encoders. This repository
+supplies the target-specific section layout, virtual addresses, relocation
+requests, entry shims, and runtime/capability policy; it no longer carries a
+second implementation of ELF headers, symbols, or RELA records.
+
 ## Representations and identity
 
 The EDN maps above are the developer/reference notation for the abstract
@@ -104,6 +109,7 @@ another codec.
 - `kotoba-lang/kotoba-kir`
 - `kotoba-lang/kotoba-gmir`
 - `kotoba-lang/kotoba-mir`
+- `kotoba-lang/kotoba-object`
 - `kotoba-lang/artifact`
 
 ## Test
