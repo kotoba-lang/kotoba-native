@@ -62,6 +62,16 @@
       {:gmir/op :gmir/add :gmir/dst result :gmir/left join-a :gmir/right join-b}
       {:gmir/op :gmir/return :gmir/value result}]}))
 
+(def scalar-record-type
+  [:record :test/pair [[:a :i64] [:b :i64]]])
+
+(def record-sroa-form
+  '(let [r (if a
+             (record-new [:record :test/pair [[:a :i64] [:b :i64]]] 1 2)
+             (record-new [:record :test/pair [[:a :i64] [:b :i64]]] 3 4))]
+     (+ (record-get [:record :test/pair [[:a :i64] [:b :i64]]] r :a)
+        (record-get [:record :test/pair [[:a :i64] [:b :i64]]] r :b))))
+
 (deftest closed-gmir-reaches-allocated-mc-for-both-targets
   (doseq [target [:x86-64 :aarch64]]
     (let [mc (machine/compile-gmir target program)]
@@ -305,6 +315,61 @@
           target)
       (is (seq (machine/encode-mc mc)) target)
       (is (= mc (machine/compile-gmir target dual-phi-program)) target))))
+
+(deftest scalar-record-sroa-reaches-multi-phi-machine-ir
+  (is (machine/pilot-expression? ['a] record-sroa-form))
+  (let [gmir (machine/lower-kir-expression ['a] record-sroa-form)
+        phis (filter #(= :gmir/phi (:gmir/op %)) (:gmir/instructions gmir))]
+    (is (= 2 (:gmir/version gmir)))
+    (is (= 2 (count phis)))
+    (is (= gmir (machine/lower-kir-expression ['a] record-sroa-form)))
+    (doseq [target [:x86-64 :aarch64]]
+      (let [mc (machine/compile-gmir target gmir)
+            encodings (keep :mc/encoding (:mc/instructions mc))]
+        (is (zero? (:mc/frame-slots mc)) target)
+        (is (= 2 (count (filter #(= (keyword (name target) "move") %)
+                                encodings)))
+            target)
+        (is (not-any? #(contains? #{(keyword (name target) "spill-store")
+                                    (keyword (name target) "spill-load")}
+                                  %)
+                      encodings)
+            target)
+        (is (seq (machine/encode-mc mc)) target)))))
+
+(deftest record-sroa-preserves-evaluation-of-unprojected-fields
+  (let [form (list 'record-get scalar-record-type
+                   (list 'record-new scalar-record-type (list 'quot 1 0) 9)
+                   :b)
+        gmir (machine/lower-kir-expression [] form)
+        operations (mapv :gmir/op (:gmir/instructions gmir))]
+    (is (machine/pilot-expression? [] form))
+    (is (= 1 (count (filter #{:gmir/quotient} operations))))
+    (is (< (.indexOf operations :gmir/quotient)
+           (.indexOf operations :gmir/return))
+        "an unprojected field still evaluates and traps before the projection")))
+
+(deftest record-sroa-fails-closed-outside-the-fixed-scalar-field-contract
+  (let [different-type [:record :test/other [[:a :i64] [:b :i64]]]
+        nested-type [:record :test/nested [[:child scalar-record-type]]]]
+    (is (not (machine/pilot-expression?
+              ['a]
+              (list 'if 'a
+                    (list 'record-new scalar-record-type 1 2)
+                    (list 'record-new different-type 3 4)))))
+    (is (not (machine/pilot-expression?
+              [] (list 'record-new scalar-record-type 1 2))))
+    (is (not (machine/pilot-expression?
+              [] (list 'record-get scalar-record-type
+                       (list 'record-new scalar-record-type 1 2) :missing))))
+    (is (not (machine/pilot-expression?
+              [] (list 'record-get nested-type
+                       (list 'record-new nested-type
+                             (list 'record-new scalar-record-type 1 2))
+                       :child))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (machine/lower-kir-expression
+                  [] (list '+ (list 'record-new scalar-record-type 1 2) 3))))))
 
 (deftest full-signed-i64-immediates-have-fixed-wire-bytes
   (is (= [0x48 0xb8 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0x7f 0xc3]

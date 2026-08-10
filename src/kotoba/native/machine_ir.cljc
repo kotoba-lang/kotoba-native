@@ -67,6 +67,29 @@
 (defn- scalar-literal [form]
   (if (boolean? form) (if form 1 0) form))
 
+(defn- scalar-record-fields [type]
+  (when (and (vector? type) (= 3 (count type)) (= :record (first type))
+             (keyword? (second type)) (vector? (nth type 2))
+             (seq (nth type 2))
+             (every? #(and (vector? %) (= 2 (count %))
+                           (keyword? (first %))
+                           (contains? #{:i64 :bool} (second %)))
+                     (nth type 2))
+             (= (count (nth type 2))
+                (count (distinct (map first (nth type 2))))))
+    (nth type 2)))
+
+(defn- record-value? [value]
+  (= :record (:aggregate/kind value)))
+
+(defn- record-value [type values]
+  {:aggregate/kind :record :aggregate/type type :aggregate/values (vec values)})
+
+(defn- scalar-register! [value form]
+  (if (gmir/vreg? value)
+    value
+    (reject! :kir-to-gmir :scalar-value-required {:form form :value value})))
+
 (def ^:dynamic *production-routing-enabled?*
   "Migration seam used by legacy-emitter regression tests. Production leaves
   this enabled; disabling it never changes the IR contracts themselves."
@@ -77,8 +100,8 @@
 
   Admitted forms are integer/boolean literals, parameters, lexical `let`,
   ordered non-empty `do`, recursive scalar arithmetic/comparisons/predicates,
-  and tail-position `if`. Unsupported shapes fail closed rather than escaping
-  to the legacy emitter."
+  tail-position `if`, and fixed scalar-field records eliminated by SROA.
+  Unsupported shapes fail closed rather than escaping to the legacy emitter."
   [params body]
   (when-not (and (vector? params) (every? symbol? params)
                  (= (count params) (count (distinct params))))
@@ -97,7 +120,37 @@
         parameter-env (into {} (map (fn [parameter register]
                                       [parameter [:local register]])
                                     params parameter-registers))]
-    (letfn [(value [form env]
+    (letfn [(merge-values [then-value else-value then-exit else-exit form]
+              (cond
+                (and (gmir/vreg? then-value) (gmir/vreg? else-value))
+                (let [dst (fresh-reg)]
+                  [[{:gmir/op :gmir/phi :gmir/dst dst
+                     :gmir/incomings
+                     [{:gmir/predecessor then-exit :gmir/value then-value}
+                      {:gmir/predecessor else-exit :gmir/value else-value}]}]
+                   dst])
+
+                (and (record-value? then-value) (record-value? else-value)
+                     (= (:aggregate/type then-value)
+                        (:aggregate/type else-value)))
+                (let [then-values (:aggregate/values then-value)
+                      else-values (:aggregate/values else-value)
+                      destinations (mapv (fn [_] (fresh-reg)) then-values)]
+                  (when-not (= (count then-values) (count else-values))
+                    (reject! :kir-to-gmir :record-value-width-mismatch {:form form}))
+                  [(mapv (fn [dst then-register else-register]
+                           {:gmir/op :gmir/phi :gmir/dst dst
+                            :gmir/incomings
+                            [{:gmir/predecessor then-exit :gmir/value then-register}
+                             {:gmir/predecessor else-exit :gmir/value else-register}]})
+                         destinations then-values else-values)
+                   (record-value (:aggregate/type then-value) destinations)])
+
+                :else
+                (reject! :kir-to-gmir :branch-value-shape-mismatch
+                         {:form form :then then-value :else else-value})))
+
+            (value [form env]
               (cond
                 (scalar-literal? form)
                 (let [dst (fresh-reg)]
@@ -120,16 +173,17 @@
                       operands (if (and (= '- op) (= 2 (count form)))
                                  (list 0 (second form))
                                  (rest form))
-                      [[initial-code initial] & lowered]
+                      [[initial-code initial-value] & lowered]
                       (mapv #(value % env) operands)]
                   (reduce (fn [[code left] [right-code right]]
-                            (let [dst (fresh-reg)]
+                            (let [right (scalar-register! right form)
+                                  dst (fresh-reg)]
                               [(vec (concat code right-code
                                             [{:gmir/op (get kir-binary-ops op)
                                               :gmir/dst dst :gmir/left left
                                               :gmir/right right}]))
                                dst]))
-                          [initial-code initial]
+                          [initial-code (scalar-register! initial-value form)]
                           lowered))
 
                 (and (seq? form) (contains? kir-comparison-ops (first form))
@@ -137,7 +191,7 @@
                 (let [op (get kir-binary-ops (first form))
                       lowered (mapv #(value % env) (rest form))
                       code (vec (mapcat first lowered))
-                      registers (mapv second lowered)
+                      registers (mapv #(scalar-register! (second %) form) lowered)
                       comparisons
                       (mapv (fn [[left right]]
                               (let [dst (fresh-reg)]
@@ -156,8 +210,10 @@
 
                 (and (seq? form) (contains? kir-binary-ops (first form))
                      (= 3 (count form)))
-                (let [[left-code left] (value (second form) env)
-                      [right-code right] (value (nth form 2) env)
+                (let [[left-code left-value] (value (second form) env)
+                      [right-code right-value] (value (nth form 2) env)
+                      left (scalar-register! left-value form)
+                      right (scalar-register! right-value form)
                       dst (fresh-reg)]
                   [(vec (concat left-code right-code
                                 [{:gmir/op (get kir-binary-ops (first form))
@@ -167,7 +223,8 @@
 
                 (and (seq? form) (contains? kir-predicate-ops (first form))
                      (= 2 (count form)))
-                (let [[operand-code operand] (value (second form) env)
+                (let [[operand-code operand-value] (value (second form) env)
+                      operand (scalar-register! operand-value form)
                       zero (fresh-reg)
                       dst (fresh-reg)]
                   [(vec (concat operand-code
@@ -178,8 +235,43 @@
                                   :gmir/right zero}]))
                    dst])
 
+                (and (seq? form) (= 'record-new (first form)) (<= 2 (count form)))
+                (let [type (second form)
+                      fields (or (scalar-record-fields type)
+                                 (reject! :kir-to-gmir :unsupported-record-type
+                                          {:form form :type type}))
+                      field-forms (vec (drop 2 form))]
+                  (when-not (= (count fields) (count field-forms))
+                    (reject! :kir-to-gmir :record-field-count-mismatch {:form form}))
+                  (let [lowered (mapv #(value % env) field-forms)]
+                    [(vec (mapcat first lowered))
+                     (record-value type
+                                   (mapv #(scalar-register! (second %) form)
+                                         lowered))]))
+
+                (and (seq? form) (= 'record-get (first form)) (= 4 (count form)))
+                (let [type (second form)
+                      fields (or (scalar-record-fields type)
+                                 (reject! :kir-to-gmir :unsupported-record-type
+                                          {:form form :type type}))
+                      [record-code aggregate] (value (nth form 2) env)
+                      field (nth form 3)
+                      field-index (first (keep-indexed
+                                          (fn [index [name _]]
+                                            (when (= name field) index))
+                                          fields))]
+                  (when-not (and (record-value? aggregate)
+                                 (= type (:aggregate/type aggregate)))
+                    (reject! :kir-to-gmir :record-type-mismatch
+                             {:form form :expected type :actual aggregate}))
+                  (when-not (some? field-index)
+                    (reject! :kir-to-gmir :unknown-record-field
+                             {:form form :field field}))
+                  [record-code (nth (:aggregate/values aggregate) field-index)])
+
                 (and (seq? form) (= 'if (first form)) (= 4 (count form)))
-                (let [[test-code test] (value (second form) env)
+                (let [[test-code test-value] (value (second form) env)
+                      test (scalar-register! test-value form)
                       then-label (fresh-label "value-if-then")
                       then-exit (fresh-label "value-if-then-exit")
                       else-label (fresh-label "value-if-else")
@@ -187,7 +279,8 @@
                       join-label (fresh-label "value-if-join")
                       [then-code then-value] (value (nth form 2) env)
                       [else-code else-value] (value (nth form 3) env)
-                      dst (fresh-reg)]
+                      [phis merged] (merge-values then-value else-value
+                                                  then-exit else-exit form)]
                   [(vec (concat test-code
                                 [{:gmir/op :gmir/branch-zero
                                   :gmir/test test :gmir/target else-label}
@@ -199,14 +292,9 @@
                                 else-code
                                 [{:gmir/op :gmir/label :gmir/id else-exit}
                                  {:gmir/op :gmir/jump :gmir/target join-label}
-                                 {:gmir/op :gmir/label :gmir/id join-label}
-                                 {:gmir/op :gmir/phi :gmir/dst dst
-                                  :gmir/incomings
-                                  [{:gmir/predecessor then-exit
-                                    :gmir/value then-value}
-                                   {:gmir/predecessor else-exit
-                                    :gmir/value else-value}]}]))
-                   dst])
+                                 {:gmir/op :gmir/label :gmir/id join-label}]
+                                phis))
+                   merged])
 
                 (and (seq? form) (= 'let (first form)) (= 3 (count form))
                      (vector? (second form)) (even? (count (second form))))
@@ -241,7 +329,8 @@
                   (into (vec prefix-code) (tail (peek expressions) env)))
 
                 (and (seq? form) (= 'if (first form)) (= 4 (count form)))
-                (let [[test-code test] (value (second form) env)
+                (let [[test-code test-value] (value (second form) env)
+                      test (scalar-register! test-value form)
                       else-label (fresh-label "if-else")]
                   (vec (concat test-code
                                [{:gmir/op :gmir/branch-zero
@@ -265,7 +354,8 @@
                   (into code (tail (nth form 2) bound-env)))
 
                 :else
-                (let [[code result] (value form env)]
+                (let [[code result-value] (value form env)
+                      result (scalar-register! result-value form)]
                   (conj code {:gmir/op :gmir/return :gmir/value result}))))]
       (let [instructions (into parameter-code (tail body parameter-env))]
         {:gmir/version (if (some #(= :gmir/phi (:gmir/op %)) instructions) 2 1)
@@ -275,60 +365,74 @@
   "True only for the deliberately bounded production migration slice.
 
   Scalar arithmetic, comparisons, predicates, lexical `let`, ordered `do`,
-  and recursive tail `if` use the extracted IR path; allocation spills when
-  necessary."
+  recursive `if`, and fixed scalar-field record SROA use the extracted IR path;
+  allocation spills when necessary."
   [params body]
   (let [parameters (set params)]
-            (letfn [(value? [form env]
-              (or (scalar-literal? form)
-                  (and (symbol? form) (contains? env form))
-                  (and (seq? form) (contains? kir-fold-ops (first form))
-                       (or (> (count form) 3)
-                           (and (= '- (first form)) (= 2 (count form))))
-                       (every? #(value? % env) (rest form)))
-                  (and (seq? form) (contains? kir-comparison-ops (first form))
-                       (> (count form) 3)
-                       (every? #(value? % env) (rest form)))
-                  (and (seq? form) (contains? kir-binary-ops (first form))
-                       (= 3 (count form))
-                       (value? (second form) env) (value? (nth form 2) env))
-                  (and (seq? form) (contains? kir-predicate-ops (first form))
-                       (= 2 (count form)) (value? (second form) env))
-                  (and (seq? form) (= 'if (first form)) (= 4 (count form))
-                       (value? (second form) env)
-                       (value? (nth form 2) env)
-                       (value? (nth form 3) env))
-                  (and (seq? form) (= 'let (first form)) (= 3 (count form))
-                       (vector? (second form)) (even? (count (second form)))
-                       (loop [bindings (partition 2 (second form)), env env]
-                         (if-let [[binding expression] (first bindings)]
-                           (and (symbol? binding) (value? expression env)
-                                (recur (next bindings) (conj env binding)))
-                           (value? (nth form 2) env))))
-                  (and (seq? form) (= 'do (first form)) (next form)
-                       (every? #(value? % env) (rest form)))))
-            (tail? [form env]
-              (or (value? form env)
-                  (and (seq? form) (= 'do (first form)) (next form)
-                       (let [expressions (vec (rest form))]
-                         (and (every? #(value? % env) (pop expressions))
-                              (tail? (peek expressions) env))))
-                  (and (seq? form) (= 'if (first form)) (= 4 (count form))
-                       (value? (second form) env)
-                       (tail? (nth form 2) env)
-                       (tail? (nth form 3) env))
-                  (and (seq? form) (= 'let (first form)) (= 3 (count form))
-                       (vector? (second form)) (even? (count (second form)))
-                       (loop [bindings (partition 2 (second form)), env env]
-                         (if-let [[binding expression] (first bindings)]
-                           (and (symbol? binding) (value? expression env)
-                                (recur (next bindings) (conj env binding)))
-                           (tail? (nth form 2) env))))))]
+    (letfn [(shape [form env]
+              (cond
+                (scalar-literal? form) :scalar
+                (symbol? form) (get env form)
+
+                (and (seq? form) (contains? kir-fold-ops (first form))
+                     (or (> (count form) 3)
+                         (and (= '- (first form)) (= 2 (count form))))
+                     (every? #(= :scalar (shape % env)) (rest form)))
+                :scalar
+
+                (and (seq? form) (contains? kir-comparison-ops (first form))
+                     (> (count form) 3)
+                     (every? #(= :scalar (shape % env)) (rest form)))
+                :scalar
+
+                (and (seq? form) (contains? kir-binary-ops (first form))
+                     (= 3 (count form))
+                     (= :scalar (shape (second form) env))
+                     (= :scalar (shape (nth form 2) env)))
+                :scalar
+
+                (and (seq? form) (contains? kir-predicate-ops (first form))
+                     (= 2 (count form))
+                     (= :scalar (shape (second form) env)))
+                :scalar
+
+                (and (seq? form) (= 'record-new (first form)) (<= 2 (count form)))
+                (let [type (second form), fields (scalar-record-fields type)]
+                  (when (and fields (= (count fields) (- (count form) 2))
+                             (every? #(= :scalar (shape % env)) (drop 2 form)))
+                    type))
+
+                (and (seq? form) (= 'record-get (first form)) (= 4 (count form)))
+                (let [type (second form), fields (scalar-record-fields type)]
+                  (when (and fields (= type (shape (nth form 2) env))
+                             (some #(= (nth form 3) (first %)) fields))
+                    :scalar))
+
+                (and (seq? form) (= 'if (first form)) (= 4 (count form))
+                     (= :scalar (shape (second form) env)))
+                (let [then-shape (shape (nth form 2) env)
+                      else-shape (shape (nth form 3) env)]
+                  (when (= then-shape else-shape) then-shape))
+
+                (and (seq? form) (= 'let (first form)) (= 3 (count form))
+                     (vector? (second form)) (even? (count (second form))))
+                (loop [bindings (partition 2 (second form)), env env]
+                  (if-let [[binding expression] (first bindings)]
+                    (let [expression-shape (shape expression env)]
+                      (when (and (symbol? binding) expression-shape)
+                        (recur (next bindings) (assoc env binding expression-shape))))
+                    (shape (nth form 2) env)))
+
+                (and (seq? form) (= 'do (first form)) (next form))
+                (let [shapes (mapv #(shape % env) (rest form))]
+                  (when (every? some? shapes) (peek shapes)))
+
+                :else nil))]
     (and *production-routing-enabled?*
          (vector? params) (<= (count params) 5)
          (= (count params) (count parameters))
          (every? symbol? params)
-         (tail? body parameters)))))
+         (= :scalar (shape body (zipmap params (repeat :scalar))))))))
 
 ;; ── MC -> bytes ──────────────────────────────────────────────────────────────
 

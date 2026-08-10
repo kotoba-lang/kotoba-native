@@ -198,3 +198,26 @@
     (is (zero? (:mc/frame-slots
                 (machine/compile-gmir :aarch64
                                       (machine/lower-kir-expression params body)))))))
+
+(deftest scalar-record-sroa-production-path-has-no-legacy-epilogue
+  (let [params ['a]
+        body '(let [r (if a
+                        (record-new [:record :test/pair [[:x :i64] [:y :i64]]] 1 2)
+                        (record-new [:record :test/pair [[:x :i64] [:y :i64]]] 3 4))]
+                (+ (record-get [:record :test/pair [[:x :i64] [:y :i64]]] r :x)
+                   (record-get [:record :test/pair [[:x :i64] [:y :i64]]] r :y)))
+        kir {:format :kotoba.kir/v4 :exports ['main]
+             :functions [{:name 'main :params params :result :i64 :body body}]}
+        gmir (machine/lower-kir-expression params body)
+        x86-expression (machine/compile-expression :x86-64 params body)
+        arm-expression (machine/compile-expression :aarch64 params body)
+        x86-code (:code (x86/emit-program kir))
+        arm-code (:code (arm/emit-program kir))]
+    (is (= 2 (count (filter #(= :gmir/phi (:gmir/op %))
+                            (:gmir/instructions gmir)))))
+    (is (= x86-expression
+           (subvec x86-code (- (count x86-code) (count x86-expression)))))
+    (is (= arm-expression
+           (subvec arm-code (- (count arm-code) (count arm-expression)))))
+    (is (zero? (:mc/frame-slots (machine/compile-gmir :x86-64 gmir))))
+    (is (zero? (:mc/frame-slots (machine/compile-gmir :aarch64 gmir))))))
