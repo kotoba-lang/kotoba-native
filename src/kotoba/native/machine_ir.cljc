@@ -88,9 +88,14 @@
         fresh-label (fn [stem]
                       (keyword "kotoba.gmir.label"
                                (str stem "-" (swap! next-label inc))))
-        parameter-env (into {} (map-indexed (fn [index parameter]
-                                              [parameter [:argument index]])
-                                            params))]
+        parameter-registers (mapv (fn [_] (fresh-reg)) params)
+        parameter-code (mapv (fn [index register]
+                               {:gmir/op :gmir/argument :gmir/dst register
+                                :gmir/index index})
+                             (range) parameter-registers)
+        parameter-env (into {} (map (fn [parameter register]
+                                      [parameter [:local register]])
+                                    params parameter-registers))]
     (letfn [(value [form env]
               (cond
                 (scalar-literal? form)
@@ -218,7 +223,8 @@
                 :else
                 (let [[code result] (value form env)]
                   (conj code {:gmir/op :gmir/return :gmir/value result}))))]
-      {:gmir/version 1 :gmir/instructions (tail body parameter-env)})))
+      {:gmir/version 1
+       :gmir/instructions (into parameter-code (tail body parameter-env))})))
 
 (defn pilot-expression?
   "True only for the deliberately bounded production migration slice.
