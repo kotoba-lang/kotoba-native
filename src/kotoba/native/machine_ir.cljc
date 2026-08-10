@@ -7,6 +7,7 @@
   use-before-definition, register exhaustion, or malformed label fails closed."
   (:require [kotoba.gmir :as gmir]
             [kotoba.mir :as mir]
+            [kotoba.codegen.mc :as mc]
             [kotoba.codegen.layout :as layout]
             #?(:cljs [kotoba.kir.cljs-i64 :as i64])))
 
@@ -24,20 +25,21 @@
   (mir/validate! program)
   (when-not (= :physical registers)
     (reject! :mc :registers-not-allocated program))
-  {:mc/version 1
-   :mc/target target
-   :mc/instructions
-   (mapv (fn [{:mir/keys [op id target test] :as instruction}]
-           (case op
-             :mir/label (layout/label id)
-             :mir/branch-zero
-             {:mc/op :mc/branch-zero :mc/test test :mc/target target}
-             :mir/jump
-             {:mc/op :mc/jump :mc/target target}
-             (into {:mc/op :mc/instruction
-                    :mc/encoding (keyword (name (:mir/target program)) (name op))}
-                   (remove (fn [[k _]] (= k :mir/op)) instruction))))
-         instructions)})
+  (mc/validate!
+   {:mc/version 1
+    :mc/target target
+    :mc/instructions
+    (mapv (fn [{:mir/keys [op id target test] :as instruction}]
+            (case op
+              :mir/label (layout/label id)
+              :mir/branch-zero
+              {:mc/op :mc/branch-zero :mc/test test :mc/target target}
+              :mir/jump
+              {:mc/op :mc/jump :mc/target target}
+              (into {:mc/op :mc/instruction
+                     :mc/encoding (keyword (name (:mir/target program)) (name op))}
+                    (remove (fn [[k _]] (= k :mir/op)) instruction))))
+          instructions)}))
 
 (defn compile-gmir [target program]
   (->> program (mir/select-target target) mir/allocate-registers lower-mc))
@@ -219,8 +221,7 @@
 (defn encode-mc
   "Encode a closed allocated MC program into final machine bytes."
   [{:mc/keys [version target instructions] :as program}]
-  (when-not (and (= 1 version) (contains? mir/targets target) (vector? instructions))
-    (reject! :mc-encode :non-canonical-program program))
+  (mc/validate! program)
   (let [tokens
         (vec (mapcat
               (fn [{:mc/keys [op test target] :as instruction}]
