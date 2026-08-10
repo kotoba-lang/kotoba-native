@@ -47,11 +47,21 @@
 
 ;; ── closed KIR expression -> GMIR pilot ─────────────────────────────────────
 
+(def ^:private kir-binary-ops
+  {'+ :gmir/add '- :gmir/subtract '* :gmir/multiply
+   'quot :gmir/quotient 'bit-and :gmir/bit-and
+   'bit-or :gmir/bit-or 'bit-xor :gmir/bit-xor})
+
+(def ^:dynamic *production-routing-enabled?*
+  "Migration seam used by legacy-emitter regression tests. Production leaves
+  this enabled; disabling it never changes the IR contracts themselves."
+  true)
+
 (defn lower-kir-expression
   "Lower a closed pure tail-expression subset to GMIR.
 
-  Admitted forms are integer literals, parameters, `(+ left right)` where both
-  operands are admitted values, and tail-position `(if test then else)`.
+  Admitted forms are integer literals, parameters, recursive i64 arithmetic,
+  and tail-position `(if test then else)`.
   Unsupported shapes fail closed rather than escaping to the legacy emitter."
   [params body]
   (when-not (and (vector? params) (every? symbol? params)
@@ -76,12 +86,14 @@
                     [[{:gmir/op :gmir/argument :gmir/dst dst :gmir/index index}] dst])
                   (reject! :kir-to-gmir :unknown-parameter {:form form}))
 
-                (and (seq? form) (= '+ (first form)) (= 3 (count form)))
+                (and (seq? form) (contains? kir-binary-ops (first form))
+                     (= 3 (count form)))
                 (let [[left-code left] (value (second form))
                       [right-code right] (value (nth form 2))
                       dst (fresh-reg)]
                   [(vec (concat left-code right-code
-                                [{:gmir/op :gmir/add :gmir/dst dst
+                                [{:gmir/op (get kir-binary-ops (first form))
+                                  :gmir/dst dst
                                   :gmir/left left :gmir/right right}]))
                    dst])
 
@@ -104,25 +116,26 @@
 (defn pilot-expression?
   "True only for the deliberately bounded production migration slice.
 
-  Binary operands are atomic and `if` is tail-only, so this production slice
-  normally stays on the register-only fast path. The allocator can now spill,
-  while every other already-supported expression remains on the legacy emitter
-  until its KIR-to-GMIR lowering is admitted explicitly."
+  Recursive i64 arithmetic and tail `if` use the extracted IR path; allocation
+  spills when necessary. Other expression families remain on the established
+  emitter until their typed GMIR operations are admitted explicitly."
   [params body]
   (let [parameters (set params)
-        atomic? #(or (gmir/i64-value? %) (contains? parameters %))
-        value? (fn [form]
-                 (or (atomic? form)
-                     (and (seq? form) (= '+ (first form)) (= 3 (count form))
-                          (atomic? (second form)) (atomic? (nth form 2)))))]
-    (and (vector? params) (<= (count params) 4)
+        atomic? #(or (gmir/i64-value? %) (contains? parameters %))]
+    (letfn [(value? [form]
+              (or (atomic? form)
+                  (and (seq? form) (contains? kir-binary-ops (first form))
+                       (= 3 (count form))
+                       (value? (second form)) (value? (nth form 2)))))]
+    (and *production-routing-enabled?*
+         (vector? params) (<= (count params) 4)
          (= (count params) (count parameters))
          (every? symbol? params)
          (or (value? body)
              (and (seq? body) (= 'if (first body)) (= 4 (count body))
                   (value? (second body))
                   (value? (nth body 2))
-                  (value? (nth body 3)))))))
+                  (value? (nth body 3))))))))
 
 ;; ── MC -> bytes ──────────────────────────────────────────────────────────────
 
@@ -192,6 +205,30 @@
      opcode
      (bit-or 0xc0 (bit-shift-left (bit-and s 7) 3) (bit-and d 7))]))
 
+(defn- x86-rr-two-byte [opcode dst src]
+  (let [d (get x86-register-code dst)
+        s (get x86-register-code src)]
+    (when-not (and (some? d) (some? s))
+      (reject! :mc-encode :unsupported-register {:dst dst :src src}))
+    [(bit-or 0x48 (if (>= d 8) 4 0) (if (>= s 8) 1 0))
+     0x0f opcode
+     (bit-or 0xc0 (bit-shift-left (bit-and d 7) 3) (bit-and s 7))]))
+
+(defn- x86-push [register]
+  (let [code (get x86-register-code register)]
+    (when-not (some? code)
+      (reject! :mc-encode :unsupported-register {:register register}))
+    (if (>= code 8) [0x41 (+ 0x50 (bit-and code 7))]
+        [(+ 0x50 code)])))
+
+(defn- x86-quotient [dst left right]
+  (vec (concat (x86-push right)
+               (when-not (= :x86-64/rax left)
+                 (x86-rr 0x89 :x86-64/rax left))
+               [0x48 0x99 0x59 0x48 0xf7 0xf9]
+               (when-not (= dst :x86-64/rax)
+                 (x86-rr 0x89 dst :x86-64/rax)))))
+
 (defn- x86-mov-imm [dst value]
   (let [d (get x86-register-code dst)]
     (when-not (some? d) (reject! :mc-encode :unsupported-register {:dst dst}))
@@ -233,6 +270,29 @@
     (let [dst (:mir/dst instruction) left (:mir/left instruction) right (:mir/right instruction)]
       (vec (concat (when-not (= dst left) (x86-rr 0x89 dst left))
                    (x86-rr 0x01 dst right))))
+    :x86-64/subtract
+    (let [dst (:mir/dst instruction) left (:mir/left instruction) right (:mir/right instruction)]
+      (vec (concat (when-not (= dst left) (x86-rr 0x89 dst left))
+                   (x86-rr 0x29 dst right))))
+    :x86-64/multiply
+    (let [dst (:mir/dst instruction) left (:mir/left instruction) right (:mir/right instruction)]
+      (vec (concat (when-not (= dst left) (x86-rr 0x89 dst left))
+                   (x86-rr-two-byte 0xaf dst right))))
+    :x86-64/quotient
+    (x86-quotient (:mir/dst instruction) (:mir/left instruction)
+                  (:mir/right instruction))
+    :x86-64/bit-and
+    (let [dst (:mir/dst instruction) left (:mir/left instruction) right (:mir/right instruction)]
+      (vec (concat (when-not (= dst left) (x86-rr 0x89 dst left))
+                   (x86-rr 0x21 dst right))))
+    :x86-64/bit-or
+    (let [dst (:mir/dst instruction) left (:mir/left instruction) right (:mir/right instruction)]
+      (vec (concat (when-not (= dst left) (x86-rr 0x89 dst left))
+                   (x86-rr 0x09 dst right))))
+    :x86-64/bit-xor
+    (let [dst (:mir/dst instruction) left (:mir/left instruction) right (:mir/right instruction)]
+      (vec (concat (when-not (= dst left) (x86-rr 0x89 dst left))
+                   (x86-rr 0x31 dst right))))
     :x86-64/spill-load
     (x86-stack-memory 0x8b (:mir/dst instruction) (:mir/slot instruction))
     :x86-64/spill-store
@@ -255,6 +315,19 @@
                    (bit-shift-left (a64-register (:mir/right instruction)) 16)
                    (bit-shift-left (a64-register (:mir/left instruction)) 5)
                    (a64-register (:mir/dst instruction))))
+    (:aarch64/subtract :aarch64/multiply :aarch64/quotient
+     :aarch64/bit-and :aarch64/bit-or :aarch64/bit-xor)
+    (let [base (case encoding
+                 :aarch64/subtract 0xcb000000
+                 :aarch64/multiply 0x9b007c00
+                 :aarch64/quotient 0x9ac00c00
+                 :aarch64/bit-and 0x8a000000
+                 :aarch64/bit-or 0xaa000000
+                 :aarch64/bit-xor 0xca000000)]
+      (u32le (bit-or base
+                     (bit-shift-left (a64-register (:mir/right instruction)) 16)
+                     (bit-shift-left (a64-register (:mir/left instruction)) 5)
+                     (a64-register (:mir/dst instruction)))))
     :aarch64/spill-load
     (a64-stack-memory 0xf9400000 (:mir/dst instruction) (:mir/slot instruction))
     :aarch64/spill-store
