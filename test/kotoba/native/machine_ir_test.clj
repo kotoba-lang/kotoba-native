@@ -115,7 +115,7 @@
   ;; AArch64 passes arguments in the same x0-x4 register set used by this
   ;; bounded allocator. If a constant is emitted first, it can overwrite an
   ;; ABI argument before the later `:gmir/argument` instruction reads it.
-  (doseq [form ['(- a) '(+ 1 a) '(* 2 (+ 3 a))]]
+  (doseq [form ['(- a) '(+ 1 a) '(* 2 (+ 3 a)) '(* a 48271N)]]
     (let [instructions (:gmir/instructions
                         (machine/lower-kir-expression ['a] form))]
       (is (= :gmir/argument (:gmir/op (first instructions))) form)

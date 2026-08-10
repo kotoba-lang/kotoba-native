@@ -233,9 +233,9 @@
   tail `if` use the extracted IR path; allocation spills when necessary."
   [params body]
   (let [parameters (set params)]
-    (letfn [(value? [form env]
+            (letfn [(value? [form env]
               (or (scalar-literal? form)
-                  (contains? env form)
+                  (and (symbol? form) (contains? env form))
                   (and (seq? form) (contains? kir-fold-ops (first form))
                        (or (> (count form) 3)
                            (and (= '- (first form)) (= 2 (count form))))
