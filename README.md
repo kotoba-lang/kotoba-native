@@ -85,6 +85,10 @@ supplies the target-specific section layout, virtual addresses, relocation
 requests, entry shims, and runtime/capability policy; it no longer carries a
 second implementation of ELF headers, symbols, or RELA records.
 
+`kotoba.native.macho/encode-text-object` is the single native integration path
+from shared typed relocation requests to ARM64/x86-64 Mach-O section records;
+it validates target and section ownership before `kotoba-object` packs bytes.
+
 ## Representations and identity
 
 The EDN maps above are the developer/reference notation for the abstract
