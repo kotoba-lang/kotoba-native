@@ -221,3 +221,31 @@
            (subvec arm-code (- (count arm-code) (count arm-expression)))))
     (is (zero? (:mc/frame-slots (machine/compile-gmir :x86-64 gmir))))
     (is (zero? (:mc/frame-slots (machine/compile-gmir :aarch64 gmir))))))
+
+(deftest scalar-variant-sroa-production-path-has-no-legacy-epilogue
+  (let [params ['a]
+        body '(let [v (if a
+                        (variant-new [:variant :test/value
+                                      [[:number :i64] [:flag :bool]]]
+                                     :number 41)
+                        (variant-new [:variant :test/value
+                                      [[:number :i64] [:flag :bool]]]
+                                     :flag false))]
+                (variant-match [:variant :test/value
+                                [[:number :i64] [:flag :bool]]]
+                               v
+                               [[:number payload (+ payload 1)]
+                                [:flag payload (if payload 1 7)]]))
+        kir {:format :kotoba.kir/v4 :exports ['main]
+             :functions [{:name 'main :params params :result :i64 :body body}]}
+        gmir (machine/lower-kir-expression params body)
+        x86-expression (machine/compile-expression :x86-64 params body)
+        arm-expression (machine/compile-expression :aarch64 params body)
+        x86-code (:code (x86/emit-program kir))
+        arm-code (:code (arm/emit-program kir))]
+    (is (= x86-expression
+           (subvec x86-code (- (count x86-code) (count x86-expression)))))
+    (is (= arm-expression
+           (subvec arm-code (- (count arm-code) (count arm-expression)))))
+    (is (zero? (:mc/frame-slots (machine/compile-gmir :x86-64 gmir))))
+    (is (zero? (:mc/frame-slots (machine/compile-gmir :aarch64 gmir))))))
