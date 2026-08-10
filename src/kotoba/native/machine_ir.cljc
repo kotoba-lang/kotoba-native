@@ -359,18 +359,50 @@
     (if (>= code 8) [0x41 (+ 0x50 (bit-and code 7))]
         [(+ 0x50 code)])))
 
+(defn- x86-pop [register]
+  (let [code (get x86-register-code register)]
+    (when-not (some? code)
+      (reject! :mc-encode :unsupported-register {:register register}))
+    (if (>= code 8) [0x41 (+ 0x58 (bit-and code 7))]
+        [(+ 0x58 code)])))
+
 (defn- x86-quotient [dst left right]
-  ;; `cqo`/`idiv` use RDX:RAX implicitly. RDX can still hold an unrelated live
-  ;; allocated value, so preserve it independently of the explicit operands.
-  ;; Restore before copying RAX to `dst`, which also handles `dst = rdx`.
-  (vec (concat (x86-push :x86-64/rdx)
-               (x86-push right)
-               (when-not (= :x86-64/rax left)
-                 (x86-rr 0x89 :x86-64/rax left))
-               [0x48 0x99 0x59 0x48 0xf7 0xf9]
-               [0x5a]
-               (when-not (= dst :x86-64/rax)
-                 (x86-rr 0x89 dst :x86-64/rax)))))
+  ;; `cqo`/`idiv` implicitly use RDX:RAX and need a non-RAX/RDX divisor. MIR
+  ;; exposes only `dst` as written, so every other allocated value in RAX,
+  ;; RDX, or RCX must survive. Save all three before loading operands; operands
+  ;; already in an implicit register are read from those stable stack slots.
+  (let [saved-slot {:x86-64/rcx 0 :x86-64/rdx 1 :x86-64/rax 2}
+        load-operand (fn [dst src]
+                       (if-some [slot (get saved-slot src)]
+                         (x86-stack-memory 0x8b dst slot)
+                         (if (= dst src) [] (x86-rr 0x89 dst src))))
+        restore (case dst
+                  :x86-64/rax
+                  (concat (x86-pop :x86-64/rcx)
+                          (x86-pop :x86-64/rdx)
+                          (x86-adjust-stack 0xc4 8))
+                  :x86-64/rcx
+                  (concat (x86-rr 0x89 :x86-64/rcx :x86-64/rax)
+                          (x86-adjust-stack 0xc4 8)
+                          (x86-pop :x86-64/rdx)
+                          (x86-pop :x86-64/rax))
+                  :x86-64/rdx
+                  (concat (x86-rr 0x89 :x86-64/rdx :x86-64/rax)
+                          (x86-pop :x86-64/rcx)
+                          (x86-adjust-stack 0xc4 8)
+                          (x86-pop :x86-64/rax))
+                  :x86-64/r8
+                  (concat (x86-rr 0x89 :x86-64/r8 :x86-64/rax)
+                          (x86-pop :x86-64/rcx)
+                          (x86-pop :x86-64/rdx)
+                          (x86-pop :x86-64/rax)))]
+    (vec (concat (x86-push :x86-64/rax)
+                 (x86-push :x86-64/rdx)
+                 (x86-push :x86-64/rcx)
+                 (load-operand :x86-64/rcx right)
+                 (load-operand :x86-64/rax left)
+                 [0x48 0x99 0x48 0xf7 0xf9]
+                 restore))))
 
 (defn- x86-mov-imm [dst value]
   (let [d (get x86-register-code dst)]
