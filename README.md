@@ -85,6 +85,11 @@ tail control, `do` delegates it to tail lowering after emitting every scalar
 prefix, so both arms return directly without a synthetic merge. Other typed KIR expression
 families remain on the established emitter and migrate incrementally.
 
+Value-position scalar `if` uses GMIR/MIR v2 phi values. Each branch reaches an
+explicit predecessor exit, MIR lowers the phi to two edge stores plus one join
+load in a dedicated bounded frame slot, and final layout resolves all resulting
+branches. Unselected branches do not execute, including trapping operations.
+
 `kotoba-object` owns the target-neutral ELF64 record encoders. This repository
 supplies the target-specific section layout, virtual addresses, relocation
 requests, entry shims, and runtime/capability policy; it no longer carries a

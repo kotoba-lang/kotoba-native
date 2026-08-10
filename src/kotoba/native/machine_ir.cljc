@@ -178,6 +178,36 @@
                                   :gmir/right zero}]))
                    dst])
 
+                (and (seq? form) (= 'if (first form)) (= 4 (count form)))
+                (let [[test-code test] (value (second form) env)
+                      then-label (fresh-label "value-if-then")
+                      then-exit (fresh-label "value-if-then-exit")
+                      else-label (fresh-label "value-if-else")
+                      else-exit (fresh-label "value-if-else-exit")
+                      join-label (fresh-label "value-if-join")
+                      [then-code then-value] (value (nth form 2) env)
+                      [else-code else-value] (value (nth form 3) env)
+                      dst (fresh-reg)]
+                  [(vec (concat test-code
+                                [{:gmir/op :gmir/branch-zero
+                                  :gmir/test test :gmir/target else-label}
+                                 {:gmir/op :gmir/label :gmir/id then-label}]
+                                then-code
+                                [{:gmir/op :gmir/label :gmir/id then-exit}
+                                 {:gmir/op :gmir/jump :gmir/target join-label}
+                                 {:gmir/op :gmir/label :gmir/id else-label}]
+                                else-code
+                                [{:gmir/op :gmir/label :gmir/id else-exit}
+                                 {:gmir/op :gmir/jump :gmir/target join-label}
+                                 {:gmir/op :gmir/label :gmir/id join-label}
+                                 {:gmir/op :gmir/phi :gmir/dst dst
+                                  :gmir/incomings
+                                  [{:gmir/predecessor then-exit
+                                    :gmir/value then-value}
+                                   {:gmir/predecessor else-exit
+                                    :gmir/value else-value}]}]))
+                   dst])
+
                 (and (seq? form) (= 'let (first form)) (= 3 (count form))
                      (vector? (second form)) (even? (count (second form))))
                 (let [[code bound-env]
@@ -237,8 +267,9 @@
                 :else
                 (let [[code result] (value form env)]
                   (conj code {:gmir/op :gmir/return :gmir/value result}))))]
-      {:gmir/version 1
-       :gmir/instructions (into parameter-code (tail body parameter-env))})))
+      (let [instructions (into parameter-code (tail body parameter-env))]
+        {:gmir/version (if (some #(= :gmir/phi (:gmir/op %)) instructions) 2 1)
+         :gmir/instructions instructions}))))
 
 (defn pilot-expression?
   "True only for the deliberately bounded production migration slice.
@@ -263,6 +294,10 @@
                        (value? (second form) env) (value? (nth form 2) env))
                   (and (seq? form) (contains? kir-predicate-ops (first form))
                        (= 2 (count form)) (value? (second form) env))
+                  (and (seq? form) (= 'if (first form)) (= 4 (count form))
+                       (value? (second form) env)
+                       (value? (nth form 2) env)
+                       (value? (nth form 3) env))
                   (and (seq? form) (= 'let (first form)) (= 3 (count form))
                        (vector? (second form)) (even? (count (second form)))
                        (loop [bindings (partition 2 (second form)), env env]

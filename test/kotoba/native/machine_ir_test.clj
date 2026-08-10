@@ -210,9 +210,8 @@
   (is (machine/pilot-expression? ['a]
                                  '(do (do (+ a 1))
                                       (if a (do 11) (do 22)))))
-  (is (not (machine/pilot-expression? ['a]
-                                      '(do (if a 1 2) 3)))
-      "a non-final if remains outside value lowering and cannot be reordered"))
+  (is (machine/pilot-expression? ['a] '(do (if a 1 2) 3))
+      "a non-final if is now a real merge value and still executes in order"))
 
 (deftest final-layout-resolves-branches-after-selected-instruction-sizes
   (let [x86 (machine/compile-expression :x86-64 ['p] '(if p 11 22))
@@ -225,8 +224,41 @@
     (is (= 52 (count arm)))))
 
 (deftest kir-to-gmir-boundary-rejects-unsupported-shapes
+  (is (machine/pilot-expression? ['a] '(+ a (if a 1 2))))
+  (is (seq (machine/compile-expression :aarch64 ['a] '(+ a (if a 1 2)))))
   (is (thrown? clojure.lang.ExceptionInfo
-               (machine/compile-expression :aarch64 ['a] '(+ a (if a 1 2))))))
+               (machine/compile-expression :aarch64 ['a] '(if a 1))))
+  (is (thrown? clojure.lang.ExceptionInfo
+               (machine/compile-expression :aarch64 ['a] '(unknown a)))))
+
+(deftest value-position-if-uses-versioned-phi-and-dedicated-merge-storage
+  (let [form '(+ 1 (if a (* a 2) (- a 3)))
+        gmir (machine/lower-kir-expression ['a] form)
+        phi (first (filter #(= :gmir/phi (:gmir/op %))
+                           (:gmir/instructions gmir)))]
+    (is (= 2 (:gmir/version gmir)))
+    (is (= 2 (count (:gmir/incomings phi))))
+    (doseq [target [:x86-64 :aarch64]]
+      (let [mc (machine/compile-gmir target gmir)
+            instructions (:mc/instructions mc)]
+        (is (= 1 (:mc/frame-slots mc)) target)
+        (is (not-any? #(= :mir/phi (:mir/op %)) instructions) target)
+        (is (= 2 (count (filter #(and (= (keyword (name target) "spill-store")
+                                         (:mc/encoding %))
+                                      (zero? (:mir/slot %)))
+                                instructions))) target)
+        (is (= 1 (count (filter #(and (= (keyword (name target) "spill-load")
+                                         (:mc/encoding %))
+                                      (zero? (:mir/slot %)))
+                                instructions))) target)
+        (is (seq (machine/encode-mc mc)) target))))
+  (doseq [form ['(let [x (if a 2 3)] (* x 4))
+                '(+ 1 (if a (if b 2 3) 4))
+                '(do (if a 1 2) 3)
+                '(if (if a 0 1) 7 8)]]
+    (is (machine/pilot-expression? ['a 'b] form) form)
+    (is (seq (machine/compile-expression :x86-64 ['a 'b] form)) form)
+    (is (seq (machine/compile-expression :aarch64 ['a 'b] form)) form)))
 
 (deftest full-signed-i64-immediates-have-fixed-wire-bytes
   (is (= [0x48 0xb8 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0x7f 0xc3]
