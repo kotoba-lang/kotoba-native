@@ -9,6 +9,7 @@
             [kotoba.mir :as mir]
             [kotoba.codegen.mc :as mc]
             [kotoba.codegen.layout :as layout]
+            [kotoba.native.aggregate-abi :as aggregate-abi]
             #?(:cljs [kotoba.kir.cljs-i64 :as i64])))
 
 (defn- reject! [phase problem instruction]
@@ -412,6 +413,9 @@
                 (let [lowered (mapv #(value % env) (rest form))]
                   [(vec (mapcat first lowered))
                    (second (peek lowered))])
+
+                (and (seq? form) (symbol? (first form)))
+                (aggregate-abi/reject-unextracted-call! form)
 
                 :else (reject! :kir-to-gmir :unsupported-value {:form form})))
 
