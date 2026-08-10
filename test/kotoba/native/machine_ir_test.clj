@@ -231,7 +231,7 @@
   (is (thrown? clojure.lang.ExceptionInfo
                (machine/compile-expression :aarch64 ['a] '(unknown a)))))
 
-(deftest value-position-if-uses-versioned-phi-and-dedicated-merge-storage
+(deftest value-position-if-uses-versioned-phi-and-direct-edge-moves
   (let [form '(+ 1 (if a (* a 2) (- a 3)))
         gmir (machine/lower-kir-expression ['a] form)
         phi (first (filter #(= :gmir/phi (:gmir/op %))
@@ -241,16 +241,15 @@
     (doseq [target [:x86-64 :aarch64]]
       (let [mc (machine/compile-gmir target gmir)
             instructions (:mc/instructions mc)]
-        (is (= 1 (:mc/frame-slots mc)) target)
+        (is (zero? (:mc/frame-slots mc)) target)
         (is (not-any? #(= :mir/phi (:mir/op %)) instructions) target)
-        (is (= 2 (count (filter #(and (= (keyword (name target) "spill-store")
-                                         (:mc/encoding %))
-                                      (zero? (:mir/slot %)))
+        (is (= 2 (count (filter #(= (keyword (name target) "move")
+                                     (:mc/encoding %))
                                 instructions))) target)
-        (is (= 1 (count (filter #(and (= (keyword (name target) "spill-load")
-                                         (:mc/encoding %))
-                                      (zero? (:mir/slot %)))
-                                instructions))) target)
+        (is (not-any? #(contains? #{(keyword (name target) "spill-store")
+                                    (keyword (name target) "spill-load")}
+                                  (:mc/encoding %))
+                      instructions) target)
         (is (seq (machine/encode-mc mc)) target))))
   (doseq [form ['(let [x (if a 2 3)] (* x 4))
                 '(+ 1 (if a (if b 2 3) 4))

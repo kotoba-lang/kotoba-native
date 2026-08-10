@@ -86,8 +86,9 @@ prefix, so both arms return directly without a synthetic merge. Other typed KIR 
 families remain on the established emitter and migrate incrementally.
 
 Value-position scalar `if` uses GMIR/MIR v2 phi values. Each branch reaches an
-explicit predecessor exit, MIR lowers the phi to two edge stores plus one join
-load in a dedicated bounded frame slot, and final layout resolves all resulting
+explicit predecessor exit. Proven-safe single-phi joins lower to two physical
+edge moves with zero phi frame bytes; joins needing unscheduled parallel copies
+retain the bounded frame fallback. Final layout resolves all resulting
 branches. Unselected branches do not execute, including trapping operations.
 
 `kotoba-object` owns the target-neutral ELF64 record encoders. This repository

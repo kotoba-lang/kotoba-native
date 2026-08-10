@@ -192,9 +192,9 @@
            (subvec x86-code (- (count x86-code) (count x86-expression)))))
     (is (= arm-expression
            (subvec arm-code (- (count arm-code) (count arm-expression)))))
-    (is (= 1 (:mc/frame-slots
-              (machine/compile-gmir :x86-64
-                                    (machine/lower-kir-expression params body)))))
-    (is (= 1 (:mc/frame-slots
-              (machine/compile-gmir :aarch64
-                                    (machine/lower-kir-expression params body)))))))
+    (is (zero? (:mc/frame-slots
+                (machine/compile-gmir :x86-64
+                                      (machine/lower-kir-expression params body)))))
+    (is (zero? (:mc/frame-slots
+                (machine/compile-gmir :aarch64
+                                      (machine/lower-kir-expression params body)))))))
