@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [kotoba.native.aarch64 :as arm]
             [kotoba.codegen.layout :as layout]
+            [kotoba.native.machine-ir :as machine]
             [kotoba.native.x86-64 :as x86]))
 
 (defn- le32 [n]
@@ -131,3 +132,19 @@
     (is (not-any? #(= [0x05 0x00 0x00 0x14] %)
                   (partition 4 1 code))
         "tail arms return directly, so no end branch is selected")))
+
+(deftest typed-scalar-control-production-path-has-no-legacy-epilogue
+  (let [params ['a 'b 'c 'd 'e]
+        body '(let [x (+ a b) y (* x c)] (if (< y d) y e))
+        kir {:format :kotoba.kir/v4 :exports ['main]
+             :functions [{:name 'main :params params :result :i64 :body body}]}
+        x86-expression (machine/compile-expression :x86-64 params body)
+        arm-expression (machine/compile-expression :aarch64 params body)
+        x86-code (:code (x86/emit-program kir))
+        arm-code (:code (arm/emit-program kir))]
+    (is (= x86-expression (subvec x86-code (- (count x86-code)
+                                               (count x86-expression))))
+        "typed i64 ends in the allocated MC expression, not a legacy epilogue")
+    (is (= arm-expression (subvec arm-code (- (count arm-code)
+                                               (count arm-expression))))
+        "the fifth AArch64 argument is admitted by the same production path")))

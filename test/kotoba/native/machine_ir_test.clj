@@ -100,15 +100,38 @@
          (machine/compile-expression :aarch64 ['a 'b] '(+ a b)))))
 
 (deftest recursive-i64-arithmetic-reaches-final-bytes-for-both-isas
-  (doseq [form ['(- a b) '(* a b) '(quot a b)
+  (doseq [form ['(- a) '(- a b) '(* a b) '(quot a b)
                 '(bit-and a b) '(bit-or a b) '(bit-xor a b)
-                '(+ (* a b) (- a b))]]
+                '(+ (* a b) (- a b)) '(+ a b 3 4)
+                '(bit-xor a b 3 4)]]
     (is (seq (machine/compile-expression :x86-64 ['a 'b] form)) form)
     (is (seq (machine/compile-expression :aarch64 ['a 'b] form)) form))
   (is (= [0x02 0x00 0x01 0xcb 0xe0 0x03 0x02 0xaa 0xc0 0x03 0x5f 0xd6]
          (machine/compile-expression :aarch64 ['a 'b] '(- a b))))
   (is (machine/pilot-expression? ['a 'b]
                                  '(+ (* a 6) (bit-xor (- a b) 3)))))
+
+(deftest scalar-comparisons-and-predicates-reach-final-bytes-for-both-isas
+  (doseq [form ['(= a b) '(< a b) '(> a b) '(<= a b) '(>= a b)
+                '(< a b 9) '(= a b 9)
+                '(not a) '(zero? a) '(pos? a) '(neg? a)]]
+    (is (seq (machine/compile-expression :x86-64 ['a 'b] form)) form)
+    (is (seq (machine/compile-expression :aarch64 ['a 'b] form)) form))
+  (is (= [0x48 0x89 0xf8 0x48 0x89 0xf1
+          0x48 0x39 0xc8 0x0f 0x9c 0xc2 0x48 0x0f 0xb6 0xd2
+          0x48 0x89 0xd0 0xc3]
+         (machine/compile-expression :x86-64 ['a 'b] '(< a b))))
+  (is (= [0x1f 0x00 0x01 0xeb 0xe2 0xa7 0x9f 0x9a
+          0xe0 0x03 0x02 0xaa 0xc0 0x03 0x5f 0xd6]
+         (machine/compile-expression :aarch64 ['a 'b] '(< a b)))))
+
+(deftest booleans-let-nested-tail-if-and-five-arguments-are-admitted
+  (doseq [form [true false
+                '(let [x (+ a b) y (* x c)] (if (< y d) y e))
+                '(if (< a b) (if c 11 12) (if d 21 22))]]
+    (is (machine/pilot-expression? ['a 'b 'c 'd 'e] form) form)
+    (is (seq (machine/compile-expression :x86-64 ['a 'b 'c 'd 'e] form)) form)
+    (is (seq (machine/compile-expression :aarch64 ['a 'b 'c 'd 'e] form)) form)))
 
 (deftest final-layout-resolves-branches-after-selected-instruction-sizes
   (let [x86 (machine/compile-expression :x86-64 ['p] '(if p 11 22))
@@ -121,8 +144,6 @@
     (is (= 52 (count arm)))))
 
 (deftest kir-to-gmir-boundary-rejects-unsupported-shapes
-  (is (thrown? clojure.lang.ExceptionInfo
-               (machine/compile-expression :x86-64 ['a] '(< a 2))))
   (is (thrown? clojure.lang.ExceptionInfo
                (machine/compile-expression :aarch64 ['a] '(+ a (if a 1 2))))))
 
