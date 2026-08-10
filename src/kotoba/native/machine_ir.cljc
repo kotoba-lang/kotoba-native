@@ -1046,17 +1046,20 @@
               :else token))
           tokens)))
 
+(defn- call-frame-policy? [frame-policy]
+  (contains? #{:all-vregs :call-live} frame-policy))
+
 (defn- function-frame [target frame-slots frame-policy]
   (let [storage-bytes (align16 (* 8 frame-slots))]
     (case target
       :x86-64
-      (let [frame-bytes (+ storage-bytes (if (= :all-vregs frame-policy) 8 0))]
+      (let [frame-bytes (+ storage-bytes (if (call-frame-policy? frame-policy) 8 0))]
         {:frame-bytes frame-bytes
          :prologue (x86-adjust-stack 0xec frame-bytes)
          :return-suffix (vec (concat (x86-adjust-stack 0xc4 frame-bytes) [0xc3]))})
 
       :aarch64
-      (if (= :all-vregs frame-policy)
+      (if (call-frame-policy? frame-policy)
         {:frame-bytes storage-bytes
          :prologue (vec (concat (u32le 0xa9bf7bfd) (u32le 0x910003fd)
                                 (a64-adjust-stack 0xd10003ff storage-bytes)))
