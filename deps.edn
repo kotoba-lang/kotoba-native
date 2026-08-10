@@ -11,10 +11,10 @@
          :git/sha "550d9b96919d6d4ba96cb0b55b59d11a20c5c00c"}
         io.github.kotoba-lang/kotoba-codegen
         {:git/url "https://github.com/kotoba-lang/kotoba-codegen.git"
-         :git/sha "59f41f5c5388278d49349285c1ae0860d9438b23"}
+         :git/sha "393d00f778e3774796025f9a81e8c029e6beac68"}
         io.github.kotoba-lang/kotoba-object
         {:git/url "https://github.com/kotoba-lang/kotoba-object.git"
-         :git/sha "76bfdc66ca0b54df69246e2884179bdecefe41e0"}
+         :git/sha "a97bb8d83ec24acfb3c79503928f49b4067fe7b5"}
         io.github.kotoba-lang/artifact
         {:git/url "https://github.com/kotoba-lang/artifact.git"
          :git/sha "af43fc8fa43edb12361828e26456f75b12ab40be"}}
