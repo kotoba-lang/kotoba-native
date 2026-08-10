@@ -80,7 +80,9 @@ integer/boolean literals, up to five parameters, lexical `let`, `+`, `-`, `*`,
 `quot`, bitwise operations, signed comparisons, scalar predicates, ordered
 non-empty `do`, and nested tail `if`, with deterministic spilling. `do` keeps
 every intermediate expression in source order, including unused operations
-that may trap; only its final value is returned. Other typed KIR expression
+that may trap; only its final value is returned. When that final expression is
+tail control, `do` delegates it to tail lowering after emitting every scalar
+prefix, so both arms return directly without a synthetic merge. Other typed KIR expression
 families remain on the established emitter and migrate incrementally.
 
 `kotoba-object` owns the target-neutral ELF64 record encoders. This repository

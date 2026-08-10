@@ -202,6 +202,14 @@
 
             (tail [form env]
               (cond
+                (and (seq? form) (= 'do (first form)) (next form))
+                (let [expressions (vec (rest form))
+                      prefix (pop expressions)
+                      prefix-code (mapcat (fn [expression]
+                                            (first (value expression env)))
+                                          prefix)]
+                  (into (vec prefix-code) (tail (peek expressions) env)))
+
                 (and (seq? form) (= 'if (first form)) (= 4 (count form)))
                 (let [[test-code test] (value (second form) env)
                       else-label (fresh-label "if-else")]
@@ -266,6 +274,10 @@
                        (every? #(value? % env) (rest form)))))
             (tail? [form env]
               (or (value? form env)
+                  (and (seq? form) (= 'do (first form)) (next form)
+                       (let [expressions (vec (rest form))]
+                         (and (every? #(value? % env) (pop expressions))
+                              (tail? (peek expressions) env))))
                   (and (seq? form) (= 'if (first form)) (= 4 (count form))
                        (value? (second form) env)
                        (tail? (nth form 2) env)

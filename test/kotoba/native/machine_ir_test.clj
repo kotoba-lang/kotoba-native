@@ -192,6 +192,28 @@
   (is (not (machine/pilot-expression? [] '(do)))
       "empty do has nil semantics and is outside the scalar i64 contract"))
 
+(deftest ordered-do-can-delegate-its-final-expression-to-tail-control
+  (let [form '(do (+ a 1) (quot a b) (if (< a b) 11 22))
+        instructions (:gmir/instructions
+                      (machine/lower-kir-expression ['a 'b] form))
+        operations (mapv :gmir/op instructions)]
+    (is (machine/pilot-expression? ['a 'b] form))
+    (is (< (.indexOf operations :gmir/add)
+           (.indexOf operations :gmir/quotient)
+           (.indexOf operations :gmir/less-than)
+           (.indexOf operations :gmir/branch-zero))
+        "prefix effects and traps execute before the tail condition")
+    (is (= 2 (count (filter #(= :gmir/return %) operations)))
+        "both tail arms return without a synthetic merge")
+    (doseq [target [:x86-64 :aarch64]]
+      (is (seq (machine/compile-expression target ['a 'b] form)) target)))
+  (is (machine/pilot-expression? ['a]
+                                 '(do (do (+ a 1))
+                                      (if a (do 11) (do 22)))))
+  (is (not (machine/pilot-expression? ['a]
+                                      '(do (if a 1 2) 3)))
+      "a non-final if remains outside value lowering and cannot be reordered"))
+
 (deftest final-layout-resolves-branches-after-selected-instruction-sizes
   (let [x86 (machine/compile-expression :x86-64 ['p] '(if p 11 22))
         arm (machine/compile-expression :aarch64 ['p] '(if p 11 22))]
