@@ -276,7 +276,7 @@
 (def ^:private x86-arguments [:x86-64/rdi :x86-64/rsi :x86-64/rdx :x86-64/rcx :x86-64/r8])
 (def ^:private aarch64-register-code
   {:aarch64/x0 0 :aarch64/x1 1 :aarch64/x2 2 :aarch64/x3 3
-   :aarch64/x4 4})
+   :aarch64/x4 4 :aarch64/x16 16})
 
 (defn- byte-value [n] (bit-and (unchecked-int n) 0xff))
 
@@ -414,6 +414,33 @@
                        (bit-shift-left (a64-register left) 5)))
         (u32le (bit-or cset (a64-register dst))))))
 
+(defn- a64-quotient [dst left right]
+  ;; AArch64 SDIV returns zero on division by zero and wraps MIN/-1; KIR traps
+  ;; on both. x16 is an ABI scratch register outside MIR's allocated profile.
+  ;; The fixed local branches are word-relative and stay inside this selected
+  ;; instruction, so final label layout cannot invalidate them.
+  (vec (concat
+        ;; cbz right, trap (+15 instructions)
+        (u32le (bit-or 0xb4000000 (bit-shift-left 15 5)
+                       (a64-register right)))
+        (a64-constant :aarch64/x16 #?(:clj Long/MIN_VALUE :cljs i64/min-i64))
+        ;; cmp left,x16; b.ne divide (+7 instructions)
+        (u32le (bit-or 0xeb00001f (bit-shift-left 16 16)
+                       (bit-shift-left (a64-register left) 5)))
+        (u32le (bit-or 0x54000001 (bit-shift-left 7 5)))
+        (a64-constant :aarch64/x16 -1)
+        ;; cmp right,x16; b.eq trap (+3 instructions)
+        (u32le (bit-or 0xeb00001f (bit-shift-left 16 16)
+                       (bit-shift-left (a64-register right) 5)))
+        (u32le (bit-or 0x54000000 (bit-shift-left 3 5)))
+        ;; divide; b done (+2 instructions); trap
+        (u32le (bit-or 0x9ac00c00
+                       (bit-shift-left (a64-register right) 16)
+                       (bit-shift-left (a64-register left) 5)
+                       (a64-register dst)))
+        (u32le (bit-or 0x14000000 2))
+        (u32le 0xd4200000))))
+
 (defn- encode-selected [isa frame-bytes {:mc/keys [encoding] :as instruction}]
   (case encoding
     :x86-64/argument
@@ -481,12 +508,11 @@
                    (bit-shift-left (a64-register (:mir/right instruction)) 16)
                    (bit-shift-left (a64-register (:mir/left instruction)) 5)
                    (a64-register (:mir/dst instruction))))
-    (:aarch64/subtract :aarch64/multiply :aarch64/quotient
+    (:aarch64/subtract :aarch64/multiply
      :aarch64/bit-and :aarch64/bit-or :aarch64/bit-xor)
     (let [base (case encoding
                  :aarch64/subtract 0xcb000000
                  :aarch64/multiply 0x9b007c00
-                 :aarch64/quotient 0x9ac00c00
                  :aarch64/bit-and 0x8a000000
                  :aarch64/bit-or 0xaa000000
                  :aarch64/bit-xor 0xca000000)]
@@ -494,6 +520,9 @@
                      (bit-shift-left (a64-register (:mir/right instruction)) 16)
                      (bit-shift-left (a64-register (:mir/left instruction)) 5)
                      (a64-register (:mir/dst instruction)))))
+    :aarch64/quotient
+    (a64-quotient (:mir/dst instruction) (:mir/left instruction)
+                  (:mir/right instruction))
     (:aarch64/equal :aarch64/less-than :aarch64/greater-than
      :aarch64/less-or-equal :aarch64/greater-or-equal)
     (a64-compare (case encoding

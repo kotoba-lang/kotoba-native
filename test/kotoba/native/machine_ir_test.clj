@@ -124,6 +124,14 @@
     (is (= 1 (count (filter #(= division-window %)
                             (partition (count division-window) 1 bytes)))))))
 
+(deftest aarch64-signed-division-explicitly-traps-kir-error-cases
+  (let [bytes (machine/compile-expression :aarch64 ['a 'b] '(quot a b))
+        words (mapv vec (partition 4 bytes))]
+    (is (= 1 (count (filter #(= [0x00 0x00 0x20 0xd4] %) words)))
+        "BRK is shared by the zero and MIN/-1 guards")
+    (is (some #(= [0x02 0x0c 0xc1 0x9a] %) words)
+        "the guarded operation remains sdiv x2,x0,x1 after allocation")))
+
 (deftest scalar-comparisons-and-predicates-reach-final-bytes-for-both-isas
   (doseq [form ['(= a b) '(< a b) '(> a b) '(<= a b) '(>= a b)
                 '(< a b 9) '(= a b 9)
