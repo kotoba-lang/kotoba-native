@@ -93,6 +93,15 @@ the existing parallel-copy scheduler with no allocation or phi frame. Escaping,
 nested, and non-scalar-field records remain on the established boxed/flattened
 path until their ABI is migrated explicitly.
 
+Non-escaping sealed variants whose case payloads are only `:i64` or `:bool`
+use the same extracted path without a stack aggregate. Construction creates an
+internal tag-and-payload SSA bundle, variant-valued `if` joins it with two
+phis, and `variant-match` becomes target-neutral tag comparison CFG while
+binding the payload register only in the selected source branch. Payload
+evaluation remains exactly once. Variant parameters/results, nested or
+non-scalar payloads, mismatched schemas, and bare escaping variant values stay
+on the established legacy path.
+
 Value-position scalar `if` uses GMIR/MIR v2 phi values. Each branch reaches an
 explicit predecessor exit. Single- and multi-phi joins lower through MIR's
 deterministic parallel-copy scheduler: acyclic edges use zero phi frame bytes,

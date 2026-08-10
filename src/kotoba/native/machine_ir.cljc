@@ -85,6 +85,25 @@
 (defn- record-value [type values]
   {:aggregate/kind :record :aggregate/type type :aggregate/values (vec values)})
 
+(defn- scalar-variant-cases [type]
+  (when (and (vector? type) (= 3 (count type)) (= :variant (first type))
+             (keyword? (second type)) (vector? (nth type 2))
+             (seq (nth type 2))
+             (every? #(and (vector? %) (= 2 (count %))
+                           (keyword? (first %))
+                           (contains? #{:i64 :bool} (second %)))
+                     (nth type 2))
+             (= (count (nth type 2))
+                (count (distinct (map first (nth type 2))))))
+    (nth type 2)))
+
+(defn- variant-value? [value]
+  (= :variant (:aggregate/kind value)))
+
+(defn- variant-value [type tag payload]
+  {:aggregate/kind :variant :aggregate/type type
+   :variant/tag tag :variant/payload payload})
+
 (defn- scalar-register! [value form]
   (if (gmir/vreg? value)
     value
@@ -100,7 +119,8 @@
 
   Admitted forms are integer/boolean literals, parameters, lexical `let`,
   ordered non-empty `do`, recursive scalar arithmetic/comparisons/predicates,
-  tail-position `if`, and fixed scalar-field records eliminated by SROA.
+  tail-position `if`, fixed scalar-field records, and non-escaping scalar
+  variants eliminated by SROA.
   Unsupported shapes fail closed rather than escaping to the legacy emitter."
   [params body]
   (when-not (and (vector? params) (every? symbol? params)
@@ -145,6 +165,26 @@
                              {:gmir/predecessor else-exit :gmir/value else-register}]})
                          destinations then-values else-values)
                    (record-value (:aggregate/type then-value) destinations)])
+
+                (and (variant-value? then-value) (variant-value? else-value)
+                     (= (:aggregate/type then-value)
+                        (:aggregate/type else-value)))
+                (let [tag-dst (fresh-reg)
+                      payload-dst (fresh-reg)]
+                  [[{:gmir/op :gmir/phi :gmir/dst tag-dst
+                     :gmir/incomings
+                     [{:gmir/predecessor then-exit
+                       :gmir/value (:variant/tag then-value)}
+                      {:gmir/predecessor else-exit
+                       :gmir/value (:variant/tag else-value)}]}
+                    {:gmir/op :gmir/phi :gmir/dst payload-dst
+                     :gmir/incomings
+                     [{:gmir/predecessor then-exit
+                       :gmir/value (:variant/payload then-value)}
+                      {:gmir/predecessor else-exit
+                       :gmir/value (:variant/payload else-value)}]}]
+                   (variant-value (:aggregate/type then-value)
+                                  tag-dst payload-dst)])
 
                 :else
                 (reject! :kir-to-gmir :branch-value-shape-mismatch
@@ -269,6 +309,63 @@
                              {:form form :field field}))
                   [record-code (nth (:aggregate/values aggregate) field-index)])
 
+                (and (seq? form) (= 'variant-new (first form)) (= 4 (count form)))
+                (let [type (second form)
+                      cases (or (scalar-variant-cases type)
+                                (reject! :kir-to-gmir :unsupported-variant-type
+                                         {:form form :type type}))
+                      tag (nth form 2)
+                      ordinal (first (keep-indexed
+                                      (fn [index [name _]]
+                                        (when (= name tag) index))
+                                      cases))]
+                  (when-not (some? ordinal)
+                    (reject! :kir-to-gmir :unknown-variant-case
+                             {:form form :case tag}))
+                  (let [tag-register (fresh-reg)
+                        [payload-code payload-value] (value (nth form 3) env)
+                        payload (scalar-register! payload-value form)]
+                    [(into [{:gmir/op :gmir/constant :gmir/dst tag-register
+                             :gmir/value ordinal}]
+                           payload-code)
+                     (variant-value type tag-register payload)]))
+
+                (and (seq? form) (= 'variant-match (first form)) (= 4 (count form)))
+                (let [type (second form)
+                      cases (or (scalar-variant-cases type)
+                                (reject! :kir-to-gmir :unsupported-variant-type
+                                         {:form form :type type}))
+                      branches (nth form 3)]
+                  (when-not (and (vector? branches)
+                                 (= (count cases) (count branches))
+                                 (every? #(and (vector? %) (= 3 (count %))
+                                               (keyword? (first %))
+                                               (symbol? (second %)))
+                                         branches)
+                                 (= (mapv first cases) (mapv first branches)))
+                    (reject! :kir-to-gmir :invalid-variant-branches
+                             {:form form :cases cases :branches branches}))
+                  (let [[variant-code aggregate] (value (nth form 2) env)]
+                    (when-not (and (variant-value? aggregate)
+                                   (= type (:aggregate/type aggregate)))
+                      (reject! :kir-to-gmir :variant-type-mismatch
+                               {:form form :expected type :actual aggregate}))
+                    (let [tag-symbol (gensym "$variant-tag-")
+                          payload-symbol (gensym "$variant-payload-")
+                          match-env (assoc env
+                                           tag-symbol [:local (:variant/tag aggregate)]
+                                           payload-symbol [:local (:variant/payload aggregate)])
+                          dispatch
+                          (reduce (fn [fallback [ordinal [_ binder body]]]
+                                    (list 'if (list '= tag-symbol ordinal)
+                                          (list 'let [binder payload-symbol] body)
+                                          fallback))
+                                  (let [[_ binder body] (peek branches)]
+                                    (list 'let [binder payload-symbol] body))
+                                  (reverse (map-indexed vector (pop branches))))
+                          [dispatch-code result] (value dispatch match-env)]
+                      [(into variant-code dispatch-code) result])))
+
                 (and (seq? form) (= 'if (first form)) (= 4 (count form)))
                 (let [[test-code test-value] (value (second form) env)
                       test (scalar-register! test-value form)
@@ -365,8 +462,8 @@
   "True only for the deliberately bounded production migration slice.
 
   Scalar arithmetic, comparisons, predicates, lexical `let`, ordered `do`,
-  recursive `if`, and fixed scalar-field record SROA use the extracted IR path;
-  allocation spills when necessary."
+  recursive `if`, fixed scalar-field record SROA, and non-escaping scalar
+  variant SROA use the extracted IR path; allocation spills when necessary."
   [params body]
   (let [parameters (set params)]
     (letfn [(shape [form env]
@@ -407,6 +504,33 @@
                   (when (and fields (= type (shape (nth form 2) env))
                              (some #(= (nth form 3) (first %)) fields))
                     :scalar))
+
+                (and (seq? form) (= 'variant-new (first form)) (= 4 (count form)))
+                (let [type (second form), cases (scalar-variant-cases type)
+                      tag (nth form 2)]
+                  (when (and cases
+                             (some #(= tag (first %)) cases)
+                             (= :scalar (shape (nth form 3) env)))
+                    type))
+
+                (and (seq? form) (= 'variant-match (first form)) (= 4 (count form)))
+                (let [type (second form), cases (scalar-variant-cases type)
+                      branches (nth form 3)]
+                  (when (and cases (= type (shape (nth form 2) env))
+                             (vector? branches)
+                             (= (count cases) (count branches))
+                             (every? #(and (vector? %) (= 3 (count %))
+                                           (keyword? (first %))
+                                           (symbol? (second %)))
+                                     branches)
+                             (= (mapv first cases) (mapv first branches)))
+                    (let [branch-shapes
+                          (mapv (fn [[_ binder branch]]
+                                  (shape branch (assoc env binder :scalar)))
+                                branches)]
+                      (when (and (every? some? branch-shapes)
+                                 (apply = branch-shapes))
+                        (first branch-shapes)))))
 
                 (and (seq? form) (= 'if (first form)) (= 4 (count form))
                      (= :scalar (shape (second form) env)))

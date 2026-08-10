@@ -72,6 +72,23 @@
      (+ (record-get [:record :test/pair [[:a :i64] [:b :i64]]] r :a)
         (record-get [:record :test/pair [[:a :i64] [:b :i64]]] r :b))))
 
+(def scalar-variant-type
+  [:variant :test/number-or-flag [[:number :i64] [:flag :bool]]])
+
+(def variant-sroa-form
+  '(let [v (if a
+             (variant-new [:variant :test/number-or-flag
+                           [[:number :i64] [:flag :bool]]]
+                          :number 41)
+             (variant-new [:variant :test/number-or-flag
+                           [[:number :i64] [:flag :bool]]]
+                          :flag false))]
+     (variant-match [:variant :test/number-or-flag
+                     [[:number :i64] [:flag :bool]]]
+                    v
+                    [[:number payload (+ payload 1)]
+                     [:flag payload (if payload 1 7)]])))
+
 (deftest closed-gmir-reaches-allocated-mc-for-both-targets
   (doseq [target [:x86-64 :aarch64]]
     (let [mc (machine/compile-gmir target program)]
@@ -370,6 +387,54 @@
     (is (thrown? clojure.lang.ExceptionInfo
                  (machine/lower-kir-expression
                   [] (list '+ (list 'record-new scalar-record-type 1 2) 3))))))
+
+(deftest scalar-variant-sroa-reaches-tag-payload-phis-and-dispatch
+  (is (machine/pilot-expression? ['a] variant-sroa-form))
+  (let [gmir (machine/lower-kir-expression ['a] variant-sroa-form)
+        instructions (:gmir/instructions gmir)
+        phis (filter #(= :gmir/phi (:gmir/op %)) instructions)]
+    (is (= 2 (:gmir/version gmir)))
+    (is (= 4 (count phis))
+        "tag and payload join independently; dispatch and branch result also join")
+    (is (= 1 (count (filter #(= :gmir/equal (:gmir/op %)) instructions))))
+    (is (= gmir (machine/lower-kir-expression ['a] variant-sroa-form)))
+    (doseq [target [:x86-64 :aarch64]]
+      (let [mc (machine/compile-gmir target gmir)]
+        (is (zero? (:mc/frame-slots mc)) target)
+        (is (seq (machine/encode-mc mc)) target)))))
+
+(deftest scalar-variant-payload-evaluates-once-even-when-branch-ignores-it
+  (let [form (list 'variant-match scalar-variant-type
+                   (list 'variant-new scalar-variant-type :number (list 'quot 1 0))
+                   [[:number 'payload 9] [:flag 'payload 8]])
+        operations (mapv :gmir/op
+                         (:gmir/instructions
+                          (machine/lower-kir-expression [] form)))]
+    (is (machine/pilot-expression? [] form))
+    (is (= 1 (count (filter #{:gmir/quotient} operations))))
+    (is (< (.indexOf operations :gmir/quotient)
+           (.indexOf operations :gmir/branch-zero)))))
+
+(deftest scalar-variant-sroa-fails-closed-outside-its-local-contract
+  (let [other [:variant :test/other [[:number :i64] [:flag :bool]]]
+        non-scalar [:variant :test/text [[:number :i64] [:text :string]]]]
+    (is (not (machine/pilot-expression?
+              [] (list 'variant-new scalar-variant-type :number 1))))
+    (is (not (machine/pilot-expression?
+              [] (list 'variant-match scalar-variant-type
+                       (list 'variant-new other :number 1)
+                       [[:number 'x 'x] [:flag 'x 0]]))))
+    (is (not (machine/pilot-expression?
+              [] (list 'variant-match non-scalar
+                       (list 'variant-new non-scalar :number 1)
+                       [[:number 'x 'x] [:text 'x 0]]))))
+    (is (not (machine/pilot-expression?
+              [] (list 'variant-match scalar-variant-type
+                       (list 'variant-new scalar-variant-type :number 1)
+                       [[:flag 'x 0] [:number 'x 'x]]))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (machine/lower-kir-expression
+                  [] (list '+ (list 'variant-new scalar-variant-type :number 1) 3))))))
 
 (deftest full-signed-i64-immediates-have-fixed-wire-bytes
   (is (= [0x48 0xb8 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0x7f 0xc3]
