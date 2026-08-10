@@ -1,5 +1,5 @@
 {:abi/id :kotoba.native/aggregate-boundary
- :abi/version 1
+ :abi/version 2
  :abi/word-bits 64
  :legacy/record
  {:boundary/parameters :pair-chain-handle
@@ -15,7 +15,7 @@
   :local-variant :scalar-replacement
   :record-boundary :held
   :variant-boundary :held
-  :call-admission :held
+  :call-admission :scalar-admitted
   :call-requires #{:per-function-frame
                    :spill-live-values-across-call
                    :parallel-argument-assignment

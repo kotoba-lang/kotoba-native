@@ -1377,7 +1377,13 @@
               (:string-literal token))))
 
 (defn emit-program [kir]
-  (let [;; See the x86-64 backend's `emit-program`: the export set is read
+  (if (machine-ir/pilot-module? kir)
+    (machine-ir/compile-kir-module
+     :aarch64 kir
+     (into {} (map (fn [{:keys [name]}]
+                     [name (vec fuel-charge-tokens)])
+                   (:functions kir))))
+    (let [;; See the x86-64 backend's `emit-program`: the export set is read
         ;; from the DECLARED functions, before the search helpers are appended.
         exported-names (set (or (:exports kir) (map :name (:functions kir))))
         functions (-> (:functions kir)
@@ -1407,4 +1413,4 @@
                    (contains? exported-names (:name function))
                    (assoc (:name function)
                           {:offset offset :length (count body) :arity (count (:params function))}))))
-        {:code (vec (concat code literal-bytes)) :exports exports}))))
+        {:code (vec (concat code literal-bytes)) :exports exports})))))

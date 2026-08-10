@@ -74,7 +74,8 @@ state and deterministic allocation. `kotoba.native.machine-ir` consumes those
 contracts and owns only the bounded KIR-to-GMIR producer, physical MC lowering,
 and x86-64/AArch64 encoding. Register exhaustion is represented by bounded MIR
 frame slots and encoded here as target stack-frame load/store instructions.
-Final layout and the allocated MC v2 schema are consumed from `kotoba-codegen`.
+Final layout and the allocated MC v2/v3 schemas are consumed from
+`kotoba-codegen`.
 The scalar/control subset is selected by the production emitters and covers
 integer/boolean literals, up to five parameters, lexical `let`, `+`, `-`, `*`,
 `quot`, bitwise operations, signed comparisons, scalar predicates, ordered
@@ -105,11 +106,18 @@ on the established legacy path.
 Function-boundary aggregates are described by the versioned portable contract
 in `resources/aggregate-abi.edn`. The established record ABI remains a single
 context-owned pair-chain handle with a 4,096-cell execution bound. Extracted
-calls remain held because the allocator uses only caller-clobbered registers
-and MC owns one shared frame rather than one frame per function. The contract
-names the frame, preservation, argument-copy, and return-register prerequisites;
-call-shaped KIR fails closed until all four are implemented and the contract is
-deliberately advanced.
+scalar calls are admitted by ABI v2: GMIR/MIR/MC v3 own a module of independent
+functions, and a call-containing function backs every vreg with its own bounded
+frame. Arguments load in parallel from stable slots into the five target ABI
+registers, every allocator register may be clobbered, and the return register is
+captured before later use. x86-64 adds an eight-byte call-alignment pad;
+AArch64 call functions save and restore FP/LR. The correctness-first all-vreg
+policy is deliberately conservative and can later be replaced by liveness-only
+spills without changing the v3 call contract.
+
+Extracted record and variant boundaries remain held. Scalar-call admission does
+not admit pair-chain handles, variants, nested aggregates, indirect calls,
+varargs, or external linkage, and it is not a Rust-parity claim.
 
 Value-position scalar `if` uses GMIR/MIR v2 phi values. Each branch reaches an
 explicit predecessor exit. Single- and multi-phi joins lower through MIR's

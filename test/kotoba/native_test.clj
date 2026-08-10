@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [kotoba.native.x86-64 :as x86]
             [kotoba.native.aarch64 :as arm]
+            [kotoba.native.machine-ir :as machine]
             [kotoba.native.elf64]))
 
 ;; Load gate: the split must not break namespace resolution. Each extracted
@@ -22,6 +23,24 @@
     (is (seq (:code a)))
     (is (= 0 (get-in x [:exports 'main :offset])))
     (is (= 0 (get-in a [:exports 'main :offset])))))
+
+(deftest production-backends-route-scalar-direct-calls-through-machine-ir
+  (let [kir {:format :kotoba.kir/v4 :exports ['main]
+             :functions
+             [{:name 'inc-one :params ['x] :result :i64 :body '(+ x 1)}
+              {:name 'main :params ['x] :result :i64
+               :body '(let [live 40] (+ live (inc-one x)))}]}
+        x (x86/emit-program kir)
+        a (arm/emit-program kir)]
+    (is (machine/pilot-module? kir))
+    (is (= x (x86/emit-program kir)))
+    (is (= a (arm/emit-program kir)))
+    (doseq [[target artifact] [[:x86-64 x] [:aarch64 a]]]
+      (is (= #{'main} (set (keys (:exports artifact)))) target)
+      (is (pos? (get-in artifact [:exports 'main :offset])) target)
+      (is (pos? (get-in artifact [:exports 'main :length])) target)
+      (is (= 1 (get-in artifact [:exports 'main :arity])) target)
+      (is (seq (:code artifact)) target))))
 
 ;; ── f64 scalar ops (ADR-2608030300 stage 1) ──────────────────────────────
 ;;

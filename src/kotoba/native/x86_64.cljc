@@ -1782,7 +1782,13 @@
               (:string-literal token))))
 
 (defn emit-program [kir]
-  (let [;; Export set from the DECLARED functions, before the search helpers
+  (if (machine-ir/pilot-module? kir)
+    (machine-ir/compile-kir-module
+     :x86-64 kir
+     (into {} (map (fn [{:keys [name]}]
+                     [name (vec (fuel-charge-tokens (atom -1)))])
+                   (:functions kir))))
+    (let [;; Export set from the DECLARED functions, before the search helpers
         ;; are appended: a program's public surface must not change because it
         ;; searched a string. (`:exports` is usually absent, in which case
         ;; every declared function is exported -- which is exactly why this
@@ -1819,4 +1825,4 @@
                    (contains? exported-names (:name function))
                    (assoc (:name function)
                           {:offset offset :length (count body) :arity (count (:params function))}))))
-        {:code (vec (concat code literal-bytes)) :exports exports}))))
+        {:code (vec (concat code literal-bytes)) :exports exports})))))
