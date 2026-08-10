@@ -164,3 +164,17 @@
            (subvec (:code (arm/emit-program kir))
                    (- (count (:code (arm/emit-program kir)))
                       (count arm-expression)))))))
+
+(deftest ordered-tail-do-production-path-has-no-legacy-epilogue
+  (let [params ['a 'b]
+        body '(do (+ a 1) (quot a b) (if (< a b) 11 22))
+        kir {:format :kotoba.kir/v4 :exports ['main]
+             :functions [{:name 'main :params params :result :i64 :body body}]}
+        x86-expression (machine/compile-expression :x86-64 params body)
+        arm-expression (machine/compile-expression :aarch64 params body)
+        x86-code (:code (x86/emit-program kir))
+        arm-code (:code (arm/emit-program kir))]
+    (is (= x86-expression
+           (subvec x86-code (- (count x86-code) (count x86-expression)))))
+    (is (= arm-expression
+           (subvec arm-code (- (count arm-code) (count arm-expression)))))))
