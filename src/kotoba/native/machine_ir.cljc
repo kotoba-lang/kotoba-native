@@ -16,32 +16,46 @@
   (throw (ex-info (str "machine IR rejected: " (name problem))
                   {:phase phase :problem problem :instruction instruction})))
 
+(defn- lower-mc-instructions [isa instructions]
+  (mapv (fn [{:mir/keys [op id test] :as instruction}]
+          (case op
+            :mir/label (layout/label id)
+            :mir/branch-zero
+            {:mc/op :mc/branch-zero :mc/test test
+             :mc/target (:mir/target instruction)}
+            :mir/jump
+            {:mc/op :mc/jump :mc/target (:mir/target instruction)}
+            (into {:mc/op :mc/instruction
+                   :mc/encoding (keyword (name isa) (name op))}
+                  (remove (fn [[k _]] (= k :mir/op)) instruction))))
+        instructions))
+
 (defn lower-mc
   "Lower allocated MIR to explicit MC instruction/layout data.
 
   Instruction bytes remain owned by the target encoders. Branches become the
   same layout tokens used by production backends, so PC-relative values cannot
   be baked before final sizes are known."
-  [{:mir/keys [target registers frame-slots instructions] :as program}]
+  [{:mir/keys [version target registers frame-slots instructions entry functions]
+    :as program}]
   (mir/validate! program)
   (when-not (= :physical registers)
     (reject! :mc :registers-not-allocated program))
   (mc/validate!
-   {:mc/version 2
-    :mc/target target
-    :mc/frame-slots (or frame-slots 0)
-    :mc/instructions
-    (mapv (fn [{:mir/keys [op id target test] :as instruction}]
-            (case op
-              :mir/label (layout/label id)
-              :mir/branch-zero
-              {:mc/op :mc/branch-zero :mc/test test :mc/target target}
-              :mir/jump
-              {:mc/op :mc/jump :mc/target target}
-              (into {:mc/op :mc/instruction
-                     :mc/encoding (keyword (name (:mir/target program)) (name op))}
-                    (remove (fn [[k _]] (= k :mir/op)) instruction))))
-          instructions)}))
+   (if (= 3 version)
+     {:mc/version 3
+      :mc/target target
+      :mc/entry entry
+      :mc/functions
+      (mapv (fn [{:mir/keys [name arity frame-slots frame-policy instructions]}]
+              {:mc/name name :mc/arity arity :mc/frame-slots frame-slots
+               :mc/frame-policy frame-policy
+               :mc/instructions (lower-mc-instructions target instructions)})
+            functions)}
+     {:mc/version 2
+      :mc/target target
+      :mc/frame-slots (or frame-slots 0)
+      :mc/instructions (lower-mc-instructions target instructions)})))
 
 (defn compile-gmir [target program]
   (->> program (mir/select-target target) mir/allocate-registers lower-mc))
@@ -123,11 +137,17 @@
   tail-position `if`, fixed scalar-field records, and non-escaping scalar
   variants eliminated by SROA.
   Unsupported shapes fail closed rather than escaping to the legacy emitter."
-  [params body]
-  (when-not (and (vector? params) (every? symbol? params)
-                 (= (count params) (count (distinct params))))
-    (reject! :kir-to-gmir :invalid-parameters {:params params}))
-  (let [next-reg (atom -1)
+  ([params body]
+   (lower-kir-expression params body {}))
+  ([params body signatures]
+   (when-not (and (vector? params) (every? symbol? params)
+                  (= (count params) (count (distinct params)))
+                  (map? signatures)
+                  (every? gmir/function-id? (keys signatures))
+                  (every? #(and (integer? %) (<= 0 % 5)) (vals signatures)))
+     (reject! :kir-to-gmir :invalid-parameters
+              {:params params :signatures signatures}))
+   (let [next-reg (atom -1)
         next-label (atom -1)
         fresh-reg #(gmir/vreg (swap! next-reg inc))
         fresh-label (fn [stem]
@@ -414,6 +434,21 @@
                   [(vec (mapcat first lowered))
                    (second (peek lowered))])
 
+                (and (seq? form) (contains? signatures (first form)))
+                (let [callee (first form)
+                      arguments (vec (rest form))
+                      expected (get signatures callee)]
+                  (when-not (= expected (count arguments))
+                    (reject! :kir-to-gmir :call-arity-mismatch
+                             {:form form :callee callee :expected expected}))
+                  (let [lowered (mapv #(value % env) arguments)
+                        registers (mapv #(scalar-register! (second %) form) lowered)
+                        dst (fresh-reg)]
+                    [(into (vec (mapcat first lowered))
+                           [{:gmir/op :gmir/call :gmir/dst dst
+                             :gmir/callee callee :gmir/arguments registers}])
+                     dst]))
+
                 (and (seq? form) (symbol? (first form)))
                 (aggregate-abi/reject-unextracted-call! form)
 
@@ -459,8 +494,11 @@
                       result (scalar-register! result-value form)]
                   (conj code {:gmir/op :gmir/return :gmir/value result}))))]
       (let [instructions (into parameter-code (tail body parameter-env))]
-        {:gmir/version (if (some #(= :gmir/phi (:gmir/op %)) instructions) 2 1)
-         :gmir/instructions instructions}))))
+        {:gmir/version (cond
+                         (some #(= :gmir/call (:gmir/op %)) instructions) 3
+                         (some #(= :gmir/phi (:gmir/op %)) instructions) 2
+                         :else 1)
+         :gmir/instructions instructions})))))
 
 (defn pilot-expression?
   "True only for the deliberately bounded production migration slice.
@@ -561,6 +599,54 @@
          (= (count params) (count parameters))
          (every? symbol? params)
          (= :scalar (shape body (zipmap params (repeat :scalar))))))))
+
+(defn lower-kir-module
+  "Lower the first closed multi-function KIR slice to GMIR v3. The module has
+  exactly one exported scalar entry; every function is scalar-only and direct
+  calls resolve against the module signature table."
+  [kir]
+  (let [functions (:functions kir)
+        exports (:exports kir)]
+    (when-not (and (vector? functions) (seq functions)
+                   (vector? exports) (= 1 (count exports))
+                   (every? #(and (map? %)
+                                 (gmir/function-id? (:name %))
+                                 (vector? (:params %))
+                                 (contains? #{nil :i64 :bool} (:result %)))
+                           functions))
+      (reject! :kir-to-gmir :unsupported-function-module kir))
+    (let [signatures (into {} (map (juxt :name #(count (:params %))) functions))
+          names (mapv :name functions)
+          entry (first exports)]
+      (when-not (and (= (count names) (count (distinct names)))
+                     (contains? signatures entry))
+        (reject! :kir-to-gmir :invalid-function-module
+                 {:entry entry :functions names}))
+      (gmir/validate!
+       {:gmir/version 3
+        :gmir/entry entry
+        :gmir/functions
+        (mapv (fn [{:keys [name params body]}]
+                (let [lowered (lower-kir-expression params body signatures)]
+                  {:gmir/name name
+                   :gmir/arity (count params)
+                   :gmir/instructions (:gmir/instructions lowered)}))
+              functions)}))))
+
+(defn pilot-module?
+  "True when a checked KIR module can use the extracted scalar-call pipeline.
+  At least one call is required so call-free programs retain their existing
+  per-expression migration route."
+  [kir]
+  (and *production-routing-enabled?*
+       (try
+         (let [module (lower-kir-module kir)]
+           (boolean
+            (some #(some (fn [instruction]
+                           (= :gmir/call (:gmir/op instruction)))
+                         (:gmir/instructions %))
+                  (:gmir/functions module))))
+         (catch #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) _ false))))
 
 ;; ── MC -> bytes ──────────────────────────────────────────────────────────────
 
@@ -767,7 +853,8 @@
         (u32le (bit-or 0x14000000 2))
         (u32le 0xd4200000))))
 
-(defn- encode-selected [isa frame-bytes {:mc/keys [encoding] :as instruction}]
+(defn- encode-selected
+  [isa frame-bytes return-suffix {:mc/keys [encoding] :as instruction}]
   (case encoding
     :x86-64/argument
     (let [dst (:mir/dst instruction)
@@ -823,8 +910,7 @@
     :x86-64/return
     (vec (concat (when-not (= :x86-64/rax (:mir/value instruction))
                    (x86-rr 0x89 :x86-64/rax (:mir/value instruction)))
-                 (x86-adjust-stack 0xc4 frame-bytes)
-                 [0xc3]))
+                 return-suffix))
 
     :aarch64/argument
     (let [dst (:mir/dst instruction)
@@ -874,64 +960,186 @@
     :aarch64/return
     (vec (concat (when-not (= :aarch64/x0 (:mir/value instruction))
                    (a64-mov :aarch64/x0 (:mir/value instruction)))
-                 (a64-adjust-stack 0x910003ff frame-bytes)
-                 (u32le 0xd65f03c0)))
+                 return-suffix))
     (reject! :mc-encode :unknown-encoding (assoc instruction :isa isa))))
 
+(defn- relative32 [opcode displacement]
+  (into [opcode] (mapv byte-value
+                       [displacement
+                        (unsigned-bit-shift-right displacement 8)
+                        (unsigned-bit-shift-right displacement 16)
+                        (unsigned-bit-shift-right displacement 24)])))
+
+(defn- encode-layout-branch [{:mir/keys [encoding operands]} displacement]
+  (case encoding
+    :x86-64/jz-rel32 (into [0x0f 0x84] (subvec (relative32 0 displacement) 1))
+    :x86-64/jmp-rel32 (relative32 0xe9 displacement)
+    :x86-64/call-rel32 (relative32 0xe8 displacement)
+    :x86-64/jne-rel8 [0x75 (byte-value displacement)]
+    :aarch64/cbz-imm19
+    (u32le (bit-or 0xb4000000
+                   (bit-shift-left (bit-and (quot displacement 4) 0x7ffff) 5)
+                   (first operands)))
+    :aarch64/b-imm26
+    (u32le (bit-or 0x14000000 (bit-and (quot displacement 4) 0x03ffffff)))
+    :aarch64/bl-imm26
+    (u32le (bit-or 0x94000000 (bit-and (quot displacement 4) 0x03ffffff)))
+    :aarch64/cbnz-x16-imm19
+    (u32le (bit-or 0xb5000010
+                   (bit-shift-left (bit-and (quot displacement 4) 0x7ffff) 5)))))
+
+(defn- size-of-token [token]
+  (or (layout/token-size token)
+      (when (and (integer? token) (<= 0 token 255)) 1)))
+
+(defn- resolve-layout [tokens]
+  (let [labels (layout/label-offsets tokens size-of-token)]
+    (layout/resolve-tokens tokens size-of-token labels encode-layout-branch
+                           (fn [token _] [token]))))
+
+(defn- instruction-tokens
+  [isa frame-bytes return-suffix callee-labels instructions]
+  (vec
+   (mapcat
+    (fn [{:mc/keys [op test] :as instruction}]
+      (if (layout/label-token? instruction)
+        [instruction]
+        (case op
+          :mc/instruction
+          (if (= "call" (name (:mc/encoding instruction)))
+            (let [callee (:mir/callee instruction)
+                  label (get callee-labels callee)]
+              (when-not label
+                (reject! :mc-encode :unknown-call-target instruction))
+              [(layout/relative-branch
+                (if (= :x86-64 isa)
+                  :x86-64/call-rel32 :aarch64/bl-imm26)
+                label)])
+            (encode-selected isa frame-bytes return-suffix instruction))
+          :mc/branch-zero
+          (if (= :x86-64 isa)
+            (concat (x86-rr 0x85 test test)
+                    [(layout/relative-branch :x86-64/jz-rel32
+                                             (:mc/target instruction))])
+            [(layout/relative-branch :aarch64/cbz-imm19
+                                     (:mc/target instruction)
+                                     [(a64-register test)])])
+          :mc/jump
+          [(layout/relative-branch
+            (if (= :x86-64 isa) :x86-64/jmp-rel32 :aarch64/b-imm26)
+            (:mc/target instruction))]
+          (reject! :mc-encode :unknown-operation instruction))))
+    instructions)))
+
+(defn- qualify-function-locals [function-index tokens]
+  (let [labels (->> tokens (filter layout/label-token?) (map :mir/id) set)
+        renamed (into {} (map (fn [id]
+                                [id (keyword (str "kotoba.native.local." function-index)
+                                             (str (namespace id) "." (name id)))])
+                              labels))]
+    (mapv (fn [token]
+            (cond
+              (layout/label-token? token) (assoc token :mir/id (get renamed (:mir/id token)))
+              (and (layout/relative-branch-token? token)
+                   (contains? renamed (:mir/target token)))
+              (assoc token :mir/target (get renamed (:mir/target token)))
+              :else token))
+          tokens)))
+
+(defn- function-frame [target frame-slots frame-policy]
+  (let [storage-bytes (align16 (* 8 frame-slots))]
+    (case target
+      :x86-64
+      (let [frame-bytes (+ storage-bytes (if (= :all-vregs frame-policy) 8 0))]
+        {:frame-bytes frame-bytes
+         :prologue (x86-adjust-stack 0xec frame-bytes)
+         :return-suffix (vec (concat (x86-adjust-stack 0xc4 frame-bytes) [0xc3]))})
+
+      :aarch64
+      (if (= :all-vregs frame-policy)
+        {:frame-bytes storage-bytes
+         :prologue (vec (concat (u32le 0xa9bf7bfd) (u32le 0x910003fd)
+                                (a64-adjust-stack 0xd10003ff storage-bytes)))
+         :return-suffix (vec (concat (a64-adjust-stack 0x910003ff storage-bytes)
+                                     (u32le 0xa8c17bfd) (u32le 0xd65f03c0)))}
+        {:frame-bytes storage-bytes
+         :prologue (a64-adjust-stack 0xd10003ff storage-bytes)
+         :return-suffix (vec (concat (a64-adjust-stack 0x910003ff storage-bytes)
+                                     (u32le 0xd65f03c0)))}))))
+
+(defn encode-mc-module
+  "Encode an allocated MC v3 module. PREFIXES is an optional function-name to
+  target-token map used by production fuel instrumentation; it participates in
+  the same final layout as frames, branches, and calls."
+  ([program] (encode-mc-module program {}))
+  ([{:mc/keys [target entry functions] :as program} prefixes]
+   (mc/validate! program)
+   (when-not (= 3 (:mc/version program))
+     (reject! :mc-encode :module-version-required program))
+   (let [callee-labels (into {}
+                             (map-indexed
+                              (fn [index {:mc/keys [name]}]
+                                [name (keyword "kotoba.native.function" (str index))])
+                              functions))
+         tokens
+         (vec
+          (mapcat
+           (fn [index {:mc/keys [name frame-slots frame-policy instructions]}]
+             (let [{:keys [frame-bytes prologue return-suffix]}
+                   (function-frame target frame-slots frame-policy)
+                   local (vec (concat (get prefixes name []) prologue
+                                      (instruction-tokens target frame-bytes return-suffix
+                                                          callee-labels instructions)))]
+               (into [(layout/label (get callee-labels name))]
+                     (qualify-function-locals index local))))
+           (range) functions))
+         labels (layout/label-offsets tokens size-of-token)
+         code (layout/resolve-tokens tokens size-of-token labels encode-layout-branch
+                                     (fn [token _] [token]))
+         function-offsets (mapv #(get labels (get callee-labels (:mc/name %))) functions)
+         entry-index (first (keep-indexed (fn [index function]
+                                           (when (= entry (:mc/name function)) index))
+                                         functions))
+         entry-offset (nth function-offsets entry-index)
+         entry-end (if (< (inc entry-index) (count function-offsets))
+                     (nth function-offsets (inc entry-index))
+                     (count code))
+         entry-arity (:mc/arity (nth functions entry-index))]
+     {:code code
+      :exports {entry {:offset entry-offset
+                       :length (- entry-end entry-offset)
+                       :arity entry-arity}}})))
+
 (defn encode-mc
-  "Encode a closed allocated MC program into final machine bytes."
-  [{:mc/keys [version target frame-slots instructions] :as program}]
+  "Encode a closed allocated MC v2 program into final machine bytes."
+  [{:mc/keys [target frame-slots instructions] :as program}]
   (mc/validate! program)
+  (when-not (= 2 (:mc/version program))
+    (reject! :mc-encode :flat-program-version-required program))
   (let [frame-bytes (align16 (* 8 frame-slots))
         prologue (if (= :x86-64 target)
                    (x86-adjust-stack 0xec frame-bytes)
                    (a64-adjust-stack 0xd10003ff frame-bytes))
-        tokens
-        (vec (concat prologue (mapcat
-              (fn [{:mc/keys [op test target] :as instruction}]
-                (if (layout/label-token? instruction)
-                  [instruction]
-                  (case op
-                    :mc/instruction (encode-selected (:mc/target program)
-                                                     frame-bytes instruction)
-                    :mc/branch-zero
-                    (if (= :x86-64 (:mc/target program))
-                      (concat (x86-rr 0x85 test test)
-                              [(layout/relative-branch :x86-64/jz-rel32 target)])
-                      [(layout/relative-branch :aarch64/cbz-imm19 target
-                                               [(a64-register test)])])
-                    :mc/jump
-                    [(layout/relative-branch
-                      (if (= :x86-64 (:mc/target program))
-                        :x86-64/jmp-rel32 :aarch64/b-imm26)
-                      target)]
-                    (reject! :mc-encode :unknown-operation instruction))))
-              instructions)))
-        size-of (fn [token]
-                  (or (layout/token-size token)
-                      (when (and (integer? token) (<= 0 token 255)) 1)))
-        labels (layout/label-offsets tokens size-of)]
-    (layout/resolve-tokens
-     tokens size-of labels
-     (fn [{:mir/keys [encoding operands]} displacement]
-       (case encoding
-         :x86-64/jz-rel32 (into [0x0f 0x84] (mapv byte-value
-                                                  [displacement
-                                                   (unsigned-bit-shift-right displacement 8)
-                                                   (unsigned-bit-shift-right displacement 16)
-                                                   (unsigned-bit-shift-right displacement 24)]))
-         :x86-64/jmp-rel32 (into [0xe9] (mapv byte-value
-                                              [displacement
-                                               (unsigned-bit-shift-right displacement 8)
-                                               (unsigned-bit-shift-right displacement 16)
-                                               (unsigned-bit-shift-right displacement 24)]))
-         :aarch64/cbz-imm19
-         (u32le (bit-or 0xb4000000
-                        (bit-shift-left (bit-and (quot displacement 4) 0x7ffff) 5)
-                        (first operands)))
-         :aarch64/b-imm26
-         (u32le (bit-or 0x14000000 (bit-and (quot displacement 4) 0x03ffffff)))))
-     (fn [token _] [token]))))
+        return-suffix (if (= :x86-64 target)
+                        (vec (concat (x86-adjust-stack 0xc4 frame-bytes) [0xc3]))
+                        (vec (concat (a64-adjust-stack 0x910003ff frame-bytes)
+                                     (u32le 0xd65f03c0))))]
+    (resolve-layout
+     (vec (concat prologue
+                  (instruction-tokens target frame-bytes return-suffix {}
+                                      instructions))))))
+
+(defn compile-kir-module
+  "End-to-end scalar direct-call slice: checked KIR module through GMIR v3,
+  MIR v3 allocation, MC v3 and final function/call layout."
+  ([target kir] (compile-kir-module target kir {}))
+  ([target kir prefixes]
+   (aggregate-abi/admit-extracted-call!
+    target #{:per-function-frame :spill-live-values-across-call
+             :parallel-argument-assignment :single-word-return-register})
+   (->> (lower-kir-module kir)
+        (compile-gmir target)
+        (#(encode-mc-module % prefixes)))))
 
 (defn compile-expression
   "End-to-end closed slice: KIR expression -> GMIR -> MIR -> RA -> MC -> bytes."

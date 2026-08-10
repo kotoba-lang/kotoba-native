@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted.
+Accepted. Scalar-call hold superseded by ADR 0017; aggregate holds remain.
 
 ## Context
 
@@ -52,9 +52,9 @@ The compiler now has an executable boundary between local SROA and external
 representation. Downstream verifier and Amu work can consume one EDN vocabulary
 instead of inferring ABI facts from target emitter comments.
 
-No new call or aggregate path is claimed. Existing record calls still allocate
-pair cells and retain the 4,096-cell execution bound. This change does not make
-the backend Rust-speed, define ownership/borrowing, or permit a Rust parity
-claim. The next implementation must first give GMIR/MIR per-function frame
-ownership and call-clobber-aware allocation, then prove scalar calls before the
-record boundary can move from `:held` to `:admitted`.
+At the time of this decision no new call or aggregate path was claimed. ADR
+0017 subsequently satisfied the four named prerequisites for scalar-only
+direct calls and advanced the contract to v2. Existing record calls still
+allocate pair cells and retain the 4,096-cell execution bound; extracted record
+and variant boundaries remain `:held`. Neither decision makes the backend
+Rust-speed, defines ownership/borrowing, or permits a Rust parity claim.

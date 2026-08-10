@@ -445,3 +445,59 @@
          (machine/compile-expression :aarch64 [] Long/MAX_VALUE)))
   (is (thrown? clojure.lang.ExceptionInfo
                (machine/compile-expression :x86-64 [] (inc (bigint Long/MAX_VALUE))))))
+
+(def scalar-call-kir
+  {:format :kotoba.kir/v4
+   :exports ['main]
+   :functions
+   [{:name 'add-one :params ['x] :result :i64 :body '(+ x 1)}
+    {:name 'main :params ['x] :result :i64
+     :body '(let [live 10] (+ live (add-one x)))}]})
+
+(deftest kir-module-lowers-to-versioned-function-and-call-ir
+  (is (machine/pilot-module? scalar-call-kir))
+  (let [gmir (machine/lower-kir-module scalar-call-kir)
+        call (first (filter #(= :gmir/call (:gmir/op %))
+                            (get-in gmir [:gmir/functions 1 :gmir/instructions])))]
+    (is (= 3 (:gmir/version gmir)))
+    (is (= 'main (:gmir/entry gmir)))
+    (is (= ['add-one 'main] (mapv :gmir/name (:gmir/functions gmir))))
+    (is (= 'add-one (:gmir/callee call)))
+    (is (= 1 (count (:gmir/arguments call))))
+    (doseq [target [:x86-64 :aarch64]]
+      (let [mc (machine/compile-gmir target gmir)
+            caller (second (:mc/functions mc))]
+        (is (= 3 (:mc/version mc)) target)
+        (is (= :all-vregs (:mc/frame-policy caller)) target)
+        (is (= 4 (:mc/frame-slots caller)) target)
+        (is (= 1 (count (filter #(= (keyword (name target) "call")
+                                     (:mc/encoding %))
+                                (:mc/instructions caller)))) target)))))
+
+(deftest scalar-call-module-reaches-final-target-layout-deterministically
+  (doseq [target [:x86-64 :aarch64]]
+    (let [first-result (machine/compile-kir-module target scalar-call-kir)
+          second-result (machine/compile-kir-module target scalar-call-kir)
+          code (:code first-result)
+          export (get-in first-result [:exports 'main])]
+      (is (= first-result second-result) target)
+      (is (seq code) target)
+      (is (pos? (:offset export)) target)
+      (is (pos? (:length export)) target)
+      (is (= 1 (:arity export)) target)
+      (is (if (= :x86-64 target)
+            (some #{0xe8} code)
+            (some #(= 0x94 (bit-and % 0xfc)) (take-nth 4 (drop 3 code))))
+          (str target " contains its direct-call opcode")))))
+
+(deftest scalar-call-module-boundary-fails-closed
+  (is (not (machine/pilot-module?
+            (assoc scalar-call-kir :exports ['main 'add-one]))))
+  (is (not (machine/pilot-module?
+            (assoc-in scalar-call-kir [:functions 1 :body] '(missing x)))))
+  (is (thrown? clojure.lang.ExceptionInfo
+               (machine/lower-kir-module
+                (assoc-in scalar-call-kir [:functions 1 :body] '(add-one x x)))))
+  (is (thrown? clojure.lang.ExceptionInfo
+               (machine/lower-kir-module
+                (assoc-in scalar-call-kir [:functions 0 :result] :string)))))

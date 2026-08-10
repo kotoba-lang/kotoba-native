@@ -42,27 +42,27 @@
       (is (contains? (set allocator-registers) return-register) target)))
   (is (thrown? clojure.lang.ExceptionInfo (abi/call-profile :riscv64))))
 
-(deftest extracted-call-admission-fails-closed
+(deftest scalar-call-admission-requires-all-versioned-guarantees
   (testing "missing preservation facts are named"
     (try
       (abi/admit-extracted-call! :x86-64 #{:per-function-frame})
-      (is false "call must remain held")
+      (is false "call must fail without every guarantee")
       (catch clojure.lang.ExceptionInfo error
         (is (= :missing-call-guarantees (:problem (ex-data error))))
         (is (= #{:spill-live-values-across-call
                  :parallel-argument-assignment
                  :single-word-return-register}
                (get-in (ex-data error) [:value :missing]))))))
-  (testing "even a complete assertion cannot flip a held contract"
-    (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo #"call-abi-not-admitted"
-         (abi/admit-extracted-call!
-          :aarch64
-          #{:per-function-frame
-            :spill-live-values-across-call
-            :parallel-argument-assignment
-            :single-word-return-register}))))
-  (testing "the production KIR producer reports the ABI boundary"
+  (testing "the complete scalar call proof returns the target profile"
+    (is (= :all-allocator-registers
+           (:call-clobbers
+            (abi/admit-extracted-call!
+             :aarch64
+             #{:per-function-frame
+               :spill-live-values-across-call
+               :parallel-argument-assignment
+               :single-word-return-register})))))
+  (testing "standalone expressions still report the module boundary"
     (try
       (machine/lower-kir-expression ['x] '(callee x))
       (is false "call-shaped KIR must not enter GMIR")

@@ -9,7 +9,7 @@
 
 (def contract
   {:abi/id :kotoba.native/aggregate-boundary
-   :abi/version 1
+   :abi/version 2
    :abi/word-bits 64
    :legacy/record
    {:boundary/parameters :pair-chain-handle
@@ -25,7 +25,7 @@
     :local-variant :scalar-replacement
     :record-boundary :held
     :variant-boundary :held
-    :call-admission :held
+    :call-admission :scalar-admitted
     :call-requires #{:per-function-frame
                      :spill-live-values-across-call
                      :parallel-argument-assignment
@@ -70,7 +70,7 @@
                (set (keys value)))
     (reject! :non-canonical-contract value))
   (when-not (and (= :kotoba.native/aggregate-boundary (:abi/id value))
-                 (= 1 (:abi/version value))
+                 (= 2 (:abi/version value))
                  (= 64 (:abi/word-bits value)))
     (reject! :unsupported-contract-version value))
   (let [record (:legacy/record value)]
@@ -94,6 +94,12 @@
                    :variant-boundary :call-admission :call-requires}
                  (set (keys extracted)))
       (reject! :invalid-extracted-boundary extracted))
+    (when-not (and (= :scalar-replacement (:local-record extracted))
+                   (= :scalar-replacement (:local-variant extracted))
+                   (= :held (:record-boundary extracted))
+                   (= :held (:variant-boundary extracted))
+                   (= :scalar-admitted (:call-admission extracted)))
+      (reject! :invalid-extracted-admission extracted))
     (when-not (= #{:per-function-frame
                    :spill-live-values-across-call
                    :parallel-argument-assignment
@@ -145,13 +151,15 @@
     (when (seq missing)
       (reject! :missing-call-guarantees
                {:target target :missing missing :profile profile}))
-    (when-not (= :admitted (get-in contract [:extracted :call-admission]))
+    (when-not (= :scalar-admitted
+                 (get-in contract [:extracted :call-admission]))
       (reject! :call-abi-not-admitted
                {:target target :required required :profile profile}))
     profile))
 
 (defn reject-unextracted-call!
-  "The current KIR-to-GMIR producer invokes this for call-shaped values."
+  "The standalone expression producer invokes this for call-shaped values.
+  Calls are admitted only inside a validated GMIR v3 function module."
   [form]
   (reject! :call-abi-not-admitted
            {:form form
