@@ -21,13 +21,14 @@
   Instruction bytes remain owned by the target encoders. Branches become the
   same layout tokens used by production backends, so PC-relative values cannot
   be baked before final sizes are known."
-  [{:mir/keys [target registers instructions] :as program}]
+  [{:mir/keys [target registers frame-slots instructions] :as program}]
   (mir/validate! program)
   (when-not (= :physical registers)
     (reject! :mc :registers-not-allocated program))
   (mc/validate!
-   {:mc/version 1
+   {:mc/version 2
     :mc/target target
+    :mc/frame-slots (or frame-slots 0)
     :mc/instructions
     (mapv (fn [{:mir/keys [op id target test] :as instruction}]
             (case op
@@ -103,9 +104,10 @@
 (defn pilot-expression?
   "True only for the deliberately bounded production migration slice.
 
-  Binary operands are atomic and `if` is tail-only, so the four-register v1
-  allocator cannot require a spill. This predicate selects the new pipeline;
-  every other already-supported expression remains on the legacy emitter."
+  Binary operands are atomic and `if` is tail-only, so this production slice
+  normally stays on the register-only fast path. The allocator can now spill,
+  while every other already-supported expression remains on the legacy emitter
+  until its KIR-to-GMIR lowering is admitted explicitly."
   [params body]
   (let [parameters (set params)
         atomic? #(or (gmir/i64-value? %) (contains? parameters %))
@@ -145,6 +147,42 @@
 (defn- u32le [word]
   (mapv #(byte-value (unsigned-bit-shift-right word (* 8 %))) (range 4)))
 
+(defn- align16 [n]
+  (* 16 (quot (+ n 15) 16)))
+
+(declare a64-register)
+
+(defn- x86-stack-memory [opcode register slot]
+  (let [code (get x86-register-code register)
+        offset (* 8 slot)]
+    (when-not (some? code)
+      (reject! :mc-encode :unsupported-register {:register register}))
+    (vec (concat [(bit-or 0x48 (if (>= code 8) 4 0))
+                  opcode
+                  (bit-or 0x84 (bit-shift-left (bit-and code 7) 3))
+                  0x24]
+                 (u32le offset)))))
+
+(defn- x86-adjust-stack [opcode frame-bytes]
+  (if (zero? frame-bytes)
+    []
+    (vec (concat [0x48 0x81 opcode] (u32le frame-bytes)))))
+
+(defn- a64-adjust-stack [opcode frame-bytes]
+  (loop [remaining frame-bytes, out []]
+    (if (zero? remaining)
+      out
+      (let [chunk (min remaining 4080)]
+        (recur (- remaining chunk)
+               (into out (u32le (bit-or opcode
+                                        (bit-shift-left chunk 10)))))))))
+
+(defn- a64-stack-memory [opcode register slot]
+  (u32le (bit-or opcode
+                 (bit-shift-left slot 10)
+                 (bit-shift-left 31 5)
+                 (a64-register register))))
+
 (defn- x86-rr [opcode dst src]
   (let [d (get x86-register-code dst)
         s (get x86-register-code src)]
@@ -183,7 +221,7 @@
                  chunks
                  [0xd2800000 0xf2a00000 0xf2c00000 0xf2e00000]))))
 
-(defn- encode-selected [isa {:mc/keys [encoding] :as instruction}]
+(defn- encode-selected [isa frame-bytes {:mc/keys [encoding] :as instruction}]
   (case encoding
     :x86-64/argument
     (let [dst (:mir/dst instruction)
@@ -195,9 +233,14 @@
     (let [dst (:mir/dst instruction) left (:mir/left instruction) right (:mir/right instruction)]
       (vec (concat (when-not (= dst left) (x86-rr 0x89 dst left))
                    (x86-rr 0x01 dst right))))
+    :x86-64/spill-load
+    (x86-stack-memory 0x8b (:mir/dst instruction) (:mir/slot instruction))
+    :x86-64/spill-store
+    (x86-stack-memory 0x89 (:mir/src instruction) (:mir/slot instruction))
     :x86-64/return
     (vec (concat (when-not (= :x86-64/rax (:mir/value instruction))
                    (x86-rr 0x89 :x86-64/rax (:mir/value instruction)))
+                 (x86-adjust-stack 0xc4 frame-bytes)
                  [0xc3]))
 
     :aarch64/argument
@@ -212,23 +255,33 @@
                    (bit-shift-left (a64-register (:mir/right instruction)) 16)
                    (bit-shift-left (a64-register (:mir/left instruction)) 5)
                    (a64-register (:mir/dst instruction))))
+    :aarch64/spill-load
+    (a64-stack-memory 0xf9400000 (:mir/dst instruction) (:mir/slot instruction))
+    :aarch64/spill-store
+    (a64-stack-memory 0xf9000000 (:mir/src instruction) (:mir/slot instruction))
     :aarch64/return
     (vec (concat (when-not (= :aarch64/x0 (:mir/value instruction))
                    (a64-mov :aarch64/x0 (:mir/value instruction)))
+                 (a64-adjust-stack 0x910003ff frame-bytes)
                  (u32le 0xd65f03c0)))
     (reject! :mc-encode :unknown-encoding (assoc instruction :isa isa))))
 
 (defn encode-mc
   "Encode a closed allocated MC program into final machine bytes."
-  [{:mc/keys [version target instructions] :as program}]
+  [{:mc/keys [version target frame-slots instructions] :as program}]
   (mc/validate! program)
-  (let [tokens
-        (vec (mapcat
+  (let [frame-bytes (align16 (* 8 frame-slots))
+        prologue (if (= :x86-64 target)
+                   (x86-adjust-stack 0xec frame-bytes)
+                   (a64-adjust-stack 0xd10003ff frame-bytes))
+        tokens
+        (vec (concat prologue (mapcat
               (fn [{:mc/keys [op test target] :as instruction}]
                 (if (layout/label-token? instruction)
                   [instruction]
                   (case op
-                    :mc/instruction (encode-selected (:mc/target program) instruction)
+                    :mc/instruction (encode-selected (:mc/target program)
+                                                     frame-bytes instruction)
                     :mc/branch-zero
                     (if (= :x86-64 (:mc/target program))
                       (concat (x86-rr 0x85 test test)
@@ -241,7 +294,7 @@
                         :x86-64/jmp-rel32 :aarch64/b-imm26)
                       target)]
                     (reject! :mc-encode :unknown-operation instruction))))
-              instructions))
+              instructions)))
         size-of (fn [token]
                   (or (layout/token-size token)
                       (when (and (integer? token) (<= 0 token 255)) 1)))
