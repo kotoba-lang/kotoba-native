@@ -6,6 +6,7 @@
   (:require [kotoba.codegen.layout :as layout]
             [kotoba.native.machine-ir :as machine-ir]
             [kotoba.native.peephole :as peephole]
+            [kotoba.native.string-index :as string-index]
             [kotoba.native.string-search :as string-search]
             #?@(:cljs [[kotoba.kir.cljs-i64 :as i64]])))
 
@@ -1069,6 +1070,17 @@
         (and (= op 'string-replace-all) (= 3 (count args)))
         (emit-expr (string-search/lower-replace-all args) env depth)
 
+        (and (contains? '#{string-index-new string-index-count
+                           string-index-contains string-index-get
+                           string-index-assoc}
+                         op)
+             (= (count args)
+                (get '{string-index-new 0 string-index-count 1
+                       string-index-contains 2 string-index-get 2
+                       string-index-assoc 3}
+                     op)))
+        (emit-expr (string-index/lower op args) env depth)
+
         ;; An f64 vector operation IS the i64 one (see vector-op-aliases):
         ;; rewrite the head and re-dispatch, so there is exactly one lowering
         ;; per operation rather than two that must be kept in step.
@@ -1368,7 +1380,9 @@
   (let [;; See the x86-64 backend's `emit-program`: the export set is read
         ;; from the DECLARED functions, before the search helpers are appended.
         exported-names (set (or (:exports kir) (map :name (:functions kir))))
-        functions (string-search/augment-functions (:functions kir))
+        functions (-> (:functions kir)
+                      string-search/augment-functions
+                      string-index/augment-functions)
         token-bodies (binding [*function-names* (set (map :name functions))]
                        (mapv (fn [f] [f (emit-function f)]) functions))
         offsets (loop [items token-bodies offset 0 out {}]
