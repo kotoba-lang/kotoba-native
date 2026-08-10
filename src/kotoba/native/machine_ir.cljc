@@ -354,10 +354,15 @@
         [(+ 0x50 code)])))
 
 (defn- x86-quotient [dst left right]
-  (vec (concat (x86-push right)
+  ;; `cqo`/`idiv` use RDX:RAX implicitly. RDX can still hold an unrelated live
+  ;; allocated value, so preserve it independently of the explicit operands.
+  ;; Restore before copying RAX to `dst`, which also handles `dst = rdx`.
+  (vec (concat (x86-push :x86-64/rdx)
+               (x86-push right)
                (when-not (= :x86-64/rax left)
                  (x86-rr 0x89 :x86-64/rax left))
                [0x48 0x99 0x59 0x48 0xf7 0xf9]
+               [0x5a]
                (when-not (= dst :x86-64/rax)
                  (x86-rr 0x89 dst :x86-64/rax)))))
 
