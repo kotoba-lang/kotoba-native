@@ -178,3 +178,23 @@
            (subvec x86-code (- (count x86-code) (count x86-expression)))))
     (is (= arm-expression
            (subvec arm-code (- (count arm-code) (count arm-expression)))))))
+
+(deftest value-position-if-production-path-has-no-legacy-epilogue
+  (let [params ['a 'b]
+        body '(+ 1 (if a (* b 2) (- b 3)))
+        kir {:format :kotoba.kir/v4 :exports ['main]
+             :functions [{:name 'main :params params :result :i64 :body body}]}
+        x86-expression (machine/compile-expression :x86-64 params body)
+        arm-expression (machine/compile-expression :aarch64 params body)
+        x86-code (:code (x86/emit-program kir))
+        arm-code (:code (arm/emit-program kir))]
+    (is (= x86-expression
+           (subvec x86-code (- (count x86-code) (count x86-expression)))))
+    (is (= arm-expression
+           (subvec arm-code (- (count arm-code) (count arm-expression)))))
+    (is (= 1 (:mc/frame-slots
+              (machine/compile-gmir :x86-64
+                                    (machine/lower-kir-expression params body)))))
+    (is (= 1 (:mc/frame-slots
+              (machine/compile-gmir :aarch64
+                                    (machine/lower-kir-expression params body)))))))
