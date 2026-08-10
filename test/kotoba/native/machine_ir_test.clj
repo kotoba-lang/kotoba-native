@@ -111,6 +111,19 @@
   (is (machine/pilot-expression? ['a 'b]
                                  '(+ (* a 6) (bit-xor (- a b) 3)))))
 
+(deftest x86-signed-division-preserves-an-unrelated-live-rdx
+  (let [bytes (machine/compile-expression
+               :x86-64 [] '(+ (* 3 4) (quot 10 2)))
+        division-window [0x52             ; push rdx (live product)
+                         0x50             ; push rax (divisor)
+                         0x4c 0x89 0xc0   ; mov rax,r8 (dividend)
+                         0x48 0x99         ; cqo
+                         0x59             ; pop rcx (divisor)
+                         0x48 0xf7 0xf9   ; idiv rcx
+                         0x5a]]           ; pop rdx (live product)
+    (is (= 1 (count (filter #(= division-window %)
+                            (partition (count division-window) 1 bytes)))))))
+
 (deftest scalar-comparisons-and-predicates-reach-final-bytes-for-both-isas
   (doseq [form ['(= a b) '(< a b) '(> a b) '(<= a b) '(>= a b)
                 '(< a b 9) '(= a b 9)
