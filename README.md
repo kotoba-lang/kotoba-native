@@ -75,10 +75,11 @@ contracts and owns only the bounded KIR-to-GMIR producer, physical MC lowering,
 and x86-64/AArch64 encoding. Register exhaustion is represented by bounded MIR
 frame slots and encoded here as target stack-frame load/store instructions.
 Final layout and the allocated MC v2 schema are consumed from `kotoba-codegen`.
-The recursive i64 arithmetic/tail-if subset is selected by the production
-emitters and covers `+`, `-`, `*`, `quot`, `bit-and`, `bit-or`, and `bit-xor`
-with deterministic spilling. Other typed KIR expression families remain on the
-established emitter and migrate incrementally.
+The scalar/control subset is selected by the production emitters and covers
+integer/boolean literals, up to five parameters, lexical `let`, `+`, `-`, `*`,
+`quot`, bitwise operations, signed comparisons, scalar predicates, and nested
+tail `if`, with deterministic spilling. Other typed KIR expression families
+remain on the established emitter and migrate incrementally.
 
 `kotoba-object` owns the target-neutral ELF64 record encoders. This repository
 supplies the target-specific section layout, virtual addresses, relocation

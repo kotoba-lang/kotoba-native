@@ -38,8 +38,8 @@
 
 (def ^:private constant-rhs
   {:format :kotoba.kir/v4 :exports ['main]
-   ;; Nested addition stays outside the bounded GMIR production pilot, so this
-   ;; fixture continues to exercise the legacy emitter's peephole seam.
+   ;; These tests explicitly disable production routing so this fixture keeps
+   ;; exercising the legacy emitter's peephole seam during migration.
    :functions [{:name 'main :params [] :body '(+ (+ 3 4) 5)}]})
 
 (deftest x86-64-materializes-a-constant-operand-into-the-scratch-register

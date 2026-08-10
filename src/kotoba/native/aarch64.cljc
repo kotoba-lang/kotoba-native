@@ -1270,7 +1270,7 @@
                (box-record-tails body record-name)
                body)
         n (count params)]
-    (if (and (nil? result)
+    (if (and (contains? #{nil :i64 :bool} result)
              (machine-ir/pilot-expression? (vec params) source-body))
       (vec (concat fuel-charge-tokens
                    (machine-ir/compile-expression :aarch64 (vec params) source-body)))

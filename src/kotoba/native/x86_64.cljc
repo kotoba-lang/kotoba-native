@@ -1705,7 +1705,7 @@
                (box-record-tails body record-name)
                body)
         n (count params)]
-    (if (and (nil? result)
+    (if (and (contains? #{nil :i64 :bool} result)
              (machine-ir/pilot-expression? (vec params) source-body))
       (let [label-counter (atom -1)
             prologue (vec (fuel-charge-tokens label-counter))
