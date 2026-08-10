@@ -85,6 +85,14 @@ tail control, `do` delegates it to tail lowering after emitting every scalar
 prefix, so both arms return directly without a synthetic merge. Other typed KIR expression
 families remain on the established emitter and migrate incrementally.
 
+Non-escaping fixed records whose fields are only `:i64` or `:bool` use scalar
+replacement before GMIR. Construction evaluates every field in declaration
+order, bindings retain an ordered SSA bundle, projection selects one scalar,
+and record-valued `if` emits one phi per field. Acyclic field transport reaches
+the existing parallel-copy scheduler with no allocation or phi frame. Escaping,
+nested, and non-scalar-field records remain on the established boxed/flattened
+path until their ABI is migrated explicitly.
+
 Value-position scalar `if` uses GMIR/MIR v2 phi values. Each branch reaches an
 explicit predecessor exit. Single- and multi-phi joins lower through MIR's
 deterministic parallel-copy scheduler: acyclic edges use zero phi frame bytes,
