@@ -31,6 +31,37 @@
     {:gmir/op :gmir/label :gmir/id :test.label/zero}
     {:gmir/op :gmir/return :gmir/value v1}]})
 
+(def dual-phi-program
+  (let [[test then-a then-b else-a else-b join-a join-b result]
+        (mapv gmir/vreg (range 8))]
+    {:gmir/version 2
+     :gmir/instructions
+     [{:gmir/op :gmir/argument :gmir/dst test :gmir/index 0}
+      {:gmir/op :gmir/branch-zero :gmir/test test :gmir/target :test.label/else}
+      {:gmir/op :gmir/label :gmir/id :test.label/then}
+      {:gmir/op :gmir/constant :gmir/dst then-a :gmir/value 1}
+      {:gmir/op :gmir/constant :gmir/dst then-b :gmir/value 2}
+      {:gmir/op :gmir/label :gmir/id :test.label/then-exit}
+      {:gmir/op :gmir/jump :gmir/target :test.label/join}
+      {:gmir/op :gmir/label :gmir/id :test.label/else}
+      {:gmir/op :gmir/constant :gmir/dst else-a :gmir/value 3}
+      {:gmir/op :gmir/constant :gmir/dst else-b :gmir/value 4}
+      {:gmir/op :gmir/label :gmir/id :test.label/else-exit}
+      {:gmir/op :gmir/jump :gmir/target :test.label/join}
+      {:gmir/op :gmir/label :gmir/id :test.label/join}
+      {:gmir/op :gmir/phi :gmir/dst join-a
+       :gmir/incomings [{:gmir/predecessor :test.label/then-exit
+                         :gmir/value then-a}
+                        {:gmir/predecessor :test.label/else-exit
+                         :gmir/value else-a}]}
+      {:gmir/op :gmir/phi :gmir/dst join-b
+       :gmir/incomings [{:gmir/predecessor :test.label/then-exit
+                         :gmir/value then-b}
+                        {:gmir/predecessor :test.label/else-exit
+                         :gmir/value else-b}]}
+      {:gmir/op :gmir/add :gmir/dst result :gmir/left join-a :gmir/right join-b}
+      {:gmir/op :gmir/return :gmir/value result}]}))
+
 (deftest closed-gmir-reaches-allocated-mc-for-both-targets
   (doseq [target [:x86-64 :aarch64]]
     (let [mc (machine/compile-gmir target program)]
@@ -258,6 +289,22 @@
     (is (machine/pilot-expression? ['a 'b] form) form)
     (is (seq (machine/compile-expression :x86-64 ['a 'b] form)) form)
     (is (seq (machine/compile-expression :aarch64 ['a 'b] form)) form)))
+
+(deftest acyclic-dual-phi-uses-scheduled-moves-without-a-frame
+  (doseq [target [:x86-64 :aarch64]]
+    (let [mc (machine/compile-gmir target dual-phi-program)
+          encodings (mapv :mc/encoding (:mc/instructions mc))]
+      (is (zero? (:mc/frame-slots mc)) target)
+      (is (= 2 (count (filter #(= (keyword (name target) "move") %)
+                              encodings)))
+          target)
+      (is (not-any? #(contains? #{(keyword (name target) "spill-store")
+                                  (keyword (name target) "spill-load")}
+                                %)
+                    encodings)
+          target)
+      (is (seq (machine/encode-mc mc)) target)
+      (is (= mc (machine/compile-gmir target dual-phi-program)) target))))
 
 (deftest full-signed-i64-immediates-have-fixed-wire-bytes
   (is (= [0x48 0xb8 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0x7f 0xc3]
