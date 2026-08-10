@@ -102,6 +102,15 @@ evaluation remains exactly once. Variant parameters/results, nested or
 non-scalar payloads, mismatched schemas, and bare escaping variant values stay
 on the established legacy path.
 
+Function-boundary aggregates are described by the versioned portable contract
+in `resources/aggregate-abi.edn`. The established record ABI remains a single
+context-owned pair-chain handle with a 4,096-cell execution bound. Extracted
+calls remain held because the allocator uses only caller-clobbered registers
+and MC owns one shared frame rather than one frame per function. The contract
+names the frame, preservation, argument-copy, and return-register prerequisites;
+call-shaped KIR fails closed until all four are implemented and the contract is
+deliberately advanced.
+
 Value-position scalar `if` uses GMIR/MIR v2 phi values. Each branch reaches an
 explicit predecessor exit. Single- and multi-phi joins lower through MIR's
 deterministic parallel-copy scheduler: acyclic edges use zero phi frame bytes,
