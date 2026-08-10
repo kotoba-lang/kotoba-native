@@ -111,6 +111,17 @@
   (is (machine/pilot-expression? ['a 'b]
                                  '(+ (* a 6) (bit-xor (- a b) 3)))))
 
+(deftest parameters-are-materialized-before-expression-temporaries
+  ;; AArch64 passes arguments in the same x0-x4 register set used by this
+  ;; bounded allocator. If a constant is emitted first, it can overwrite an
+  ;; ABI argument before the later `:gmir/argument` instruction reads it.
+  (doseq [form ['(- a) '(+ 1 a) '(* 2 (+ 3 a))]]
+    (let [instructions (:gmir/instructions
+                        (machine/lower-kir-expression ['a] form))]
+      (is (= :gmir/argument (:gmir/op (first instructions))) form)
+      (is (= 0 (:gmir/index (first instructions))) form)
+      (is (seq (machine/compile-expression :aarch64 ['a] form)) form))))
+
 (deftest x86-signed-division-preserves-an-unrelated-live-rdx
   (let [bytes (machine/compile-expression
                :x86-64 [] '(+ (* 3 4) (quot 10 2)))
