@@ -77,9 +77,11 @@ frame slots and encoded here as target stack-frame load/store instructions.
 Final layout and the allocated MC v2 schema are consumed from `kotoba-codegen`.
 The scalar/control subset is selected by the production emitters and covers
 integer/boolean literals, up to five parameters, lexical `let`, `+`, `-`, `*`,
-`quot`, bitwise operations, signed comparisons, scalar predicates, and nested
-tail `if`, with deterministic spilling. Other typed KIR expression families
-remain on the established emitter and migrate incrementally.
+`quot`, bitwise operations, signed comparisons, scalar predicates, ordered
+non-empty `do`, and nested tail `if`, with deterministic spilling. `do` keeps
+every intermediate expression in source order, including unused operations
+that may trap; only its final value is returned. Other typed KIR expression
+families remain on the established emitter and migrate incrementally.
 
 `kotoba-object` owns the target-neutral ELF64 record encoders. This repository
 supplies the target-specific section layout, virtual addresses, relocation

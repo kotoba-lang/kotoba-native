@@ -1,5 +1,5 @@
 (ns kotoba.native.machine-ir
-  "Closed pilot contract for GMIR -> target MIR -> allocated MC data.
+  "Closed production contract for GMIR -> target MIR -> allocated MC data.
 
   The existing production emitters are migrated incrementally. This namespace
   makes the missing layers explicit without pretending arbitrary KIR is already
@@ -76,8 +76,9 @@
   "Lower a closed pure tail-expression subset to GMIR.
 
   Admitted forms are integer/boolean literals, parameters, lexical `let`,
-  recursive scalar arithmetic/comparisons/predicates, and tail-position `if`.
-  Unsupported shapes fail closed rather than escaping to the legacy emitter."
+  ordered non-empty `do`, recursive scalar arithmetic/comparisons/predicates,
+  and tail-position `if`. Unsupported shapes fail closed rather than escaping
+  to the legacy emitter."
   [params body]
   (when-not (and (vector? params) (every? symbol? params)
                  (= (count params) (count (distinct params))))
@@ -192,6 +193,11 @@
                       [body-code result] (value (nth form 2) bound-env)]
                   [(into code body-code) result])
 
+                (and (seq? form) (= 'do (first form)) (next form))
+                (let [lowered (mapv #(value % env) (rest form))]
+                  [(vec (mapcat first lowered))
+                   (second (peek lowered))])
+
                 :else (reject! :kir-to-gmir :unsupported-value {:form form})))
 
             (tail [form env]
@@ -229,8 +235,9 @@
 (defn pilot-expression?
   "True only for the deliberately bounded production migration slice.
 
-  Scalar arithmetic, comparisons, predicates, lexical `let`, and recursive
-  tail `if` use the extracted IR path; allocation spills when necessary."
+  Scalar arithmetic, comparisons, predicates, lexical `let`, ordered `do`,
+  and recursive tail `if` use the extracted IR path; allocation spills when
+  necessary."
   [params body]
   (let [parameters (set params)]
             (letfn [(value? [form env]
@@ -254,7 +261,9 @@
                          (if-let [[binding expression] (first bindings)]
                            (and (symbol? binding) (value? expression env)
                                 (recur (next bindings) (conj env binding)))
-                           (value? (nth form 2) env))))))
+                           (value? (nth form 2) env))))
+                  (and (seq? form) (= 'do (first form)) (next form)
+                       (every? #(value? % env) (rest form)))))
             (tail? [form env]
               (or (value? form env)
                   (and (seq? form) (= 'if (first form)) (= 4 (count form))

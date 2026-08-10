@@ -169,6 +169,29 @@
     (is (seq (machine/compile-expression :x86-64 ['a 'b 'c 'd 'e] form)) form)
     (is (seq (machine/compile-expression :aarch64 ['a 'b 'c 'd 'e] form)) form)))
 
+(deftest ordered-do-reaches-production-ir-without-dropping-traps
+  (let [form '(do (+ a 1) (quot a b) (* a b))
+        instructions (:gmir/instructions
+                      (machine/lower-kir-expression ['a 'b] form))
+        operations (mapv :gmir/op instructions)
+        x86 (machine/compile-expression :x86-64 ['a 'b] form)
+        arm (machine/compile-expression :aarch64 ['a 'b] form)]
+    (is (machine/pilot-expression? ['a 'b] form))
+    (is (< (.indexOf operations :gmir/add)
+           (.indexOf operations :gmir/quotient)
+           (.indexOf operations :gmir/multiply))
+        "all do forms retain source evaluation order")
+    (is (= :gmir/return (last operations)))
+    (is (= 1 (count (filter #(= [0x48 0xf7 0xf9] %)
+                            (partition 3 1 x86))))
+        "an unused x86 quotient still executes and can trap")
+    (is (= 1 (count (filter #(= [0x00 0x00 0x20 0xd4] %)
+                            (partition 4 arm))))
+        "an unused AArch64 quotient retains the shared BRK guards"))
+  (is (machine/pilot-expression? [] '(do 1)))
+  (is (not (machine/pilot-expression? [] '(do)))
+      "empty do has nil semantics and is outside the scalar i64 contract"))
+
 (deftest final-layout-resolves-branches-after-selected-instruction-sizes
   (let [x86 (machine/compile-expression :x86-64 ['p] '(if p 11 22))
         arm (machine/compile-expression :aarch64 ['p] '(if p 11 22))]

@@ -148,3 +148,19 @@
     (is (= arm-expression (subvec arm-code (- (count arm-code)
                                                (count arm-expression))))
         "the fifth AArch64 argument is admitted by the same production path")))
+
+(deftest ordered-do-production-path-has-no-legacy-epilogue
+  (let [params ['a 'b]
+        body '(do (+ a 1) (quot a b) (* a b))
+        kir {:format :kotoba.kir/v4 :exports ['main]
+             :functions [{:name 'main :params params :result :i64 :body body}]}
+        x86-expression (machine/compile-expression :x86-64 params body)
+        arm-expression (machine/compile-expression :aarch64 params body)]
+    (is (= x86-expression
+           (subvec (:code (x86/emit-program kir))
+                   (- (count (:code (x86/emit-program kir)))
+                      (count x86-expression)))))
+    (is (= arm-expression
+           (subvec (:code (arm/emit-program kir))
+                   (- (count (:code (arm/emit-program kir)))
+                      (count arm-expression)))))))
