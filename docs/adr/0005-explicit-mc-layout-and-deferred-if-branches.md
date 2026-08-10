@@ -93,9 +93,9 @@ contract.
   windows and the layout pass recomputes downstream branches.
 - `kotoba.native.machine-ir` now supplies a closed production slice with
   target-independent GMIR, target MIR, virtual registers, deterministic
-  allocation, physical-register MC, and final byte encoding. Broader KIR
-  coverage and spilling remain incremental work rather than implicit fallback
-  inside this contract.
+  allocation, bounded stack-slot spills, physical-register MC, and final byte
+  encoding. Broader KIR coverage remains incremental work rather than implicit
+  fallback inside this contract.
 
 ## Verification
 

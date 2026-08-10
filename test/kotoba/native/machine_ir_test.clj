@@ -7,6 +7,19 @@
 (def v1 (gmir/vreg 1))
 (def v2 (gmir/vreg 2))
 
+(def spill-program
+  (let [registers (mapv gmir/vreg (range 6))]
+    {:gmir/version 1
+     :gmir/instructions
+     (vec (concat
+           (map-indexed (fn [index register]
+                          {:gmir/op :gmir/constant :gmir/dst register
+                           :gmir/value index})
+                        registers)
+           [{:gmir/op :gmir/add :gmir/dst (gmir/vreg 6)
+             :gmir/left (first registers) :gmir/right (last registers)}
+            {:gmir/op :gmir/return :gmir/value (gmir/vreg 6)}]))}))
+
 (def program
   {:gmir/version 1
    :gmir/instructions
@@ -55,6 +68,24 @@
     (is (thrown? clojure.lang.ExceptionInfo
                  (machine/encode-mc
                   (assoc-in mc [:mc/instructions 0 :ambient/policy] true))))))
+
+(deftest exhausted-register-profile-encodes-bounded-spills-for-both-isas
+  (let [x86-mc (machine/compile-gmir :x86-64 spill-program)
+        arm-mc (machine/compile-gmir :aarch64 spill-program)
+        x86 (machine/encode-mc x86-mc)
+        arm (machine/encode-mc arm-mc)]
+    (is (= 7 (:mc/frame-slots x86-mc)))
+    (is (= 7 (:mc/frame-slots arm-mc)))
+    (is (= [0x48 0x81 0xec 0x40 0x00 0x00 0x00]
+           (subvec x86 0 7)))
+    (is (= [0x48 0x89 0x84 0x24 0x00 0x00 0x00 0x00]
+           (subvec x86 17 25)))
+    (is (= [0x48 0x81 0xc4 0x40 0x00 0x00 0x00 0xc3]
+           (subvec x86 (- (count x86) 8))))
+    (is (= [0xff 0x03 0x01 0xd1] (subvec arm 0 4)))
+    (is (= [0xe0 0x03 0x00 0xf9] (subvec arm 20 24)))
+    (is (= [0xff 0x03 0x01 0x91 0xc0 0x03 0x5f 0xd6]
+           (subvec arm (- (count arm) 8))))))
 
 (deftest kir-expression-slice-encodes-final-bytes-for-both-isas
   (is (= [0x48 0x89 0xf8             ; mov rax,rdi

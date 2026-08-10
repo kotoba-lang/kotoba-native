@@ -72,7 +72,9 @@ no architectural NOP padding. Final layout recomputes every affected branch.
 `kotoba-mir` owns target selection plus explicit virtual/physical register
 state and deterministic allocation. `kotoba.native.machine-ir` consumes those
 contracts and owns only the bounded KIR-to-GMIR producer, physical MC lowering,
-and x86-64/AArch64 encoding. Final layout is consumed from `kotoba-codegen`.
+and x86-64/AArch64 encoding. Register exhaustion is represented by bounded MIR
+frame slots and encoded here as target stack-frame load/store instructions.
+Final layout and the allocated MC v2 schema are consumed from `kotoba-codegen`.
 The atomic-add/tail-if subset is selected
 by the production emitters and has cross-ISA real-process coverage. Other KIR
 expression families remain on the established emitter and migrate
