@@ -46,6 +46,16 @@
                   {:gmir/version 1
                    :gmir/instructions [{:gmir/op :gmir/magic}]})))))
 
+(deftest shared-mc-contract-gates-the-target-encoder
+  (let [mc (machine/compile-gmir :x86-64 program)]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (machine/encode-mc
+                  (assoc-in mc [:mc/instructions 0 :mc/encoding]
+                            :aarch64/argument))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (machine/encode-mc
+                  (assoc-in mc [:mc/instructions 0 :ambient/policy] true))))))
+
 (deftest kir-expression-slice-encodes-final-bytes-for-both-isas
   (is (= [0x48 0x89 0xf8             ; mov rax,rdi
           0x48 0x89 0xf1             ; mov rcx,rsi

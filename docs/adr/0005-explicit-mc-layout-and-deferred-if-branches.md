@@ -74,7 +74,10 @@ The in-repository pilot satisfied the extraction gate. `kotoba-gmir` now owns
 the target-independent closed contract and `kotoba-mir` owns target selection,
 explicit allocation state, and deterministic register allocation.
 `kotoba-native` remains their first production consumer and owns KIR-to-GMIR
-lowering, MC/layout, byte encoding, and ELF emission.
+lowering, target instruction selection, byte encoding, and ELF emission.
+`kotoba-codegen` owns the closed allocated MC program schema and final layout;
+native validates at both selection and encoding boundaries through that shared
+contract.
 
 ## Consequences
 
