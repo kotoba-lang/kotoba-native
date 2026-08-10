@@ -584,6 +584,10 @@
     (x86-stack-memory 0x8b (:mir/dst instruction) (:mir/slot instruction))
     :x86-64/spill-store
     (x86-stack-memory 0x89 (:mir/src instruction) (:mir/slot instruction))
+    :x86-64/move
+    (if (= (:mir/dst instruction) (:mir/src instruction))
+      []
+      (x86-rr 0x89 (:mir/dst instruction) (:mir/src instruction)))
     :x86-64/return
     (vec (concat (when-not (= :x86-64/rax (:mir/value instruction))
                    (x86-rr 0x89 :x86-64/rax (:mir/value instruction)))
@@ -631,6 +635,10 @@
     (a64-stack-memory 0xf9400000 (:mir/dst instruction) (:mir/slot instruction))
     :aarch64/spill-store
     (a64-stack-memory 0xf9000000 (:mir/src instruction) (:mir/slot instruction))
+    :aarch64/move
+    (if (= (:mir/dst instruction) (:mir/src instruction))
+      []
+      (a64-mov (:mir/dst instruction) (:mir/src instruction)))
     :aarch64/return
     (vec (concat (when-not (= :aarch64/x0 (:mir/value instruction))
                    (a64-mov :aarch64/x0 (:mir/value instruction)))
