@@ -226,10 +226,9 @@
 ;; ---------------------------------------------------------------------------
 
 (deftest aarch64-bitwise-operators-use-the-logical-shifted-register-encodings
-  ;; Rm=x1, Rn=x0, Rd=x0 -- the same operand placement the add/sub/mul cases
-  ;; beside them use. `mov-reg`'s own 0xaa0003e0 is the ORR base with Rn=xzr,
-  ;; which independently cross-checks the opcode bits below.
-  (doseq [[op word] {'bit-and 0x8a010000 'bit-or 0xaa010000 'bit-xor 0xca010000}]
+  ;; Rm=x1, Rn=x0, Rd=x2: the extracted allocator keeps both arguments live and
+  ;; assigns the result to x2 before the return move to x0.
+  (doseq [[op word] {'bit-and 0x8a010002 'bit-or 0xaa010002 'bit-xor 0xca010002}]
     (let [expected (mapv #(bit-and (unsigned-bit-shift-right word (* 8 %)) 0xff) (range 4))
           code (:code (arm/emit-program (program '[a b] (list op 'a 'b))))]
       (is (some #(= expected %) (partition 4 1 code))

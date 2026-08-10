@@ -1,8 +1,17 @@
 (ns kotoba.native.peephole-test
   (:require [clojure.test :refer [deftest is testing]]
             [kotoba.native.peephole :as peephole]
+            [kotoba.native.machine-ir :as machine-ir]
             [kotoba.native.x86-64 :as x86]
             [kotoba.native.aarch64 :as arm]))
+
+(defn- legacy-x86 [kir]
+  (binding [machine-ir/*production-routing-enabled?* false]
+    (x86/emit-program kir)))
+
+(defn- legacy-arm [kir]
+  (binding [machine-ir/*production-routing-enabled?* false]
+    (arm/emit-program kir)))
 
 ;; ---------------------------------------------------------------------------
 ;; Operand recognition
@@ -34,7 +43,7 @@
    :functions [{:name 'main :params [] :body '(+ (+ 3 4) 5)}]})
 
 (deftest x86-64-materializes-a-constant-operand-into-the-scratch-register
-  (let [code (:code (x86/emit-program constant-rhs))
+  (let [code (:code (legacy-x86 constant-rhs))
         window [0x48 0xb9 0x05 0x00 0x00 0x00 0x00 0x00 0x00 0x00]]
     (is (= 1 (count (filter #(= window %) (partition 10 1 code))))
         "the optimized window must appear exactly once, byte for byte")
@@ -44,7 +53,7 @@
         "no spill/reload round trip may survive for a constant operand")))
 
 (deftest aarch64-materializes-a-constant-operand-into-the-scratch-register
-  (let [code (:code (arm/emit-program constant-rhs))
+  (let [code (:code (legacy-arm constant-rhs))
         ;; movz x1,#5 ; movk x1,#0,lsl 16 ; lsl 32 ; lsl 48.
         window (concat [0xa1 0x00 0x80 0xd2] [0x01 0x00 0xa0 0xf2]
                        [0x01 0x00 0xc0 0xf2] [0x01 0x00 0xe0 0xf2])]
@@ -53,9 +62,9 @@
 
 (deftest optimized-windows-reclaim-the-spill-and-reload-bytes
   (testing "x86-64 reclaims push/mov/pop (5 bytes)"
-    (is (= 58 (count (:code (x86/emit-program constant-rhs))))))
+    (is (= 58 (count (:code (legacy-x86 constant-rhs))))))
   (testing "AArch64 reclaims save/restore (20 bytes)"
-    (is (= 92 (count (:code (arm/emit-program constant-rhs)))))))
+    (is (= 92 (count (:code (legacy-arm constant-rhs)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; What the verifier actually requires
@@ -73,16 +82,16 @@
   ;; so a pass that was nondeterministic would not merely be untidy -- it would
   ;; make every artifact it touched unverifiable.
   (doseq [kir [constant-rhs branch-heavy]]
-    (is (= (x86/emit-program kir) (x86/emit-program kir)))
-    (is (= (arm/emit-program kir) (arm/emit-program kir)))
-    (is (apply = (repeatedly 5 #(:code (x86/emit-program kir)))))
-    (is (apply = (repeatedly 5 #(:code (arm/emit-program kir)))))))
+    (is (= (legacy-x86 kir) (legacy-x86 kir)))
+    (is (= (legacy-arm kir) (legacy-arm kir)))
+    (is (apply = (repeatedly 5 #(:code (legacy-x86 kir)))))
+    (is (apply = (repeatedly 5 #(:code (legacy-arm kir)))))))
 
 (deftest branch-displacements-still-span-optimized-windows
   ;; A branch whose arms contain shortened windows must still be emitted,
   ;; deterministic, and keep both arms present.
-  (let [x (x86/emit-program branch-heavy)
-        a (arm/emit-program branch-heavy)]
+  (let [x (legacy-x86 branch-heavy)
+        a (legacy-arm branch-heavy)]
     (is (seq (:code x)))
     (is (seq (:code a)))
     (is (= 0 (get-in x [:exports 'main :offset])))

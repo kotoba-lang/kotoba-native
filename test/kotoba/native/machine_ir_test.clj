@@ -99,6 +99,17 @@
           0xc0 0x03 0x5f 0xd6]      ; ret
          (machine/compile-expression :aarch64 ['a 'b] '(+ a b)))))
 
+(deftest recursive-i64-arithmetic-reaches-final-bytes-for-both-isas
+  (doseq [form ['(- a b) '(* a b) '(quot a b)
+                '(bit-and a b) '(bit-or a b) '(bit-xor a b)
+                '(+ (* a b) (- a b))]]
+    (is (seq (machine/compile-expression :x86-64 ['a 'b] form)) form)
+    (is (seq (machine/compile-expression :aarch64 ['a 'b] form)) form))
+  (is (= [0x02 0x00 0x01 0xcb 0xe0 0x03 0x02 0xaa 0xc0 0x03 0x5f 0xd6]
+         (machine/compile-expression :aarch64 ['a 'b] '(- a b))))
+  (is (machine/pilot-expression? ['a 'b]
+                                 '(+ (* a 6) (bit-xor (- a b) 3)))))
+
 (deftest final-layout-resolves-branches-after-selected-instruction-sizes
   (let [x86 (machine/compile-expression :x86-64 ['p] '(if p 11 22))
         arm (machine/compile-expression :aarch64 ['p] '(if p 11 22))]
@@ -111,7 +122,7 @@
 
 (deftest kir-to-gmir-boundary-rejects-unsupported-shapes
   (is (thrown? clojure.lang.ExceptionInfo
-               (machine/compile-expression :x86-64 ['a] '(* a 2))))
+               (machine/compile-expression :x86-64 ['a] '(< a 2))))
   (is (thrown? clojure.lang.ExceptionInfo
                (machine/compile-expression :aarch64 ['a] '(+ a (if a 1 2))))))
 
