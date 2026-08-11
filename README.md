@@ -71,7 +71,9 @@ no architectural NOP padding. Final layout recomputes every affected branch.
 `kotoba-gmir` now owns the closed target-independent GMIR contract and
 `kotoba-mir` owns target selection plus explicit virtual/physical register
 state and deterministic allocation, including liveness-minimal straight-line
-call frames and the explicit all-vreg fallback. `kotoba.native.machine-ir` consumes those
+call frames, parallel function-entry assignment for four live scalar
+parameters, and the explicit all-vreg fallback at five-live-parameter pressure.
+`kotoba.native.machine-ir` consumes those
 contracts and owns only the bounded KIR-to-GMIR producer, physical MC lowering,
 and x86-64/AArch64 encoding. Register exhaustion is represented by bounded MIR
 frame slots and encoded here as target stack-frame load/store instructions.

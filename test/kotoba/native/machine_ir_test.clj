@@ -8,17 +8,25 @@
 (def v2 (gmir/vreg 2))
 
 (def spill-program
-  (let [registers (mapv gmir/vreg (range 6))]
+  (let [registers (mapv gmir/vreg (range 11))]
     {:gmir/version 1
      :gmir/instructions
      (vec (concat
            (map-indexed (fn [index register]
                           {:gmir/op :gmir/constant :gmir/dst register
                            :gmir/value index})
-                        registers)
-           [{:gmir/op :gmir/add :gmir/dst (gmir/vreg 6)
-             :gmir/left (first registers) :gmir/right (last registers)}
-            {:gmir/op :gmir/return :gmir/value (gmir/vreg 6)}]))}))
+                        (subvec registers 0 6))
+           [{:gmir/op :gmir/add :gmir/dst (registers 6)
+             :gmir/left (registers 0) :gmir/right (registers 1)}
+            {:gmir/op :gmir/add :gmir/dst (registers 7)
+             :gmir/left (registers 2) :gmir/right (registers 3)}
+            {:gmir/op :gmir/add :gmir/dst (registers 8)
+             :gmir/left (registers 4) :gmir/right (registers 5)}
+            {:gmir/op :gmir/add :gmir/dst (registers 9)
+             :gmir/left (registers 6) :gmir/right (registers 7)}
+            {:gmir/op :gmir/add :gmir/dst (registers 10)
+             :gmir/left (registers 9) :gmir/right (registers 8)}
+            {:gmir/op :gmir/return :gmir/value (registers 10)}]))}))
 
 (def program
   {:gmir/version 1
@@ -93,9 +101,10 @@
   (doseq [target [:x86-64 :aarch64]]
     (let [mc (machine/compile-gmir target program)]
       (is (= target (:mc/target mc)))
-      (is (= :mc/branch-zero
-             (get-in mc [:mc/instructions 3 :mc/op])))
-      (is (= :mir/label (get-in mc [:mc/instructions 5 :mir/op])))
+      (is (= 1 (count (filter #(= :mc/branch-zero (:mc/op %))
+                             (:mc/instructions mc)))))
+      (is (= 1 (count (filter #(= :mir/label (:mir/op %))
+                             (:mc/instructions mc)))))
       (is (not-any? #(and (keyword? %)
                           (= "kotoba.gmir.vreg" (namespace %)))
                     (tree-seq coll? seq mc))))))
@@ -132,17 +141,22 @@
         arm-mc (machine/compile-gmir :aarch64 spill-program)
         x86 (machine/encode-mc x86-mc)
         arm (machine/encode-mc arm-mc)]
-    (is (= 7 (:mc/frame-slots x86-mc)))
-    (is (= 7 (:mc/frame-slots arm-mc)))
-    (is (= [0x48 0x81 0xec 0x40 0x00 0x00 0x00]
+    (is (= 11 (:mc/frame-slots x86-mc)))
+    (is (= 11 (:mc/frame-slots arm-mc)))
+    (doseq [mc [x86-mc arm-mc]]
+      (is (some #(= "spill-store" (some-> % :mc/encoding name))
+                (:mc/instructions mc)))
+      (is (some #(= "spill-load" (some-> % :mc/encoding name))
+                (:mc/instructions mc))))
+    (is (= [0x48 0x81 0xec 0x60 0x00 0x00 0x00]
            (subvec x86 0 7)))
-    (is (= [0x48 0x89 0x84 0x24 0x00 0x00 0x00 0x00]
-           (subvec x86 17 25)))
-    (is (= [0x48 0x81 0xc4 0x40 0x00 0x00 0x00 0xc3]
+    (is (= [0x48 0x81 0xc4 0x60 0x00 0x00 0x00 0xc3]
            (subvec x86 (- (count x86) 8))))
-    (is (= [0xff 0x03 0x01 0xd1] (subvec arm 0 4)))
-    (is (= [0xe0 0x03 0x00 0xf9] (subvec arm 20 24)))
-    (is (= [0xff 0x03 0x01 0x91 0xc0 0x03 0x5f 0xd6]
+    (is (= [0xc0 0x03 0x5f 0xd6]
+           (subvec arm (- (count arm) 4))))
+    (is (= [0xff 0x83 0x01 0xd1]
+           (subvec arm 0 4)))
+    (is (= [0xff 0x83 0x01 0x91 0xc0 0x03 0x5f 0xd6]
            (subvec arm (- (count arm) 8))))))
 
 (deftest kir-expression-slice-encodes-final-bytes-for-both-isas
@@ -301,7 +315,8 @@
             instructions (:mc/instructions mc)]
         (is (zero? (:mc/frame-slots mc)) target)
         (is (not-any? #(= :mir/phi (:mir/op %)) instructions) target)
-        (is (= 2 (count (filter #(= (keyword (name target) "move")
+        (is (= (if (= :x86-64 target) 3 2)
+               (count (filter #(= (keyword (name target) "move")
                                      (:mc/encoding %))
                                 instructions))) target)
         (is (not-any? #(contains? #{(keyword (name target) "spill-store")
@@ -322,7 +337,8 @@
     (let [mc (machine/compile-gmir target dual-phi-program)
           encodings (mapv :mc/encoding (:mc/instructions mc))]
       (is (zero? (:mc/frame-slots mc)) target)
-      (is (= 2 (count (filter #(= (keyword (name target) "move") %)
+      (is (= (if (= :x86-64 target) 3 2)
+             (count (filter #(= (keyword (name target) "move") %)
                               encodings)))
           target)
       (is (not-any? #(contains? #{(keyword (name target) "spill-store")
@@ -344,7 +360,8 @@
       (let [mc (machine/compile-gmir target gmir)
             encodings (keep :mc/encoding (:mc/instructions mc))]
         (is (zero? (:mc/frame-slots mc)) target)
-        (is (= 2 (count (filter #(= (keyword (name target) "move") %)
+        (is (= (if (= :x86-64 target) 3 2)
+               (count (filter #(= (keyword (name target) "move") %)
                                 encodings)))
             target)
         (is (not-any? #(contains? #{(keyword (name target) "spill-store")
@@ -454,6 +471,24 @@
     {:name 'main :params ['x] :result :i64
      :body '(let [live 10] (+ live (add-one x)))}]})
 
+(def four-argument-call-kir
+  {:format :kotoba.kir/v4
+   :exports ['main]
+   :functions
+   [{:name 'sum-four :params ['a 'b 'c 'd] :result :i64
+     :body '(+ (+ a b) (+ c d))}
+    {:name 'main :params ['a 'b 'c 'd] :result :i64
+     :body '(sum-four a b c d)}]})
+
+(def five-argument-call-kir
+  {:format :kotoba.kir/v4
+   :exports ['main]
+   :functions
+   [{:name 'sum-five :params ['a 'b 'c 'd 'e] :result :i64
+     :body '(+ (+ (+ a b) (+ c d)) e)}
+    {:name 'main :params ['a 'b 'c 'd 'e] :result :i64
+     :body '(sum-five a b c d e)}]})
+
 (deftest kir-module-lowers-to-versioned-function-and-call-ir
   (is (machine/pilot-module? scalar-call-kir))
   (let [gmir (machine/lower-kir-module scalar-call-kir)
@@ -495,6 +530,47 @@
             (some #{0xe8} code)
             (some #(= 0x94 (bit-and % 0xfc)) (take-nth 4 (drop 3 code))))
           (str target " contains its direct-call opcode")))))
+
+(deftest four-entry-arguments-reach-both-encoders-without-a-spill-frame
+  (doseq [target [:x86-64 :aarch64]]
+    (let [gmir (machine/lower-kir-module four-argument-call-kir)
+          mc (machine/compile-gmir target gmir)
+          [callee caller] (:mc/functions mc)
+          argument-encoding (keyword (name target) "argument")
+          spill-encodings #{(keyword (name target) "spill-store")
+                            (keyword (name target) "spill-load")}
+          expected-inputs (if (= :x86-64 target)
+                            [:x86-64/rdi :x86-64/rsi :x86-64/rdx :x86-64/rcx]
+                            [:aarch64/x0 :aarch64/x1 :aarch64/x2 :aarch64/x3])]
+      (is (= [:allocator :call-live]
+             (mapv :mc/frame-policy [callee caller])) target)
+      (is (= [0 0] (mapv :mc/frame-slots [callee caller])) target)
+      (doseq [function [callee caller]]
+        (is (= expected-inputs
+               (mapv :mir/dst
+                     (filter #(= argument-encoding (:mc/encoding %))
+                             (:mc/instructions function))))
+            [target (:mc/name function)])
+        (is (not-any? #(contains? spill-encodings (:mc/encoding %))
+                      (:mc/instructions function))
+            [target (:mc/name function)]))
+      (is (seq (:code (machine/compile-kir-module target four-argument-call-kir)))
+          target))))
+
+(deftest five-live-entry-arguments-retain-the-safe-spill-fallback
+  (doseq [target [:x86-64 :aarch64]]
+    (let [mc (->> five-argument-call-kir machine/lower-kir-module
+                  (machine/compile-gmir target))
+          [callee caller] (:mc/functions mc)
+          spill-store (keyword (name target) "spill-store")]
+      (is (pos? (:mc/frame-slots callee)) target)
+      (is (= :all-vregs (:mc/frame-policy caller)) target)
+      (is (pos? (:mc/frame-slots caller)) target)
+      (is (<= 5 (count (filter #(= spill-store (:mc/encoding %))
+                               (:mc/instructions callee))))
+          target)
+      (is (seq (:code (machine/compile-kir-module target five-argument-call-kir)))
+          target))))
 
 (deftest scalar-call-module-boundary-fails-closed
   (is (not (machine/pilot-module?
