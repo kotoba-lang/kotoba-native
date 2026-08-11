@@ -92,6 +92,14 @@
    'f64-unordered :gmir/f64-unordered})
 (def ^:private kir-f64-unary-ops
   '#{f64-from-bits f64-to-bits f64-abs f64-neg f64-sqrt})
+(def ^:private kir-kernel-memory-ops
+  {'kernel-load-u8 [:gmir/kernel-load-u8 512]
+   'kernel-load-u8-4k [:gmir/kernel-load-u8 4096]
+   'kernel-load-u8-16k [:gmir/kernel-load-u8 16384]
+   'kernel-store-u8 [:gmir/kernel-store-u8 512]
+   'kernel-store-u8-4k [:gmir/kernel-store-u8 4096]
+   'kernel-load-u32 [:gmir/kernel-load-u32 512]
+   'kernel-store-u32 [:gmir/kernel-store-u32 512]})
 
 (defn- scalar-literal? [form]
   (or (boolean? form) (gmir/i64-value? form)))
@@ -407,6 +415,38 @@
                                    :gmir/input (scalar-register! input form)})
                        dst])))
 
+                (and (seq? form) (contains? kir-kernel-memory-ops (first form))
+                     (contains? #{4 5} (count form)))
+                (let [[op maximum] (get kir-kernel-memory-ops (first form))
+                      lowered (mapv #(value % env) (rest form))
+                      code (vec (mapcat first lowered))
+                      operands (mapv #(scalar-register! (second %) form) lowered)
+                      dst (fresh-reg)
+                      [base length index stored] operands]
+                  (when-not (= (if (contains? #{:gmir/kernel-store-u8
+                                                :gmir/kernel-store-u32} op)
+                                 4 3)
+                               (count operands))
+                    (reject! :kir-to-gmir :kernel-memory-arity {:form form}))
+                  [(conj code
+                         (cond-> {:gmir/op op :gmir/dst dst :gmir/base base
+                                  :gmir/length length :gmir/index index
+                                  :gmir/maximum maximum}
+                           stored (assoc :gmir/stored stored)))
+                   dst])
+
+                (and (seq? form) (= 'kernel-subregion (first form))
+                     (= 5 (count form)))
+                (let [lowered (mapv #(value % env) (rest form))
+                      [base length offset size]
+                      (mapv #(scalar-register! (second %) form) lowered)
+                      dst (fresh-reg)]
+                  [(conj (vec (mapcat first lowered))
+                         {:gmir/op :gmir/kernel-subregion :gmir/dst dst
+                          :gmir/base base :gmir/length length
+                          :gmir/offset offset :gmir/size size})
+                   dst])
+
                 (and (seq? form) (= 'record-new (first form)) (<= 2 (count form)))
                 (let [type (second form)
                       fields (or (scalar-record-fields type)
@@ -668,6 +708,16 @@
                      (= :scalar (shape (second form) env)))
                 :scalar
 
+                (and (seq? form) (contains? kir-kernel-memory-ops (first form))
+                     (contains? #{4 5} (count form))
+                     (every? #(= :scalar (shape % env)) (rest form)))
+                :scalar
+
+                (and (seq? form) (= 'kernel-subregion (first form))
+                     (= 5 (count form))
+                     (every? #(= :scalar (shape % env)) (rest form)))
+                :scalar
+
                 (and (seq? form) (= 'record-new (first form)) (<= 2 (count form)))
                 (let [type (second form), fields (scalar-record-fields type)]
                   (when (and fields (= (count fields) (- (count form) 2))
@@ -784,12 +834,13 @@
 ;; ── MC -> bytes ──────────────────────────────────────────────────────────────
 
 (def ^:private x86-register-code
-  {:x86-64/rax 0 :x86-64/rcx 1 :x86-64/rdx 2 :x86-64/r8 8 :x86-64/r11 11
+  {:x86-64/rax 0 :x86-64/rcx 1 :x86-64/rdx 2 :x86-64/r8 8
+   :x86-64/r10 10 :x86-64/r11 11
    :x86-64/rdi 7 :x86-64/rsi 6})
 (def ^:private x86-arguments [:x86-64/rdi :x86-64/rsi :x86-64/rdx :x86-64/rcx :x86-64/r8])
 (def ^:private aarch64-register-code
   {:aarch64/x0 0 :aarch64/x1 1 :aarch64/x2 2 :aarch64/x3 3
-   :aarch64/x4 4 :aarch64/x16 16})
+   :aarch64/x4 4 :aarch64/x16 16 :aarch64/x17 17})
 
 (defn- byte-value [n] (bit-and (unchecked-int n) 0xff))
 
@@ -1055,6 +1106,144 @@
         (u32le 0x1e612000)
         (u32le (bit-or cset (a64-register dst))))))
 
+(defn- x86-cmp-imm32 [register value]
+  (let [code (get x86-register-code register)]
+    (when-not (some? code)
+      (reject! :mc-encode :unsupported-register {:register register}))
+    (vec (concat [(bit-or 0x48 (if (>= code 8) 1 0)) 0x81
+                  (bit-or 0xf8 (bit-and code 7))]
+                 (u32le value)))))
+
+(defn- x86-memory-access [kind register]
+  (let [code (get x86-register-code register)]
+    (when-not (some? code)
+      (reject! :mc-encode :unsupported-register {:register register}))
+    (let [rex (bit-or 0x40 (if (>= code 8) 4 0) 1)
+          modrm (bit-or (bit-shift-left (bit-and code 7) 3) 3)]
+      (case kind
+        :load-u8 [rex 0x0f 0xb6 modrm]
+        :load-u32 [(bit-or rex 0x40) 0x8b modrm]
+        :store-u8 [rex 0x88 modrm]
+        :store-u32 [rex 0x89 modrm]))))
+
+(defn- memory-label [instruction-index suffix]
+  (keyword "kotoba.native.kernel-memory"
+           (str suffix "-" instruction-index)))
+
+(defn- x86-kernel-memory
+  [instruction-index width store? {:mir/keys [dst base length index stored maximum]}]
+  (let [trap (memory-label instruction-index "trap")
+        done (memory-label instruction-index "done")
+        result (if store? stored dst)]
+    (vec (concat
+          (x86-cmp-imm32 length maximum)
+          [(layout/relative-branch :x86-64/ja-rel32 trap)]
+          (x86-rr 0x85 base base)
+          [(layout/relative-branch :x86-64/jz-rel32 trap)]
+          (x86-rr 0x39 index length)
+          [(layout/relative-branch :x86-64/jae-rel32 trap)]
+          (when (= 32 width)
+            (concat (x86-rr 0x89 :x86-64/r10 length)
+                    (x86-rr 0x29 :x86-64/r10 index)
+                    (x86-cmp-imm32 :x86-64/r10 4)
+                    [(layout/relative-branch :x86-64/jl-rel32 trap)]))
+          (x86-rr 0x89 :x86-64/r11 base)
+          (x86-rr 0x01 :x86-64/r11 index)
+          (x86-memory-access (keyword (str (if store? "store" "load")
+                                           "-u" width)) result)
+          [(layout/relative-branch :x86-64/jmp-rel32 done)
+           (layout/label trap)]
+          [0x0f 0x0b]
+          [(layout/label done)]))))
+
+(defn- x86-kernel-subregion
+  [instruction-index {:mir/keys [dst base length offset size]}]
+  (let [trap (memory-label instruction-index "subregion-trap")
+        done (memory-label instruction-index "subregion-done")]
+    (vec (concat
+          (x86-rr 0x85 base base)
+          [(layout/relative-branch :x86-64/jz-rel32 trap)]
+          (x86-rr 0x39 offset length)
+          [(layout/relative-branch :x86-64/ja-rel32 trap)]
+          (x86-rr 0x89 :x86-64/r10 length)
+          (x86-rr 0x29 :x86-64/r10 offset)
+          (x86-rr 0x39 size :x86-64/r10)
+          [(layout/relative-branch :x86-64/ja-rel32 trap)]
+          (when-not (= dst base) (x86-rr 0x89 dst base))
+          (x86-rr 0x01 dst offset)
+          [(layout/relative-branch :x86-64/jmp-rel32 done)
+           (layout/label trap)]
+          [0x0f 0x0b]
+          [(layout/label done)]))))
+
+(defn- a64-kernel-memory
+  [instruction-index width store? {:mir/keys [dst base length index stored maximum]}]
+  (let [trap (memory-label instruction-index "trap")
+        done (memory-label instruction-index "done")
+        result (if store? stored dst)
+        address :aarch64/x16]
+    (vec (concat
+          (a64-constant :aarch64/x16 maximum)
+          (u32le (bit-or 0xeb00001f (bit-shift-left 16 16)
+                         (bit-shift-left (a64-register length) 5)))
+          [(layout/relative-branch :aarch64/b-hi-imm19 trap)
+           (layout/relative-branch :aarch64/cbz-imm19 trap
+                                   [(a64-register base)])]
+          (u32le (bit-or 0xeb00001f
+                         (bit-shift-left (a64-register length) 16)
+                         (bit-shift-left (a64-register index) 5)))
+          [(layout/relative-branch :aarch64/b-hs-imm19 trap)]
+          (when (= 32 width)
+            (concat
+             (u32le (bit-or 0xcb000000
+                            (bit-shift-left (a64-register index) 16)
+                            (bit-shift-left (a64-register length) 5) 16))
+             (u32le (bit-or 0xf100001f (bit-shift-left 4 10)
+                            (bit-shift-left 16 5)))
+             [(layout/relative-branch :aarch64/b-lt-imm19 trap)]))
+          (u32le (bit-or 0x8b000000
+                         (bit-shift-left (a64-register index) 16)
+                         (bit-shift-left (a64-register base) 5) 16))
+          (u32le (case [store? width]
+                   [false 8] (bit-or 0x39400000 (bit-shift-left 16 5)
+                                     (a64-register result))
+                   [false 32] (bit-or 0xb9400000 (bit-shift-left 16 5)
+                                      (a64-register result))
+                   [true 8] (bit-or 0x39000000 (bit-shift-left 16 5)
+                                    (a64-register result))
+                   [true 32] (bit-or 0xb9000000 (bit-shift-left 16 5)
+                                     (a64-register result))))
+          [(layout/relative-branch :aarch64/b-imm26 done)
+           (layout/label trap)]
+          (u32le 0xd4200000)
+          [(layout/label done)]))))
+
+(defn- a64-kernel-subregion
+  [instruction-index {:mir/keys [dst base length offset size]}]
+  (let [trap (memory-label instruction-index "subregion-trap")
+        done (memory-label instruction-index "subregion-done")]
+    (vec (concat
+          [(layout/relative-branch :aarch64/cbz-imm19 trap
+                                   [(a64-register base)])]
+          (u32le (bit-or 0xeb00001f
+                         (bit-shift-left (a64-register length) 16)
+                         (bit-shift-left (a64-register offset) 5)))
+          [(layout/relative-branch :aarch64/b-hi-imm19 trap)]
+          (u32le (bit-or 0xcb000000
+                         (bit-shift-left (a64-register offset) 16)
+                         (bit-shift-left (a64-register length) 5) 16))
+          (u32le (bit-or 0xeb00001f (bit-shift-left 16 16)
+                         (bit-shift-left (a64-register size) 5)))
+          [(layout/relative-branch :aarch64/b-hi-imm19 trap)]
+          (u32le (bit-or 0x8b000000
+                         (bit-shift-left (a64-register offset) 16)
+                         (bit-shift-left (a64-register base) 5)
+                         (a64-register dst)))
+          [(layout/relative-branch :aarch64/b-imm26 done)
+           (layout/label trap)]
+          (u32le 0xd4200000)
+          [(layout/label done)]))))
+
 (defn- a64-quotient [dst left right]
   ;; AArch64 SDIV returns zero on division by zero and wraps MIN/-1; KIR traps
   ;; on both. x16 is an ABI scratch register outside MIR's allocated profile.
@@ -1083,7 +1272,8 @@
         (u32le 0xd4200000))))
 
 (defn- encode-selected
-  [isa frame-bytes return-suffix {:mc/keys [encoding] :as instruction}]
+  [isa frame-bytes return-suffix instruction-index
+   {:mc/keys [encoding] :as instruction}]
   (case encoding
     :x86-64/argument
     (let [dst (:mir/dst instruction)
@@ -1140,6 +1330,11 @@
      :x86-64/f64-greater-or-equal :x86-64/f64-unordered)
     (x86-f64-compare encoding (:mir/dst instruction) (:mir/left instruction)
                      (:mir/right instruction))
+    :x86-64/kernel-load-u8 (x86-kernel-memory instruction-index 8 false instruction)
+    :x86-64/kernel-store-u8 (x86-kernel-memory instruction-index 8 true instruction)
+    :x86-64/kernel-load-u32 (x86-kernel-memory instruction-index 32 false instruction)
+    :x86-64/kernel-store-u32 (x86-kernel-memory instruction-index 32 true instruction)
+    :x86-64/kernel-subregion (x86-kernel-subregion instruction-index instruction)
     (:x86-64/equal :x86-64/less-than :x86-64/greater-than
      :x86-64/less-or-equal :x86-64/greater-or-equal)
     (x86-compare (case encoding
@@ -1224,6 +1419,11 @@
                        :aarch64/f64-unordered 0x9a9f77e0)
                      (:mir/dst instruction) (:mir/left instruction)
                      (:mir/right instruction))
+    :aarch64/kernel-load-u8 (a64-kernel-memory instruction-index 8 false instruction)
+    :aarch64/kernel-store-u8 (a64-kernel-memory instruction-index 8 true instruction)
+    :aarch64/kernel-load-u32 (a64-kernel-memory instruction-index 32 false instruction)
+    :aarch64/kernel-store-u32 (a64-kernel-memory instruction-index 32 true instruction)
+    :aarch64/kernel-subregion (a64-kernel-subregion instruction-index instruction)
     (:aarch64/equal :aarch64/less-than :aarch64/greater-than
      :aarch64/less-or-equal :aarch64/greater-or-equal)
     (a64-compare (case encoding
@@ -1258,6 +1458,9 @@
 (defn- encode-layout-branch [{:mir/keys [encoding operands]} displacement]
   (case encoding
     :x86-64/jz-rel32 (into [0x0f 0x84] (subvec (relative32 0 displacement) 1))
+    :x86-64/jl-rel32 (into [0x0f 0x8c] (subvec (relative32 0 displacement) 1))
+    :x86-64/ja-rel32 (into [0x0f 0x87] (subvec (relative32 0 displacement) 1))
+    :x86-64/jae-rel32 (into [0x0f 0x83] (subvec (relative32 0 displacement) 1))
     :x86-64/jmp-rel32 (relative32 0xe9 displacement)
     :x86-64/call-rel32 (relative32 0xe8 displacement)
     :x86-64/jne-rel8 [0x75 (byte-value displacement)]
@@ -1265,6 +1468,15 @@
     (u32le (bit-or 0xb4000000
                    (bit-shift-left (bit-and (quot displacement 4) 0x7ffff) 5)
                    (first operands)))
+    :aarch64/b-hi-imm19
+    (u32le (bit-or 0x54000008
+                   (bit-shift-left (bit-and (quot displacement 4) 0x7ffff) 5)))
+    :aarch64/b-hs-imm19
+    (u32le (bit-or 0x54000002
+                   (bit-shift-left (bit-and (quot displacement 4) 0x7ffff) 5)))
+    :aarch64/b-lt-imm19
+    (u32le (bit-or 0x5400000b
+                   (bit-shift-left (bit-and (quot displacement 4) 0x7ffff) 5)))
     :aarch64/b-imm26
     (u32le (bit-or 0x14000000 (bit-and (quot displacement 4) 0x03ffffff)))
     :aarch64/bl-imm26
@@ -1286,7 +1498,7 @@
   [isa frame-bytes return-suffix callee-labels instructions]
   (vec
    (mapcat
-    (fn [{:mc/keys [op test] :as instruction}]
+    (fn [instruction-index {:mc/keys [op test] :as instruction}]
       (if (layout/label-token? instruction)
         [instruction]
         (case op
@@ -1300,7 +1512,7 @@
                 (if (= :x86-64 isa)
                   :x86-64/call-rel32 :aarch64/bl-imm26)
                 label)])
-            (encode-selected isa frame-bytes return-suffix instruction))
+            (encode-selected isa frame-bytes return-suffix instruction-index instruction))
           :mc/branch-zero
           (if (= :x86-64 isa)
             (concat (x86-rr 0x85 test test)
@@ -1314,7 +1526,7 @@
             (if (= :x86-64 isa) :x86-64/jmp-rel32 :aarch64/b-imm26)
             (:mc/target instruction))]
           (reject! :mc-encode :unknown-operation instruction))))
-    instructions)))
+    (range) instructions)))
 
 (defn- qualify-function-locals [function-index tokens]
   (let [labels (->> tokens (filter layout/label-token?) (map :mir/id) set)
