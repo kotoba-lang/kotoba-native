@@ -110,6 +110,8 @@
 ;; backend alone shows up as a failure rather than as silence.
 (def ^:private x86-only
   [[[] '(kernel-boot-info)]
+   [[] '(kernel-read-cr0)]
+   [['v] '(kernel-write-cr0 v)]
    [[] '(kernel-read-cr2)]
    [[] '(kernel-read-cr3)]
    [['v] '(kernel-write-cr3 v)]

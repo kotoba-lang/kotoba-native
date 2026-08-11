@@ -106,6 +106,8 @@
 
 (def ^:private kir-x86-privileged-ops
   {'kernel-boot-info :boot-info
+   'kernel-read-cr0 :read-cr0
+   'kernel-write-cr0 :write-cr0
    'kernel-read-cr2 :read-cr2
    'kernel-read-cr3 :read-cr3
    'kernel-write-cr3 :write-cr3
@@ -1964,6 +1966,12 @@
     (case action
       :boot-info
       (finish [0x4d 0x8b 0x51 0x50] :x86-64/r10)
+      :read-cr0
+      (finish [0x41 0x0f 0x20 0xc2] :x86-64/r10)
+      :write-cr0
+      (finish (concat (copy-to :x86-64/r10 a)
+                      [0x41 0x0f 0x22 0xc2])
+              :x86-64/r10)
       :read-cr2
       (finish [0x41 0x0f 0x20 0xd2] :x86-64/r10)
       :read-cr3
