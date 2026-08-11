@@ -46,6 +46,25 @@
   (boolean (some #(= (vec needle) %)
                  (partition (count needle) 1 bytes))))
 
+(deftest production-runtime-handle-calls-route-through-machine-ir
+  (let [kir {:format :kotoba.kir/v4 :exports ['main]
+             :functions [{:name 'main :params ['v] :result :i64
+                          :body '(+ (vector-count v) (vector-count v))}]}
+        x86-code (:code (x86/emit-program kir))
+        arm-code (:code (arm/emit-program kir))]
+    (is (machine/pilot-expression? '[v]
+                                   '(+ (vector-count v) (vector-count v))))
+    (is (= 2 (count (filter #(= [0x41 0xff 0x91 0xa8 0x00 0x00 0x00] %)
+                            (partition 7 1 x86-code))))
+        "both x86 runtime calls use [r9+168]")
+    (is (contains-bytes? x86-code [0x4c 0x89 0x8c 0x24])
+        "the production x86 path uses the MIR-owned context spill")
+    (is (= 2 (count (filter #(= [0xf0 0x54 0x40 0xf9] %)
+                            (partition 4 1 arm-code))))
+        "both AArch64 runtime calls load [x7,#168]")
+    (is (contains-bytes? arm-code [0xe7 0x03 0x00 0xf9])
+        "the production AArch64 path preserves x7")))
+
 (deftest f64-production-slice-routes-through-machine-ir
   (let [binary-forms
         {'f64-add '(f64-add (f64-from-bits 4607182418800017408)

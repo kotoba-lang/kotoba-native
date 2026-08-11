@@ -109,6 +109,56 @@
                           (= "kotoba.gmir.vreg" (namespace %)))
                     (tree-seq coll? seq mc))))))
 
+(deftest runtime-handle-operations-lower-through-the-closed-call-boundary
+  (let [cases [['[a b] '(pair a b) :pair]
+               ['[p] '(pair-first p) :pair-first]
+               ['[p] '(pair-second p) :pair-second]
+               ['[e a v] '(kgraph-assert! e a v) :kgraph-assert!]
+               ['[e a] '(kgraph-get e a) :kgraph-get]
+               ['[a] '(kgraph-count a) :kgraph-count]
+               ['[a i] '(kgraph-entity-at a i) :kgraph-entity-at]
+               ['[s] '(string-byte-length s) :string-byte-length]
+               ['[a b] '(string=? a b) :string=?]
+               ['[a b] '(string-concat a b) :string-concat]
+               ['[s i n] '(string-substring s i n) :string-substring]
+               ['[s i] '(string-code-point-at s i) :string-code-point-at]
+               [[] '(vector-new-empty) :vector-new-empty]
+               ['[v x] '(vector-conj v x) :vector-conj]
+               ['[v] '(vector-count v) :vector-count]
+               ['[v i] '(vector-at v i) :vector-at]
+               ['[v i x] '(vector-assoc v i x) :vector-assoc]
+               ['[v n] '(vector-drop v n) :vector-drop]]]
+    (doseq [[params form runtime] cases]
+      (is (machine/pilot-expression? params form) (str runtime))
+      (let [instructions (:gmir/instructions
+                          (machine/lower-kir-expression params form))
+            call (first (filter #(= :gmir/runtime-call (:gmir/op %))
+                                instructions))]
+        (is (= runtime (:gmir/runtime call)) (str runtime))
+        (is (= (get gmir/runtime-operation-arities runtime)
+               (count (:gmir/arguments call))) (str runtime))))))
+
+(deftest runtime-call-encoders-preserve-the-hidden-context-register
+  (let [x86-code (machine/compile-expression :x86-64 '[v] '(vector-count v))
+        arm-code (machine/compile-expression :aarch64 '[v] '(vector-count v))
+        contains-bytes? (fn [bytes needle]
+                          (boolean (some #(= (vec needle) %)
+                                         (partition (count needle) 1 bytes))))]
+    (is (contains-bytes? x86-code [0x41 0xff 0x91 0xa8 0x00 0x00 0x00])
+        "x86 calls qword ptr [r9+168]")
+    (is (contains-bytes? x86-code [0x4c 0x89 0x8c 0x24])
+        "x86 saves r9 in its reserved call-frame slot")
+    (is (contains-bytes? x86-code [0x4c 0x8b 0x8c 0x24])
+        "x86 restores r9 after the host call")
+    (is (contains-bytes? arm-code [0xf0 0x54 0x40 0xf9])
+        "AArch64 loads x16 from [x7,#168]")
+    (is (contains-bytes? arm-code [0x00 0x02 0x3f 0xd6])
+        "AArch64 calls x16")
+    (is (contains-bytes? arm-code [0xe7 0x03 0x00 0xf9])
+        "AArch64 saves x7 across the host call")
+    (is (contains-bytes? arm-code [0xe7 0x03 0x40 0xf9])
+        "AArch64 restores x7 after the host call")))
+
 (deftest allocation-is-deterministic-and-fails-closed
   (is (= (machine/compile-gmir :x86-64 program)
          (machine/compile-gmir :x86-64 program)))
