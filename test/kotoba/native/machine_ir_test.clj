@@ -565,6 +565,12 @@
                                     instructions))
             code (:code (machine/compile-kir-module target kir))]
         (is (= 2147483647 (:mir/divisor quotient)) target)
+        (is (not (contains? quotient :mir/right)) target)
+        (is (not-any? #(and (= (keyword (name target) "constant")
+                              (:mc/encoding %))
+                           (= 2147483647 (:mir/value %)))
+                      instructions)
+            "the consumed divisor has no materialize instruction")
         (if (= :x86-64 target)
           (do
             (is (not-any? #{[0x48 0xf7 0xf9]} (partition 3 1 code))
