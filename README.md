@@ -84,7 +84,8 @@ integer/boolean literals, up to five parameters, lexical `let`, `+`, `-`, `*`,
 `quot`, bitwise operations, signed comparisons, scalar predicates, ordered
 word shifts, signed/unsigned 32-bit wrapping operations, f64 arithmetic,
 ordered/unordered f64 comparisons, f64 bit-pattern conversions and unary
-abs/neg/sqrt operations, ordered non-empty
+abs/neg/sqrt operations, bounded kernel u8/u32 loads and stores, bounded kernel
+subregion derivation, ordered non-empty
 `do`, and nested tail `if`, with deterministic spilling. `bit-not`, `bool-not`,
 and the i32 family are target-neutral compositions over constants, arithmetic,
 comparisons, and the three portable shift instructions. `do` keeps
@@ -96,6 +97,11 @@ expression families remain on the established emitter and migrate incrementally.
 Native f64 values stay as their IEEE-754 bit patterns in the general-register
 IR; selected instructions alone move them through the target FP bank, so GMIR
 does not acquire target register classes.
+Kernel memory instructions preserve their GMIR maximum through MIR and selected
+MC. Both targets reject an oversized declared length, a null base, and an
+out-of-range index before access; u32 uses the non-wrapping
+`length - index >= 4` proof. Subregions similarly prove offset and size against
+the remaining parent length before deriving the child pointer.
 
 Non-escaping fixed records whose fields are only `:i64` or `:bool` use scalar
 replacement before GMIR. Construction evaluates every field in declaration

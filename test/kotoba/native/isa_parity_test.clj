@@ -201,25 +201,29 @@
 ;; The u32 bound is four bytes wider than the u8 bound
 ;; ---------------------------------------------------------------------------
 
+(defn- subsequence? [needle haystack]
+  (some #(= needle (subvec haystack % (min (count haystack) (+ % (count needle)))))
+        (range (inc (- (count haystack) (count needle))))))
+
 (deftest u32-accesses-reserve-four-bytes-not-one
-  ;; A four-byte access at `length - 1` must trap, so the check is
-  ;; `index + 4 <= length`, not `index < length`. Both backends compute the
-  ;; widened index before comparing; asserting the instruction is present keeps
-  ;; a future edit from silently narrowing the check back to the u8 form, which
-  ;; would read or write three bytes past the buffer.
-  (testing "x86-64 widens the index with lea before the range comparison"
+  ;; A four-byte access at `length - 1` must trap. The machine-IR path first
+  ;; proves index < length, then checks length-index >= 4. This form cannot wrap
+  ;; at UINT64_MAX the way index+4 can.
+  (testing "x86-64 checks the non-wrapping remaining-byte count"
     (let [load (:code (x86/emit-program (program '[b l i] '(kernel-load-u32 b l i))))
           store (:code (x86/emit-program (program '[b l i v] '(kernel-store-u32 b l i v))))]
-      ;; lea rsi,[rax+4] / lea rsi,[rdi+4]
-      (is (some #(= [0x48 0x8d 0x70 0x04] %) (partition 4 1 load)))
-      (is (some #(= [0x48 0x8d 0x77 0x04] %) (partition 4 1 store)))
-      ;; cmp rsi,rcx -- the widened index against the length
-      (is (some #(= [0x48 0x39 0xce] %) (partition 3 1 load)))
-      (is (some #(= [0x48 0x39 0xce] %) (partition 3 1 store)))))
-  (testing "AArch64 widens the index with add x5,x3,#4 before the comparison"
+      ;; mov r10,rcx; sub r10,rdx; cmp r10,4; jl trap
+      (doseq [code [load store]]
+        (is (subsequence? [0x49 0x89 0xca 0x49 0x29 0xd2
+                           0x49 0x81 0xfa 0x04 0x00 0x00 0x00 0x0f 0x8c]
+                          code)))))
+  (testing "AArch64 checks the non-wrapping remaining-byte count"
     (let [load (:code (arm/emit-program (program '[b l i] '(kernel-load-u32 b l i))))]
-      ;; 0x91001065 = add x5, x3, #4, little-endian
-      (is (some #(= [0x65 0x10 0x00 0x91] %) (partition 4 1 load))))))
+      ;; sub x16,x1,x2; cmp x16,#4; b.lt trap
+      (is (subsequence? [0x30 0x00 0x02 0xcb
+                         0x1f 0x12 0x00 0xf1
+                         0x8b 0x00 0x00 0x54]
+                        load)))))
 
 ;; ---------------------------------------------------------------------------
 ;; The new operators are real instructions, not accidental no-ops
@@ -419,23 +423,18 @@
                  :functions [{:name 'main :params params :body body :result :i64}]}]
     (mapv #(bit-and % 0xff) (:code (emit program)))))
 
-(defn- subsequence? [needle haystack]
-  (some #(= needle (subvec haystack % (min (count haystack) (+ % (count needle)))))
-        (range (inc (- (count haystack) (count needle))))))
-
 (deftest x86-64-kernel-subregion-encodes-its-checks
   (let [code (emitted x86/emit-program '[b l o s] '(kernel-subregion b l o s))]
     (is (subsequence?
-         [0x5f 0x59 0x5a                          ; pop rdi/rcx/rdx = offset/length/base
-          0x48 0x85 0xd2                          ; test rdx,rdx
-          0x0f 0x84 0x1b 0x00 0x00 0x00           ; jz  -> ud2 at +27
-          0x48 0x39 0xcf                          ; cmp rdi,rcx
-          0x0f 0x87 0x12 0x00 0x00 0x00           ; ja  -> ud2 at +18
-          0x48 0x29 0xf9                          ; sub rcx,rdi  (remaining)
-          0x48 0x39 0xc8                          ; cmp rax,rcx
-          0x0f 0x87 0x06 0x00 0x00 0x00           ; ja  -> ud2 at +6
-          0x48 0x8d 0x04 0x3a                     ; lea rax,[rdx+rdi]
-          0xeb 0x02 0x0f 0x0b]                    ; jmp +2 / ud2
+         [0x48 0x85 0xc0                          ; test rax,rax
+          0x0f 0x84 0x20 0x00 0x00 0x00           ; jz  -> ud2 at +32
+          0x48 0x39 0xca                          ; cmp rdx,rcx
+          0x0f 0x87 0x17 0x00 0x00 0x00           ; ja  -> ud2 at +23
+          0x49 0x89 0xca 0x49 0x29 0xd2           ; r10 = length-offset
+          0x4d 0x39 0xd0                          ; cmp r8,r10
+          0x0f 0x87 0x08 0x00 0x00 0x00           ; ja  -> ud2 at +8
+          0x48 0x01 0xd0                          ; add rax,rdx
+          0xe9 0x02 0x00 0x00 0x00 0x0f 0x0b]    ; jmp +2 / ud2
          code)
         "every branch must land on the UD2, or the check never fires")))
 
@@ -444,13 +443,13 @@
         word (fn [w] [(bit-and w 0xff) (bit-and (bit-shift-right w 8) 0xff)
                       (bit-and (bit-shift-right w 16) 0xff) (bit-and (bit-shift-right w 24) 0xff)])]
     (is (subsequence?
-         (vec (mapcat word [0xb4000101   ; cbz x1, +32   (null parent)
-                            0xeb02007f   ; cmp x3, x2    (offset vs length)
+         (vec (mapcat word [0xb4000100   ; cbz x0, +32   (null parent)
+                            0xeb01005f   ; cmp x2, x1    (offset vs length)
                             0x540000c8   ; b.hi +24
-                            0xcb030044   ; sub x4, x2, x3 (remaining)
-                            0xeb0400bf   ; cmp x5, x4    (sublen vs remaining)
+                            0xcb020030   ; sub x16,x1,x2 (remaining)
+                            0xeb10007f   ; cmp x3,x16    (sublen vs remaining)
                             0x54000068   ; b.hi +12
-                            0x8b030020   ; add x0, x1, x3
+                            0x8b020000   ; add x0,x0,x2
                             0x14000002   ; b +8
                             0xd4200000])) ; brk #0
          code)

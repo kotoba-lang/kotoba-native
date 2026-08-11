@@ -201,6 +201,28 @@
     (is (some #{:gmir/shift-left} operations))
     (is (some #{:gmir/shift-right-signed} operations))))
 
+(deftest bounded-kernel-memory-routes-through-machine-ir
+  (let [forms ['(kernel-load-u8 b l i)
+               '(kernel-load-u8-4k b l i)
+               '(kernel-load-u8-16k b l i)
+               '(kernel-store-u8 b l i v)
+               '(kernel-store-u8-4k b l i v)
+               '(kernel-load-u32 b l i)
+               '(kernel-store-u32 b l i v)
+               '(kernel-subregion b l i v)]]
+    (doseq [form forms]
+      (is (machine/pilot-expression? ['b 'l 'i 'v] form) form)
+      (doseq [target [:x86-64 :aarch64]]
+        (is (seq (machine/compile-expression target ['b 'l 'i 'v] form))
+            [target form]))))
+  (let [instructions (:gmir/instructions
+                      (machine/lower-kir-expression
+                       ['b 'l 'i] '(kernel-load-u8-16k b l i)))
+        load (first (filter #(= :gmir/kernel-load-u8 (:gmir/op %))
+                            instructions))]
+    (is (= 16384 (:gmir/maximum load)))
+    (is (= :gmir/return (:gmir/op (last instructions))))))
+
 (deftest parameters-are-materialized-before-expression-temporaries
   ;; AArch64 passes arguments in the same x0-x4 register set used by this
   ;; bounded allocator. If a constant is emitted first, it can overwrite an
