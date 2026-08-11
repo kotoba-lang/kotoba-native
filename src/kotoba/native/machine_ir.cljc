@@ -101,6 +101,32 @@
    'kernel-load-u32 [:gmir/kernel-load-u32 512]
    'kernel-store-u32 [:gmir/kernel-store-u32 512]})
 
+(def ^:private kir-runtime-ops
+  {'pair :pair
+   'pair-first :pair-first
+   'pair-second :pair-second
+   'kgraph-assert! :kgraph-assert!
+   'kgraph-get :kgraph-get
+   'kgraph-count :kgraph-count
+   'kgraph-entity-at :kgraph-entity-at
+   'string-byte-length :string-byte-length
+   'string=? :string=?
+   'string-concat :string-concat
+   'string-substring :string-substring
+   'string-code-point-at :string-code-point-at
+   'vector-new-empty :vector-new-empty
+   'vector-conj :vector-conj
+   'vector-count :vector-count
+   'vector-at :vector-at
+   'vector-assoc :vector-assoc
+   'vector-drop :vector-drop
+   'vector-f64-new :vector-new-empty
+   'vector-f64-conj :vector-conj
+   'vector-f64-count :vector-count
+   'vector-f64-at :vector-at
+   'vector-f64-assoc :vector-assoc
+   'vector-f64-drop :vector-drop})
+
 (defn- scalar-literal? [form]
   (or (boolean? form) (gmir/i64-value? form)))
 
@@ -447,6 +473,21 @@
                           :gmir/offset offset :gmir/size size})
                    dst])
 
+                (and (seq? form) (contains? kir-runtime-ops (first form)))
+                (let [runtime (get kir-runtime-ops (first form))
+                      arguments (vec (rest form))
+                      expected (get gmir/runtime-operation-arities runtime)
+                      lowered (mapv #(value % env) arguments)
+                      registers (mapv #(scalar-register! (second %) form) lowered)
+                      dst (fresh-reg)]
+                  (when-not (= expected (count arguments))
+                    (reject! :kir-to-gmir :runtime-call-arity
+                             {:form form :runtime runtime :expected expected}))
+                  [(conj (vec (mapcat first lowered))
+                         {:gmir/op :gmir/runtime-call :gmir/dst dst
+                          :gmir/runtime runtime :gmir/arguments registers})
+                   dst])
+
                 (and (seq? form) (= 'record-new (first form)) (<= 2 (count form)))
                 (let [type (second form)
                       fields (or (scalar-record-fields type)
@@ -718,6 +759,13 @@
                      (every? #(= :scalar (shape % env)) (rest form)))
                 :scalar
 
+                (and (seq? form) (contains? kir-runtime-ops (first form))
+                     (= (get gmir/runtime-operation-arities
+                             (get kir-runtime-ops (first form)))
+                        (count (rest form)))
+                     (every? #(= :scalar (shape % env)) (rest form)))
+                :scalar
+
                 (and (seq? form) (= 'record-new (first form)) (<= 2 (count form)))
                 (let [type (second form), fields (scalar-record-fields type)]
                   (when (and fields (= (count fields) (- (count form) 2))
@@ -835,12 +883,12 @@
 
 (def ^:private x86-register-code
   {:x86-64/rax 0 :x86-64/rcx 1 :x86-64/rdx 2 :x86-64/r8 8
-   :x86-64/r10 10 :x86-64/r11 11
+   :x86-64/r9 9 :x86-64/r10 10 :x86-64/r11 11
    :x86-64/rdi 7 :x86-64/rsi 6})
 (def ^:private x86-arguments [:x86-64/rdi :x86-64/rsi :x86-64/rdx :x86-64/rcx :x86-64/r8])
 (def ^:private aarch64-register-code
   {:aarch64/x0 0 :aarch64/x1 1 :aarch64/x2 2 :aarch64/x3 3
-   :aarch64/x4 4 :aarch64/x16 16 :aarch64/x17 17})
+   :aarch64/x4 4 :aarch64/x7 7 :aarch64/x16 16 :aarch64/x17 17})
 
 (defn- byte-value [n] (bit-and (unchecked-int n) 0xff))
 
@@ -1271,6 +1319,37 @@
         (u32le (bit-or 0x14000000 2))
         (u32le 0xd4200000))))
 
+(defn- x86-runtime-call
+  [frame-bytes {:mir/keys [context-offset] :as instruction}]
+  (when (or (< frame-bytes 8) (not (zero? (mod context-offset 8))))
+    (reject! :mc-encode :invalid-runtime-call-frame instruction))
+  (let [context-slot (quot (- frame-bytes 8) 8)
+        indirect-call (if (<= context-offset 127)
+                        [0x41 0xff 0x51 context-offset]
+                        (vec (concat [0x41 0xff 0x91]
+                                     (u32le context-offset))))]
+    (vec (concat
+          (x86-stack-memory 0x89 :x86-64/r9 context-slot)
+          (x86-rr 0x89 :x86-64/rdi :x86-64/r9)
+          indirect-call
+          (x86-stack-memory 0x8b :x86-64/r9 context-slot)))))
+
+(defn- a64-runtime-call
+  [{:mir/keys [context-offset] :as instruction}]
+  (when (or (neg? context-offset) (not (zero? (mod context-offset 8)))
+            (> (quot context-offset 8) 4095))
+    (reject! :mc-encode :invalid-runtime-context-offset instruction))
+  (vec (concat
+        (a64-adjust-stack 0xd10003ff 16)
+        (a64-stack-memory 0xf9000000 :aarch64/x7 0)
+        (a64-mov :aarch64/x0 :aarch64/x7)
+        (u32le (bit-or 0xf9400000
+                       (bit-shift-left (quot context-offset 8) 10)
+                       (bit-shift-left 7 5) 16))
+        (u32le 0xd63f0200)
+        (a64-stack-memory 0xf9400000 :aarch64/x7 0)
+        (a64-adjust-stack 0x910003ff 16))))
+
 (defn- encode-selected
   [isa frame-bytes return-suffix instruction-index
    {:mc/keys [encoding] :as instruction}]
@@ -1353,6 +1432,7 @@
     (if (= (:mir/dst instruction) (:mir/src instruction))
       []
       (x86-rr 0x89 (:mir/dst instruction) (:mir/src instruction)))
+    :x86-64/runtime-call (x86-runtime-call frame-bytes instruction)
     :x86-64/return
     (vec (concat (when-not (= :x86-64/rax (:mir/value instruction))
                    (x86-rr 0x89 :x86-64/rax (:mir/value instruction)))
@@ -1442,6 +1522,7 @@
     (if (= (:mir/dst instruction) (:mir/src instruction))
       []
       (a64-mov (:mir/dst instruction) (:mir/src instruction)))
+    :aarch64/runtime-call (a64-runtime-call instruction)
     :aarch64/return
     (vec (concat (when-not (= :aarch64/x0 (:mir/value instruction))
                    (a64-mov :aarch64/x0 (:mir/value instruction)))
@@ -1616,14 +1697,12 @@
   (mc/validate! program)
   (when-not (= 2 (:mc/version program))
     (reject! :mc-encode :flat-program-version-required program))
-  (let [frame-bytes (align16 (* 8 frame-slots))
-        prologue (if (= :x86-64 target)
-                   (x86-adjust-stack 0xec frame-bytes)
-                   (a64-adjust-stack 0xd10003ff frame-bytes))
-        return-suffix (if (= :x86-64 target)
-                        (vec (concat (x86-adjust-stack 0xc4 frame-bytes) [0xc3]))
-                        (vec (concat (a64-adjust-stack 0x910003ff frame-bytes)
-                                     (u32le 0xd65f03c0))))]
+  (let [runtime-call? (some #(= "runtime-call"
+                                (some-> (:mc/encoding %) name))
+                            instructions)
+        {:keys [frame-bytes prologue return-suffix]}
+        (function-frame target frame-slots
+                        (if runtime-call? :call-live :allocator))]
     (resolve-layout
      (vec (concat prologue
                   (instruction-tokens target frame-bytes return-suffix {}
