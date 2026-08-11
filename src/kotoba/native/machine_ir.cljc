@@ -178,8 +178,19 @@
    [:result-i64 :result-i64] :result-i64
    [native-clock-request-type native-clock-result-type] :clock-v1})
 
+(defn- capability-id
+  "Return the closed host representation of an admitted capability id.
+
+  NBB reads KIR i64 literals as JavaScript BigInt values. GMIR and the machine
+  encoders intentionally represent the bounded 0..255 capability namespace as
+  ordinary host integers, so normalize only after proving the value fits."
+  [value]
+  (let [value #?(:clj value
+                 :cljs (if (i64/bigint-value? value) (js/Number value) value))]
+    (when (and (integer? value) (<= 0 value 255)) value)))
+
 (defn- valid-capability-id? [value]
-  (and (integer? value) (<= 0 value 255)))
+  (some? (capability-id value)))
 
 (defn word-result-type?
   "True for result descriptors represented by one native word. Escaping
@@ -917,10 +928,10 @@
                    dst])
 
                 (and (seq? form) (= 'cap-call (first form)) (= 3 (count form)))
-                (let [capability (second form)
+                (let [capability (capability-id (second form))
                       [code input] (value (nth form 2) env)
                       dst (fresh-reg)]
-                  (when-not (valid-capability-id? capability)
+                  (when-not capability
                     (reject! :kir-to-gmir :invalid-capability-id {:form form}))
                   [(conj code {:gmir/op :gmir/capability-call :gmir/dst dst
                                :gmir/capability capability :gmir/kind :i64
@@ -929,11 +940,12 @@
 
                 (and (seq? form) (= 'typed-cap-call (first form))
                      (= 5 (count form)))
-                (let [[_ capability request-type result-type request] form
+                (let [[_ raw-capability request-type result-type request] form
+                      capability (capability-id raw-capability)
                       kind (get typed-capability-kinds [request-type result-type])
                       [code input] (value request env)
                       dst (fresh-reg)]
-                  (when-not (and (valid-capability-id? capability) kind)
+                  (when-not (and capability kind)
                     (reject! :kir-to-gmir :invalid-typed-capability-call
                              {:form form :request-type request-type
                               :result-type result-type}))
