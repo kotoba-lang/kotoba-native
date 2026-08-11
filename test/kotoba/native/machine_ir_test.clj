@@ -183,6 +183,24 @@
   (is (machine/pilot-expression? ['a 'b]
                                  '(+ (* a 6) (bit-xor (- a b) 3)))))
 
+(deftest native-word-operations-route-through-machine-ir
+  (doseq [form ['(bool-not a) '(bit-not a)
+                '(i64-shift-left a 3) '(i64-shift-right a 3)
+                '(u64-shift-right a 3) '(i32-wrap a) '(u32-wrap a)
+                '(i32-wrapping-add a b) '(i32-wrapping-mul a b)
+                '(i32-xor a b) '(i32-shift-left a 3)
+                '(i32-shift-right a 3) '(u32-shift-right a 3)]]
+    (is (machine/pilot-expression? ['a 'b] form) form)
+    (doseq [target [:x86-64 :aarch64]]
+      (is (seq (machine/compile-expression target ['a 'b] form))
+          [target form])))
+  (let [operations (->> '(i32-shift-right a 3)
+                        (machine/lower-kir-expression ['a 'b])
+                        :gmir/instructions
+                        (mapv :gmir/op))]
+    (is (some #{:gmir/shift-left} operations))
+    (is (some #{:gmir/shift-right-signed} operations))))
+
 (deftest parameters-are-materialized-before-expression-temporaries
   ;; AArch64 passes arguments in the same x0-x4 register set used by this
   ;; bounded allocator. If a constant is emitted first, it can overwrite an
