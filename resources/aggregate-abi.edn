@@ -1,5 +1,5 @@
 {:abi/id :kotoba.native/aggregate-boundary
- :abi/version 6
+ :abi/version 7
  :abi/word-bits 64
  :portable/record
  {:boundary/parameters :pair-chain-handle
@@ -17,7 +17,9 @@
   :boundary/results :pair-tag-payload-handle
   :boundary/word-count 1
   :boundary/tag :zero-based-declaration-ordinal
-  :boundary/payload-types #{:i64 :bool}
+  :boundary/payload-types #{:i64 :bool :record}
+  :boundary/payload-representation :recursive-word-handles
+  :boundary/max-payload-nesting-depth 32
   :boundary/bool-words #{0 1}
   :boundary/case-limit 32
   :boundary/allocation :context-pair-arena
@@ -27,12 +29,19 @@
  {:local-record :scalar-replacement
   :local-variant :scalar-replacement
   :record-boundary :word-pair-chain-admitted
-  :variant-boundary :scalar-pair-handle-admitted
-  :call-admission :scalar-admitted
+  :variant-boundary :recursive-payload-pair-handle-admitted
+  :call-admission :sealed-callable-admitted
   :call-requires #{:per-function-frame
                    :spill-live-values-across-call
                    :parallel-argument-assignment
-                   :single-word-return-register}}
+                   :single-word-return-register}
+  :callable-dispatch {:indirect :closed-ordinal-dispatch
+                      :apply :bounded-pair-chain
+                      :max-apply-arguments 4
+                      :arbitrary-address false}
+  :linkage {:mode :closed-module-graph
+            :ambient-symbols false
+            :unresolved-symbols false}}
  :targets
  {:x86-64
   {:argument-registers [:x86-64/rdi :x86-64/rsi :x86-64/rdx

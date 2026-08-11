@@ -17,6 +17,10 @@
 (def scalar-variant
   [:variant :test/outcome [[:count :i64] [:ready :bool]]])
 
+(def aggregate-variant
+  [:variant :test/aggregate-outcome
+   [[:pair scalar-pair] [:nested nested-record] [:count :i64]]])
+
 (deftest published-edn-is-the-portable-contract
   (let [published (-> "aggregate-abi.edn" io/resource slurp edn/read-string)]
     (is (= abi/contract published))
@@ -68,9 +72,17 @@
     (is (= :pair-tag-payload-handle (:boundary/results plan)))
     (is (= :zero-based-declaration-ordinal (:boundary/tag plan)))
     (is (= [:count :ready] (:boundary/cases plan)))
-    (is (= #{:i64 :bool} (:boundary/payload-types plan)))
+    (is (= [:i64 :bool] (:boundary/payload-schemas plan)))
+    (is (= #{:i64 :bool :record} (:boundary/payload-types plan)))
     (is (= #{0 1} (:boundary/bool-words plan)))
     (is (= :admitted (:boundary/extracted-admission plan))))
+  (let [plan (abi/variant-boundary-plan aggregate-variant)]
+    (is (abi/aggregate-payload-variant-type? aggregate-variant))
+    (is (= [scalar-pair nested-record :i64]
+           (:boundary/payload-schemas plan)))
+    (is (= :recursive-word-handles
+           (:boundary/payload-representation plan)))
+    (is (= 32 (:boundary/max-payload-nesting-depth plan))))
   (doseq [type [[:variant :unqualified [[:x :i64]]]
                 [:variant :test/empty []]
                 [:variant :test/duplicate [[:x :i64] [:x :bool]]]
@@ -115,3 +127,25 @@
         (is (= :aggregate-abi (:phase (ex-data error))))
         (is (= :call-abi-not-admitted (:problem (ex-data error)))))))
   (is (not (machine/pilot-expression? ['x] '(callee x)))))
+
+(deftest callable-and-linkage-admission-is-closed-and-bounded
+  (let [{:keys [callable-dispatch linkage]} (:extracted abi/contract)]
+    (is (= :closed-ordinal-dispatch (:indirect callable-dispatch)))
+    (is (= :bounded-pair-chain (:apply callable-dispatch)))
+    (is (= 4 (:max-apply-arguments callable-dispatch)))
+    (is (false? (:arbitrary-address callable-dispatch)))
+    (is (= :closed-module-graph (:mode linkage)))
+    (is (false? (:ambient-symbols linkage)))
+    (is (false? (:unresolved-symbols linkage))))
+  (let [evidence {:mode :closed-module-graph
+                  :module-graph-digest (apply str (repeat 64 "a"))
+                  :unresolved-symbols #{}
+                  :ambient-symbols false}]
+    (is (= evidence (abi/admit-closed-linkage! evidence)))
+    (doseq [invalid [(assoc evidence :unresolved-symbols #{'missing})
+                     (assoc evidence :ambient-symbols true)
+                     (assoc evidence :module-graph-digest "not-a-digest")
+                     (dissoc evidence :unresolved-symbols)]]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                            #"unsealed-external-linkage"
+                            (abi/admit-closed-linkage! invalid))))))

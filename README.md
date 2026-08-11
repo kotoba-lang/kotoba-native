@@ -146,11 +146,12 @@ internal tag-and-payload SSA bundle, variant-valued `if` joins it with two
 phis, and `variant-match` becomes target-neutral tag comparison CFG while
 binding the payload register only in the selected source branch. Payload
 evaluation remains exactly once. A bounded function-boundary family is admitted
-separately: qualified variants with 1--32 unique cases and only `:i64`/`:bool`
-payloads cross as one context-owned
-`pair(zero-based-declaration-ordinal,payload)` handle. The public value keeps
-the canonical KIR shape `[type case-keyword payload]`; nested and non-scalar
-variants remain outside the extracted path.
+separately: qualified variants with 1--32 unique cases and `:i64`, `:bool`, or
+admitted record payloads cross as one context-owned
+`pair(zero-based-declaration-ordinal,payload-word)` handle. A record payload is
+itself its recursive pair-chain handle. The public value keeps the canonical
+KIR shape `[type case-keyword payload]`; unsupported payload schemas remain
+outside the extracted path.
 
 Function-boundary aggregates are described by the versioned portable contract
 in `resources/aggregate-abi.edn`. The established record ABI remains a single
@@ -166,11 +167,15 @@ AArch64 call functions save and restore FP/LR. The correctness-first all-vreg
 policy remains the fail-closed path for remaining pressure without changing the
 v3 call contract.
 
-Word-field record pair chains, recursively nested record handles, and scalar
-variant handles are admitted by aggregate ABI v6. Local non-escaping flat
-aggregates retain scalar replacement. Variant payload aggregates, indirect
-calls, varargs, and external linkage remain explicit non-native language
-boundaries. This is not a Rust-parity claim.
+Word-field record pair chains, recursively nested record handles, and variants
+carrying record handles are admitted by aggregate ABI v7. Local non-escaping
+flat aggregates retain scalar replacement. Callable indirection is sealed to a
+closed ordinal dispatcher and `apply` consumes at most four arguments from a
+bounded pair chain; neither path accepts an arbitrary code address. External
+linkage means a content-addressed closed module graph with no ambient or
+unresolved symbol. Open-ended variadic parameters, arbitrary code pointers,
+and dynamic unresolved linkage remain structurally rejected. This is not a
+Rust-parity claim.
 
 Value-position scalar `if` uses GMIR/MIR v2 phi values. Each branch reaches an
 explicit predecessor exit. Single- and multi-phi joins lower through MIR's
