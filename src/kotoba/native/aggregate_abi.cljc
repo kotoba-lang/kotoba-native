@@ -1,13 +1,13 @@
 (ns kotoba.native.aggregate-abi
   "Portable contract for aggregates that reach a native function boundary.
 
-  Scalar records and variants cross extracted calls as one-word context-owned
-  pair handles. Local non-escaping aggregates remain scalar-replaced."
+  Word-field records and scalar variants cross extracted calls as one-word
+  context-owned pair handles. Local non-escaping aggregates remain replaced."
   (:require [clojure.set :as set]))
 
 (def contract
   {:abi/id :kotoba.native/aggregate-boundary
-   :abi/version 4
+   :abi/version 5
    :abi/word-bits 64
    :portable/record
    {:boundary/parameters :pair-chain-handle
@@ -32,7 +32,7 @@
    :extracted
    {:local-record :scalar-replacement
     :local-variant :scalar-replacement
-    :record-boundary :scalar-pair-chain-admitted
+    :record-boundary :word-pair-chain-admitted
     :variant-boundary :scalar-pair-handle-admitted
     :call-admission :scalar-admitted
     :call-requires #{:per-function-frame
@@ -59,17 +59,24 @@
                   {:phase :aggregate-abi :problem problem :value value})))
 
 (defn scalar-record-type?
-  "True for the first aggregate family eligible for a future extracted
-  boundary: a named, non-empty record with unique scalar fields."
+  "True for a named, non-empty record whose unique fields each occupy one
+  native word. Nested record/variant layouts remain outside this boundary."
   [type]
-  (and (vector? type) (= 3 (count type)) (= :record (first type))
-       (keyword? (second type)) (vector? (nth type 2)) (seq (nth type 2))
-       (every? #(and (vector? %) (= 2 (count %))
-                     (keyword? (first %))
-                     (contains? #{:i64 :bool} (second %)))
-               (nth type 2))
-       (= (count (nth type 2))
-          (count (distinct (map first (nth type 2)))))))
+  (letfn [(word-field-type? [field-type]
+            (or (contains? #{:i64 :bool :f32 :f64 :string :keyword
+                             :vector :vector-f64 :string-index}
+                           field-type)
+                (and (vector? field-type)
+                     (contains? #{:option :result :list :set :map :ref}
+                                (first field-type)))))]
+    (and (vector? type) (= 3 (count type)) (= :record (first type))
+         (keyword? (second type)) (vector? (nth type 2)) (seq (nth type 2))
+         (every? #(and (vector? %) (= 2 (count %))
+                       (keyword? (first %))
+                       (word-field-type? (second %)))
+                 (nth type 2))
+         (= (count (nth type 2))
+            (count (distinct (map first (nth type 2))))))))
 
 (defn validate-contract!
   "Validate the published contract and return it unchanged."
@@ -80,7 +87,7 @@
                (set (keys value)))
     (reject! :non-canonical-contract value))
   (when-not (and (= :kotoba.native/aggregate-boundary (:abi/id value))
-                 (= 4 (:abi/version value))
+                 (= 5 (:abi/version value))
                  (= 64 (:abi/word-bits value)))
     (reject! :unsupported-contract-version value))
   (let [record (:portable/record value)]
@@ -124,7 +131,7 @@
       (reject! :invalid-extracted-boundary extracted))
     (when-not (and (= :scalar-replacement (:local-record extracted))
                    (= :scalar-replacement (:local-variant extracted))
-                   (= :scalar-pair-chain-admitted (:record-boundary extracted))
+                   (= :word-pair-chain-admitted (:record-boundary extracted))
                    (= :scalar-pair-handle-admitted (:variant-boundary extracted))
                    (= :scalar-admitted (:call-admission extracted)))
       (reject! :invalid-extracted-admission extracted))

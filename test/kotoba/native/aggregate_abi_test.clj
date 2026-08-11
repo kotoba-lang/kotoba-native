@@ -8,6 +8,9 @@
 (def scalar-pair
   [:record :test/pair [[:left :i64] [:ready :bool]]])
 
+(def word-record
+  [:record :test/word [[:maybe [:option :i64]] [:text :string]]])
+
 (def scalar-variant
   [:variant :test/outcome [[:count :i64] [:ready :bool]]])
 
@@ -31,6 +34,9 @@
     (is (= :host-context (:boundary/ownership plan)))
     (is (= 4096 (:boundary/arena-cell-limit plan)))
     (is (= :admitted (:boundary/extracted-admission plan))))
+  (is (= :admitted
+         (:boundary/extracted-admission
+          (abi/record-boundary-plan word-record))))
   (doseq [type [[:record :test/empty []]
                 [:record :test/nested [[:value [:record :test/inner [[:x :i64]]]]]]
                 [:record :test/duplicate [[:x :i64] [:x :bool]]]
