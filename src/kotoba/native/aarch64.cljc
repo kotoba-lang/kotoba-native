@@ -1377,45 +1377,13 @@
               (:string-literal token))))
 
 (defn emit-program [kir]
-  (if machine-ir/*production-routing-enabled?*
-    (let [kir (-> kir
-                  (update :functions #(-> % string-search/augment-functions
-                                             string-index/augment-functions))
-                  (#(if (:exports %) %
-                        (assoc % :exports (mapv :name (:functions %))))))]
+  (let [kir (-> kir
+                (update :functions #(-> % string-search/augment-functions
+                                           string-index/augment-functions))
+                (#(if (:exports %) %
+                      (assoc % :exports (mapv :name (:functions %))))))]
     (machine-ir/compile-kir-module
      :aarch64 kir
      (into {} (map (fn [{:keys [name]}]
                      [name (vec fuel-charge-tokens)])
-                   (:functions kir)))))
-    (let [;; See the x86-64 backend's `emit-program`: the export set is read
-        ;; from the DECLARED functions, before the search helpers are appended.
-        exported-names (set (or (:exports kir) (map :name (:functions kir))))
-        functions (-> (:functions kir)
-                      string-search/augment-functions
-                      string-index/augment-functions)
-        token-bodies (binding [*function-names* (set (map :name functions))]
-                       (mapv (fn [f] [f (emit-function f)]) functions))
-        offsets (loop [items token-bodies offset 0 out {}]
-                  (if-let [[f body] (first items)]
-                    (recur (next items) (+ offset (code-size body)) (assoc out (:name f) offset)) out))
-        code-size-total (reduce + 0 (map (fn [[_ body]] (code-size body)) token-bodies))
-        literal-contents (collect-string-literals token-bodies)
-        literal-offsets (loop [remaining literal-contents pos code-size-total out {}]
-                          (if-let [content (first remaining)]
-                            (recur (next remaining)
-                                   (+ pos (count (utf8-bytes content)))
-                                   (assoc out content pos))
-                            out))
-        literal-bytes (vec (mapcat (fn [content]
-                                     (map #(bit-and (int %) 0xff) (utf8-bytes content)))
-                                   literal-contents))]
-    (loop [items token-bodies code [] exports {}]
-      (if-let [[function tokens] (first items)]
-        (let [offset (get offsets (:name function)) body (finalize tokens offset offsets literal-offsets)]
-          (recur (next items) (into code body)
-                 (cond-> exports
-                   (contains? exported-names (:name function))
-                   (assoc (:name function)
-                          {:offset offset :length (count body) :arity (count (:params function))}))))
-        {:code (vec (concat code literal-bytes)) :exports exports})))))
+                   (:functions kir))))))
