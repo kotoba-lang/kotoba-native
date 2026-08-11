@@ -698,6 +698,25 @@
              clojure.lang.ExceptionInfo #"(result-schema-mismatch|record-new is only supported)"
              (emit (mk-program tail-ref (list 'record-new other 1 2 3) :a))))))))
 
+(deftest a-non-tail-record-of-another-schema-is-a-local-not-a-boundary
+  ;; The converse of the test above, and the reason it has to be stated: a
+  ;; function that BUILDS one record on the way to RETURNING another is the
+  ;; ordinary shape, not a boundary violation. The intermediate never reaches a
+  ;; caller -- it flattens into slots and is read in place -- so only the tail
+  ;; construction is evidence about the declared result.
+  ;;
+  ;; Measured 2026-08-11: scanning the whole body instead took
+  ;; kotoba-lang/murakumo's shipped `*_core.kotoba` modules from 33/33 to 27/33
+  ;; on both native ISAs. `task_plan_core/assign-task-step-2` is the
+  ;; representative case -- it returns `[:ref :task/assign2]` and builds a
+  ;; `:task/score` to pick with.
+  (let [other '[:record :t/other [[:x :i64] [:y :i64] [:z :i64]]]
+        body (list 'let ['n (list 'record-get other (list 'record-new other 1 2 3) :y)]
+                   (list 'record-new tail-rec 'n 22))]
+    (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
+      (testing label
+        (is (seq (:code (emit (mk-program tail-ref body :a)))))))))
+
 ;; ---------------------------------------------------------------------------
 ;; A projection over a `let`-bound boxed handle (ADR 0004).
 ;;
