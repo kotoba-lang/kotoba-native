@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted.
+Accepted. Its five-live-argument fallback measurements are superseded by ADR
+0020; the four-register parallel-entry evidence remains current.
 
 ## Decision
 
