@@ -25,7 +25,11 @@
            [:aarch64-aiueos-kernel-v1 elf64/package-kernel-aarch64]]]
     (let [fuel 4096
           image (:bytes (package (sealed-kernel target fuel)))]
-      (is (= fuel (le64 image (+ 0x8000 8))) (str target)))))
+      (is (= fuel (le64 image (+ (if (= target :x86_64-aiueos-kernel-v1)
+                                    0x10000
+                                    0x8000)
+                                 8)))
+          (str target)))))
 
 (deftest kernel-image-rejects-disagreeing-fuel-identities
   (let [value (assoc (sealed-kernel :x86_64-aiueos-kernel-v1 4096)
