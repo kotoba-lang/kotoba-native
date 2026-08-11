@@ -199,6 +199,43 @@
     (is (contains-bytes? arm-typed [0x00 0x02 0x3f 0xd6])
         "AArch64 calls the checked callback")))
 
+(deftest option-and-result-sugar-normalizes-to-the-closed-pair-runtime
+  (let [forms ['(option-some? (option-some 7))
+               '(option-value (option-none) 9)
+               '(option-some?-of [:option :i64]
+                                 (option-some-of [:option :i64] 7))
+               '(option-value-of [:option :i64]
+                                 (option-none-of [:option :i64]) 9)
+               '(option-match [:option :i64]
+                              (option-some-of [:option :i64] 7)
+                              0 value (+ value 1))
+               '(result-ok? (result-ok 7))
+               '(result-value (result-err 8) 9)
+               '(result-error (result-ok 7) 9)
+               '(result-ok?-of [:result :i64 :i64]
+                               (result-err-of [:result :i64 :i64] 8))
+               '(result-value-of [:result :i64 :i64]
+                                 (result-ok-of [:result :i64 :i64] 7) 9)
+               '(result-error-of [:result :i64 :i64]
+                                 (result-err-of [:result :i64 :i64] 8) 9)
+               '(result-match-of [:result :i64 :i64]
+                                 (result-ok-of [:result :i64 :i64] 7)
+                                 value (+ value 1) error (+ error 2))]]
+    (doseq [form forms]
+      (is (machine/pilot-expression? [] form) (pr-str form))
+      (let [instructions (:gmir/instructions
+                          (machine/lower-kir-expression [] form))]
+        (is (some #(= :gmir/runtime-call (:gmir/op %)) instructions)
+            (pr-str form))
+        (is (= :gmir/return (:gmir/op (peek instructions))) (pr-str form)))))
+  (let [instructions (:gmir/instructions
+                      (machine/lower-kir-expression
+                       [] '(option-value (pair 1 7) 0)))]
+    (is (= 1 (count (filter #(= :pair (:gmir/runtime %)) instructions)))
+        "the tagged expression is evaluated exactly once"))
+  (is (not (machine/pilot-expression? [] '(option-match :bad 0 1 2 3))))
+  (is (not (machine/pilot-expression? [] '(result-match-of :bad 0 x 1 2 3)))))
+
 (deftest allocation-is-deterministic-and-fails-closed
   (is (= (machine/compile-gmir :x86-64 program)
          (machine/compile-gmir :x86-64 program)))
