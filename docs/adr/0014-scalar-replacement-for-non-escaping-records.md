@@ -35,9 +35,10 @@ non-empty `[:record name fields]` values when every declared field is `:i64` or
 The bundle is internal producer state, not a new serialized GMIR operation.
 GMIR and MIR continue to carry canonical scalar definitions and phis; MIR's
 parallel-copy scheduler owns their physical transport. Unknown fields,
-mismatched branch types, nested records, non-scalar fields, escaping record
-results, and record parameters fail the pilot predicate and remain on the
-established backend path.
+mismatched branch types, non-scalar fields, escaping record results, and record
+parameters fail this flat SROA predicate. Nested records are not flattened by
+this optimization; ADR 0031 subsequently routes them through recursive
+one-word pair handles.
 
 ## Consequences
 
@@ -46,6 +47,6 @@ record frame. A two-field record-valued branch produces the real multi-phi path
 and, when acyclic, has zero frame slots and zero spill traffic. Evaluation of an
 unprojected field is retained, including division traps.
 
-This does not unify the boxed function-boundary ABI, nested aggregate layout,
-variant payloads, or runtime record identity. Those remain explicit follow-up
-contracts rather than being inferred from this non-escaping optimization.
+This does not unify variant payloads or runtime record identity. The boxed
+function boundary and nested record layout were subsequently admitted by ADR
+0024 and ADR 0031 rather than inferred from this non-escaping optimization.

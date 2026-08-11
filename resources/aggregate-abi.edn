@@ -1,11 +1,13 @@
 {:abi/id :kotoba.native/aggregate-boundary
- :abi/version 5
+ :abi/version 6
  :abi/word-bits 64
  :portable/record
  {:boundary/parameters :pair-chain-handle
   :boundary/results :pair-chain-handle
   :boundary/word-count 1
   :boundary/layout :declaration-order
+  :boundary/field-representation :recursive-word-handles
+  :boundary/max-nesting-depth 32
   :boundary/terminator 0
   :boundary/allocation :context-pair-arena
   :boundary/ownership :host-context

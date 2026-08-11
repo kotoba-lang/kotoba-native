@@ -830,6 +830,19 @@
      :result scalar-record-type
      :body (list 'record-new scalar-record-type 'value 9)}]})
 
+(def nested-record-type
+  [:record :test/nested [[:value scalar-record-type] [:count :i64]]])
+
+(def nested-record-result-kir
+  {:format :kotoba.kir/v4
+   :exports ['make]
+   :functions
+   [{:name 'make :params ['value] :param-types [:i64]
+     :result nested-record-type
+     :body (list 'record-new nested-record-type
+                 (list 'record-new scalar-record-type 'value true)
+                 2)}]})
+
 (deftest kir-module-lowers-to-versioned-function-and-call-ir
   (is (machine/pilot-module? scalar-call-kir))
   (let [gmir (machine/lower-kir-module scalar-call-kir)
@@ -922,9 +935,11 @@
           (is (seq (:code compiled)) target)
           (is (= 1 (get-in compiled [:exports (first (:exports kir)) :arity]))
               target)))))
-  (is (not (machine/pilot-module?
-            (assoc-in scalar-record-result-kir [:functions 0 :result]
-                      [:record :test/nested [[:value scalar-record-type]]])))))
+  (is (machine/pilot-module? nested-record-result-kir))
+  (doseq [target [:x86-64 :aarch64]]
+    (is (seq (:code (machine/compile-kir-module
+                     target nested-record-result-kir)))
+        target)))
 
 (deftest canonical-option-and-result-handles-are-native-words
   (doseq [type [:option-i64 :result-i64]]
@@ -1015,8 +1030,13 @@
                  (assoc-in [:functions 0 :body]
                            '(record-new [:record :demo/value [[:value :i64]]]
                                         x)))))))
-  (is (thrown? clojure.lang.ExceptionInfo
-               (machine/lower-kir-module
-                (assoc-in scalar-call-kir [:functions 0 :result]
-                          [:record :demo/outer
-                           [[:value [:record :demo/inner [[:x :i64]]]]]])))))
+  (let [too-deep
+        (reduce (fn [field-type index]
+                  [:record (keyword "demo" (str "level-" index))
+                   [[:value field-type]]])
+                :i64
+                (range 33))]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (machine/lower-kir-module
+                  (assoc-in scalar-call-kir [:functions 0 :result]
+                            too-deep))))))

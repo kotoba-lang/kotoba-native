@@ -11,6 +11,9 @@
 (def word-record
   [:record :test/word [[:maybe [:option :i64]] [:text :string]]])
 
+(def nested-record
+  [:record :test/nested [[:value [:record :test/inner [[:x :i64]]]]]])
+
 (def scalar-variant
   [:variant :test/outcome [[:count :i64] [:ready :bool]]])
 
@@ -37,12 +40,27 @@
   (is (= :admitted
          (:boundary/extracted-admission
           (abi/record-boundary-plan word-record))))
+  (let [plan (abi/record-boundary-plan nested-record)]
+    (is (= :recursive-word-handles (:boundary/field-representation plan)))
+    (is (= 32 (:boundary/max-nesting-depth plan))))
   (doseq [type [[:record :test/empty []]
-                [:record :test/nested [[:value [:record :test/inner [[:x :i64]]]]]]
                 [:record :test/duplicate [[:x :i64] [:x :bool]]]
                 [:variant :test/v [[:x :i64]]]]]
     (is (thrown? clojure.lang.ExceptionInfo
                  (abi/record-boundary-plan type)) type)))
+
+(deftest recursive-record-boundary-is-depth-bounded
+  (let [nested (fn [depth]
+                 (reduce (fn [field-type index]
+                           [:record (keyword "test" (str "level-" index))
+                            [[:value field-type]]])
+                         :i64
+                         (range depth)))]
+    (is (= :admitted
+           (:boundary/extracted-admission
+            (abi/record-boundary-plan (nested 32)))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (abi/record-boundary-plan (nested 33))))))
 
 (deftest scalar-variant-boundary-is-one-owned-checked-handle
   (let [plan (abi/variant-boundary-plan scalar-variant)]

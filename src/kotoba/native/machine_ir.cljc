@@ -416,8 +416,9 @@
    body))
 
 (defn- normalize-scalar-record-boundary
-  "Lower admitted scalar record parameters/results to the established
-  declaration-order pair-chain handle. Call-free local records retain SROA."
+  "Lower admitted record parameters/results and nested records to the
+  declaration-order pair-chain handle. Post-order rewriting makes every inner
+  record a one-word handle before its enclosing constructor is lowered."
   [body]
   (walk/postwalk
    (fn [form]
@@ -557,13 +558,19 @@
   ([functions] (record-boundary-module? functions (module-record-types functions)))
   ([functions record-types]
    (boolean
-    (some (fn [function]
-            (some (fn [type]
-                    (or (aggregate-abi/scalar-record-type? type)
-                        (and (vector? type) (= :ref (first type))
-                             (contains? record-types (second type)))))
-                  (function-boundary-types function)))
-          functions))))
+    (or
+     (some (fn [function]
+             (some (fn [type]
+                     (or (aggregate-abi/scalar-record-type? type)
+                         (and (vector? type) (= :ref (first type))
+                              (contains? record-types (second type)))))
+                   (function-boundary-types function)))
+           functions)
+     ;; Flat local records retain allocation-free SROA. Nested records need
+     ;; each inner value boxed to one word before it occupies an outer field,
+     ;; so a module containing an inline nested schema uses pair-chain lowering.
+     (some aggregate-abi/nested-record-type?
+           (tree-seq coll? seq functions))))))
 
 (defn- provider-boundary-module? [functions]
   (boolean

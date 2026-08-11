@@ -4,7 +4,8 @@
  :production-path [:checked-kir :gmir :mir :allocated-mc :target-encoder]
  :fallback :none
  :exports :one-or-more
- :held-values #{:nested-aggregate :non-scalar-record :non-scalar-variant}
+ :held-values #{:variant-with-aggregate-payload :indirect-call
+                :varargs :external-linkage}
  :legacy-access :none
  :claims #{:all-native-operations-versioned :fail-closed-ir-rejection
            :multi-export-layout :no-production-legacy-fallback}}
