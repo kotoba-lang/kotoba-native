@@ -1,10 +1,10 @@
 (ns kotoba.native.machine-ir
   "Closed production contract for GMIR -> target MIR -> allocated MC data.
 
-  The existing production emitters are migrated incrementally. This namespace
-  makes the missing layers explicit without pretending arbitrary KIR is already
-  covered: the admitted integer/control subset is closed and every unknown op,
-  use-before-definition, register exhaustion, or malformed label fails closed."
+  Production native emission crosses this namespace exclusively. Admitted KIR
+  lowers through closed GMIR/MIR/MC data; unknown operations, unsupported value
+  shapes, use-before-definition, register exhaustion, and malformed labels fail
+  closed before either ISA encoder."
   (:require [clojure.walk :as walk]
             [kotoba.gmir :as gmir]
             [kotoba.mir :as mir]
@@ -165,6 +165,7 @@
   records and variants retain their explicit aggregate ABI boundary."
   [type]
   (or (contains? #{nil :i64 :bool :f32 :f64 :string :keyword
+                   :option-i64 :result-i64
                    :vector :vector-f64 :string-index} type)
       (and (vector? type)
            (contains? #{:option :result :list :set :map :ref}
@@ -182,15 +183,7 @@
            :cljs (js/Array.from (.encode (js/TextEncoder.) content)))))
 
 (defn- scalar-record-fields [type]
-  (when (and (vector? type) (= 3 (count type)) (= :record (first type))
-             (keyword? (second type)) (vector? (nth type 2))
-             (seq (nth type 2))
-             (every? #(and (vector? %) (= 2 (count %))
-                           (keyword? (first %))
-                           (contains? #{:i64 :bool} (second %)))
-                     (nth type 2))
-             (= (count (nth type 2))
-                (count (distinct (map first (nth type 2))))))
+  (when (aggregate-abi/scalar-record-type? type)
     (nth type 2)))
 
 (defn- record-value? [value]
@@ -467,8 +460,8 @@
                {:function name :result result :constructed type}))))
 
 (def ^:dynamic *production-routing-enabled?*
-  "Migration seam used by legacy-emitter regression tests. Production leaves
-  this enabled; disabling it never changes the IR contracts themselves."
+  "Test-only compatibility seam for byte regressions of retired emitters.
+  Production leaves this enabled and has no fallback from an IR rejection."
   true)
 
 (defn lower-kir-expression
@@ -1201,16 +1194,19 @@
          (= :scalar (shape body (zipmap params (repeat :scalar))))))))
 
 (defn lower-kir-module
-  "Lower the first closed multi-function KIR slice to GMIR v3. The module has
-  exactly one exported scalar entry; every function is scalar-only and direct
-  calls resolve against the module signature table."
+  "Lower a closed multi-function KIR module to GMIR v3. The first export owns
+  the GMIR entry identity; all requested exports are retained by final native
+  layout. Every function is scalar-boundary-only and direct calls resolve
+  against the module signature table."
   [kir]
   (let [functions (:functions kir)
         exports (:exports kir)
         record-types (module-record-types functions)]
     (validate-record-reference-results! functions)
     (when-not (and (vector? functions) (seq functions)
-                   (vector? exports) (= 1 (count exports))
+                   (vector? exports) (seq exports)
+                   (= (count exports) (count (distinct exports)))
+                   (every? gmir/function-id? exports)
                    (every? #(and (map? %)
                                  (gmir/function-id? (:name %))
                                  (vector? (:params %))
@@ -1224,9 +1220,9 @@
           variant-boundary? (variant-boundary-module? functions)
           record-boundary? (record-boundary-module? functions record-types)]
       (when-not (and (= (count names) (count (distinct names)))
-                     (contains? signatures entry))
+                     (every? #(contains? signatures %) exports))
         (reject! :kir-to-gmir :invalid-function-module
-                 {:entry entry :functions names}))
+                 {:entry entry :exports exports :functions names}))
       (gmir/validate!
        {:gmir/version 3
         :gmir/entry entry
@@ -2214,12 +2210,18 @@
   "Encode an allocated MC v3 module. PREFIXES is an optional function-name to
   target-token map used by production fuel instrumentation; it participates in
   the same final layout as frames, branches, and calls."
-  ([program] (encode-mc-module program {}))
-  ([{:mc/keys [target entry functions] :as program} prefixes]
+  ([program] (encode-mc-module program {} [(:mc/entry program)]))
+  ([program prefixes] (encode-mc-module program prefixes [(:mc/entry program)]))
+  ([{:mc/keys [target entry functions] :as program} prefixes exports]
    (mc/validate! program)
    (when-not (= 3 (:mc/version program))
      (reject! :mc-encode :module-version-required program))
-   (let [callee-labels (into {}
+   (let [function-names (set (map :mc/name functions))
+         _ (when-not (and (vector? exports) (seq exports)
+                          (= (count exports) (count (distinct exports)))
+                          (every? function-names exports))
+             (reject! :mc-encode :invalid-module-exports {:exports exports}))
+         callee-labels (into {}
                              (map-indexed
                               (fn [index {:mc/keys [name]}]
                                 [name (keyword "kotoba.native.function" (str index))])
@@ -2245,11 +2247,22 @@
          entry-end (if (< (inc entry-index) (count function-offsets))
                      (nth function-offsets (inc entry-index))
                      code-size)
-         entry-arity (:mc/arity (nth functions entry-index))]
+         entry-arity (:mc/arity (nth functions entry-index))
+         indexes (into {} (map-indexed (fn [index function]
+                                         [(:mc/name function) index])
+                                       functions))]
      {:code code
-      :exports {entry {:offset entry-offset
-                       :length (- entry-end entry-offset)
-                       :arity entry-arity}}})))
+      :exports
+      (into {}
+            (map (fn [name]
+                   (let [index (get indexes name)
+                         offset (nth function-offsets index)
+                         end (if (< (inc index) (count function-offsets))
+                               (nth function-offsets (inc index))
+                               code-size)]
+                     [name {:offset offset :length (- end offset)
+                            :arity (:mc/arity (nth functions index))}]))
+                 exports))})))
 
 (defn encode-mc
   "Encode a closed allocated MC v2 program into final machine bytes."
@@ -2278,7 +2291,7 @@
              :parallel-argument-assignment :single-word-return-register})
    (->> (lower-kir-module kir)
         (compile-gmir target)
-        (#(encode-mc-module % prefixes)))))
+        (#(encode-mc-module % prefixes (:exports kir))))))
 
 (defn compile-expression
   "End-to-end closed slice: KIR expression -> GMIR -> MIR -> RA -> MC -> bytes."

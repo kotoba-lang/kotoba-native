@@ -884,6 +884,26 @@
             (assoc-in scalar-record-result-kir [:functions 0 :result]
                       [:record :test/nested [[:value scalar-record-type]]])))))
 
+(deftest canonical-option-and-result-handles-are-native-words
+  (doseq [type [:option-i64 :result-i64]]
+    (is (machine/word-result-type? type) type))
+  (let [instructions
+        (get-in (machine/lower-kir-module
+                 {:format :kotoba.kir/v4 :exports ['main]
+                  :functions
+                  [{:name 'main :params ['r]
+                    :param-types [[:record :test/word
+                                   [[:maybe [:option :i64]] [:text :string]]]]
+                    :result :i64
+                    :body '(record-get
+                            [:record :test/word
+                             [[:maybe [:option :i64]] [:text :string]]]
+                            r :maybe)}]})
+                [:gmir/functions 0 :gmir/instructions])]
+    (is (some #(and (= :gmir/runtime-call (:gmir/op %))
+                    (= :pair-first (:gmir/runtime %)))
+              instructions))))
+
 (deftest four-entry-arguments-reach-both-encoders-without-a-spill-frame
   (doseq [target [:x86-64 :aarch64]]
     (let [gmir (machine/lower-kir-module four-argument-call-kir)
@@ -931,9 +951,12 @@
       (is (= (if (= :x86-64 target) 115 72)
              (count (:code compiled))) target))))
 
-(deftest word-call-module-boundary-fails-closed
-  (is (not (machine/pilot-module?
-            (assoc scalar-call-kir :exports ['main 'add-one]))))
+(deftest word-call-module-boundary-supports-multiple-exports-and-fails-closed
+  (let [multi-export (assoc scalar-call-kir :exports ['main 'add-one])]
+    (is (machine/pilot-module? multi-export))
+    (doseq [target [:x86-64 :aarch64]]
+      (is (= #{'main 'add-one}
+             (set (keys (:exports (machine/compile-kir-module target multi-export))))))))
   (is (not (machine/pilot-module?
             (assoc-in scalar-call-kir [:functions 1 :body] '(missing x)))))
   (is (thrown? clojure.lang.ExceptionInfo

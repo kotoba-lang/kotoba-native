@@ -93,7 +93,8 @@ every intermediate expression in source order, including unused operations
 that may trap; only its final value is returned. When that final expression is
 tail control, `do` delegates it to tail lowering after emitting every scalar
 prefix, so both arms return directly without a synthetic merge. Other typed KIR
-expression families remain on the established emitter and migrate incrementally.
+expression families outside the published native boundary fail closed before
+target selection; production has no legacy-emitter fallback.
 Native f64 values stay as their IEEE-754 bit patterns in the general-register
 IR; selected instructions alone move them through the target FP bank, so GMIR
 does not acquire target register classes.
@@ -143,8 +144,8 @@ AArch64 call functions save and restore FP/LR. The correctness-first all-vreg
 policy remains the fail-closed path for remaining pressure without changing the
 v3 call contract.
 
-Scalar record pair chains and scalar variant handles are admitted by aggregate
-ABI v4. Local non-escaping aggregates retain scalar replacement; nested
+Word-field record pair chains and scalar variant handles are admitted by
+aggregate ABI v5. Local non-escaping aggregates retain scalar replacement; nested
 aggregates, indirect calls, varargs, and external linkage remain explicit
 non-native language boundaries. This is not a Rust-parity claim.
 

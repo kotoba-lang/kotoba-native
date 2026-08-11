@@ -1377,15 +1377,17 @@
               (:string-literal token))))
 
 (defn emit-program [kir]
-  (if-let [kir (let [candidate (update kir :functions
-                                       #(-> % string-search/augment-functions
-                                              string-index/augment-functions))]
-                 (when (machine-ir/pilot-module? candidate) candidate))]
+  (if machine-ir/*production-routing-enabled?*
+    (let [kir (-> kir
+                  (update :functions #(-> % string-search/augment-functions
+                                             string-index/augment-functions))
+                  (#(if (:exports %) %
+                        (assoc % :exports (mapv :name (:functions %))))))]
     (machine-ir/compile-kir-module
      :aarch64 kir
      (into {} (map (fn [{:keys [name]}]
                      [name (vec fuel-charge-tokens)])
-                   (:functions kir))))
+                   (:functions kir)))))
     (let [;; See the x86-64 backend's `emit-program`: the export set is read
         ;; from the DECLARED functions, before the search helpers are appended.
         exported-names (set (or (:exports kir) (map :name (:functions kir))))

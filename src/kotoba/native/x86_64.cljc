@@ -1782,15 +1782,17 @@
               (:string-literal token))))
 
 (defn emit-program [kir]
-  (if-let [kir (let [candidate (update kir :functions
-                                       #(-> % string-search/augment-functions
-                                              string-index/augment-functions))]
-                 (when (machine-ir/pilot-module? candidate) candidate))]
+  (if machine-ir/*production-routing-enabled?*
+    (let [kir (-> kir
+                  (update :functions #(-> % string-search/augment-functions
+                                             string-index/augment-functions))
+                  (#(if (:exports %) %
+                        (assoc % :exports (mapv :name (:functions %))))))]
     (machine-ir/compile-kir-module
      :x86-64 kir
      (into {} (map (fn [{:keys [name]}]
                      [name (vec (fuel-charge-tokens (atom -1)))])
-                   (:functions kir))))
+                   (:functions kir)))))
     (let [;; Export set from the DECLARED functions, before the search helpers
         ;; are appended: a program's public surface must not change because it
         ;; searched a string. (`:exports` is usually absent, in which case

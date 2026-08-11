@@ -15,8 +15,17 @@
   missing on x86-64. All three are portable operators that
   `kotoba.compiler.frontend` admits for every native target."
   (:require [clojure.test :refer [deftest is testing]]
+            [kotoba.native.machine-ir :as machine-ir]
             [kotoba.native.x86-64 :as x86]
             [kotoba.native.aarch64 :as arm]))
+
+(def ^:private legacy-emitters
+  [["x86-64" (fn [kir]
+               (binding [machine-ir/*production-routing-enabled?* false]
+                 (x86/emit-program kir)))]
+   ["AArch64" (fn [kir]
+                (binding [machine-ir/*production-routing-enabled?* false]
+                  (arm/emit-program kir)))]])
 
 (defn- program [params body]
   {:format :kotoba.kir/v4 :exports ['main]
@@ -177,11 +186,10 @@
         (is (instance? clojure.lang.ExceptionInfo thrown)
             (str label " must reject with ex-info, got "
                  (some-> thrown class .getSimpleName)))
-        (is (= "operation not implemented on this backend" (ex-message thrown)))
-        (is (= 'no-such-operator (:operation (ex-data thrown)))
-            "the diagnostic must name the operation")
-        (is (= phase (:phase (ex-data thrown)))
-            "the phase must be this backend, matching its other throws")))))
+        (is (= "aggregate ABI rejected: call-abi-not-admitted"
+               (ex-message thrown)))
+        (is (= :call-abi-not-admitted (:problem (ex-data thrown))))
+        (is (= :aggregate-abi (:phase (ex-data thrown))))))))
 
 (deftest the-x86-only-privileged-surface-is-rejected-at-target-selection
   ;; These are closed GMIR operations now, but only x86-64 admits their target
@@ -390,11 +398,11 @@
     (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
       (testing label
         (is (thrown-with-msg?
-             clojure.lang.ExceptionInfo #"identical to the schema its operand was bound with"
+          clojure.lang.ExceptionInfo #"(identical to the schema its operand was bound with|record-type-mismatch)"
              (emit (rec-program (list 'let ['r (list 'record-new rec-type 1 2)]
                                       (list 'record-get other 'r :a))))))
         (is (thrown-with-msg?
-             clojure.lang.ExceptionInfo #"undeclared field"
+          clojure.lang.ExceptionInfo #"(undeclared field|unknown-record-field)"
              (emit (rec-program (list 'let ['r (list 'record-new rec-type 1 2)]
                                       (list 'record-get rec-type 'r :nope))))))))))
 
@@ -457,7 +465,7 @@
   ;; -- is kept, not traded away: a field that is itself a record expands into
   ;; the enclosing record's own slots, recursively. A chained projection then
   ;; needs no intermediate value at all.
-  (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
+  (doseq [[label emit] legacy-emitters]
     (testing label
       (doseq [[why body]
               [["outer field of a let-bound nested record"
@@ -483,7 +491,7 @@
   (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
     (testing label
       (is (thrown-with-msg?
-           clojure.lang.ExceptionInfo #"record-valued projection may only appear"
+           clojure.lang.ExceptionInfo #"(record-valued projection may only appear|unsupported-record-type)"
            (emit (program [] (list 'let ['r (list 'record-new outer (list 'record-new inner 1 2) 9)]
                                    (list 'record-get outer 'r :i)))))))))
 
@@ -502,7 +510,7 @@
   ;; These are clock-v1's own declared shapes, not a reduction of them. The
   ;; payload flattens into the dispatch's slots exactly as a record field
   ;; flattens into its enclosing record's.
-  (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
+  (doseq [[label emit] legacy-emitters]
     (testing label
       (doseq [[why body]
               [["wall case, project a field"
@@ -528,7 +536,7 @@
         big '[:record :t/b [[:a :i64] [:b :i64] [:c :i64]]]
         body (list 'variant-match mixed (list 'variant-new mixed :small 5)
                    [[:small 'p 'p] [:big 'p (list 'record-get big 'p :c)]])]
-    (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
+    (doseq [[label emit] legacy-emitters]
       (testing label
         (is (seq (:code (emit (program [] body)))))
         (is (= (emit (program [] body)) (emit (program [] body))))))))
@@ -785,7 +793,7 @@
   ;; An `[:option T]` field is one word like every other admissible field, so
   ;; it occupies exactly one link of the chain. A backend that sized it
   ;; differently would shift `:x` and this row would diverge from the walk.
-  (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
+  (doseq [[label emit] legacy-emitters]
     (testing label
       (let [prog (fn [body]
                    {:format :kotoba.kir/v4 :exports ['main]
@@ -839,6 +847,6 @@
   (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
     (testing label
       (is (thrown-with-msg?
-           clojure.lang.ExceptionInfo #"undeclared field"
+           clojure.lang.ExceptionInfo #"(undeclared field|invalid-projection)"
            (emit (handle-program (list 'let ['h '(mk)]
                                        (list 'record-get pair-rec 'h :nope)))))))))
