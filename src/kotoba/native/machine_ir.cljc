@@ -151,11 +151,32 @@
    'vector-f64-assoc :vector-assoc
    'vector-f64-drop :vector-drop})
 
+(def ^:private native-clock-request-type
+  [:variant :kotoba.clock/request [[:wall :bool] [:monotonic :bool]]])
+
+(def ^:private native-clock-wall-type
+  [:record :kotoba.clock/wall
+   [[:unix-millis :i64] [:observation-sequence :i64]]])
+
+(def ^:private native-clock-monotonic-type
+  [:record :kotoba.clock/monotonic
+   [[:nanos :i64] [:observation-sequence :i64]]])
+
+(def ^:private native-clock-error-type
+  [:record :kotoba.clock/error [[:code :keyword] [:message :string]]])
+
+(def ^:private native-clock-result-type
+  [:variant :kotoba.clock/result
+   [[:wall native-clock-wall-type]
+    [:monotonic native-clock-monotonic-type]
+    [:error native-clock-error-type]]])
+
 (def ^:private typed-capability-kinds
   {[:i64 :i64] :i64
    [:string :string] :string
    [:option-i64 :option-i64] :option-i64
-   [:result-i64 :result-i64] :result-i64})
+   [:result-i64 :result-i64] :result-i64
+   [native-clock-request-type native-clock-result-type] :clock-v1})
 
 (defn- valid-capability-id? [value]
   (and (integer? value) (<= 0 value 255)))
@@ -202,6 +223,16 @@
                      (nth type 2))
              (= (count (nth type 2))
                 (count (distinct (map first (nth type 2))))))
+    (nth type 2)))
+
+(defn- provider-record-fields [type]
+  (when (contains? #{native-clock-wall-type native-clock-monotonic-type
+                     native-clock-error-type}
+                   type)
+    (nth type 2)))
+
+(defn- provider-variant-cases [type]
+  (when (contains? #{native-clock-request-type native-clock-result-type} type)
     (nth type 2)))
 
 (defn- variant-value? [value]
@@ -407,6 +438,79 @@
            :else form))))
    body))
 
+(defn- normalize-provider-boundary
+  "Lower the sealed clock provider's nested variant/record values to pair
+  handles. This path is selected only by an exact typed-cap-call contract; it
+  does not widen public entry aggregates or local SROA."
+  [body]
+  (walk/postwalk
+   (fn [form]
+     (if-not (seq? form)
+       form
+       (let [op (first form), args (rest form)]
+         (cond
+           (and (= op 'record-new) (<= 2 (count args))
+                (provider-record-fields (first args)))
+           (let [[type & values] args, fields (provider-record-fields type)]
+             (when-not (and fields (= (count fields) (count values)))
+               (reject! :provider-boundary :invalid-record-constructor
+                        {:type type :values values}))
+             (reduce (fn [tail value] (list 'pair value tail))
+                     0 (reverse values)))
+
+           (and (= op 'record-get) (= 3 (count args))
+                (provider-record-fields (first args)))
+           (let [[type value field] args
+                 fields (provider-record-fields type)
+                 index (first (keep-indexed (fn [i [candidate _]]
+                                              (when (= candidate field) i))
+                                            fields))]
+             (when (or (nil? fields) (nil? index))
+               (reject! :provider-boundary :invalid-record-projection
+                        {:type type :field field}))
+             (list 'pair-first
+                   (nth (iterate (fn [handle] (list 'pair-second handle)) value)
+                        index)))
+
+           (and (= op 'variant-new) (= 3 (count args))
+                (provider-variant-cases (first args)))
+           (let [[type tag payload] args
+                 cases (provider-variant-cases type)
+                 ordinal (first (keep-indexed (fn [index [candidate _]]
+                                                (when (= candidate tag) index))
+                                              cases))]
+             (when (or (nil? cases) (nil? ordinal))
+               (reject! :provider-boundary :invalid-variant-constructor
+                        {:type type :tag tag}))
+             (list 'pair ordinal payload))
+
+           (and (= op 'variant-match) (= 3 (count args))
+                (provider-variant-cases (first args)))
+           (let [[type value branches] args
+                 cases (provider-variant-cases type)
+                 declared (mapv first cases)
+                 supplied (when (vector? branches) (mapv first branches))]
+             (when-not (and cases (= declared supplied)
+                            (every? #(and (vector? %) (= 3 (count %))
+                                          (symbol? (second %)))
+                                    branches))
+               (reject! :provider-boundary :invalid-variant-dispatch
+                        {:type type :branches branches}))
+             (let [tagged (gensym "provider_variant__")
+                   ordinal (list 'pair-first tagged)
+                   payload (list 'pair-second tagged)
+                   dispatch
+                   (reduce (fn [fallback [index [_ binder branch]]]
+                             (list 'if (list '= ordinal index)
+                                   (list 'let [binder payload] branch)
+                                   fallback))
+                           (list 'quot 1 0)
+                           (reverse (map-indexed vector branches)))]
+               (list 'let [tagged value] dispatch)))
+
+           :else form))))
+   body))
+
 (defn- scalar-boundary-type? [type]
   (or (word-result-type? type)
       (aggregate-abi/scalar-record-type? type)
@@ -449,6 +553,16 @@
                              (contains? record-types (second type)))))
                   (function-boundary-types function)))
           functions))))
+
+(defn- provider-boundary-module? [functions]
+  (boolean
+   (some (fn [form]
+           (and (seq? form) (= 'typed-cap-call (first form))
+                (= 5 (count form))
+                (= :clock-v1
+                   (get typed-capability-kinds [(nth form 2) (nth form 3)]))
+                (= 7 (second form))))
+         (tree-seq coll? seq functions))))
 
 (defn- validate-record-reference-results! [functions]
   (doseq [{:keys [name result body]} functions
@@ -1218,7 +1332,8 @@
           names (mapv :name functions)
           entry (first exports)
           variant-boundary? (variant-boundary-module? functions)
-          record-boundary? (record-boundary-module? functions record-types)]
+          record-boundary? (record-boundary-module? functions record-types)
+          provider-boundary? (provider-boundary-module? functions)]
       (when-not (and (= (count names) (count (distinct names)))
                      (every? #(contains? signatures %) exports))
         (reject! :kir-to-gmir :invalid-function-module
@@ -1229,6 +1344,7 @@
         :gmir/functions
         (mapv (fn [{:keys [name params body]}]
                 (let [body (cond-> body
+                             provider-boundary? normalize-provider-boundary
                              record-boundary? normalize-scalar-record-boundary
                              variant-boundary? normalize-scalar-variant-boundary)
                       lowered (lower-kir-expression params body signatures)]
@@ -1247,6 +1363,7 @@
          (let [module (lower-kir-module kir)]
            (or (record-boundary-module? (:functions kir))
                (variant-boundary-module? (:functions kir))
+               (provider-boundary-module? (:functions kir))
                (boolean
                 (some #(some (fn [instruction]
                                (= :gmir/data-address (:gmir/op instruction)))

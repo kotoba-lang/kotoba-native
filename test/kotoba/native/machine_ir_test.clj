@@ -178,6 +178,36 @@
   (is (not (machine/pilot-expression?
             '[x] '(typed-cap-call 7 :string :result-i64 x)))))
 
+(deftest clock-provider-contract-lowers-through-the-module-pipeline
+  (let [request [:variant :kotoba.clock/request
+                 [[:wall :bool] [:monotonic :bool]]]
+        wall [:record :kotoba.clock/wall
+              [[:unix-millis :i64] [:observation-sequence :i64]]]
+        monotonic [:record :kotoba.clock/monotonic
+                   [[:nanos :i64] [:observation-sequence :i64]]]
+        error [:record :kotoba.clock/error
+               [[:code :keyword] [:message :string]]]
+        result [:variant :kotoba.clock/result
+                [[:wall wall] [:monotonic monotonic] [:error error]]]
+        body (list 'let ['answer
+                         (list 'typed-cap-call 7 request result
+                               (list 'variant-new request :wall false))]
+                   (list 'variant-match result 'answer
+                         [[:wall 'w (list 'record-get wall 'w :unix-millis)]
+                          [:monotonic 'm (list 'record-get monotonic 'm :nanos)]
+                          [:error 'e 0]]))
+        module {:format :kotoba.kir/v4 :entry 'main :exports ['main]
+                :functions [{:name 'main :params [] :param-types []
+                             :result :i64 :body body}]}
+        gmir (machine/lower-kir-module module)
+        calls (filter #(= :gmir/capability-call (:gmir/op %))
+                      (get-in gmir [:gmir/functions 0 :gmir/instructions]))]
+    (is (machine/pilot-module? module))
+    (is (= 1 (count calls)))
+    (is (= :clock-v1 (:gmir/kind (first calls))))
+    (doseq [target [:x86-64 :aarch64]]
+      (is (seq (:mc/functions (machine/compile-gmir target gmir))) target))))
+
 (deftest capability-call-encoders-check-policy-before-the-host-call
   (let [x86-scalar (machine/compile-expression :x86-64 '[x] '(cap-call 7 x))
         x86-typed (machine/compile-expression
