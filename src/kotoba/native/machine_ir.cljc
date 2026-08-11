@@ -11,6 +11,8 @@
             [kotoba.codegen.mc :as mc]
             [kotoba.codegen.layout :as layout]
             [kotoba.native.aggregate-abi :as aggregate-abi]
+            [kotoba.native.string-index :as string-index]
+            [kotoba.native.string-search :as string-search]
             #?(:cljs [kotoba.kir.cljs-i64 :as i64])))
 
 (defn- reject! [phase problem instruction]
@@ -137,6 +139,16 @@
 (defn- valid-capability-id? [value]
   (and (integer? value) (<= 0 value 255)))
 
+(defn word-result-type?
+  "True for result descriptors represented by one native word. Escaping
+  records and variants retain their explicit aggregate ABI boundary."
+  [type]
+  (or (contains? #{nil :i64 :bool :f32 :f64 :string :keyword
+                   :vector :vector-f64 :string-index} type)
+      (and (vector? type)
+           (contains? #{:option :result :list :set :map :ref}
+                      (first type)))))
+
 (defn- scalar-literal? [form]
   (or (boolean? form) (gmir/i64-value? form)))
 
@@ -185,9 +197,9 @@
     value
     (reject! :kir-to-gmir :scalar-value-required {:form form :value value})))
 
-(defn- normalize-option-result
-  "Expand option/result surface forms into the closed pair/control subset.
-  Generated lets preserve exact-once evaluation of tagged values."
+(defn- normalize-surface-operations
+  "Expand composite surface forms into the closed runtime/control subset.
+  Generated lets preserve exact-once evaluation of reused operands."
   [body]
   (walk/postwalk
    (fn [form]
@@ -260,6 +272,35 @@
                    (list 'if (list 'pair-first tagged)
                          (list 'let [ok-binder payload] ok-body)
                          (list 'let [err-binder payload] err-body))))
+           (contains? '#{vector-new vector-f64-new} op)
+           (reduce (fn [items item] (list 'vector-conj items item))
+                   (list 'vector-new-empty) args)
+           (and (contains? '#{vector-get vector-f64-get} op)
+                (= 3 (count args)))
+           (let [[items-form index-form fallback] args
+                 items (gensym "vector__"), index (gensym "index__")]
+             (list 'let [items items-form index index-form]
+                   (list 'if (list 'if (list '< index 0) 0
+                                   (list '< index (list 'vector-count items)))
+                         (list 'vector-at items index)
+                         fallback)))
+           (and (= op 'keyword-name) (= 1 (count args)))
+           (let [subject (gensym "keyword__")]
+             (list 'let [subject (first args)]
+                   (list 'string-substring subject 1
+                         (list 'string-byte-length subject))))
+           (and (= op 'string-contains?) (= 2 (count args)))
+           (normalize-surface-operations (string-search/lower-contains args))
+           (and (= op 'string-replace-all) (= 3 (count args)))
+           (normalize-surface-operations (string-search/lower-replace-all args))
+           (and (contains? '#{string-index-new string-index-count
+                              string-index-contains string-index-get
+                              string-index-assoc} op)
+                (= (count args)
+                   (get '{string-index-new 0 string-index-count 1
+                          string-index-contains 2 string-index-get 2
+                          string-index-assoc 3} op)))
+           (normalize-surface-operations (string-index/lower op args))
            :else form))))
    body))
 
@@ -312,7 +353,7 @@
    body))
 
 (defn- scalar-boundary-type? [type]
-  (or (contains? #{nil :i64 :bool} type)
+  (or (word-result-type? type)
       (aggregate-abi/scalar-variant-type? type)))
 
 (defn- function-boundary-types [{:keys [params param-types result]}]
@@ -350,7 +391,7 @@
                   (every? #(and (integer? %) (<= 0 % 5)) (vals signatures)))
      (reject! :kir-to-gmir :invalid-parameters
               {:params params :signatures signatures}))
-   (let [body (normalize-option-result body)
+   (let [body (normalize-surface-operations body)
         next-reg (atom -1)
         next-label (atom -1)
         fresh-reg #(gmir/vreg (swap! next-reg inc))
@@ -878,7 +919,7 @@
   recursive `if`, fixed scalar-field record SROA, and non-escaping scalar
   variant SROA use the extracted IR path; allocation spills when necessary."
   [params body]
-  (let [body (normalize-option-result body)
+  (let [body (normalize-surface-operations body)
         parameters (set params)]
     (letfn [(shape [form env]
               (cond

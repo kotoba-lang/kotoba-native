@@ -1705,7 +1705,7 @@
                (box-record-tails body record-name)
                body)
         n (count params)]
-    (if (and (contains? #{nil :i64 :bool} result)
+    (if (and (machine-ir/word-result-type? result)
              (machine-ir/pilot-expression? (vec params) source-body))
       (let [label-counter (atom -1)
             prologue (vec (fuel-charge-tokens label-counter))
@@ -1782,7 +1782,10 @@
               (:string-literal token))))
 
 (defn emit-program [kir]
-  (if (machine-ir/pilot-module? kir)
+  (if-let [kir (let [candidate (update kir :functions
+                                       #(-> % string-search/augment-functions
+                                              string-index/augment-functions))]
+                 (when (machine-ir/pilot-module? candidate) candidate))]
     (machine-ir/compile-kir-module
      :x86-64 kir
      (into {} (map (fn [{:keys [name]}]
