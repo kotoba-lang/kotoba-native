@@ -1782,52 +1782,13 @@
               (:string-literal token))))
 
 (defn emit-program [kir]
-  (if machine-ir/*production-routing-enabled?*
-    (let [kir (-> kir
-                  (update :functions #(-> % string-search/augment-functions
-                                             string-index/augment-functions))
-                  (#(if (:exports %) %
-                        (assoc % :exports (mapv :name (:functions %))))))]
+  (let [kir (-> kir
+                (update :functions #(-> % string-search/augment-functions
+                                           string-index/augment-functions))
+                (#(if (:exports %) %
+                      (assoc % :exports (mapv :name (:functions %))))))]
     (machine-ir/compile-kir-module
      :x86-64 kir
      (into {} (map (fn [{:keys [name]}]
                      [name (vec (fuel-charge-tokens (atom -1)))])
-                   (:functions kir)))))
-    (let [;; Export set from the DECLARED functions, before the search helpers
-        ;; are appended: a program's public surface must not change because it
-        ;; searched a string. (`:exports` is usually absent, in which case
-        ;; every declared function is exported -- which is exactly why this
-        ;; has to be read first.)
-        exported-names (set (or (:exports kir) (map :name (:functions kir))))
-        functions (-> (:functions kir)
-                      string-search/augment-functions
-                      string-index/augment-functions)
-        function-names (set (map :name functions))
-        token-bodies (mapv (fn [f] [f (emit-function f function-names)]) functions)
-        offsets (loop [items token-bodies offset 0 out {}]
-                  (if-let [[f emitted] (first items)]
-                    (recur (next items) (+ offset (code-size (:tokens emitted)))
-                           (assoc out (:name f) offset))
-                    out))
-        code-size-total (reduce + 0 (map (fn [[_ emitted]] (code-size (:tokens emitted))) token-bodies))
-        literal-contents (collect-string-literals token-bodies)
-        literal-offsets (loop [remaining literal-contents pos code-size-total out {}]
-                          (if-let [content (first remaining)]
-                            (recur (next remaining)
-                                   (+ pos (count (utf8-bytes content)))
-                                   (assoc out content pos))
-                            out))
-        literal-bytes (vec (mapcat (fn [content]
-                                     (map #(bit-and (int %) 0xff) (utf8-bytes content)))
-                                   literal-contents))]
-    (loop [items token-bodies code [] exports {}]
-      (if-let [[function emitted] (first items)]
-        (let [offset (get offsets (:name function))
-              tokens (:tokens emitted)
-              body (finalize tokens offset (+ offset (:expression-start emitted)) offsets literal-offsets)]
-          (recur (next items) (into code body)
-                 (cond-> exports
-                   (contains? exported-names (:name function))
-                   (assoc (:name function)
-                          {:offset offset :length (count body) :arity (count (:params function))}))))
-        {:code (vec (concat code literal-bytes)) :exports exports})))))
+                   (:functions kir))))))

@@ -15,17 +15,12 @@
   missing on x86-64. All three are portable operators that
   `kotoba.compiler.frontend` admits for every native target."
   (:require [clojure.test :refer [deftest is testing]]
-            [kotoba.native.machine-ir :as machine-ir]
             [kotoba.native.x86-64 :as x86]
             [kotoba.native.aarch64 :as arm]))
 
-(def ^:private legacy-emitters
-  [["x86-64" (fn [kir]
-               (binding [machine-ir/*production-routing-enabled?* false]
-                 (x86/emit-program kir)))]
-   ["AArch64" (fn [kir]
-                (binding [machine-ir/*production-routing-enabled?* false]
-                  (arm/emit-program kir)))]])
+(def ^:private emitters
+  [["x86-64" x86/emit-program]
+   ["AArch64" arm/emit-program]])
 
 (defn- program [params body]
   {:format :kotoba.kir/v4 :exports ['main]
@@ -460,12 +455,11 @@
 (def ^:private inner '[:record :t/s [[:a :i64] [:b :i64]]])
 (def ^:private outer '[:record :t/n [[:i [:record :t/s [[:a :i64] [:b :i64]]]] [:m :i64]]])
 
-(deftest a-nested-record-flattens-into-the-enclosing-slots
-  ;; ADR 0062's property -- a record has no independent runtime representation
-  ;; -- is kept, not traded away: a field that is itself a record expands into
-  ;; the enclosing record's own slots, recursively. A chained projection then
-  ;; needs no intermediate value at all.
-  (doseq [[label emit] legacy-emitters]
+(deftest nested-records-fail-closed-at-the-production-boundary
+  ;; Nested aggregate ABI is not admitted yet. These shapes used to be tested
+  ;; only by switching the public emitters onto retired recursive code. The
+  ;; production contract is explicit rejection until GMIR owns the layout.
+  (doseq [[label emit] emitters]
     (testing label
       (doseq [[why body]
               [["outer field of a let-bound nested record"
@@ -480,9 +474,9 @@
                             (list 'record-get outer 'r :m)))]
                ["construction, outer field"
                 (list 'record-get outer (list 'record-new outer (list 'record-new inner 1 2) 7) :m)]]]
-        (is (seq (:code (emit (program [] body)))) why)
-        (is (= (emit (program [] body)) (emit (program [] body)))
-            (str why " must be reproducible"))))))
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unsupported-record-type"
+                              (emit (program [] body)))
+            why)))))
 
 (deftest a-record-valued-projection-is-not-a-value
   ;; Selecting a record-typed field yields a record, which is only meaningful as
@@ -506,11 +500,10 @@
     [[:wall [:record :kotoba.clock/wall [[:unix-millis :i64] [:observation-sequence :i64]]]]
      [:error [:record :kotoba.clock/error [[:code :keyword] [:message :string]]]]]])
 
-(deftest a-variant-case-payload-may-be-a-record
-  ;; These are clock-v1's own declared shapes, not a reduction of them. The
-  ;; payload flattens into the dispatch's slots exactly as a record field
-  ;; flattens into its enclosing record's.
-  (doseq [[label emit] legacy-emitters]
+(deftest record-payload-variants-fail-closed-at-the-production-boundary
+  ;; Aggregate payload variants are outside the extracted ABI. Keep the clock
+  ;; shapes as rejection vectors instead of reaching retired emitters.
+  (doseq [[label emit] emitters]
     (testing label
       (doseq [[why body]
               [["wall case, project a field"
@@ -521,25 +514,20 @@
                 (list 'variant-match clock-result
                       (list 'variant-new clock-result :error (list 'record-new clock-error :timeout "slow"))
                       [[:wall 'p 0] [:error 'p (list 'string-byte-length (list 'record-get clock-error 'p :message))]])]]]
-        (is (seq (:code (emit (program [] body)))) why)
-        (is (= (emit (program [] body)) (emit (program [] body)))
-            (str why " must be reproducible"))))))
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unsupported-variant-type"
+                              (emit (program [] body)))
+            why)))))
 
-(deftest the-payload-region-is-sized-by-the-widest-case
-  ;; Only the constructed case is materialised, but every branch is emitted. A
-  ;; branch whose declared payload is wider than the constructed one must still
-  ;; describe slots that exist -- otherwise it emits a load running off the
-  ;; frame, unreachable but wrong. Constructing the NARROW case of a variant
-  ;; whose other case is wider is the shape that would expose it.
+(deftest mixed-width-record-payload-variants-fail-closed
   (let [mixed '[:variant :t/m [[:small :i64]
                                [:big [:record :t/b [[:a :i64] [:b :i64] [:c :i64]]]]]]
         big '[:record :t/b [[:a :i64] [:b :i64] [:c :i64]]]
         body (list 'variant-match mixed (list 'variant-new mixed :small 5)
                    [[:small 'p 'p] [:big 'p (list 'record-get big 'p :c)]])]
-    (doseq [[label emit] legacy-emitters]
+    (doseq [[label emit] emitters]
       (testing label
-        (is (seq (:code (emit (program [] body)))))
-        (is (= (emit (program [] body)) (emit (program [] body))))))))
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unsupported-variant-type"
+                              (emit (program [] body))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; A record crossing a function boundary
@@ -793,7 +781,7 @@
   ;; An `[:option T]` field is one word like every other admissible field, so
   ;; it occupies exactly one link of the chain. A backend that sized it
   ;; differently would shift `:x` and this row would diverge from the walk.
-  (doseq [[label emit] legacy-emitters]
+  (doseq [[label emit] emitters]
     (testing label
       (let [prog (fn [body]
                    {:format :kotoba.kir/v4 :exports ['main]

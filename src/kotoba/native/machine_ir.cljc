@@ -584,11 +584,6 @@
       (reject! :record-boundary :result-schema-mismatch
                {:function name :result result :constructed type}))))
 
-(def ^:dynamic *production-routing-enabled?*
-  "Test-only compatibility seam for byte regressions of retired emitters.
-  Production leaves this enabled and has no fallback from an IR rejection."
-  true)
-
 (defn lower-kir-expression
   "Lower a closed pure tail-expression subset to GMIR.
 
@@ -1327,8 +1322,7 @@
                   (when (every? some? shapes) (peek shapes)))
 
                 :else nil))]
-    (and *production-routing-enabled?*
-         (vector? params) (<= (count params) 5)
+    (and (vector? params) (<= (count params) 5)
          (= (count params) (count parameters))
          (every? symbol? params)
          (= :scalar (shape body (zipmap params (repeat :scalar))))))))
@@ -1384,8 +1378,7 @@
   At least one call is required so call-free programs retain their existing
   per-expression migration route."
   [kir]
-  (and *production-routing-enabled?*
-       (try
+  (try
          (let [module (lower-kir-module kir)]
            (or (record-boundary-module? (:functions kir))
                (variant-boundary-module? (:functions kir))
@@ -1401,7 +1394,7 @@
                                           (:gmir/op instruction)))
                              (:gmir/instructions %))
                       (:gmir/functions module)))))
-         (catch #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) _ false))))
+         (catch #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) _ false)))
 
 ;; ── MC -> bytes ──────────────────────────────────────────────────────────────
 

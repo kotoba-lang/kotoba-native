@@ -13,10 +13,10 @@ Whole-module lowering accepts one or more declared exports. GMIR retains the
 first export as its entry identity, while final native layout publishes exact
 offset, length, and arity metadata for every requested export.
 
-The old emitters remain reachable only when the dynamic test compatibility
-seam is explicitly disabled. This preserves byte-level regression evidence for
-held nested/non-scalar aggregate representations without making those shapes a
-production native claim.
+The dynamic test compatibility seam is removed. Public emitters have exactly
+one route, and tests for held nested/non-scalar aggregate representations now
+assert the same fail-closed production boundary rather than executing retired
+recursive code.
 
 ## Consequences
 
@@ -24,4 +24,4 @@ production native claim.
   MIR, allocated MC, and the closed target encoder.
 - Unknown operations and held value shapes fail before ISA emission.
 - Multi-export modules no longer require the old layout path.
-- Test-only legacy evidence is structurally separated from production routing.
+- Retired emitter code has no public or test routing switch.

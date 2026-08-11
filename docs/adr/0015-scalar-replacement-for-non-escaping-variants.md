@@ -40,7 +40,8 @@ so an invalid external discriminant cannot enter this representation.
 
 Unknown cases, reordered or incomplete branches, schema mismatches, nested or
 non-scalar payloads, and escaping variant values fail the pilot predicate and
-remain on the legacy emitter.
+fail closed before target selection. ADR 0026 removed the former test-only
+legacy routing seam.
 
 ## Consequences
 
@@ -50,6 +51,6 @@ variant-valued branch exercises the real multi-phi path, while payload
 evaluation and unselected-branch control flow preserve KIR trap behavior.
 
 This decision does not define an aggregate function-boundary ABI, scalarize
-record payloads inside variants, accept variant parameters/results, or replace
-the legacy defensive invalid-tag trap. Those are separate migration stages and
-must not be inferred from this local SROA contract.
+record payloads inside variants, accept variant parameters/results, or define
+an external invalid-tag ABI. Those are separate migration stages and must not
+be inferred from this local SROA contract.
