@@ -136,9 +136,10 @@ AArch64 call functions save and restore FP/LR. The correctness-first all-vreg
 policy remains the fail-closed path for remaining pressure without changing the
 v3 call contract.
 
-The extracted record boundary remains held. Scalar variant handles are admitted
-by aggregate ABI v3, while nested aggregates, indirect calls, varargs, and
-external linkage remain held. This is not a Rust-parity claim.
+Scalar record pair chains and scalar variant handles are admitted by aggregate
+ABI v4. Local non-escaping aggregates retain scalar replacement; nested
+aggregates, indirect calls, varargs, and external linkage remain explicit
+non-native language boundaries. This is not a Rust-parity claim.
 
 Value-position scalar `if` uses GMIR/MIR v2 phi values. Each branch reaches an
 explicit predecessor exit. Single- and multi-phi joins lower through MIR's

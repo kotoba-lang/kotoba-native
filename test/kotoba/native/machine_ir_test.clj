@@ -743,6 +743,26 @@
      :result scalar-variant-type
      :body (list 'variant-new scalar-variant-type :flag 'value)}]})
 
+(def scalar-record-boundary-kir
+  {:format :kotoba.kir/v4
+   :exports ['main]
+   :functions
+   [{:name 'identity :params ['value] :param-types [scalar-record-type]
+     :result scalar-record-type :body 'value}
+    {:name 'main :params ['value] :param-types [:i64] :result :i64
+     :body (list 'record-get scalar-record-type
+                 (list 'identity
+                       (list 'record-new scalar-record-type 'value 9))
+                 :a)}]})
+
+(def scalar-record-result-kir
+  {:format :kotoba.kir/v4
+   :exports ['make]
+   :functions
+   [{:name 'make :params ['value] :param-types [:i64]
+     :result scalar-record-type
+     :body (list 'record-new scalar-record-type 'value 9)}]})
+
 (deftest kir-module-lowers-to-versioned-function-and-call-ir
   (is (machine/pilot-module? scalar-call-kir))
   (let [gmir (machine/lower-kir-module scalar-call-kir)
@@ -810,6 +830,23 @@
               (assoc-in scalar-variant-result-kir [:functions 0 :result]
                         [:variant :test/text [[:text :string]]]))))))
 
+(deftest scalar-record-parameters-and-results-use-the-versioned-pair-chain
+  (doseq [kir [scalar-record-boundary-kir scalar-record-result-kir]]
+    (is (machine/pilot-module? kir))
+    (let [gmir (machine/lower-kir-module kir)
+          instructions (mapcat :gmir/instructions (:gmir/functions gmir))]
+      (is (some #(and (= :gmir/runtime-call (:gmir/op %))
+                      (= :pair (:gmir/runtime %)))
+                instructions))
+      (doseq [target [:x86-64 :aarch64]]
+        (let [compiled (machine/compile-kir-module target kir)]
+          (is (seq (:code compiled)) target)
+          (is (= 1 (get-in compiled [:exports (first (:exports kir)) :arity]))
+              target)))))
+  (is (not (machine/pilot-module?
+            (assoc-in scalar-record-result-kir [:functions 0 :result]
+                      [:record :test/nested [[:value scalar-record-type]]])))))
+
 (deftest four-entry-arguments-reach-both-encoders-without-a-spill-frame
   (doseq [target [:x86-64 :aarch64]]
     (let [gmir (machine/lower-kir-module four-argument-call-kir)
@@ -868,11 +905,16 @@
   (is (= 3 (:gmir/version
             (machine/lower-kir-module
              (assoc-in scalar-call-kir [:functions 0 :result] :string)))))
+  (is (= 3 (:gmir/version
+            (machine/lower-kir-module
+             (-> scalar-call-kir
+                 (assoc-in [:functions 0 :result]
+                           [:record :demo/value [[:value :i64]]])
+                 (assoc-in [:functions 0 :body]
+                           '(record-new [:record :demo/value [[:value :i64]]]
+                                        x)))))))
   (is (thrown? clojure.lang.ExceptionInfo
                (machine/lower-kir-module
-                (-> scalar-call-kir
-                    (assoc-in [:functions 0 :result]
-                              [:record :demo/value [[:value :i64]]])
-                    (assoc-in [:functions 0 :body]
-                              '(record-new [:record :demo/value [[:value :i64]]]
-                                           x)))))))
+                (assoc-in scalar-call-kir [:functions 0 :result]
+                          [:record :demo/outer
+                           [[:value [:record :demo/inner [[:x :i64]]]]]])))))

@@ -1,17 +1,15 @@
 (ns kotoba.native.aggregate-abi
   "Portable contract for aggregates that reach a native function boundary.
 
-  The established emitters already pass records as one-word pair-chain
-  handles. The extracted GMIR path has no call operation yet. Keeping those
-  facts in one closed value prevents a local SROA bundle from being mistaken
-  for an external ABI and gives future call lowering an executable gate."
+  Scalar records and variants cross extracted calls as one-word context-owned
+  pair handles. Local non-escaping aggregates remain scalar-replaced."
   (:require [clojure.set :as set]))
 
 (def contract
   {:abi/id :kotoba.native/aggregate-boundary
-   :abi/version 3
+   :abi/version 4
    :abi/word-bits 64
-   :legacy/record
+   :portable/record
    {:boundary/parameters :pair-chain-handle
     :boundary/results :pair-chain-handle
     :boundary/word-count 1
@@ -34,7 +32,7 @@
    :extracted
    {:local-record :scalar-replacement
     :local-variant :scalar-replacement
-    :record-boundary :held
+    :record-boundary :scalar-pair-chain-admitted
     :variant-boundary :scalar-pair-handle-admitted
     :call-admission :scalar-admitted
     :call-requires #{:per-function-frame
@@ -76,16 +74,16 @@
 (defn validate-contract!
   "Validate the published contract and return it unchanged."
   [value]
-  (when-not (= #{:abi/id :abi/version :abi/word-bits :legacy/record
+  (when-not (= #{:abi/id :abi/version :abi/word-bits :portable/record
                  :portable/variant
                  :extracted :targets}
                (set (keys value)))
     (reject! :non-canonical-contract value))
   (when-not (and (= :kotoba.native/aggregate-boundary (:abi/id value))
-                 (= 3 (:abi/version value))
+                 (= 4 (:abi/version value))
                  (= 64 (:abi/word-bits value)))
     (reject! :unsupported-contract-version value))
-  (let [record (:legacy/record value)]
+  (let [record (:portable/record value)]
     (when-not (and (= #{:boundary/parameters :boundary/results
                         :boundary/word-count :boundary/layout
                         :boundary/terminator :boundary/allocation
@@ -99,7 +97,7 @@
                    (= :context-pair-arena (:boundary/allocation record))
                    (= :host-context (:boundary/ownership record))
                    (= 4096 (:boundary/arena-cell-limit record)))
-      (reject! :invalid-legacy-record-boundary record)))
+      (reject! :invalid-portable-record-boundary record)))
   (let [variant (:portable/variant value)]
     (when-not (and (= #{:boundary/parameters :boundary/results
                         :boundary/word-count :boundary/tag :boundary/payload-types
@@ -126,7 +124,7 @@
       (reject! :invalid-extracted-boundary extracted))
     (when-not (and (= :scalar-replacement (:local-record extracted))
                    (= :scalar-replacement (:local-variant extracted))
-                   (= :held (:record-boundary extracted))
+                   (= :scalar-pair-chain-admitted (:record-boundary extracted))
                    (= :scalar-pair-handle-admitted (:variant-boundary extracted))
                    (= :scalar-admitted (:call-admission extracted)))
       (reject! :invalid-extracted-admission extracted))
@@ -157,14 +155,13 @@
   value)
 
 (defn record-boundary-plan
-  "Return the established one-word record boundary for an eligible scalar
-  record. This describes the legacy path; it does not admit extracted calls."
+  "Return the admitted one-word scalar record boundary plan."
   [type]
   (when-not (scalar-record-type? type)
     (reject! :unsupported-record-type type))
-  (assoc (:legacy/record contract)
+  (assoc (:portable/record contract)
          :boundary/type type
-         :boundary/extracted-admission :held))
+         :boundary/extracted-admission :admitted))
 
 (defn scalar-variant-type?
   "True for the admitted sealed scalar variant boundary family."

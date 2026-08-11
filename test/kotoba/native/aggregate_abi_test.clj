@@ -16,21 +16,21 @@
     (is (= abi/contract published))
     (is (= published (abi/validate-contract! published)))
     (doseq [invalid [(update published :targets dissoc :aarch64)
-                     (assoc-in published [:legacy/record :ambient/policy] true)
+                     (assoc-in published [:portable/record :ambient/policy] true)
                      (assoc-in published [:portable/variant :boundary/case-limit] 33)
                      (assoc-in published [:targets :x86-64 :ambient/policy] true)
                      (update published :extracted dissoc :variant-boundary)]]
       (is (thrown? clojure.lang.ExceptionInfo
                    (abi/validate-contract! invalid))))))
 
-(deftest established-record-boundary-is-one-owned-handle
+(deftest scalar-record-boundary-is-one-owned-admitted-handle
   (let [plan (abi/record-boundary-plan scalar-pair)]
     (is (= :pair-chain-handle (:boundary/parameters plan)))
     (is (= :pair-chain-handle (:boundary/results plan)))
     (is (= 1 (:boundary/word-count plan)))
     (is (= :host-context (:boundary/ownership plan)))
     (is (= 4096 (:boundary/arena-cell-limit plan)))
-    (is (= :held (:boundary/extracted-admission plan))))
+    (is (= :admitted (:boundary/extracted-admission plan))))
   (doseq [type [[:record :test/empty []]
                 [:record :test/nested [[:value [:record :test/inner [[:x :i64]]]]]]
                 [:record :test/duplicate [[:x :i64] [:x :bool]]]

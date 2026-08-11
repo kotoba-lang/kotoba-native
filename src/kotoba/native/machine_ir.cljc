@@ -359,8 +359,43 @@
            :else form))))
    body))
 
+(defn- normalize-scalar-record-boundary
+  "Lower admitted scalar record parameters/results to the established
+  declaration-order pair-chain handle. Call-free local records retain SROA."
+  [body]
+  (walk/postwalk
+   (fn [form]
+     (if-not (seq? form)
+       form
+       (let [op (first form), args (rest form)]
+         (cond
+           (and (= op 'record-new) (<= 2 (count args)))
+           (let [[type & values] args, fields (scalar-record-fields type)]
+             (when-not (and fields (= (count fields) (count values)))
+               (reject! :record-boundary :invalid-constructor
+                        {:type type :values values}))
+             (reduce (fn [tail value] (list 'pair value tail))
+                     0 (reverse values)))
+
+           (and (= op 'record-get) (= 3 (count args)))
+           (let [[type value field] args
+                 fields (scalar-record-fields type)
+                 index (first (keep-indexed (fn [i [candidate _]]
+                                              (when (= candidate field) i))
+                                            fields))]
+             (when (or (nil? fields) (nil? index))
+               (reject! :record-boundary :invalid-projection
+                        {:type type :field field}))
+             (list 'pair-first
+                   (nth (iterate (fn [handle] (list 'pair-second handle)) value)
+                        index)))
+
+           :else form))))
+   body))
+
 (defn- scalar-boundary-type? [type]
   (or (word-result-type? type)
+      (aggregate-abi/scalar-record-type? type)
       (aggregate-abi/scalar-variant-type? type)))
 
 (defn- function-boundary-types [{:keys [params param-types result]}]
@@ -374,6 +409,41 @@
            (some aggregate-abi/scalar-variant-type?
                  (function-boundary-types function)))
          functions)))
+
+(defn- module-record-types [functions]
+  (reduce
+   (fn [types type]
+     (let [name (second type)]
+       (if-let [existing (get types name)]
+         (do (when-not (= existing type)
+               (reject! :record-boundary :conflicting-schema
+                        {:name name :left existing :right type}))
+             types)
+         (assoc types name type))))
+   {}
+   (filter aggregate-abi/scalar-record-type?
+           (tree-seq coll? seq functions))))
+
+(defn- record-boundary-module?
+  ([functions] (record-boundary-module? functions (module-record-types functions)))
+  ([functions record-types]
+   (boolean
+    (some (fn [function]
+            (some (fn [type]
+                    (or (aggregate-abi/scalar-record-type? type)
+                        (and (vector? type) (= :ref (first type))
+                             (contains? record-types (second type)))))
+                  (function-boundary-types function)))
+          functions))))
+
+(defn- validate-record-reference-results! [functions]
+  (doseq [{:keys [name result body]} functions
+          :when (and (vector? result) (= :ref (first result)))
+          type (filter aggregate-abi/scalar-record-type?
+                       (tree-seq coll? seq body))]
+    (when-not (= (second result) (second type))
+      (reject! :record-boundary :result-schema-mismatch
+               {:function name :result result :constructed type}))))
 
 (def ^:dynamic *production-routing-enabled?*
   "Migration seam used by legacy-emitter regression tests. Production leaves
@@ -1091,7 +1161,9 @@
   calls resolve against the module signature table."
   [kir]
   (let [functions (:functions kir)
-        exports (:exports kir)]
+        exports (:exports kir)
+        record-types (module-record-types functions)]
+    (validate-record-reference-results! functions)
     (when-not (and (vector? functions) (seq functions)
                    (vector? exports) (= 1 (count exports))
                    (every? #(and (map? %)
@@ -1104,7 +1176,8 @@
     (let [signatures (into {} (map (juxt :name #(count (:params %))) functions))
           names (mapv :name functions)
           entry (first exports)
-          variant-boundary? (variant-boundary-module? functions)]
+          variant-boundary? (variant-boundary-module? functions)
+          record-boundary? (record-boundary-module? functions record-types)]
       (when-not (and (= (count names) (count (distinct names)))
                      (contains? signatures entry))
         (reject! :kir-to-gmir :invalid-function-module
@@ -1114,9 +1187,9 @@
         :gmir/entry entry
         :gmir/functions
         (mapv (fn [{:keys [name params body]}]
-                (let [body (if variant-boundary?
-                             (normalize-scalar-variant-boundary body)
-                             body)
+                (let [body (cond-> body
+                             record-boundary? normalize-scalar-record-boundary
+                             variant-boundary? normalize-scalar-variant-boundary)
                       lowered (lower-kir-expression params body signatures)]
                   {:gmir/name name
                    :gmir/arity (count params)
@@ -1131,7 +1204,8 @@
   (and *production-routing-enabled?*
        (try
          (let [module (lower-kir-module kir)]
-           (or (variant-boundary-module? (:functions kir))
+           (or (record-boundary-module? (:functions kir))
+               (variant-boundary-module? (:functions kir))
                (boolean
                 (some #(some (fn [instruction]
                                (= :gmir/data-address (:gmir/op instruction)))
