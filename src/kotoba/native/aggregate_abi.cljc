@@ -9,7 +9,7 @@
 
 (def contract
   {:abi/id :kotoba.native/aggregate-boundary
-   :abi/version 2
+   :abi/version 3
    :abi/word-bits 64
    :legacy/record
    {:boundary/parameters :pair-chain-handle
@@ -20,11 +20,22 @@
     :boundary/allocation :context-pair-arena
     :boundary/ownership :host-context
     :boundary/arena-cell-limit 4096}
+   :portable/variant
+   {:boundary/parameters :pair-tag-payload-handle
+    :boundary/results :pair-tag-payload-handle
+    :boundary/word-count 1
+    :boundary/tag :zero-based-declaration-ordinal
+    :boundary/payload-types #{:i64 :bool}
+    :boundary/bool-words #{0 1}
+    :boundary/case-limit 32
+    :boundary/allocation :context-pair-arena
+    :boundary/ownership :host-context
+    :boundary/arena-cell-limit 4096}
    :extracted
    {:local-record :scalar-replacement
     :local-variant :scalar-replacement
     :record-boundary :held
-    :variant-boundary :held
+    :variant-boundary :scalar-pair-handle-admitted
     :call-admission :scalar-admitted
     :call-requires #{:per-function-frame
                      :spill-live-values-across-call
@@ -66,11 +77,12 @@
   "Validate the published contract and return it unchanged."
   [value]
   (when-not (= #{:abi/id :abi/version :abi/word-bits :legacy/record
+                 :portable/variant
                  :extracted :targets}
                (set (keys value)))
     (reject! :non-canonical-contract value))
   (when-not (and (= :kotoba.native/aggregate-boundary (:abi/id value))
-                 (= 2 (:abi/version value))
+                 (= 3 (:abi/version value))
                  (= 64 (:abi/word-bits value)))
     (reject! :unsupported-contract-version value))
   (let [record (:legacy/record value)]
@@ -88,6 +100,24 @@
                    (= :host-context (:boundary/ownership record))
                    (= 4096 (:boundary/arena-cell-limit record)))
       (reject! :invalid-legacy-record-boundary record)))
+  (let [variant (:portable/variant value)]
+    (when-not (and (= #{:boundary/parameters :boundary/results
+                        :boundary/word-count :boundary/tag :boundary/payload-types
+                        :boundary/bool-words :boundary/case-limit
+                        :boundary/allocation :boundary/ownership
+                        :boundary/arena-cell-limit}
+                      (set (keys variant)))
+                   (= :pair-tag-payload-handle (:boundary/parameters variant))
+                   (= :pair-tag-payload-handle (:boundary/results variant))
+                   (= 1 (:boundary/word-count variant))
+                   (= :zero-based-declaration-ordinal (:boundary/tag variant))
+                   (= #{:i64 :bool} (:boundary/payload-types variant))
+                   (= #{0 1} (:boundary/bool-words variant))
+                   (= 32 (:boundary/case-limit variant))
+                   (= :context-pair-arena (:boundary/allocation variant))
+                   (= :host-context (:boundary/ownership variant))
+                   (= 4096 (:boundary/arena-cell-limit variant)))
+      (reject! :invalid-portable-variant-boundary variant)))
   (let [extracted (:extracted value)
         required (:call-requires extracted)]
     (when-not (= #{:local-record :local-variant :record-boundary
@@ -97,7 +127,7 @@
     (when-not (and (= :scalar-replacement (:local-record extracted))
                    (= :scalar-replacement (:local-variant extracted))
                    (= :held (:record-boundary extracted))
-                   (= :held (:variant-boundary extracted))
+                   (= :scalar-pair-handle-admitted (:variant-boundary extracted))
                    (= :scalar-admitted (:call-admission extracted)))
       (reject! :invalid-extracted-admission extracted))
     (when-not (= #{:per-function-frame
@@ -135,6 +165,29 @@
   (assoc (:legacy/record contract)
          :boundary/type type
          :boundary/extracted-admission :held))
+
+(defn scalar-variant-type?
+  "True for the admitted sealed scalar variant boundary family."
+  [type]
+  (and (vector? type) (= 3 (count type)) (= :variant (first type))
+       (keyword? (second type)) (some? (namespace (second type)))
+       (vector? (nth type 2)) (<= 1 (count (nth type 2)) 32)
+       (every? #(and (vector? %) (= 2 (count %))
+                     (keyword? (first %))
+                     (contains? #{:i64 :bool} (second %)))
+               (nth type 2))
+       (= (count (nth type 2))
+          (count (distinct (map first (nth type 2)))))))
+
+(defn variant-boundary-plan
+  "Return the admitted one-word scalar variant boundary plan."
+  [type]
+  (when-not (scalar-variant-type? type)
+    (reject! :unsupported-variant-type type))
+  (assoc (:portable/variant contract)
+         :boundary/type type
+         :boundary/cases (mapv first (nth type 2))
+         :boundary/extracted-admission :admitted))
 
 (defn call-profile [target]
   (or (get-in contract [:targets target])
