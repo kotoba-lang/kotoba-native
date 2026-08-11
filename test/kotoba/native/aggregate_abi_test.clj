@@ -8,12 +8,16 @@
 (def scalar-pair
   [:record :test/pair [[:left :i64] [:ready :bool]]])
 
+(def scalar-variant
+  [:variant :test/outcome [[:count :i64] [:ready :bool]]])
+
 (deftest published-edn-is-the-portable-contract
   (let [published (-> "aggregate-abi.edn" io/resource slurp edn/read-string)]
     (is (= abi/contract published))
     (is (= published (abi/validate-contract! published)))
     (doseq [invalid [(update published :targets dissoc :aarch64)
                      (assoc-in published [:legacy/record :ambient/policy] true)
+                     (assoc-in published [:portable/variant :boundary/case-limit] 33)
                      (assoc-in published [:targets :x86-64 :ambient/policy] true)
                      (update published :extracted dissoc :variant-boundary)]]
       (is (thrown? clojure.lang.ExceptionInfo
@@ -33,6 +37,23 @@
                 [:variant :test/v [[:x :i64]]]]]
     (is (thrown? clojure.lang.ExceptionInfo
                  (abi/record-boundary-plan type)) type)))
+
+(deftest scalar-variant-boundary-is-one-owned-checked-handle
+  (let [plan (abi/variant-boundary-plan scalar-variant)]
+    (is (= :pair-tag-payload-handle (:boundary/parameters plan)))
+    (is (= :pair-tag-payload-handle (:boundary/results plan)))
+    (is (= :zero-based-declaration-ordinal (:boundary/tag plan)))
+    (is (= [:count :ready] (:boundary/cases plan)))
+    (is (= #{:i64 :bool} (:boundary/payload-types plan)))
+    (is (= #{0 1} (:boundary/bool-words plan)))
+    (is (= :admitted (:boundary/extracted-admission plan))))
+  (doseq [type [[:variant :unqualified [[:x :i64]]]
+                [:variant :test/empty []]
+                [:variant :test/duplicate [[:x :i64] [:x :bool]]]
+                [:variant :test/text [[:x :string]]]
+                [:record :test/not-variant [[:x :i64]]]]]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (abi/variant-boundary-plan type)) type)))
 
 (deftest every-allocator-register-is-call-clobbered
   (doseq [target [:x86-64 :aarch64]]

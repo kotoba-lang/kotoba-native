@@ -656,6 +656,27 @@
     {:name 'main :params ['a 'b 'c 'd 'e] :result :i64
      :body '(sum-five a b c d e)}]})
 
+(def scalar-variant-boundary-kir
+  {:format :kotoba.kir/v4
+   :exports ['main]
+   :functions
+   [{:name 'identity :params ['value] :param-types [scalar-variant-type]
+     :result scalar-variant-type :body 'value}
+    {:name 'main :params ['value] :param-types [:i64] :result :i64
+     :body (list 'variant-match scalar-variant-type
+                 (list 'identity
+                       (list 'variant-new scalar-variant-type :number 'value))
+                 [[:number 'payload (list '+ 'payload 1)]
+                  [:flag 'payload (list 'if 'payload 1 0)]])}]})
+
+(def scalar-variant-result-kir
+  {:format :kotoba.kir/v4
+   :exports ['make]
+   :functions
+   [{:name 'make :params ['value] :param-types [:bool]
+     :result scalar-variant-type
+     :body (list 'variant-new scalar-variant-type :flag 'value)}]})
+
 (deftest kir-module-lowers-to-versioned-function-and-call-ir
   (is (machine/pilot-module? scalar-call-kir))
   (let [gmir (machine/lower-kir-module scalar-call-kir)
@@ -697,6 +718,31 @@
             (some #{0xe8} code)
             (some #(= 0x94 (bit-and % 0xfc)) (take-nth 4 (drop 3 code))))
           (str target " contains its direct-call opcode")))))
+
+(deftest scalar-variant-parameters-and-results-use-the-versioned-pair-boundary
+  (doseq [kir [scalar-variant-boundary-kir scalar-variant-result-kir]]
+    (is (machine/pilot-module? kir))
+    (let [gmir (machine/lower-kir-module kir)
+          instructions (mapcat :gmir/instructions (:gmir/functions gmir))]
+      (is (some #(and (= :gmir/runtime-call (:gmir/op %))
+                      (= :pair (:gmir/runtime %)))
+                instructions))
+      (doseq [target [:x86-64 :aarch64]]
+        (let [compiled (machine/compile-kir-module target kir)]
+          (is (seq (:code compiled)) target)
+          (is (= 1 (get-in compiled [:exports (first (:exports kir)) :arity]))
+              target)))))
+  (testing "case order and payload family remain fail closed in the producer"
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (machine/lower-kir-module
+                  (assoc-in scalar-variant-boundary-kir [:functions 1 :body]
+                            (list 'variant-match scalar-variant-type
+                                  (list 'variant-new scalar-variant-type :number 1)
+                                  [[:flag 'payload 0]
+                                   [:number 'payload 'payload]])))))
+    (is (not (machine/pilot-module?
+              (assoc-in scalar-variant-result-kir [:functions 0 :result]
+                        [:variant :test/text [[:text :string]]]))))))
 
 (deftest four-entry-arguments-reach-both-encoders-without-a-spill-frame
   (doseq [target [:x86-64 :aarch64]]
