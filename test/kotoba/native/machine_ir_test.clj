@@ -826,6 +826,18 @@
                                      (:mc/encoding %))
                                 (:mc/instructions caller)))) target)))))
 
+(deftest tail-position-direct-calls-lower-to-terminal-non-linking-transfer
+  (let [gmir (machine/lower-kir-module four-argument-call-kir)
+        caller (second (:gmir/functions gmir))
+        tail (peek (:gmir/instructions caller))]
+    (is (= :gmir/tail-call (:gmir/op tail)))
+    (is (= 'sum-four (:gmir/callee tail)))
+    (doseq [target [:x86-64 :aarch64]]
+      (let [mc-caller (second (:mc/functions (machine/compile-gmir target gmir)))
+            encodings (mapv :mc/encoding (:mc/instructions mc-caller))]
+        (is (= (keyword (name target) "tail-call") (peek encodings)) target)
+        (is (not-any? #(= (keyword (name target) "call") %) encodings) target)))))
+
 (deftest scalar-call-module-reaches-final-target-layout-deterministically
   (doseq [target [:x86-64 :aarch64]]
     (let [first-result (machine/compile-kir-module target scalar-call-kir)
@@ -948,7 +960,7 @@
         (is (= 1 (count (filter #(= spill-load (:mc/encoding %))
                                 (:mc/instructions function))))
             [target (:mc/name function)]))
-      (is (= (if (= :x86-64 target) 115 72)
+      (is (= (if (= :x86-64 target) 114 68)
              (count (:code compiled))) target))))
 
 (deftest word-call-module-boundary-supports-multiple-exports-and-fails-closed
