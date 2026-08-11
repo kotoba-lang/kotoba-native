@@ -1,14 +1,15 @@
 (ns kotoba.native.aggregate-abi
   "Portable contract for aggregates that reach a native function boundary.
 
-  Word-field records, including recursively nested records, and scalar variants
-  cross extracted calls as one-word context-owned pair handles. Local flat
-  non-escaping aggregates remain replaced."
+  Word-field records, including recursively nested records, and variants whose
+  payload is either scalar or a recursively boxed record cross extracted calls
+  as one-word context-owned pair handles. Local flat non-escaping aggregates
+  remain replaced."
   (:require [clojure.set :as set]))
 
 (def contract
   {:abi/id :kotoba.native/aggregate-boundary
-   :abi/version 6
+   :abi/version 7
    :abi/word-bits 64
    :portable/record
    {:boundary/parameters :pair-chain-handle
@@ -26,7 +27,9 @@
     :boundary/results :pair-tag-payload-handle
     :boundary/word-count 1
     :boundary/tag :zero-based-declaration-ordinal
-    :boundary/payload-types #{:i64 :bool}
+    :boundary/payload-types #{:i64 :bool :record}
+    :boundary/payload-representation :recursive-word-handles
+    :boundary/max-payload-nesting-depth 32
     :boundary/bool-words #{0 1}
     :boundary/case-limit 32
     :boundary/allocation :context-pair-arena
@@ -36,12 +39,19 @@
    {:local-record :scalar-replacement
     :local-variant :scalar-replacement
     :record-boundary :word-pair-chain-admitted
-    :variant-boundary :scalar-pair-handle-admitted
-    :call-admission :scalar-admitted
+    :variant-boundary :recursive-payload-pair-handle-admitted
+    :call-admission :sealed-callable-admitted
     :call-requires #{:per-function-frame
                      :spill-live-values-across-call
                      :parallel-argument-assignment
-                     :single-word-return-register}}
+                     :single-word-return-register}
+    :callable-dispatch {:indirect :closed-ordinal-dispatch
+                        :apply :bounded-pair-chain
+                        :max-apply-arguments 4
+                        :arbitrary-address false}
+    :linkage {:mode :closed-module-graph
+              :ambient-symbols false
+              :unresolved-symbols false}}
    :targets
    {:x86-64
     {:argument-registers [:x86-64/rdi :x86-64/rsi :x86-64/rdx
@@ -109,7 +119,7 @@
                (set (keys value)))
     (reject! :non-canonical-contract value))
   (when-not (and (= :kotoba.native/aggregate-boundary (:abi/id value))
-                 (= 6 (:abi/version value))
+                 (= 7 (:abi/version value))
                  (= 64 (:abi/word-bits value)))
     (reject! :unsupported-contract-version value))
   (let [record (:portable/record value)]
@@ -133,6 +143,8 @@
   (let [variant (:portable/variant value)]
     (when-not (and (= #{:boundary/parameters :boundary/results
                         :boundary/word-count :boundary/tag :boundary/payload-types
+                        :boundary/payload-representation
+                        :boundary/max-payload-nesting-depth
                         :boundary/bool-words :boundary/case-limit
                         :boundary/allocation :boundary/ownership
                         :boundary/arena-cell-limit}
@@ -141,7 +153,10 @@
                    (= :pair-tag-payload-handle (:boundary/results variant))
                    (= 1 (:boundary/word-count variant))
                    (= :zero-based-declaration-ordinal (:boundary/tag variant))
-                   (= #{:i64 :bool} (:boundary/payload-types variant))
+                   (= #{:i64 :bool :record} (:boundary/payload-types variant))
+                   (= :recursive-word-handles
+                      (:boundary/payload-representation variant))
+                   (= 32 (:boundary/max-payload-nesting-depth variant))
                    (= #{0 1} (:boundary/bool-words variant))
                    (= 32 (:boundary/case-limit variant))
                    (= :context-pair-arena (:boundary/allocation variant))
@@ -151,14 +166,25 @@
   (let [extracted (:extracted value)
         required (:call-requires extracted)]
     (when-not (= #{:local-record :local-variant :record-boundary
-                   :variant-boundary :call-admission :call-requires}
+                   :variant-boundary :call-admission :call-requires
+                   :callable-dispatch :linkage}
                  (set (keys extracted)))
       (reject! :invalid-extracted-boundary extracted))
     (when-not (and (= :scalar-replacement (:local-record extracted))
                    (= :scalar-replacement (:local-variant extracted))
                    (= :word-pair-chain-admitted (:record-boundary extracted))
-                   (= :scalar-pair-handle-admitted (:variant-boundary extracted))
-                   (= :scalar-admitted (:call-admission extracted)))
+                   (= :recursive-payload-pair-handle-admitted
+                      (:variant-boundary extracted))
+                   (= :sealed-callable-admitted (:call-admission extracted))
+                   (= {:indirect :closed-ordinal-dispatch
+                       :apply :bounded-pair-chain
+                       :max-apply-arguments 4
+                       :arbitrary-address false}
+                      (:callable-dispatch extracted))
+                   (= {:mode :closed-module-graph
+                       :ambient-symbols false
+                       :unresolved-symbols false}
+                      (:linkage extracted)))
       (reject! :invalid-extracted-admission extracted))
     (when-not (= #{:per-function-frame
                    :spill-live-values-across-call
@@ -196,26 +222,39 @@
          :boundary/extracted-admission :admitted))
 
 (defn scalar-variant-type?
-  "True for the admitted sealed scalar variant boundary family."
+  "True for the admitted sealed one-word variant boundary family.
+
+  The historical name remains API-compatible. Record payloads occupy one word
+  through the same bounded pair-chain handle used by record boundaries."
   [type]
   (and (vector? type) (= 3 (count type)) (= :variant (first type))
        (keyword? (second type)) (some? (namespace (second type)))
        (vector? (nth type 2)) (<= 1 (count (nth type 2)) 32)
        (every? #(and (vector? %) (= 2 (count %))
                      (keyword? (first %))
-                     (contains? #{:i64 :bool} (second %)))
+                     (or (contains? #{:i64 :bool} (second %))
+                         (scalar-record-type? (second %))))
                (nth type 2))
        (= (count (nth type 2))
           (count (distinct (map first (nth type 2)))))))
 
+(defn aggregate-payload-variant-type?
+  "True when TYPE is admitted and at least one case carries a record handle."
+  [type]
+  (and (scalar-variant-type? type)
+       (boolean (some (fn [[_ payload-type]]
+                        (scalar-record-type? payload-type))
+                      (nth type 2)))))
+
 (defn variant-boundary-plan
-  "Return the admitted one-word scalar variant boundary plan."
+  "Return the admitted one-word scalar/record-payload variant boundary plan."
   [type]
   (when-not (scalar-variant-type? type)
     (reject! :unsupported-variant-type type))
   (assoc (:portable/variant contract)
          :boundary/type type
          :boundary/cases (mapv first (nth type 2))
+         :boundary/payload-schemas (mapv second (nth type 2))
          :boundary/extracted-admission :admitted))
 
 (defn call-profile [target]
@@ -233,11 +272,31 @@
     (when (seq missing)
       (reject! :missing-call-guarantees
                {:target target :missing missing :profile profile}))
-    (when-not (= :scalar-admitted
+    (when-not (= :sealed-callable-admitted
                  (get-in contract [:extracted :call-admission]))
       (reject! :call-abi-not-admitted
                {:target target :required required :profile profile}))
     profile))
+
+(defn admit-closed-linkage!
+  "Admit only a fully resolved, content-addressed module graph.
+
+  Native code never resolves an ambient symbol at load time. The source owner
+  must seal the graph first and provide its digest; an empty unresolved-symbol
+  set is part of the evidence rather than an assumed default."
+  [evidence]
+  (when-not (and (map? evidence)
+                 (= #{:mode :module-graph-digest :unresolved-symbols
+                      :ambient-symbols}
+                    (set (keys evidence)))
+                 (= :closed-module-graph (:mode evidence))
+                 (string? (:module-graph-digest evidence))
+                 (boolean (re-matches #"[0-9a-f]{64}"
+                                      (:module-graph-digest evidence)))
+                 (= #{} (:unresolved-symbols evidence))
+                 (false? (:ambient-symbols evidence)))
+    (reject! :unsealed-external-linkage evidence))
+  evidence)
 
 (defn reject-unextracted-call!
   "The standalone expression producer invokes this for call-shaped values.

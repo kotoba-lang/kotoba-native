@@ -1,6 +1,7 @@
 (ns kotoba.native.machine-ir-test
   (:require [clojure.test :refer [deftest is testing]]
             [kotoba.gmir :as gmir]
+            [kotoba.native.aggregate-abi :as aggregate-abi]
             [kotoba.native.machine-ir :as machine]
             [kotoba.native.string-index :as string-index]
             [kotoba.native.string-search :as string-search]))
@@ -810,6 +811,46 @@
      :result scalar-variant-type
      :body (list 'variant-new scalar-variant-type :flag 'value)}]})
 
+(def aggregate-variant-type
+  [:variant :test/record-or-count
+   [[:record scalar-record-type] [:count :i64]]])
+
+(def aggregate-variant-boundary-kir
+  {:format :kotoba.kir/v4
+   :exports ['main]
+   :functions
+   [{:name 'identity :params ['value] :param-types [aggregate-variant-type]
+     :result aggregate-variant-type :body 'value}
+    {:name 'main :params [] :result :i64
+     :body (list 'variant-match aggregate-variant-type
+                 (list 'identity
+                       (list 'variant-new aggregate-variant-type :record
+                             (list 'record-new scalar-record-type 20 22)))
+                 [[:record 'payload
+                   (list '+
+                         (list 'record-get scalar-record-type 'payload :a)
+                         (list 'record-get scalar-record-type 'payload :b))]
+                  [:count 'payload 'payload]])}]})
+
+(def sealed-callable-kir
+  {:format :kotoba.kir/v4
+   :exports ['main]
+   :functions
+   [{:name 'add-two :params ['a 'b] :result :i64 :body '(+ a b)}
+    {:name 'lambda-add-two :params ['a 'b] :result :i64
+     :body '(add-two a b)}
+    {:name 'invoke$arity2 :params ['closure 'a 'b] :result :i64
+     :body '(if (= (pair-first closure) 0)
+              (lambda-add-two a b)
+              (quot 1 0))}
+    {:name 'apply$arity2 :params ['closure 'arguments] :result :i64
+     :body '(invoke$arity2 closure
+                           (pair-first arguments)
+                           (pair-first (pair-second arguments)))}
+    {:name 'main :params [] :result :i64
+     :body '(+ (invoke$arity2 (pair 0 0) 20 22)
+               (apply$arity2 (pair 0 0) (pair 4 (pair 5 0))))}]})
+
 (def scalar-record-boundary-kir
   {:format :kotoba.kir/v4
    :exports ['main]
@@ -921,6 +962,37 @@
     (is (not (machine/pilot-module?
               (assoc-in scalar-variant-result-kir [:functions 0 :result]
                         [:variant :test/text [[:text :string]]]))))))
+
+(deftest aggregate-payload-variants-cross-calls-as-recursive-handles
+  (is (aggregate-abi/aggregate-payload-variant-type? aggregate-variant-type))
+  (is (machine/pilot-module? aggregate-variant-boundary-kir))
+  (let [gmir (machine/lower-kir-module aggregate-variant-boundary-kir)
+        runtime-ops (->> (:gmir/functions gmir)
+                         (mapcat :gmir/instructions)
+                         (keep :gmir/runtime)
+                         set)]
+    (is (every? runtime-ops [:pair :pair-first :pair-second]))
+    (doseq [target [:x86-64 :aarch64]]
+      (let [compiled (machine/compile-kir-module
+                      target aggregate-variant-boundary-kir)]
+        (is (seq (:code compiled)) target)
+        (is (= 0 (get-in compiled [:exports 'main :arity])) target)))))
+
+(deftest sealed-indirect-call-and-bounded-apply-remain-direct-machine-calls
+  (is (machine/pilot-module? sealed-callable-kir))
+  (let [gmir (machine/lower-kir-module sealed-callable-kir)
+        instructions (mapcat :gmir/instructions (:gmir/functions gmir))
+        calls (filter #(contains? #{:gmir/call :gmir/tail-call} (:gmir/op %))
+                      instructions)]
+    (is (seq calls))
+    (is (every? symbol? (map :gmir/callee calls)))
+    (is (not-any? #(contains? #{:gmir/indirect-call :gmir/call-address}
+                               (:gmir/op %))
+                  instructions))
+    (doseq [target [:x86-64 :aarch64]]
+      (let [compiled (machine/compile-kir-module target sealed-callable-kir)]
+        (is (seq (:code compiled)) target)
+        (is (= 0 (get-in compiled [:exports 'main :arity])) target)))))
 
 (deftest scalar-record-parameters-and-results-use-the-versioned-pair-chain
   (doseq [kir [scalar-record-boundary-kir scalar-record-result-kir]]

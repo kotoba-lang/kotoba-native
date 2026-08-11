@@ -510,34 +510,53 @@
     [[:wall [:record :kotoba.clock/wall [[:unix-millis :i64] [:observation-sequence :i64]]]]
      [:error [:record :kotoba.clock/error [[:code :keyword] [:message :string]]]]]])
 
-(deftest record-payload-variants-fail-closed-at-the-production-boundary
-  ;; Aggregate payload variants are outside the extracted ABI. Keep the clock
-  ;; shapes as rejection vectors instead of reaching retired emitters.
+(deftest record-payload-variants-lower-to-recursive-one-word-handles
   (doseq [[label emit] emitters]
     (testing label
-      (doseq [[why body]
+      (doseq [[why body boxed]
               [["wall case, project a field"
                 (list 'variant-match clock-result
                       (list 'variant-new clock-result :wall (list 'record-new wall 123 4))
-                      [[:wall 'p (list 'record-get wall 'p :unix-millis)] [:error 'p 0]])]
+                      [[:wall 'p (list 'record-get wall 'p :unix-millis)] [:error 'p 0]])
+                '(let [v (pair 0 (pair 123 (pair 4 0)))]
+                   (if (= (pair-first v) 0)
+                     (let [p (pair-second v)] (pair-first p))
+                     (if (= (pair-first v) 1)
+                       (let [p (pair-second v)] 0)
+                       (quot 1 0))))]
                ["error case, project the string field"
                 (list 'variant-match clock-result
                       (list 'variant-new clock-result :error (list 'record-new clock-error :timeout "slow"))
-                      [[:wall 'p 0] [:error 'p (list 'string-byte-length (list 'record-get clock-error 'p :message))]])]]]
-        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unsupported-variant-type"
-                              (emit (program [] body)))
-            why)))))
+                      [[:wall 'p 0] [:error 'p (list 'string-byte-length (list 'record-get clock-error 'p :message))]])
+                '(let [v (pair 1 (pair :timeout (pair "slow" 0)))]
+                   (if (= (pair-first v) 0)
+                     (let [p (pair-second v)] 0)
+                     (if (= (pair-first v) 1)
+                       (let [p (pair-second v)]
+                         (string-byte-length (pair-first (pair-second p))))
+                       (quot 1 0))))]]]
+        (let [actual (emit (program [] body))
+              expected (emit (program [] boxed))]
+          (is (seq (:code actual)) why)
+          (is (= expected actual) why))))))
 
-(deftest mixed-width-record-payload-variants-fail-closed
+(deftest mixed-scalar-and-record-payload-variants-are-admitted
   (let [mixed '[:variant :t/m [[:small :i64]
                                [:big [:record :t/b [[:a :i64] [:b :i64] [:c :i64]]]]]]
         big '[:record :t/b [[:a :i64] [:b :i64] [:c :i64]]]
         body (list 'variant-match mixed (list 'variant-new mixed :small 5)
-                   [[:small 'p 'p] [:big 'p (list 'record-get big 'p :c)]])]
+                   [[:small 'p 'p] [:big 'p (list 'record-get big 'p :c)]])
+        boxed '(let [v (pair 0 5)]
+                 (if (= (pair-first v) 0)
+                   (let [p (pair-second v)] p)
+                   (if (= (pair-first v) 1)
+                     (let [p (pair-second v)]
+                       (pair-first (pair-second (pair-second p))))
+                     (quot 1 0))))]
     (doseq [[label emit] emitters]
       (testing label
-        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unsupported-variant-type"
-                              (emit (program [] body))))))))
+        (is (= (emit (program [] boxed))
+               (emit (program [] body))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; A record crossing a function boundary

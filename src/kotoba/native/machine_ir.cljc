@@ -225,15 +225,7 @@
   {:aggregate/kind :record :aggregate/type type :aggregate/values (vec values)})
 
 (defn- scalar-variant-cases [type]
-  (when (and (vector? type) (= 3 (count type)) (= :variant (first type))
-             (keyword? (second type)) (vector? (nth type 2))
-             (seq (nth type 2))
-             (every? #(and (vector? %) (= 2 (count %))
-                           (keyword? (first %))
-                           (contains? #{:i64 :bool} (second %)))
-                     (nth type 2))
-             (= (count (nth type 2))
-                (count (distinct (map first (nth type 2))))))
+  (when (aggregate-abi/scalar-variant-type? type)
     (nth type 2)))
 
 (defn- provider-record-fields [type]
@@ -535,10 +527,17 @@
 
 (defn- variant-boundary-module? [functions]
   (boolean
-   (some (fn [function]
-           (some aggregate-abi/scalar-variant-type?
-                 (function-boundary-types function)))
-         functions)))
+   (or
+    (some (fn [function]
+            (some aggregate-abi/scalar-variant-type?
+                  (function-boundary-types function)))
+          functions)
+    ;; Aggregate payload variants cannot use the two-register local SROA
+    ;; representation: their payload record already occupies one word through
+    ;; a pair-chain handle. Select the boxed normalization even when the
+    ;; variant itself does not cross a function boundary.
+    (some aggregate-abi/aggregate-payload-variant-type?
+          (tree-seq coll? seq functions)))))
 
 (defn- module-record-types [functions]
   (reduce
@@ -570,6 +569,10 @@
      ;; each inner value boxed to one word before it occupies an outer field,
      ;; so a module containing an inline nested schema uses pair-chain lowering.
      (some aggregate-abi/nested-record-type?
+           (tree-seq coll? seq functions))
+     ;; A flat record used as an aggregate variant payload is also boxed before
+     ;; the enclosing tag/payload pair is constructed.
+     (some aggregate-abi/aggregate-payload-variant-type?
            (tree-seq coll? seq functions))))))
 
 (defn- provider-boundary-module? [functions]
