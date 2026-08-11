@@ -116,9 +116,12 @@ use the same extracted path without a stack aggregate. Construction creates an
 internal tag-and-payload SSA bundle, variant-valued `if` joins it with two
 phis, and `variant-match` becomes target-neutral tag comparison CFG while
 binding the payload register only in the selected source branch. Payload
-evaluation remains exactly once. Variant parameters/results, nested or
-non-scalar payloads, mismatched schemas, and bare escaping variant values stay
-on the established legacy path.
+evaluation remains exactly once. A bounded function-boundary family is admitted
+separately: qualified variants with 1--32 unique cases and only `:i64`/`:bool`
+payloads cross as one context-owned
+`pair(zero-based-declaration-ordinal,payload)` handle. The public value keeps
+the canonical KIR shape `[type case-keyword payload]`; nested and non-scalar
+variants remain outside the extracted path.
 
 Function-boundary aggregates are described by the versioned portable contract
 in `resources/aggregate-abi.edn`. The established record ABI remains a single
@@ -133,9 +136,9 @@ AArch64 call functions save and restore FP/LR. The correctness-first all-vreg
 policy remains the fail-closed path for remaining pressure without changing the
 v3 call contract.
 
-Extracted record and variant boundaries remain held. Scalar-call admission does
-not admit pair-chain handles, variants, nested aggregates, indirect calls,
-varargs, or external linkage, and it is not a Rust-parity claim.
+The extracted record boundary remains held. Scalar variant handles are admitted
+by aggregate ABI v3, while nested aggregates, indirect calls, varargs, and
+external linkage remain held. This is not a Rust-parity claim.
 
 Value-position scalar `if` uses GMIR/MIR v2 phi values. Each branch reaches an
 explicit predecessor exit. Single- and multi-phi joins lower through MIR's

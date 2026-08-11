@@ -142,9 +142,12 @@
 (defn word-result-type?
   "True for result descriptors represented by one native word. Escaping
   records and variants retain their explicit aggregate ABI boundary."
-  [result]
-  (not (and (vector? result)
-            (contains? #{:record :variant} (first result)))))
+  [type]
+  (or (contains? #{nil :i64 :bool :f32 :f64 :string :keyword
+                   :vector :vector-f64 :string-index} type)
+      (and (vector? type)
+           (contains? #{:option :result :list :set :map :ref}
+                      (first type)))))
 
 (defn- scalar-literal? [form]
   (or (boolean? form) (gmir/i64-value? form)))
@@ -300,6 +303,70 @@
            (normalize-surface-operations (string-index/lower op args))
            :else form))))
    body))
+
+(defn- normalize-scalar-variant-boundary
+  "Lower the admitted scalar variant boundary to the existing one-word pair
+  handle. This is used only for a module that declares a variant parameter or
+  result; call-free local variants retain the allocation-free SROA path."
+  [body]
+  (walk/postwalk
+   (fn [form]
+     (if-not (seq? form)
+       form
+       (let [op (first form), args (rest form)]
+         (cond
+           (and (= op 'variant-new) (= 3 (count args)))
+           (let [[type tag payload] args
+                 cases (scalar-variant-cases type)
+                 ordinal (first (keep-indexed (fn [index [candidate _]]
+                                                (when (= candidate tag) index))
+                                              cases))]
+             (when (or (nil? cases) (nil? ordinal))
+               (reject! :variant-boundary :invalid-constructor
+                        {:type type :tag tag}))
+             (list 'pair ordinal payload))
+
+           (and (= op 'variant-match) (= 3 (count args)))
+           (let [[type value branches] args
+                 cases (scalar-variant-cases type)
+                 declared (mapv first cases)
+                 supplied (when (vector? branches) (mapv first branches))]
+             (when-not (and cases (= declared supplied)
+                            (every? #(and (vector? %) (= 3 (count %))
+                                          (symbol? (second %)))
+                                    branches))
+               (reject! :variant-boundary :invalid-dispatch
+                        {:type type :branches branches}))
+             (let [tagged (gensym "variant__")
+                   ordinal (list 'pair-first tagged)
+                   payload (list 'pair-second tagged)
+                   dispatch
+                   (reduce (fn [fallback [index [_ binder branch]]]
+                             (list 'if (list '= ordinal index)
+                                   (list 'let [binder payload] branch)
+                                   fallback))
+                           (list 'quot 1 0)
+                           (reverse (map-indexed vector branches)))]
+               (list 'let [tagged value] dispatch)))
+
+           :else form))))
+   body))
+
+(defn- scalar-boundary-type? [type]
+  (or (word-result-type? type)
+      (aggregate-abi/scalar-variant-type? type)))
+
+(defn- function-boundary-types [{:keys [params param-types result]}]
+  (let [types (or param-types (vec (repeat (count params) :i64)))]
+    (when (= (count params) (count types))
+      (conj (vec types) result))))
+
+(defn- variant-boundary-module? [functions]
+  (boolean
+   (some (fn [function]
+           (some aggregate-abi/scalar-variant-type?
+                 (function-boundary-types function)))
+         functions)))
 
 (def ^:dynamic *production-routing-enabled?*
   "Migration seam used by legacy-emitter regression tests. Production leaves
@@ -1010,13 +1077,14 @@
                    (every? #(and (map? %)
                                  (gmir/function-id? (:name %))
                                  (vector? (:params %))
-                                 (contains? % :result)
-                                 (word-result-type? (:result %)))
+                                 (let [types (function-boundary-types %)]
+                                   (and types (every? scalar-boundary-type? types))))
                            functions))
       (reject! :kir-to-gmir :unsupported-function-module kir))
     (let [signatures (into {} (map (juxt :name #(count (:params %))) functions))
           names (mapv :name functions)
-          entry (first exports)]
+          entry (first exports)
+          variant-boundary? (variant-boundary-module? functions)]
       (when-not (and (= (count names) (count (distinct names)))
                      (contains? signatures entry))
         (reject! :kir-to-gmir :invalid-function-module
@@ -1026,7 +1094,10 @@
         :gmir/entry entry
         :gmir/functions
         (mapv (fn [{:keys [name params body]}]
-                (let [lowered (lower-kir-expression params body signatures)]
+                (let [body (if variant-boundary?
+                             (normalize-scalar-variant-boundary body)
+                             body)
+                      lowered (lower-kir-expression params body signatures)]
                   {:gmir/name name
                    :gmir/arity (count params)
                    :gmir/instructions (:gmir/instructions lowered)}))
@@ -1040,11 +1111,12 @@
   (and *production-routing-enabled?*
        (try
          (let [module (lower-kir-module kir)]
-           (boolean
-            (some #(some (fn [instruction]
-                           (= :gmir/call (:gmir/op instruction)))
-                         (:gmir/instructions %))
-                  (:gmir/functions module))))
+           (or (variant-boundary-module? (:functions kir))
+               (boolean
+                (some #(some (fn [instruction]
+                               (= :gmir/call (:gmir/op instruction)))
+                             (:gmir/instructions %))
+                      (:gmir/functions module)))))
          (catch #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) _ false))))
 
 ;; ── MC -> bytes ──────────────────────────────────────────────────────────────
