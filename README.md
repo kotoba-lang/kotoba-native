@@ -82,15 +82,20 @@ Final layout and the allocated MC v2/v3 schemas are consumed from
 The scalar/control subset is selected by the production emitters and covers
 integer/boolean literals, up to five parameters, lexical `let`, `+`, `-`, `*`,
 `quot`, bitwise operations, signed comparisons, scalar predicates, ordered
-word shifts, signed/unsigned 32-bit wrapping operations, ordered non-empty
+word shifts, signed/unsigned 32-bit wrapping operations, f64 arithmetic,
+ordered/unordered f64 comparisons, f64 bit-pattern conversions and unary
+abs/neg/sqrt operations, ordered non-empty
 `do`, and nested tail `if`, with deterministic spilling. `bit-not`, `bool-not`,
 and the i32 family are target-neutral compositions over constants, arithmetic,
 comparisons, and the three portable shift instructions. `do` keeps
 every intermediate expression in source order, including unused operations
 that may trap; only its final value is returned. When that final expression is
 tail control, `do` delegates it to tail lowering after emitting every scalar
-prefix, so both arms return directly without a synthetic merge. Other typed KIR expression
-families remain on the established emitter and migrate incrementally.
+prefix, so both arms return directly without a synthetic merge. Other typed KIR
+expression families remain on the established emitter and migrate incrementally.
+Native f64 values stay as their IEEE-754 bit patterns in the general-register
+IR; selected instructions alone move them through the target FP bank, so GMIR
+does not acquire target register classes.
 
 Non-escaping fixed records whose fields are only `:i64` or `:bool` use scalar
 replacement before GMIR. Construction evaluates every field in declaration

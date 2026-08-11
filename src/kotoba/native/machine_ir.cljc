@@ -82,6 +82,16 @@
 (def ^:private kir-i32-binary-ops
   '#{i32-wrapping-add i32-wrapping-mul i32-xor
      i32-shift-left i32-shift-right u32-shift-right})
+(def ^:private kir-f64-binary-ops
+  {'f64-add :gmir/f64-add 'f64-sub :gmir/f64-subtract
+   'f64-mul :gmir/f64-multiply 'f64-div :gmir/f64-divide
+   'f64-min :gmir/f64-min 'f64-max :gmir/f64-max
+   'f64-eq :gmir/f64-equal 'f64-lt :gmir/f64-less-than
+   'f64-le :gmir/f64-less-or-equal 'f64-gt :gmir/f64-greater-than
+   'f64-ge :gmir/f64-greater-or-equal
+   'f64-unordered :gmir/f64-unordered})
+(def ^:private kir-f64-unary-ops
+  '#{f64-from-bits f64-to-bits f64-abs f64-neg f64-sqrt})
 
 (defn- scalar-literal? [form]
   (or (boolean? form) (gmir/i64-value? form)))
@@ -374,6 +384,29 @@
                     (binary-value :gmir/shift-right-unsigned
                                   (unsigned-i32-value left form) right form)))
 
+                (and (seq? form) (contains? kir-f64-binary-ops (first form))
+                     (= 3 (count form)))
+                (binary-value (get kir-f64-binary-ops (first form))
+                              (value (second form) env)
+                              (value (nth form 2) env) form)
+
+                (and (seq? form) (contains? kir-f64-unary-ops (first form))
+                     (= 2 (count form)))
+                (let [lowered (value (second form) env)]
+                  (case (first form)
+                    (f64-from-bits f64-to-bits) lowered
+                    f64-abs (binary-value :gmir/bit-and lowered
+                                          (constant-value #?(:clj Long/MAX_VALUE
+                                                             :cljs i64/max-i64)) form)
+                    f64-neg (binary-value :gmir/bit-xor lowered
+                                          (constant-value #?(:clj Long/MIN_VALUE
+                                                             :cljs i64/min-i64)) form)
+                    f64-sqrt
+                    (let [[code input] lowered, dst (fresh-reg)]
+                      [(conj code {:gmir/op :gmir/f64-sqrt :gmir/dst dst
+                                   :gmir/input (scalar-register! input form)})
+                       dst])))
+
                 (and (seq? form) (= 'record-new (first form)) (<= 2 (count form)))
                 (let [type (second form)
                       fields (or (scalar-record-fields type)
@@ -622,6 +655,17 @@
                      (= 3 (count form))
                      (= :scalar (shape (second form) env))
                      (= :scalar (shape (nth form 2) env)))
+                :scalar
+
+                (and (seq? form) (contains? kir-f64-binary-ops (first form))
+                     (= 3 (count form))
+                     (= :scalar (shape (second form) env))
+                     (= :scalar (shape (nth form 2) env)))
+                :scalar
+
+                (and (seq? form) (contains? kir-f64-unary-ops (first form))
+                     (= 2 (count form))
+                     (= :scalar (shape (second form) env)))
                 :scalar
 
                 (and (seq? form) (= 'record-new (first form)) (<= 2 (count form)))
@@ -881,6 +925,70 @@
                (when-not (= dst :x86-64/r11)
                  (x86-rr 0x89 dst :x86-64/r11)))))
 
+(defn- x86-gpr-to-xmm [xmm src]
+  (let [s (get x86-register-code src)]
+    (when-not (and (integer? xmm) (<= 0 xmm 15) (some? s))
+      (reject! :mc-encode :unsupported-f64-register {:xmm xmm :src src}))
+    [0x66 (bit-or 0x48 (if (>= xmm 8) 4 0) (if (>= s 8) 1 0))
+     0x0f 0x6e
+     (bit-or 0xc0 (bit-shift-left (bit-and xmm 7) 3) (bit-and s 7))]))
+
+(defn- x86-xmm-to-gpr [dst xmm]
+  (let [d (get x86-register-code dst)]
+    (when-not (and (some? d) (integer? xmm) (<= 0 xmm 15))
+      (reject! :mc-encode :unsupported-f64-register {:dst dst :xmm xmm}))
+    [0x66 (bit-or 0x48 (if (>= xmm 8) 4 0) (if (>= d 8) 1 0))
+     0x0f 0x7e
+     (bit-or 0xc0 (bit-shift-left (bit-and xmm 7) 3) (bit-and d 7))]))
+
+(defn- x86-setcc [condition dst]
+  (let [d (get x86-register-code dst)]
+    (when-not (some? d)
+      (reject! :mc-encode :unsupported-register {:dst dst}))
+    (vec (concat (when (>= d 4) [(bit-or 0x40 (if (>= d 8) 1 0))])
+                 [0x0f condition (bit-or 0xc0 (bit-and d 7))]))))
+
+(defn- x86-movzx-byte [dst]
+  (let [d (get x86-register-code dst)]
+    (when-not (some? d)
+      (reject! :mc-encode :unsupported-register {:dst dst}))
+    [(bit-or 0x48 (if (>= d 8) 5 0)) 0x0f 0xb6
+     (bit-or 0xc0 (bit-shift-left (bit-and d 7) 3) (bit-and d 7))]))
+
+(def ^:private x86-f64-binary-opcode
+  {:x86-64/f64-add 0x58 :x86-64/f64-subtract 0x5c
+   :x86-64/f64-multiply 0x59 :x86-64/f64-divide 0x5e
+   :x86-64/f64-min 0x5d :x86-64/f64-max 0x5f})
+
+(defn- x86-f64-binary [encoding dst left right]
+  (vec (concat (x86-gpr-to-xmm 0 left)
+               (x86-gpr-to-xmm 1 right)
+               [0xf2 0x0f (get x86-f64-binary-opcode encoding) 0xc1]
+               (x86-xmm-to-gpr dst 0))))
+
+(defn- x86-f64-compare [encoding dst left right]
+  (let [swapped? (contains? #{:x86-64/f64-less-than
+                              :x86-64/f64-less-or-equal} encoding)
+        condition (case encoding
+                    :x86-64/f64-equal 0x94
+                    :x86-64/f64-less-than 0x97
+                    :x86-64/f64-less-or-equal 0x93
+                    :x86-64/f64-greater-than 0x97
+                    :x86-64/f64-greater-or-equal 0x93
+                    :x86-64/f64-unordered 0x9a)]
+    (vec (concat (x86-gpr-to-xmm 0 left)
+                 (x86-gpr-to-xmm 1 right)
+                 (if swapped? [0x66 0x0f 0x2e 0xc8]
+                     [0x66 0x0f 0x2e 0xc1])
+                 (x86-setcc condition dst)
+                 (when (= :x86-64/f64-equal encoding)
+                   (concat (x86-setcc 0x9b :x86-64/r11)
+                           [(bit-or 0x40 4 (if (= :x86-64/r8 dst) 1 0))
+                            0x20
+                            (bit-or 0xc0 (bit-shift-left 3 3)
+                                    (bit-and (get x86-register-code dst) 7))]))
+                 (x86-movzx-byte dst)))))
+
 (defn- x86-mov-imm [dst value]
   (let [d (get x86-register-code dst)]
     (when-not (some? d) (reject! :mc-encode :unsupported-register {:dst dst}))
@@ -927,6 +1035,24 @@
         (u32le (bit-or 0xeb00001f
                        (bit-shift-left (a64-register right) 16)
                        (bit-shift-left (a64-register left) 5)))
+        (u32le (bit-or cset (a64-register dst))))))
+
+(defn- a64-f64-binary [base dst left right]
+  (vec (concat
+        (u32le (bit-or 0x9e670000
+                       (bit-shift-left (a64-register left) 5)))
+        (u32le (bit-or 0x9e670001
+                       (bit-shift-left (a64-register right) 5)))
+        (u32le base)
+        (u32le (bit-or 0x9e660000 (a64-register dst))))))
+
+(defn- a64-f64-compare [cset dst left right]
+  (vec (concat
+        (u32le (bit-or 0x9e670000
+                       (bit-shift-left (a64-register left) 5)))
+        (u32le (bit-or 0x9e670001
+                       (bit-shift-left (a64-register right) 5)))
+        (u32le 0x1e612000)
         (u32le (bit-or cset (a64-register dst))))))
 
 (defn- a64-quotient [dst left right]
@@ -1001,6 +1127,19 @@
     :x86-64/shift-right-unsigned
     (x86-shift 5 (:mir/dst instruction) (:mir/left instruction)
                (:mir/right instruction))
+    (:x86-64/f64-add :x86-64/f64-subtract :x86-64/f64-multiply
+     :x86-64/f64-divide :x86-64/f64-min :x86-64/f64-max)
+    (x86-f64-binary encoding (:mir/dst instruction) (:mir/left instruction)
+                    (:mir/right instruction))
+    :x86-64/f64-sqrt
+    (vec (concat (x86-gpr-to-xmm 0 (:mir/input instruction))
+                 [0xf2 0x0f 0x51 0xc0]
+                 (x86-xmm-to-gpr (:mir/dst instruction) 0)))
+    (:x86-64/f64-equal :x86-64/f64-less-than
+     :x86-64/f64-less-or-equal :x86-64/f64-greater-than
+     :x86-64/f64-greater-or-equal :x86-64/f64-unordered)
+    (x86-f64-compare encoding (:mir/dst instruction) (:mir/left instruction)
+                     (:mir/right instruction))
     (:x86-64/equal :x86-64/less-than :x86-64/greater-than
      :x86-64/less-or-equal :x86-64/greater-or-equal)
     (x86-compare (case encoding
@@ -1056,6 +1195,35 @@
     :aarch64/quotient
     (a64-quotient (:mir/dst instruction) (:mir/left instruction)
                   (:mir/right instruction))
+    (:aarch64/f64-add :aarch64/f64-subtract :aarch64/f64-multiply
+     :aarch64/f64-divide :aarch64/f64-min :aarch64/f64-max)
+    (a64-f64-binary (case encoding
+                      :aarch64/f64-add 0x1e612800
+                      :aarch64/f64-subtract 0x1e613800
+                      :aarch64/f64-multiply 0x1e610800
+                      :aarch64/f64-divide 0x1e611800
+                      :aarch64/f64-min 0x1e615800
+                      :aarch64/f64-max 0x1e614800)
+                    (:mir/dst instruction) (:mir/left instruction)
+                    (:mir/right instruction))
+    :aarch64/f64-sqrt
+    (vec (concat
+          (u32le (bit-or 0x9e670000
+                         (bit-shift-left (a64-register (:mir/input instruction)) 5)))
+          (u32le 0x1e61c000)
+          (u32le (bit-or 0x9e660000 (a64-register (:mir/dst instruction))))))
+    (:aarch64/f64-equal :aarch64/f64-less-than
+     :aarch64/f64-less-or-equal :aarch64/f64-greater-than
+     :aarch64/f64-greater-or-equal :aarch64/f64-unordered)
+    (a64-f64-compare (case encoding
+                       :aarch64/f64-equal 0x9a9f17e0
+                       :aarch64/f64-less-than 0x9a9f57e0
+                       :aarch64/f64-less-or-equal 0x9a9f87e0
+                       :aarch64/f64-greater-than 0x9a9fd7e0
+                       :aarch64/f64-greater-or-equal 0x9a9fb7e0
+                       :aarch64/f64-unordered 0x9a9f77e0)
+                     (:mir/dst instruction) (:mir/left instruction)
+                     (:mir/right instruction))
     (:aarch64/equal :aarch64/less-than :aarch64/greater-than
      :aarch64/less-or-equal :aarch64/greater-or-equal)
     (a64-compare (case encoding
