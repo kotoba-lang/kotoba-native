@@ -12,9 +12,27 @@ checkable from outside.
 
 - `kotoba.native.x86-64`
 - `kotoba.native.aarch64`
-- `kotoba.native.elf64` target layout, entry shims, and aiueos policy
+- `kotoba.native.elf64` target layout, entry shims, and aiueos target-admission
+  policy (which operations/ELF shapes the backend can emit)
 - `kotoba.native.peephole`
 - `kotoba.native.string-search`
+
+## Native is not an effect provider
+
+The production direction is one-way:
+
+```text
+checked KIR -> kotoba-native machine semantics -> Amu artifacts/qualification
+            -> aiueos OS providers and QEMU evidence
+```
+
+This repository owns instruction selection, encoding, freestanding entry ABI,
+and target-level fail-closed admission. It does not own UEFI memory policy,
+page allocation, process isolation, syscalls, capability tables, or an effect
+provider. Those are `kotoba-lang/aiueos` product responsibilities. Likewise,
+emission parity here does not qualify Amu or aiueos maturity: qualification
+requires the exact-pinned consumer chain, empty foreign-code receipts, and
+positive plus negative machine execution. See ADR-0029.
 
 ## String search
 
