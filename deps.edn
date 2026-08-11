@@ -5,13 +5,13 @@
          :git/sha "45d23aa0a6ece3fb4bffe2879dfabebdd1c17e60"}
         io.github.kotoba-lang/kotoba-gmir
         {:git/url "https://github.com/kotoba-lang/kotoba-gmir.git"
-         :git/sha "2283d82ddd06ffa77a72b37cb9d6e01e484643e9"}
+         :git/sha "5b2bbc150175c4b9dde678a985fcb81e3bbfb5a2"}
         io.github.kotoba-lang/kotoba-mir
         {:git/url "https://github.com/kotoba-lang/kotoba-mir.git"
-         :git/sha "b2742c935b927e2cb81e0b022e8a6e8848aed457"}
+         :git/sha "3dbf14e2d0e16be693a8a3c14c542f57aff030c3"}
         io.github.kotoba-lang/kotoba-codegen
         {:git/url "https://github.com/kotoba-lang/kotoba-codegen.git"
-         :git/sha "488943fb9f3ceb789d605a3707ed0f468d862933"}
+         :git/sha "3c92f7cf7a26bd346ba755efcdf57a2cc4b25819"}
         io.github.kotoba-lang/kotoba-object
         {:git/url "https://github.com/kotoba-lang/kotoba-object.git"
          :git/sha "a97bb8d83ec24acfb3c79503928f49b4067fe7b5"}
