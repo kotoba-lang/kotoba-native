@@ -13,7 +13,9 @@ checkable from outside.
 - `kotoba.native.x86-64`
 - `kotoba.native.aarch64`
 - `kotoba.native.elf64` target layout, entry shims, and aiueos target-admission
-  policy (which operations/ELF shapes the backend can emit)
+  policy (which operations/ELF shapes the backend can emit). Kernel images copy
+  the sealed artifact's finite fuel bound into the hidden context; the
+  packager rejects disagreement between `:limits` and `:fuel-abi`.
 - `kotoba.native.peephole`
 - `kotoba.native.string-search`
 
