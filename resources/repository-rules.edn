@@ -10,4 +10,6 @@
   :depends-on ["kotoba-lang/kotoba-kir"
                "kotoba-lang/kotoba-gmir"
                "kotoba-lang/kotoba-mir"
+               "kotoba-lang/kotoba-codegen"
+               "kotoba-lang/kotoba-object"
                "kotoba-lang/artifact"]}}
