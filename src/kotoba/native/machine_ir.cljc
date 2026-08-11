@@ -582,11 +582,33 @@
                 (= 7 (second form))))
          (tree-seq coll? seq functions))))
 
+(defn- tail-constructed-record-types
+  "Record type descriptors a body can actually RETURN.
+
+  Only a tail `record-new` reaches the result boundary and gets boxed into the
+  pair chain a caller walks. A record constructed anywhere else is a local: a
+  binding's value flattens into slots (ADR 0002) and an operand is consumed in
+  place, so neither is boundary evidence. Walking the whole body instead
+  rejected every function that builds one record while returning another --
+  measured 2026-08-11 on kotoba-lang/murakumo, six of its thirty-three
+  `*_core.kotoba` modules, all on that shape alone."
+  [body]
+  (if-not (seq? body)
+    #{}
+    (let [op (first body)]
+      (cond
+        (= op 'record-new) (let [type (second body)]
+                             (if (aggregate-abi/scalar-record-type? type) #{type} #{}))
+        (= op 'let) (tail-constructed-record-types (nth body 2 nil))
+        (= op 'do) (tail-constructed-record-types (last body))
+        (= op 'if) (into (tail-constructed-record-types (nth body 2 nil))
+                         (tail-constructed-record-types (nth body 3 nil)))
+        :else #{}))))
+
 (defn- validate-record-reference-results! [functions]
   (doseq [{:keys [name result body]} functions
           :when (and (vector? result) (= :ref (first result)))
-          type (filter aggregate-abi/scalar-record-type?
-                       (tree-seq coll? seq body))]
+          type (tail-constructed-record-types body)]
     (when-not (= (second result) (second type))
       (reject! :record-boundary :result-schema-mismatch
                {:function name :result result :constructed type}))))
