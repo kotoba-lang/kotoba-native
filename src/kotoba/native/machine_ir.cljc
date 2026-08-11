@@ -1147,13 +1147,27 @@
                               (partition 2 (second form)))]
                   (into code (tail (nth form 2) bound-env)))
 
+                (and (seq? form) (contains? signatures (first form)))
+                (let [callee (first form)
+                      arguments (vec (rest form))
+                      expected (get signatures callee)]
+                  (when-not (= expected (count arguments))
+                    (reject! :kir-to-gmir :call-arity-mismatch
+                             {:form form :callee callee :expected expected}))
+                  (let [lowered (mapv #(value % env) arguments)
+                        registers (mapv #(scalar-register! (second %) form) lowered)]
+                    (into (vec (mapcat first lowered))
+                          [{:gmir/op :gmir/tail-call :gmir/callee callee
+                            :gmir/arguments registers}])))
+
                 :else
                 (let [[code result-value] (value form env)
                       result (scalar-register! result-value form)]
                   (conj code {:gmir/op :gmir/return :gmir/value result}))))]
       (let [instructions (into parameter-code (tail body parameter-env))]
         {:gmir/version (cond
-                         (some #(= :gmir/call (:gmir/op %)) instructions) 3
+                         (some #(contains? #{:gmir/call :gmir/tail-call}
+                                            (:gmir/op %)) instructions) 3
                          (some #(= :gmir/phi (:gmir/op %)) instructions) 2
                          :else 1)
          :gmir/instructions instructions})))))
@@ -1383,7 +1397,8 @@
                       (:gmir/functions module)))
                (boolean
                 (some #(some (fn [instruction]
-                               (= :gmir/call (:gmir/op instruction)))
+                               (contains? #{:gmir/call :gmir/tail-call}
+                                          (:gmir/op instruction)))
                              (:gmir/instructions %))
                       (:gmir/functions module)))))
          (catch #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) _ false))))
@@ -2263,7 +2278,7 @@
   (:code (resolve-program-layout tokens)))
 
 (defn- instruction-tokens
-  [isa frame-bytes return-suffix callee-labels instructions]
+  [isa frame-bytes return-suffix tail-suffix callee-labels instructions]
   (vec
    (mapcat
     (fn [instruction-index {:mc/keys [op test] :as instruction}]
@@ -2271,15 +2286,22 @@
         [instruction]
         (case op
           :mc/instruction
-          (if (= "call" (name (:mc/encoding instruction)))
+          (if (contains? #{"call" "tail-call"}
+                         (name (:mc/encoding instruction)))
             (let [callee (:mir/callee instruction)
                   label (get callee-labels callee)]
               (when-not label
                 (reject! :mc-encode :unknown-call-target instruction))
-              [(layout/relative-branch
-                (if (= :x86-64 isa)
-                  :x86-64/call-rel32 :aarch64/bl-imm26)
-                label)])
+              (if (= "tail-call" (name (:mc/encoding instruction)))
+                (concat tail-suffix
+                        [(layout/relative-branch
+                          (if (= :x86-64 isa)
+                            :x86-64/jmp-rel32 :aarch64/b-imm26)
+                          label)])
+                [(layout/relative-branch
+                  (if (= :x86-64 isa)
+                    :x86-64/call-rel32 :aarch64/bl-imm26)
+                  label)]))
             (encode-selected isa frame-bytes return-suffix instruction-index instruction))
           :mc/branch-zero
           (if (= :x86-64 isa)
@@ -2321,6 +2343,7 @@
       (let [frame-bytes (+ storage-bytes (if (call-frame-policy? frame-policy) 8 0))]
         {:frame-bytes frame-bytes
          :prologue (x86-adjust-stack 0xec frame-bytes)
+         :tail-suffix (x86-adjust-stack 0xc4 frame-bytes)
          :return-suffix (vec (concat (x86-adjust-stack 0xc4 frame-bytes) [0xc3]))})
 
       :aarch64
@@ -2328,10 +2351,13 @@
         {:frame-bytes storage-bytes
          :prologue (vec (concat (u32le 0xa9bf7bfd) (u32le 0x910003fd)
                                 (a64-adjust-stack 0xd10003ff storage-bytes)))
+         :tail-suffix (vec (concat (a64-adjust-stack 0x910003ff storage-bytes)
+                                   (u32le 0xa8c17bfd)))
          :return-suffix (vec (concat (a64-adjust-stack 0x910003ff storage-bytes)
                                      (u32le 0xa8c17bfd) (u32le 0xd65f03c0)))}
         {:frame-bytes storage-bytes
          :prologue (a64-adjust-stack 0xd10003ff storage-bytes)
+         :tail-suffix (a64-adjust-stack 0x910003ff storage-bytes)
          :return-suffix (vec (concat (a64-adjust-stack 0x910003ff storage-bytes)
                                      (u32le 0xd65f03c0)))}))))
 
@@ -2359,10 +2385,10 @@
          (vec
           (mapcat
            (fn [index {:mc/keys [name frame-slots frame-policy instructions]}]
-             (let [{:keys [frame-bytes prologue return-suffix]}
+             (let [{:keys [frame-bytes prologue return-suffix tail-suffix]}
                    (function-frame target frame-slots frame-policy)
                    local (vec (concat (get prefixes name []) prologue
-                                      (instruction-tokens target frame-bytes return-suffix
+                                      (instruction-tokens target frame-bytes return-suffix tail-suffix
                                                           callee-labels instructions)))]
                (into [(layout/label (get callee-labels name))]
                      (qualify-function-locals index local))))
@@ -2402,12 +2428,12 @@
   (let [host-call? (some #(contains? #{"runtime-call" "capability-call"}
                                      (some-> (:mc/encoding %) name))
                          instructions)
-        {:keys [frame-bytes prologue return-suffix]}
+        {:keys [frame-bytes prologue return-suffix tail-suffix]}
         (function-frame target frame-slots
                         (if host-call? :call-live :allocator))]
     (resolve-layout
      (vec (concat prologue
-                  (instruction-tokens target frame-bytes return-suffix {}
+                  (instruction-tokens target frame-bytes return-suffix tail-suffix {}
                                       instructions))))))
 
 (defn compile-kir-module
