@@ -155,6 +155,11 @@
 (defn- scalar-literal [form]
   (if (boolean? form) (if form 1 0) form))
 
+(defn- utf8-bytes [content]
+  (mapv #(bit-and (int %) 0xff)
+        #?(:clj (.getBytes ^String content "UTF-8")
+           :cljs (js/Array.from (.encode (js/TextEncoder.) content)))))
+
 (defn- scalar-record-fields [type]
   (when (and (vector? type) (= 3 (count type)) (= :record (first type))
              (keyword? (second type)) (vector? (nth type 2))
@@ -289,6 +294,8 @@
              (list 'let [subject (first args)]
                    (list 'string-substring subject 1
                          (list 'string-byte-length subject))))
+           (and (= op 'keyword-from-string) (= 1 (count args)))
+           (list 'string-concat ":" (first args))
            (and (= op 'string-contains?) (= 2 (count args)))
            (normalize-surface-operations (string-search/lower-contains args))
            (and (= op 'string-replace-all) (= 3 (count args)))
@@ -411,6 +418,16 @@
                 [[{:gmir/op :gmir/constant :gmir/dst dst :gmir/value literal}]
                  dst]))
 
+            (string-literal-value [content]
+              (let [address (fresh-reg), length (fresh-reg), dst (fresh-reg)]
+                [[{:gmir/op :gmir/data-address :gmir/dst address
+                   :gmir/content content}
+                  {:gmir/op :gmir/constant :gmir/dst length
+                   :gmir/value (count (utf8-bytes content))}
+                  {:gmir/op :gmir/runtime-call :gmir/dst dst :gmir/runtime :pair
+                   :gmir/arguments [address length]}]
+                 dst]))
+
             (binary-value [op [left-code left-value] [right-code right-value] form]
               (let [left (scalar-register! left-value form)
                     right (scalar-register! right-value form)
@@ -497,6 +514,9 @@
                 (let [dst (fresh-reg)]
                   [[{:gmir/op :gmir/constant :gmir/dst dst
                      :gmir/value (scalar-literal form)}] dst])
+
+                (string? form) (string-literal-value form)
+                (keyword? form) (string-literal-value (str form))
 
                 (symbol? form)
                 (if-some [[kind payload] (get env form)]
@@ -1114,6 +1134,11 @@
            (or (variant-boundary-module? (:functions kir))
                (boolean
                 (some #(some (fn [instruction]
+                               (= :gmir/data-address (:gmir/op instruction)))
+                             (:gmir/instructions %))
+                      (:gmir/functions module)))
+               (boolean
+                (some #(some (fn [instruction]
                                (= :gmir/call (:gmir/op instruction)))
                              (:gmir/instructions %))
                       (:gmir/functions module)))))
@@ -1655,6 +1680,9 @@
       (when-not src (reject! :mc-encode :argument-index-unsupported instruction))
       (if (= dst src) [] (x86-rr 0x89 dst src)))
     :x86-64/constant (x86-mov-imm (:mir/dst instruction) (:mir/value instruction))
+    :x86-64/data-address
+    [{:native/data-content (:mir/content instruction)
+      :native/data-dst (:mir/dst instruction) :native/data-target :x86-64}]
     :x86-64/add
     (let [dst (:mir/dst instruction) left (:mir/left instruction) right (:mir/right instruction)]
       (vec (concat (when-not (= dst left) (x86-rr 0x89 dst left))
@@ -1741,6 +1769,9 @@
       (when-not (<= 0 index 4) (reject! :mc-encode :argument-index-unsupported instruction))
       (if (= dst src) [] (a64-mov dst src)))
     :aarch64/constant (a64-constant (:mir/dst instruction) (:mir/value instruction))
+    :aarch64/data-address
+    [{:native/data-content (:mir/content instruction)
+      :native/data-dst (:mir/dst instruction) :native/data-target :aarch64}]
     :aarch64/add
     (u32le (bit-or 0x8b000000
                    (bit-shift-left (a64-register (:mir/right instruction)) 16)
@@ -1865,12 +1896,34 @@
 
 (defn- size-of-token [token]
   (or (layout/token-size token)
+      (when (:native/data-content token)
+        (case (:native/data-target token) :x86-64 10 :aarch64 16 nil))
       (when (and (integer? token) (<= 0 token 255)) 1)))
 
+(defn- resolve-program-layout [tokens]
+  (let [labels (layout/label-offsets tokens size-of-token)
+        code-size (reduce + 0 (keep size-of-token tokens))
+        contents (distinct (keep :native/data-content tokens))
+        data-offsets (loop [remaining (seq contents), offset code-size, out {}]
+                       (if-let [content (first remaining)]
+                         (recur (next remaining)
+                                (+ offset (count (utf8-bytes content)))
+                                (assoc out content offset))
+                         out))
+        code (layout/resolve-tokens
+              tokens size-of-token labels encode-layout-branch
+              (fn [token _]
+                (if-let [content (:native/data-content token)]
+                  (let [offset (get data-offsets content)]
+                    (case (:native/data-target token)
+                      :x86-64 (x86-mov-imm (:native/data-dst token) offset)
+                      :aarch64 (a64-constant (:native/data-dst token) offset)))
+                  [token])))
+        data (vec (mapcat utf8-bytes contents))]
+    {:code (vec (concat code data)) :code-size code-size :labels labels}))
+
 (defn- resolve-layout [tokens]
-  (let [labels (layout/label-offsets tokens size-of-token)]
-    (layout/resolve-tokens tokens size-of-token labels encode-layout-branch
-                           (fn [token _] [token]))))
+  (:code (resolve-program-layout tokens)))
 
 (defn- instruction-tokens
   [isa frame-bytes return-suffix callee-labels instructions]
@@ -1971,9 +2024,7 @@
                (into [(layout/label (get callee-labels name))]
                      (qualify-function-locals index local))))
            (range) functions))
-         labels (layout/label-offsets tokens size-of-token)
-         code (layout/resolve-tokens tokens size-of-token labels encode-layout-branch
-                                     (fn [token _] [token]))
+         {:keys [labels code code-size]} (resolve-program-layout tokens)
          function-offsets (mapv #(get labels (get callee-labels (:mc/name %))) functions)
          entry-index (first (keep-indexed (fn [index function]
                                            (when (= entry (:mc/name function)) index))
@@ -1981,7 +2032,7 @@
          entry-offset (nth function-offsets entry-index)
          entry-end (if (< (inc entry-index) (count function-offsets))
                      (nth function-offsets (inc entry-index))
-                     (count code))
+                     code-size)
          entry-arity (:mc/arity (nth functions entry-index))]
      {:code code
       :exports {entry {:offset entry-offset

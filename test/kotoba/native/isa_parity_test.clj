@@ -295,10 +295,8 @@
   ;; This used to assert these shapes were REJECTED as unimplemented, on the
   ;; grounds that checking their offsets needs a byte read the emitted code
   ;; cannot perform. That read is now exactly what the loader's
-  ;; `string_substring` at context offset 136 does, so they emit. The
-  ;; all-ASCII literal above still compiles to pure pair arithmetic and never
-  ;; calls it -- that is the property worth keeping, and the reason the fast
-  ;; path was not simply deleted.
+  ;; `string_substring` at context offset 136 does, so they emit. Immutable
+  ;; literal placement now also uses that same closed callback boundary.
   (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
     (testing label
       (doseq [[why body] [["multi-byte literal" '(string-substring "a\u00e9" 0 1)]
@@ -336,22 +334,19 @@
                         (windows 7))
                   "must call through the disp32 form"))))))))
 
-(deftest the-range-check-and-its-trap-are-emitted
-  ;; Defence in depth, and not reachable through the ordinary pipeline: for a
-  ;; pure entry the constant-folding oracle evaluates the substring at compile
-  ;; time and rejects an out-of-range index as :phase :value long before the
-  ;; emitted check could fire -- the same property ADR 0063 records for the
-  ;; variant dispatch trap. So the check is asserted structurally.
+(deftest substring-range-checks-use-the-closed-runtime-boundary
+  ;; The extracted path represents literal placement explicitly and delegates
+  ;; UTF-8 boundary/range validation to the established substring callback.
+  ;; The callback traps invalid ranges; native code must call exactly the
+  ;; MIR-owned context slot rather than retain a second ISA-specific checker.
   (let [x (:code (x86/emit-program substring-program))
         a (:code (arm/emit-program substring-program))
-        word (fn [w] (mapv #(bit-and (unsigned-bit-shift-right w (* 8 %)) 0xff) (range 4)))]
-    (testing "x86-64 tests the start, orders the bounds, and ends in UD2"
-      (is (some #(= [0x48 0x85 0xd2] %) (partition 3 1 x)) "test rdx,rdx")
-      (is (some #(= [0x48 0x39 0xd1] %) (partition 3 1 x)) "cmp rcx,rdx")
-      (is (some #(= [0x0f 0x0b] %) (partition 2 1 x)) "UD2"))
-    (testing "AArch64 does the same and ends in BRK"
-      (is (some #(= (word 0xeb01005f) %) (partition 4 1 a)) "cmp x2,x1")
-      (is (some #(= (word 0xd4200000) %) (partition 4 1 a)) "BRK"))))
+        windows (fn [bytes n] (map vec (partition n 1 bytes)))]
+    (is (some #(= [0x41 0xff 0x91 0x88 0x00 0x00 0x00] %)
+              (windows x 7))
+        "x86-64 calls [r9+136] with a disp32")
+    (is (some #(= [0xf0 0x44 0x40 0xf9] %) (windows a 4))
+        "AArch64 loads the callback from [x7,#136]")))
 
 ;; ---------------------------------------------------------------------------
 ;; A let-bound record (ADR 0062's named remaining gap)
