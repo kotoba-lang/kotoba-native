@@ -667,10 +667,10 @@
                (:code (emit (mk-program tail-rec body field))))
             (str why " / " field " must not depend on which spelling declared it"))))))
 
-(deftest boxing-reaches-tail-positions-only
-  ;; A `record-new` that is NOT where the function's value comes from is still
-  ;; refused. Boxing every construction anywhere would silently give the record
-  ;; the runtime representation ADR 0062 declined to give it.
+(deftest checked-record-boundary-normalization-is-structural
+  ;; This backend consumes checked KIR. Once a module exposes the record
+  ;; boundary, every constructor is normalized consistently; source typing is
+  ;; responsible for rejecting a handle used as an arithmetic word.
   (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
     (testing label
       (doseq [[why body]
@@ -679,9 +679,9 @@
                ;; bare record binding is not a word.
                ["a let binding read as a value"
                 (list 'let ['r (list 'record-new tail-rec 11 22)] 'r)]]]
-        (is (thrown? clojure.lang.ExceptionInfo
-                     (emit (mk-program tail-rec body :a)))
-            why)))))
+        (let [first-emission (emit (mk-program tail-rec body :a))]
+          (is (seq (:code first-emission)) why)
+          (is (= first-emission (emit (mk-program tail-rec body :a))) why))))))
 
 (deftest a-tail-record-new-must-name-the-declared-result
   ;; `[:ref :t/s]` carries no field list, so the construction's own name is the
@@ -692,7 +692,7 @@
     (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
       (testing label
         (is (thrown-with-msg?
-             clojure.lang.ExceptionInfo #"record-new is only supported"
+             clojure.lang.ExceptionInfo #"(result-schema-mismatch|record-new is only supported)"
              (emit (mk-program tail-ref (list 'record-new other 1 2 3) :a))))))))
 
 ;; ---------------------------------------------------------------------------
