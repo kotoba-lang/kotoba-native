@@ -5,7 +5,8 @@
   makes the missing layers explicit without pretending arbitrary KIR is already
   covered: the admitted integer/control subset is closed and every unknown op,
   use-before-definition, register exhaustion, or malformed label fails closed."
-  (:require [kotoba.gmir :as gmir]
+  (:require [clojure.walk :as walk]
+            [kotoba.gmir :as gmir]
             [kotoba.mir :as mir]
             [kotoba.codegen.mc :as mc]
             [kotoba.codegen.layout :as layout]
@@ -184,6 +185,84 @@
     value
     (reject! :kir-to-gmir :scalar-value-required {:form form :value value})))
 
+(defn- normalize-option-result
+  "Expand option/result surface forms into the closed pair/control subset.
+  Generated lets preserve exact-once evaluation of tagged values."
+  [body]
+  (walk/postwalk
+   (fn [form]
+     (if-not (seq? form)
+       form
+       (let [op (first form), args (rest form)]
+         (cond
+           (and (= op 'option-some) (= 1 (count args)))
+           (list 'pair 1 (first args))
+           (and (= op 'option-none) (empty? args)) (list 'pair 0 0)
+           (and (= op 'option-some?) (= 1 (count args)))
+           (list 'pair-first (first args))
+           (and (= op 'option-value) (= 2 (count args)))
+           (let [[value fallback] args, tagged (gensym "option__")]
+             (list 'let [tagged value]
+                   (list 'if (list 'pair-first tagged)
+                         (list 'pair-second tagged) fallback)))
+           (and (= op 'option-some-of) (= 2 (count args)))
+           (list 'pair 1 (second args))
+           (and (= op 'option-none-of) (= 1 (count args))) (list 'pair 0 0)
+           (and (= op 'option-some?-of) (= 2 (count args)))
+           (list 'pair-first (second args))
+           (and (= op 'option-value-of) (= 3 (count args)))
+           (let [[_ value fallback] args, tagged (gensym "option__")]
+             (list 'let [tagged value]
+                   (list 'if (list 'pair-first tagged)
+                         (list 'pair-second tagged) fallback)))
+           (and (= op 'option-match) (= 5 (count args))
+                (symbol? (nth args 3)))
+           (let [[_ value none-body binder some-body] args
+                 tagged (gensym "option__")]
+             (list 'let [tagged value]
+                   (list 'if (list 'pair-first tagged)
+                         (list 'let [binder (list 'pair-second tagged)] some-body)
+                         none-body)))
+           (and (= op 'result-ok) (= 1 (count args)))
+           (list 'pair 1 (first args))
+           (and (= op 'result-err) (= 1 (count args)))
+           (list 'pair 0 (first args))
+           (and (= op 'result-ok?) (= 1 (count args)))
+           (list 'pair-first (first args))
+           (and (contains? '#{result-value result-error} op)
+                (= 2 (count args)))
+           (let [[value fallback] args, tagged (gensym "result__")
+                 ok? (list 'pair-first tagged)
+                 payload (list 'pair-second tagged)]
+             (list 'let [tagged value]
+                   (if (= op 'result-value)
+                     (list 'if ok? payload fallback)
+                     (list 'if ok? fallback payload))))
+           (and (contains? '#{result-ok-of result-err-of} op)
+                (= 2 (count args)))
+           (list 'pair (if (= op 'result-ok-of) 1 0) (second args))
+           (and (= op 'result-ok?-of) (= 2 (count args)))
+           (list 'pair-first (second args))
+           (and (contains? '#{result-value-of result-error-of} op)
+                (= 3 (count args)))
+           (let [[_ value fallback] args, tagged (gensym "result__")
+                 ok? (list 'pair-first tagged)
+                 payload (list 'pair-second tagged)]
+             (list 'let [tagged value]
+                   (if (= op 'result-value-of)
+                     (list 'if ok? payload fallback)
+                     (list 'if ok? fallback payload))))
+           (and (= op 'result-match-of) (= 6 (count args))
+                (symbol? (nth args 2)) (symbol? (nth args 4)))
+           (let [[_ value ok-binder ok-body err-binder err-body] args
+                 tagged (gensym "result__"), payload (list 'pair-second tagged)]
+             (list 'let [tagged value]
+                   (list 'if (list 'pair-first tagged)
+                         (list 'let [ok-binder payload] ok-body)
+                         (list 'let [err-binder payload] err-body))))
+           :else form))))
+   body))
+
 (def ^:dynamic *production-routing-enabled?*
   "Migration seam used by legacy-emitter regression tests. Production leaves
   this enabled; disabling it never changes the IR contracts themselves."
@@ -207,7 +286,8 @@
                   (every? #(and (integer? %) (<= 0 % 5)) (vals signatures)))
      (reject! :kir-to-gmir :invalid-parameters
               {:params params :signatures signatures}))
-   (let [next-reg (atom -1)
+   (let [body (normalize-option-result body)
+        next-reg (atom -1)
         next-label (atom -1)
         fresh-reg #(gmir/vreg (swap! next-reg inc))
         fresh-label (fn [stem]
@@ -734,7 +814,8 @@
   recursive `if`, fixed scalar-field record SROA, and non-escaping scalar
   variant SROA use the extracted IR path; allocation spills when necessary."
   [params body]
-  (let [parameters (set params)]
+  (let [body (normalize-option-result body)
+        parameters (set params)]
     (letfn [(shape [form env]
               (cond
                 (scalar-literal? form) :scalar
