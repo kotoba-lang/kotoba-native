@@ -1,7 +1,9 @@
 (ns kotoba.native.machine-ir-test
   (:require [clojure.test :refer [deftest is testing]]
             [kotoba.gmir :as gmir]
-            [kotoba.native.machine-ir :as machine]))
+            [kotoba.native.machine-ir :as machine]
+            [kotoba.native.string-index :as string-index]
+            [kotoba.native.string-search :as string-search]))
 
 (def v0 (gmir/vreg 0))
 (def v1 (gmir/vreg 1))
@@ -235,6 +237,46 @@
         "the tagged expression is evaluated exactly once"))
   (is (not (machine/pilot-expression? [] '(option-match :bad 0 1 2 3))))
   (is (not (machine/pilot-expression? [] '(result-match-of :bad 0 x 1 2 3)))))
+
+(deftest composite-vector-and-keyword-operations-use-the-runtime-ir
+  (doseq [form ['(vector-count (vector-new 1 2 3))
+                '(vector-f64-count (vector-f64-new 1 2 3))
+                '(vector-get (vector-new 4 5) 1 9)
+                '(vector-f64-get (vector-f64-new 4 5) -1 9)
+                '(string-byte-length (keyword-name keyword-handle))]]
+    (let [params (if (some #{'keyword-handle} (tree-seq coll? seq form))
+                   '[keyword-handle] [])]
+      (is (machine/pilot-expression? params form) (pr-str form))
+      (is (seq (filter #(= :gmir/runtime-call (:gmir/op %))
+                       (:gmir/instructions
+                        (machine/lower-kir-expression params form))))
+          (pr-str form))))
+  (let [instructions (:gmir/instructions
+                      (machine/lower-kir-expression
+                       [] '(vector-get (vector-new 4 5) 1 9)))]
+    (is (= 1 (count (filter #(= :vector-new-empty (:gmir/runtime %))
+                            instructions))))
+    (is (= 2 (count (filter #(= :vector-conj (:gmir/runtime %))
+                            instructions))))))
+
+(deftest search-and-index-helpers-use-the-word-call-module
+  (doseq [function [{:name 'main :params '[subject needle]
+                     :result :bool
+                     :body '(string-contains? subject needle)}
+                    {:name 'main :params '[subject needle replacement]
+                     :result :string
+                     :body '(string-replace-all subject needle replacement)}
+                    {:name 'main :params '[index key]
+                     :result :bool
+                     :body '(string-index-contains index key)}]]
+    (let [kir {:format :kotoba.kir/v4 :exports ['main]
+               :functions (-> [function]
+                              string-search/augment-functions
+                              string-index/augment-functions)}]
+      (is (machine/pilot-module? kir) (:body function))
+      (doseq [target [:x86-64 :aarch64]]
+        (is (seq (:code (machine/compile-kir-module target kir)))
+            [target (:body function)])))))
 
 (deftest allocation-is-deterministic-and-fails-closed
   (is (= (machine/compile-gmir :x86-64 program)
@@ -745,7 +787,7 @@
       (is (= (if (= :x86-64 target) 115 72)
              (count (:code compiled))) target))))
 
-(deftest scalar-call-module-boundary-fails-closed
+(deftest word-call-module-boundary-fails-closed
   (is (not (machine/pilot-module?
             (assoc scalar-call-kir :exports ['main 'add-one]))))
   (is (not (machine/pilot-module?
@@ -753,6 +795,14 @@
   (is (thrown? clojure.lang.ExceptionInfo
                (machine/lower-kir-module
                 (assoc-in scalar-call-kir [:functions 1 :body] '(add-one x x)))))
+  (is (= 3 (:gmir/version
+            (machine/lower-kir-module
+             (assoc-in scalar-call-kir [:functions 0 :result] :string)))))
   (is (thrown? clojure.lang.ExceptionInfo
                (machine/lower-kir-module
-                (assoc-in scalar-call-kir [:functions 0 :result] :string)))))
+                (-> scalar-call-kir
+                    (assoc-in [:functions 0 :result]
+                              [:record :demo/value [[:value :i64]]])
+                    (assoc-in [:functions 0 :body]
+                              '(record-new [:record :demo/value [[:value :i64]]]
+                                           x)))))))
