@@ -127,6 +127,15 @@
    'vector-f64-assoc :vector-assoc
    'vector-f64-drop :vector-drop})
 
+(def ^:private typed-capability-kinds
+  {[:i64 :i64] :i64
+   [:string :string] :string
+   [:option-i64 :option-i64] :option-i64
+   [:result-i64 :result-i64] :result-i64})
+
+(defn- valid-capability-id? [value]
+  (and (integer? value) (<= 0 value 255)))
+
 (defn- scalar-literal? [form]
   (or (boolean? form) (gmir/i64-value? form)))
 
@@ -488,6 +497,32 @@
                           :gmir/runtime runtime :gmir/arguments registers})
                    dst])
 
+                (and (seq? form) (= 'cap-call (first form)) (= 3 (count form)))
+                (let [capability (second form)
+                      [code input] (value (nth form 2) env)
+                      dst (fresh-reg)]
+                  (when-not (valid-capability-id? capability)
+                    (reject! :kir-to-gmir :invalid-capability-id {:form form}))
+                  [(conj code {:gmir/op :gmir/capability-call :gmir/dst dst
+                               :gmir/capability capability :gmir/kind :i64
+                               :gmir/arguments [(scalar-register! input form)]})
+                   dst])
+
+                (and (seq? form) (= 'typed-cap-call (first form))
+                     (= 5 (count form)))
+                (let [[_ capability request-type result-type request] form
+                      kind (get typed-capability-kinds [request-type result-type])
+                      [code input] (value request env)
+                      dst (fresh-reg)]
+                  (when-not (and (valid-capability-id? capability) kind)
+                    (reject! :kir-to-gmir :invalid-typed-capability-call
+                             {:form form :request-type request-type
+                              :result-type result-type}))
+                  [(conj code {:gmir/op :gmir/capability-call :gmir/dst dst
+                               :gmir/capability capability :gmir/kind kind
+                               :gmir/arguments [(scalar-register! input form)]})
+                   dst])
+
                 (and (seq? form) (= 'record-new (first form)) (<= 2 (count form)))
                 (let [type (second form)
                       fields (or (scalar-record-fields type)
@@ -764,6 +799,19 @@
                              (get kir-runtime-ops (first form)))
                         (count (rest form)))
                      (every? #(= :scalar (shape % env)) (rest form)))
+                :scalar
+
+                (and (seq? form) (= 'cap-call (first form)) (= 3 (count form))
+                     (valid-capability-id? (second form))
+                     (= :scalar (shape (nth form 2) env)))
+                :scalar
+
+                (and (seq? form) (= 'typed-cap-call (first form))
+                     (= 5 (count form))
+                     (valid-capability-id? (second form))
+                     (contains? typed-capability-kinds
+                                [(nth form 2) (nth form 3)])
+                     (= :scalar (shape (nth form 4) env)))
                 :scalar
 
                 (and (seq? form) (= 'record-new (first form)) (<= 2 (count form)))
@@ -1350,6 +1398,61 @@
         (a64-stack-memory 0xf9400000 :aarch64/x7 0)
         (a64-adjust-stack 0x910003ff 16))))
 
+(defn- x86-capability-call
+  [frame-bytes {:mir/keys [capability kind context-offset] :as instruction}]
+  (when (< frame-bytes 8)
+    (reject! :mc-encode :invalid-capability-call-frame instruction))
+  (let [context-slot (quot (- frame-bytes 8) 8)
+        byte-offset (+ 16 (quot capability 8))
+        mask (bit-shift-left 1 (mod capability 8))
+        kind-code (get gmir/capability-kinds kind)
+        typed? (pos? kind-code)
+        indirect-call (if (<= context-offset 127)
+                        [0x41 0xff 0x51 context-offset]
+                        (vec (concat [0x41 0xff 0x91]
+                                     (u32le context-offset))))]
+    (vec (concat
+          [0x41 0xf6 0x41 byte-offset mask 0x75 0x02 0x0f 0x0b]
+          (x86-stack-memory 0x89 :x86-64/r9 context-slot)
+          [0xbe] (u32le capability)
+          (when typed?
+            (concat [0xba] (u32le kind-code)
+                    [0xb9] (u32le kind-code)))
+          (x86-rr 0x89 :x86-64/rdi :x86-64/r9)
+          indirect-call
+          (x86-stack-memory 0x8b :x86-64/r9 context-slot)))))
+
+(defn- a64-capability-call
+  [{:mir/keys [capability kind context-offset] :as instruction}]
+  (let [word-offset (+ 16 (* 8 (quot capability 64)))
+        bit-index (mod capability 64)
+        kind-code (get gmir/capability-kinds kind)
+        typed? (pos? kind-code)]
+    (when-not (and (some? kind-code) (<= 0 capability 255))
+      (reject! :mc-encode :invalid-capability-call instruction))
+    (vec (concat
+          (u32le (bit-or 0xf9400000
+                         (bit-shift-left (quot word-offset 8) 10)
+                         (bit-shift-left 7 5) 16))
+          (u32le (bit-or 0x37000000
+                         (bit-shift-left (bit-and bit-index 0x20) 26)
+                         (bit-shift-left (bit-and bit-index 0x1f) 19)
+                         (bit-shift-left 2 5) 16))
+          (u32le 0xd4200000)
+          (a64-adjust-stack 0xd10003ff 16)
+          (a64-stack-memory 0xf9000000 :aarch64/x7 0)
+          (a64-constant :aarch64/x1 capability)
+          (when typed?
+            (concat (a64-constant :aarch64/x2 kind-code)
+                    (a64-constant :aarch64/x3 kind-code)))
+          (a64-mov :aarch64/x0 :aarch64/x7)
+          (u32le (bit-or 0xf9400000
+                         (bit-shift-left (quot context-offset 8) 10)
+                         (bit-shift-left 7 5) 16))
+          (u32le 0xd63f0200)
+          (a64-stack-memory 0xf9400000 :aarch64/x7 0)
+          (a64-adjust-stack 0x910003ff 16)))))
+
 (defn- encode-selected
   [isa frame-bytes return-suffix instruction-index
    {:mc/keys [encoding] :as instruction}]
@@ -1433,6 +1536,7 @@
       []
       (x86-rr 0x89 (:mir/dst instruction) (:mir/src instruction)))
     :x86-64/runtime-call (x86-runtime-call frame-bytes instruction)
+    :x86-64/capability-call (x86-capability-call frame-bytes instruction)
     :x86-64/return
     (vec (concat (when-not (= :x86-64/rax (:mir/value instruction))
                    (x86-rr 0x89 :x86-64/rax (:mir/value instruction)))
@@ -1523,6 +1627,7 @@
       []
       (a64-mov (:mir/dst instruction) (:mir/src instruction)))
     :aarch64/runtime-call (a64-runtime-call instruction)
+    :aarch64/capability-call (a64-capability-call instruction)
     :aarch64/return
     (vec (concat (when-not (= :aarch64/x0 (:mir/value instruction))
                    (a64-mov :aarch64/x0 (:mir/value instruction)))
@@ -1697,12 +1802,12 @@
   (mc/validate! program)
   (when-not (= 2 (:mc/version program))
     (reject! :mc-encode :flat-program-version-required program))
-  (let [runtime-call? (some #(= "runtime-call"
-                                (some-> (:mc/encoding %) name))
-                            instructions)
+  (let [host-call? (some #(contains? #{"runtime-call" "capability-call"}
+                                     (some-> (:mc/encoding %) name))
+                         instructions)
         {:keys [frame-bytes prologue return-suffix]}
         (function-frame target frame-slots
-                        (if runtime-call? :call-live :allocator))]
+                        (if host-call? :call-live :allocator))]
     (resolve-layout
      (vec (concat prologue
                   (instruction-tokens target frame-bytes return-suffix {}

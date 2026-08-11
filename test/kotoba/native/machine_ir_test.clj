@@ -159,6 +159,46 @@
     (is (contains-bytes? arm-code [0xe7 0x03 0x40 0xf9])
         "AArch64 restores x7 after the host call")))
 
+(deftest capability-calls-lower-with-a-closed-id-and-kind
+  (doseq [[form kind] [['(cap-call 7 x) :i64]
+                       ['(typed-cap-call 7 :i64 :i64 x) :i64]
+                       ['(typed-cap-call 7 :string :string x) :string]
+                       ['(typed-cap-call 7 :option-i64 :option-i64 x) :option-i64]
+                       ['(typed-cap-call 7 :result-i64 :result-i64 x) :result-i64]]]
+    (is (machine/pilot-expression? '[x] form) (str kind))
+    (let [call (->> (machine/lower-kir-expression '[x] form)
+                    :gmir/instructions
+                    (filter #(= :gmir/capability-call (:gmir/op %)))
+                    first)]
+      (is (= 7 (:gmir/capability call)) (str kind))
+      (is (= kind (:gmir/kind call)) (str kind))))
+  (is (not (machine/pilot-expression? '[x] '(cap-call 256 x))))
+  (is (not (machine/pilot-expression?
+            '[x] '(typed-cap-call 7 :string :result-i64 x)))))
+
+(deftest capability-call-encoders-check-policy-before-the-host-call
+  (let [x86-scalar (machine/compile-expression :x86-64 '[x] '(cap-call 7 x))
+        x86-typed (machine/compile-expression
+                   :x86-64 '[x] '(typed-cap-call 7 :string :string x))
+        arm-typed (machine/compile-expression
+                   :aarch64 '[x] '(typed-cap-call 7 :string :string x))
+        contains-bytes? (fn [bytes needle]
+                          (boolean (some #(= (vec needle) %)
+                                         (partition (count needle) 1 bytes))))]
+    (is (contains-bytes? x86-scalar [0x41 0xf6 0x41 0x10 0x80
+                                     0x75 0x02 0x0f 0x0b])
+        "x86 tests capability bit 7 before UD2")
+    (is (contains-bytes? x86-scalar [0x41 0xff 0x51 0x30])
+        "scalar capability calls context offset 48")
+    (is (contains-bytes? x86-typed [0x41 0xff 0x91 0x80 0x00 0x00 0x00])
+        "typed capability calls context offset 128")
+    (is (contains-bytes? arm-typed [0x00 0x00 0x20 0xd4])
+        "AArch64 denial reaches BRK before BLR")
+    (is (contains-bytes? arm-typed [0xf0 0x40 0x40 0xf9])
+        "AArch64 loads the typed callback from [x7,#128]")
+    (is (contains-bytes? arm-typed [0x00 0x02 0x3f 0xd6])
+        "AArch64 calls the checked callback")))
+
 (deftest allocation-is-deterministic-and-fails-closed
   (is (= (machine/compile-gmir :x86-64 program)
          (machine/compile-gmir :x86-64 program)))
