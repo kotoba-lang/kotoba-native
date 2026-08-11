@@ -220,6 +220,15 @@
           (vec (repeat 32 0))
           (filter #(= :cap/call (first %)) effects)))
 
+(defn- artifact-fuel [artifact]
+  (let [fuel (get-in artifact [:limits :fuel])
+        abi-fuel (get-in artifact [:fuel-abi :initial])]
+    (when-not (and (integer? fuel) (pos? fuel) (<= fuel Long/MAX_VALUE)
+                   (= fuel abi-fuel))
+      (throw (ex-info "ELF64 kernel packaging requires one valid sealed fuel bound"
+                      {:fuel fuel :fuel-abi-initial abi-fuel})))
+    fuel))
+
 (defn package-kernel
   "Package a sealed aiueos kernel artifact as a freestanding ELF64 ET_EXEC.
   The returned byte vector has no interpreter, dynamic section, or host imports."
@@ -242,7 +251,8 @@
           shim (entry-shim (+ entry-address 23 (:offset export)) context-address)
           text (into shim (:code artifact))
           context (into (vec (repeat 8 0))
-                        (concat (le 512 8) (repeat (- kernel-image-context-size 16) 0)))
+                        (concat (le (artifact-fuel artifact) 8)
+                                (repeat (- kernel-image-context-size 16) 0)))
           names (mapv int (.getBytes "\u0000.text\u0000.data\u0000.shstrtab\u0000" "UTF-8"))
           names-offset (+ kernel-data-offset kernel-image-context-size)
           section-offset (+ names-offset (count names)
@@ -312,7 +322,8 @@
           shim (entry-shim-aarch64 (+ entry-address 16 (:offset export)) context-address)
           text (into shim (:code artifact))
           context (into (vec (repeat 8 0))
-                        (concat (le 512 8) (repeat (- kernel-image-context-size 16) 0)))
+                        (concat (le (artifact-fuel artifact) 8)
+                                (repeat (- kernel-image-context-size 16) 0)))
           names (mapv int (.getBytes " .text .data .shstrtab " "UTF-8"))
           names-offset (+ kernel-data-offset kernel-image-context-size)
           section-offset (+ names-offset (count names)
