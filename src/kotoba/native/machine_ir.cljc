@@ -104,6 +104,27 @@
    'kernel-load-u32 [:gmir/kernel-load-u32 512]
    'kernel-store-u32 [:gmir/kernel-store-u32 512]})
 
+(def ^:private kir-x86-privileged-ops
+  {'kernel-boot-info :boot-info
+   'kernel-read-cr2 :read-cr2
+   'kernel-read-cr3 :read-cr3
+   'kernel-write-cr3 :write-cr3
+   'kernel-invlpg :invlpg
+   'kernel-cli :cli
+   'kernel-sti :sti
+   'kernel-hlt :hlt
+   'kernel-pause :pause
+   'kernel-out-u8 :out-u8
+   'kernel-out-u32 :out-u32
+   'kernel-in-u8 :in-u8
+   'kernel-in-u32 :in-u32
+   'kernel-read-msr :read-msr
+   'kernel-write-msr :write-msr
+   'kernel-cpuid-eax :cpuid-eax
+   'kernel-cpuid-ebx :cpuid-ebx
+   'kernel-cpuid-ecx :cpuid-ecx
+   'kernel-cpuid-edx :cpuid-edx})
+
 (def ^:private kir-runtime-ops
   {'pair :pair
    'pair-first :pair-first
@@ -757,6 +778,22 @@
                           :gmir/offset offset :gmir/size size})
                    dst])
 
+                (and (seq? form)
+                     (contains? kir-x86-privileged-ops (first form)))
+                (let [action (get kir-x86-privileged-ops (first form))
+                      arguments (vec (rest form))
+                      expected (get gmir/x86-privileged-action-arities action)
+                      lowered (mapv #(value % env) arguments)
+                      registers (mapv #(scalar-register! (second %) form) lowered)
+                      dst (fresh-reg)]
+                  (when-not (= expected (count arguments))
+                    (reject! :kir-to-gmir :x86-privileged-arity
+                             {:form form :action action :expected expected}))
+                  [(conj (vec (mapcat first lowered))
+                         {:gmir/op :gmir/x86-privileged :gmir/dst dst
+                          :gmir/action action :gmir/arguments registers})
+                   dst])
+
                 (and (seq? form) (contains? kir-runtime-ops (first form)))
                 (let [runtime (get kir-runtime-ops (first form))
                       arguments (vec (rest form))
@@ -1070,6 +1107,14 @@
                      (every? #(= :scalar (shape % env)) (rest form)))
                 :scalar
 
+                (and (seq? form)
+                     (contains? kir-x86-privileged-ops (first form))
+                     (= (get gmir/x86-privileged-action-arities
+                             (get kir-x86-privileged-ops (first form)))
+                        (count (rest form)))
+                     (every? #(= :scalar (shape % env)) (rest form)))
+                :scalar
+
                 (and (seq? form) (contains? kir-runtime-ops (first form))
                      (= (get gmir/runtime-operation-arities
                              (get kir-runtime-ops (first form)))
@@ -1221,7 +1266,7 @@
 ;; ── MC -> bytes ──────────────────────────────────────────────────────────────
 
 (def ^:private x86-register-code
-  {:x86-64/rax 0 :x86-64/rcx 1 :x86-64/rdx 2 :x86-64/r8 8
+  {:x86-64/rax 0 :x86-64/rcx 1 :x86-64/rdx 2 :x86-64/rbx 3 :x86-64/r8 8
    :x86-64/r9 9 :x86-64/r10 10 :x86-64/r11 11
    :x86-64/rdi 7 :x86-64/rsi 6})
 (def ^:private x86-arguments [:x86-64/rdi :x86-64/rsi :x86-64/rdx :x86-64/rcx :x86-64/r8])
@@ -1744,6 +1789,98 @@
           (a64-stack-memory 0xf9400000 :aarch64/x7 0)
           (a64-adjust-stack 0x910003ff 16)))))
 
+(defn- x86-privileged
+  [{:mir/keys [dst action arguments] :as instruction}]
+  (let [copy-to (fn [register value]
+                  (if (= register value) [] (x86-rr 0x89 register value)))
+        finish (fn [bytes result]
+                 (vec (concat bytes (copy-to dst result))))
+        [a b] arguments]
+    (case action
+      :boot-info
+      (finish [0x4d 0x8b 0x51 0x50] :x86-64/r10)
+      :read-cr2
+      (finish [0x41 0x0f 0x20 0xd2] :x86-64/r10)
+      :read-cr3
+      (finish [0x41 0x0f 0x20 0xda] :x86-64/r10)
+      :write-cr3
+      (finish (concat (copy-to :x86-64/r10 a)
+                      [0x41 0x0f 0x22 0xda])
+              :x86-64/r10)
+      :invlpg
+      (finish (concat (copy-to :x86-64/r10 a)
+                      [0x41 0x0f 0x01 0x3a])
+              :x86-64/r10)
+      (:cli :sti :hlt :pause)
+      (finish (concat (case action
+                        :cli [0xfa] :sti [0xfb] :hlt [0xf4] :pause [0xf3 0x90])
+                      (x86-mov-imm :x86-64/r10 0))
+              :x86-64/r10)
+      (:out-u8 :out-u32)
+      (finish
+       (concat (copy-to :x86-64/r10 a)
+               (copy-to :x86-64/r11 b)
+               (x86-push :x86-64/rax) (x86-push :x86-64/rdx)
+               (x86-rr 0x89 :x86-64/rdx :x86-64/r10)
+               (x86-rr 0x89 :x86-64/rax :x86-64/r11)
+               [(if (= action :out-u8) 0xee 0xef)]
+               (x86-pop :x86-64/rdx) (x86-pop :x86-64/rax))
+       :x86-64/r11)
+      (:in-u8 :in-u32)
+      (finish
+       (concat (copy-to :x86-64/r10 a)
+               (x86-push :x86-64/rax) (x86-push :x86-64/rdx)
+               (x86-rr 0x89 :x86-64/rdx :x86-64/r10)
+               (when (= action :in-u8) [0x31 0xc0])
+               [(if (= action :in-u8) 0xec 0xed)]
+               (x86-rr 0x89 :x86-64/r11 :x86-64/rax)
+               (x86-pop :x86-64/rdx) (x86-pop :x86-64/rax))
+       :x86-64/r11)
+      :read-msr
+      (finish
+       (concat (copy-to :x86-64/r10 a)
+               (x86-push :x86-64/rax) (x86-push :x86-64/rcx)
+               (x86-push :x86-64/rdx)
+               (x86-rr 0x89 :x86-64/rcx :x86-64/r10)
+               [0x0f 0x32]
+               (x86-rr 0x89 :x86-64/r11 :x86-64/rdx)
+               [0x49 0xc1 0xe3 0x20]
+               (x86-rr 0x09 :x86-64/r11 :x86-64/rax)
+               (x86-pop :x86-64/rdx) (x86-pop :x86-64/rcx)
+               (x86-pop :x86-64/rax))
+       :x86-64/r11)
+      :write-msr
+      (finish
+       (concat (copy-to :x86-64/r10 a)
+               (copy-to :x86-64/r11 b)
+               (x86-push :x86-64/rax) (x86-push :x86-64/rcx)
+               (x86-push :x86-64/rdx)
+               (x86-rr 0x89 :x86-64/rcx :x86-64/r10)
+               (x86-rr 0x89 :x86-64/rax :x86-64/r11)
+               (x86-rr 0x89 :x86-64/rdx :x86-64/r11)
+               [0x48 0xc1 0xea 0x20 0x0f 0x30]
+               (x86-pop :x86-64/rdx) (x86-pop :x86-64/rcx)
+               (x86-pop :x86-64/rax))
+       :x86-64/r11)
+      (:cpuid-eax :cpuid-ebx :cpuid-ecx :cpuid-edx)
+      (finish
+       (concat (copy-to :x86-64/r10 a)
+               (copy-to :x86-64/r11 b)
+               (x86-push :x86-64/rax) (x86-push :x86-64/rbx)
+               (x86-push :x86-64/rcx) (x86-push :x86-64/rdx)
+               (x86-rr 0x89 :x86-64/rax :x86-64/r10)
+               (x86-rr 0x89 :x86-64/rcx :x86-64/r11)
+               [0x0f 0xa2]
+               (case action
+                 :cpuid-eax [0x41 0x89 0xc2]
+                 :cpuid-ebx [0x41 0x89 0xda]
+                 :cpuid-ecx [0x41 0x89 0xca]
+                 :cpuid-edx [0x41 0x89 0xd2])
+               (x86-pop :x86-64/rdx) (x86-pop :x86-64/rcx)
+               (x86-pop :x86-64/rbx) (x86-pop :x86-64/rax))
+       :x86-64/r10)
+      (reject! :mc-encode :unknown-x86-privileged-action instruction))))
+
 (defn- encode-selected
   [isa frame-bytes return-suffix instruction-index
    {:mc/keys [encoding] :as instruction}]
@@ -1831,6 +1968,7 @@
       (x86-rr 0x89 (:mir/dst instruction) (:mir/src instruction)))
     :x86-64/runtime-call (x86-runtime-call frame-bytes instruction)
     :x86-64/capability-call (x86-capability-call frame-bytes instruction)
+    :x86-64/x86-privileged (x86-privileged instruction)
     :x86-64/return
     (vec (concat (when-not (= :x86-64/rax (:mir/value instruction))
                    (x86-rr 0x89 :x86-64/rax (:mir/value instruction)))
