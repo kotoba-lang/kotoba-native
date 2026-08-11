@@ -519,6 +519,64 @@
     (is (some #(= [0x02 0x0c 0xc1 0x9a] %) words)
         "the guarded operation remains sdiv x2,x0,x1 after allocation")))
 
+(defn- floor-div [left right]
+  (let [q (quot left right)
+        remainder (- left (* q right))]
+    (if (and (neg? left) (not (zero? remainder))) (dec q) q)))
+
+(defn- apply-signed-division-magic [numerator divisor]
+  (let [numerator (bigint numerator)
+        {:keys [multiplier shift add-numerator? subtract-numerator?]}
+        (machine/signed-division-magic divisor)
+        high (floor-div (* numerator multiplier)
+                        18446744073709551616N)
+        corrected (cond add-numerator? (+ high numerator)
+                        subtract-numerator? (- high numerator)
+                        :else high)
+        shifted (floor-div corrected (bit-shift-left 1 shift))]
+    (+ shifted (if (neg? shifted) 1 0))))
+
+(deftest signed-constant-division-reciprocals-match-i64-truncation
+  (let [divisors [2 3 5 7 10 31 127 255 1024 2147483647
+                  -2 -3 -5 -7 -10 -31 -127 -255 -1024 -2147483647
+                  Long/MAX_VALUE (- Long/MAX_VALUE)]
+        numerators [Long/MIN_VALUE (inc Long/MIN_VALUE) -1000000000000
+                    -1000 -1 0 1 2 1000 1000000000000
+                    (dec Long/MAX_VALUE) Long/MAX_VALUE]]
+    (doseq [divisor divisors, numerator numerators]
+      (is (= (quot numerator divisor)
+             (apply-signed-division-magic numerator divisor))
+          {:numerator numerator :divisor divisor})))
+  (is (nil? (machine/signed-division-magic 0)))
+  (is (nil? (machine/signed-division-magic 1)))
+  (is (nil? (machine/signed-division-magic -1))))
+
+(deftest v3-constant-division-selects-reciprocal-machine-code
+  (let [kir {:format :kotoba.kir/v3 :entry 'kernel :exports ['kernel]
+             :functions [{:name 'kernel :params ['n]
+                          :body '(quot n 2147483647)}]}
+        gmir (machine/lower-kir-module kir)]
+    (doseq [target [:x86-64 :aarch64]]
+      (let [mc (machine/compile-gmir target gmir)
+            instructions (mapcat :mc/instructions (:mc/functions mc))
+            quotient (first (filter #(= (keyword (name target)
+                                                 "quotient-constant")
+                                          (:mc/encoding %))
+                                    instructions))
+            code (:code (machine/compile-kir-module target kir))]
+        (is (= 2147483647 (:mir/divisor quotient)) target)
+        (if (= :x86-64 target)
+          (do
+            (is (not-any? #{[0x48 0xf7 0xf9]} (partition 3 1 code))
+                "constant division emits no idiv")
+            (is (some #{[0x49 0xf7 0xea]} (partition 3 1 code))
+                "constant division uses signed multiply-high"))
+          (let [words (mapv vec (partition 4 code))]
+            (is (not-any? #{[0x02 0x0c 0xc1 0x9a]} words)
+                "constant division emits no SDIV family opcode")
+            (is (some #(= [0x11 0x7c 0x50 0x9b] %) words)
+                "constant division uses SMULH x17,x16 input allocation")))))))
+
 (deftest scalar-comparisons-and-predicates-reach-final-bytes-for-both-isas
   (doseq [form ['(= a b) '(< a b) '(> a b) '(<= a b) '(>= a b)
                 '(< a b 9) '(= a b 9)
