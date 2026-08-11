@@ -575,20 +575,26 @@
       (is (seq (:code (machine/compile-kir-module target four-argument-call-kir)))
           target))))
 
-(deftest five-live-entry-arguments-retain-the-safe-spill-fallback
+(deftest five-live-entry-arguments-encode-one-bounded-lazy-spill
   (doseq [target [:x86-64 :aarch64]]
     (let [mc (->> five-argument-call-kir machine/lower-kir-module
                   (machine/compile-gmir target))
           [callee caller] (:mc/functions mc)
-          spill-store (keyword (name target) "spill-store")]
-      (is (pos? (:mc/frame-slots callee)) target)
-      (is (= :all-vregs (:mc/frame-policy caller)) target)
-      (is (pos? (:mc/frame-slots caller)) target)
-      (is (<= 5 (count (filter #(= spill-store (:mc/encoding %))
-                               (:mc/instructions callee))))
-          target)
-      (is (seq (:code (machine/compile-kir-module target five-argument-call-kir)))
-          target))))
+          spill-store (keyword (name target) "spill-store")
+          spill-load (keyword (name target) "spill-load")
+          compiled (machine/compile-kir-module target five-argument-call-kir)]
+      (is (= [:allocator :call-live]
+             (mapv :mc/frame-policy [callee caller])) target)
+      (is (= [1 1] (mapv :mc/frame-slots [callee caller])) target)
+      (doseq [function [callee caller]]
+        (is (= 1 (count (filter #(= spill-store (:mc/encoding %))
+                                (:mc/instructions function))))
+            [target (:mc/name function)])
+        (is (= 1 (count (filter #(= spill-load (:mc/encoding %))
+                                (:mc/instructions function))))
+            [target (:mc/name function)]))
+      (is (= (if (= :x86-64 target) 115 72)
+             (count (:code compiled))) target))))
 
 (deftest scalar-call-module-boundary-fails-closed
   (is (not (machine/pilot-module?

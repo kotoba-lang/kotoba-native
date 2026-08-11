@@ -72,7 +72,7 @@ no architectural NOP padding. Final layout recomputes every affected branch.
 `kotoba-mir` owns target selection plus explicit virtual/physical register
 state and deterministic allocation, including liveness-minimal straight-line
 call frames, parallel function-entry assignment for four live scalar
-parameters, and the explicit all-vreg fallback at five-live-parameter pressure.
+parameters, and one bounded lazy entry spill at five-live-parameter pressure.
 `kotoba.native.machine-ir` consumes those
 contracts and owns only the bounded KIR-to-GMIR producer, physical MC lowering,
 and x86-64/AArch64 encoding. Register exhaustion is represented by bounded MIR
@@ -114,12 +114,13 @@ in `resources/aggregate-abi.edn`. The established record ABI remains a single
 context-owned pair-chain handle with a 4,096-cell execution bound. Extracted
 scalar calls are admitted by ABI v2: GMIR/MIR/MC v3 own a module of independent
 functions, and a call-containing function backs every vreg with its own bounded
-frame. Arguments load in parallel from stable slots into the five target ABI
-registers, every allocator register may be clobbered, and the return register is
+frame. Register-resident arguments move in parallel into the target ABI
+registers; an excess backed entry value loads directly into its outgoing ABI
+register. Every allocator register may be clobbered, and the return register is
 captured before later use. x86-64 adds an eight-byte call-alignment pad;
 AArch64 call functions save and restore FP/LR. The correctness-first all-vreg
-policy is deliberately conservative and can later be replaced by liveness-only
-spills without changing the v3 call contract.
+policy remains the fail-closed path for remaining pressure without changing the
+v3 call contract.
 
 Extracted record and variant boundaries remain held. Scalar-call admission does
 not admit pair-chain handles, variants, nested aggregates, indirect calls,
