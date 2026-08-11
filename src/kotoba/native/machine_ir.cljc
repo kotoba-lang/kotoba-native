@@ -66,6 +66,9 @@
   {'+ :gmir/add '- :gmir/subtract '* :gmir/multiply
    'quot :gmir/quotient 'bit-and :gmir/bit-and
    'bit-or :gmir/bit-or 'bit-xor :gmir/bit-xor
+   'i64-shift-left :gmir/shift-left
+   'i64-shift-right :gmir/shift-right-signed
+   'u64-shift-right :gmir/shift-right-unsigned
    '= :gmir/equal '< :gmir/less-than '> :gmir/greater-than
    '<= :gmir/less-or-equal '>= :gmir/greater-or-equal})
 
@@ -75,6 +78,10 @@
 
 (def ^:private kir-fold-ops '#{+ - * bit-and bit-or bit-xor})
 (def ^:private kir-comparison-ops '#{= < > <= >=})
+(def ^:private kir-word-unary-ops '#{bool-not bit-not i32-wrap u32-wrap})
+(def ^:private kir-i32-binary-ops
+  '#{i32-wrapping-add i32-wrapping-mul i32-xor
+     i32-shift-left i32-shift-right u32-shift-right})
 
 (defn- scalar-literal? [form]
   (or (boolean? form) (gmir/i64-value? form)))
@@ -161,7 +168,42 @@
         parameter-env (into {} (map (fn [parameter register]
                                       [parameter [:local register]])
                                     params parameter-registers))]
-    (letfn [(merge-values [then-value else-value then-exit else-exit form]
+    (letfn [(constant-value [literal]
+              (let [dst (fresh-reg)]
+                [[{:gmir/op :gmir/constant :gmir/dst dst :gmir/value literal}]
+                 dst]))
+
+            (binary-value [op [left-code left-value] [right-code right-value] form]
+              (let [left (scalar-register! left-value form)
+                    right (scalar-register! right-value form)
+                    dst (fresh-reg)]
+                [(vec (concat left-code right-code
+                              [{:gmir/op op :gmir/dst dst
+                                :gmir/left left :gmir/right right}]))
+                 dst]))
+
+            (signed-i32-value [[code source] form]
+              (let [[count-code count-register] (constant-value 32)
+                    shifted (fresh-reg)
+                    dst (fresh-reg)]
+                [(vec (concat code count-code
+                              [{:gmir/op :gmir/shift-left :gmir/dst shifted
+                                :gmir/left (scalar-register! source form)
+                                :gmir/right count-register}
+                               {:gmir/op :gmir/shift-right-signed :gmir/dst dst
+                                :gmir/left shifted :gmir/right count-register}]))
+                 dst]))
+
+            (unsigned-i32-value [[code source] form]
+              (let [[mask-code mask-register] (constant-value 4294967295)
+                    dst (fresh-reg)]
+                [(vec (concat code mask-code
+                              [{:gmir/op :gmir/bit-and :gmir/dst dst
+                                :gmir/left (scalar-register! source form)
+                                :gmir/right mask-register}]))
+                 dst]))
+
+            (merge-values [then-value else-value then-exit else-exit form]
               (cond
                 (and (gmir/vreg? then-value) (gmir/vreg? else-value))
                 (let [dst (fresh-reg)]
@@ -295,6 +337,42 @@
                                   :gmir/dst dst :gmir/left operand
                                   :gmir/right zero}]))
                    dst])
+
+                (and (seq? form) (contains? kir-word-unary-ops (first form))
+                     (= 2 (count form)))
+                (let [lowered (value (second form) env)]
+                  (case (first form)
+                    bool-not (binary-value :gmir/equal lowered
+                                           (constant-value 0) form)
+                    bit-not (binary-value :gmir/bit-xor lowered
+                                          (constant-value -1) form)
+                    i32-wrap (signed-i32-value lowered form)
+                    u32-wrap (unsigned-i32-value lowered form)))
+
+                (and (seq? form) (contains? kir-i32-binary-ops (first form))
+                     (= 3 (count form)))
+                (let [op (first form)
+                      left (value (second form) env)
+                      right (value (nth form 2) env)]
+                  (case op
+                    i32-wrapping-add
+                    (signed-i32-value
+                     (binary-value :gmir/add left right form) form)
+                    i32-wrapping-mul
+                    (signed-i32-value
+                     (binary-value :gmir/multiply left right form) form)
+                    i32-xor
+                    (signed-i32-value
+                     (binary-value :gmir/bit-xor left right form) form)
+                    i32-shift-left
+                    (signed-i32-value
+                     (binary-value :gmir/shift-left left right form) form)
+                    i32-shift-right
+                    (binary-value :gmir/shift-right-signed
+                                  (signed-i32-value left form) right form)
+                    u32-shift-right
+                    (binary-value :gmir/shift-right-unsigned
+                                  (unsigned-i32-value left form) right form)))
 
                 (and (seq? form) (= 'record-new (first form)) (<= 2 (count form)))
                 (let [type (second form)
@@ -535,6 +613,17 @@
                      (= :scalar (shape (second form) env)))
                 :scalar
 
+                (and (seq? form) (contains? kir-word-unary-ops (first form))
+                     (= 2 (count form))
+                     (= :scalar (shape (second form) env)))
+                :scalar
+
+                (and (seq? form) (contains? kir-i32-binary-ops (first form))
+                     (= 3 (count form))
+                     (= :scalar (shape (second form) env))
+                     (= :scalar (shape (nth form 2) env)))
+                :scalar
+
                 (and (seq? form) (= 'record-new (first form)) (<= 2 (count form)))
                 (let [type (second form), fields (scalar-record-fields type)]
                   (when (and fields (= (count fields) (- (count form) 2))
@@ -651,7 +740,7 @@
 ;; ── MC -> bytes ──────────────────────────────────────────────────────────────
 
 (def ^:private x86-register-code
-  {:x86-64/rax 0 :x86-64/rcx 1 :x86-64/rdx 2 :x86-64/r8 8
+  {:x86-64/rax 0 :x86-64/rcx 1 :x86-64/rdx 2 :x86-64/r8 8 :x86-64/r11 11
    :x86-64/rdi 7 :x86-64/rsi 6})
 (def ^:private x86-arguments [:x86-64/rdi :x86-64/rsi :x86-64/rdx :x86-64/rcx :x86-64/r8])
 (def ^:private aarch64-register-code
@@ -778,6 +867,20 @@
                  [0x48 0x99 0x48 0xf7 0xf9]
                  restore))))
 
+(defn- x86-shift [subop dst left right]
+  ;; Variable-count shifts require CL. r11 is outside MIR's allocator profile,
+  ;; and saving rcx makes the selected instruction preserve every non-dst
+  ;; register exactly as its MIR dataflow promises.
+  (vec (concat (x86-push :x86-64/rcx)
+               (when-not (= :x86-64/r11 left)
+                 (x86-rr 0x89 :x86-64/r11 left))
+               (when-not (= :x86-64/rcx right)
+                 (x86-rr 0x89 :x86-64/rcx right))
+               [0x49 0xd3 (bit-or 0xc0 (bit-shift-left subop 3) 3)]
+               (x86-pop :x86-64/rcx)
+               (when-not (= dst :x86-64/r11)
+                 (x86-rr 0x89 dst :x86-64/r11)))))
+
 (defn- x86-mov-imm [dst value]
   (let [d (get x86-register-code dst)]
     (when-not (some? d) (reject! :mc-encode :unsupported-register {:dst dst}))
@@ -889,6 +992,15 @@
     (let [dst (:mir/dst instruction) left (:mir/left instruction) right (:mir/right instruction)]
       (vec (concat (when-not (= dst left) (x86-rr 0x89 dst left))
                    (x86-rr 0x31 dst right))))
+    :x86-64/shift-left
+    (x86-shift 4 (:mir/dst instruction) (:mir/left instruction)
+               (:mir/right instruction))
+    :x86-64/shift-right-signed
+    (x86-shift 7 (:mir/dst instruction) (:mir/left instruction)
+               (:mir/right instruction))
+    :x86-64/shift-right-unsigned
+    (x86-shift 5 (:mir/dst instruction) (:mir/left instruction)
+               (:mir/right instruction))
     (:x86-64/equal :x86-64/less-than :x86-64/greater-than
      :x86-64/less-or-equal :x86-64/greater-or-equal)
     (x86-compare (case encoding
@@ -925,13 +1037,18 @@
                    (bit-shift-left (a64-register (:mir/left instruction)) 5)
                    (a64-register (:mir/dst instruction))))
     (:aarch64/subtract :aarch64/multiply
-     :aarch64/bit-and :aarch64/bit-or :aarch64/bit-xor)
+     :aarch64/bit-and :aarch64/bit-or :aarch64/bit-xor
+     :aarch64/shift-left :aarch64/shift-right-signed
+     :aarch64/shift-right-unsigned)
     (let [base (case encoding
                  :aarch64/subtract 0xcb000000
                  :aarch64/multiply 0x9b007c00
                  :aarch64/bit-and 0x8a000000
                  :aarch64/bit-or 0xaa000000
-                 :aarch64/bit-xor 0xca000000)]
+                 :aarch64/bit-xor 0xca000000
+                 :aarch64/shift-left 0x9ac02000
+                 :aarch64/shift-right-signed 0x9ac02800
+                 :aarch64/shift-right-unsigned 0x9ac02400)]
       (u32le (bit-or base
                      (bit-shift-left (a64-register (:mir/right instruction)) 16)
                      (bit-shift-left (a64-register (:mir/left instruction)) 5)

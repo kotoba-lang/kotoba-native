@@ -248,19 +248,20 @@
 (deftest i64-operations-use-the-documented-encodings
   (testing "x86-64"
     (let [code #(:code (x86/emit-program (program '[a] %)))]
-      ;; not rax -- group 3 /2, sharing its opcode with the neg (/3) beside it
-      (is (some #(= [0x48 0xf7 0xd0] %) (partition 3 1 (code '(bit-not a)))))
-      ;; shl/sar/shr rax,cl -- the count arrives in rcx, whose low byte is CL
-      (is (some #(= [0x48 0xd3 0xe0] %) (partition 3 1 (code '(i64-shift-left a 3)))))
-      (is (some #(= [0x48 0xd3 0xf8] %) (partition 3 1 (code '(i64-shift-right a 3)))))
-      (is (some #(= [0x48 0xd3 0xe8] %) (partition 3 1 (code '(u64-shift-right a 3)))))))
+      ;; bit-not is target-neutral xor -1 after KIR-to-GMIR lowering.
+      (is (some #(= [0x48 0x31 0xca] %) (partition 3 1 (code '(bit-not a)))))
+      ;; CL remains an architectural constraint. The MC encoder preserves rcx
+      ;; and shifts its private r11 scratch before moving into the allocated dst.
+      (is (some #(= [0x49 0xd3 0xe3] %) (partition 3 1 (code '(i64-shift-left a 3)))))
+      (is (some #(= [0x49 0xd3 0xfb] %) (partition 3 1 (code '(i64-shift-right a 3)))))
+      (is (some #(= [0x49 0xd3 0xeb] %) (partition 3 1 (code '(u64-shift-right a 3)))))))
   (testing "AArch64"
     (let [code #(:code (arm/emit-program (program '[a] %)))
           word (fn [w] (mapv #(bit-and (unsigned-bit-shift-right w (* 8 %)) 0xff) (range 4)))]
-      (is (some #(= (word 0xaa2003e0) %) (partition 4 1 (code '(bit-not a)))))
-      (is (some #(= (word 0x9ac12000) %) (partition 4 1 (code '(i64-shift-left a 3)))))
-      (is (some #(= (word 0x9ac12800) %) (partition 4 1 (code '(i64-shift-right a 3)))))
-      (is (some #(= (word 0x9ac12400) %) (partition 4 1 (code '(u64-shift-right a 3))))))))
+      (is (some #(= (word 0xca010002) %) (partition 4 1 (code '(bit-not a)))))
+      (is (some #(= (word 0x9ac12002) %) (partition 4 1 (code '(i64-shift-left a 3)))))
+      (is (some #(= (word 0x9ac12802) %) (partition 4 1 (code '(i64-shift-right a 3)))))
+      (is (some #(= (word 0x9ac12402) %) (partition 4 1 (code '(u64-shift-right a 3))))))))
 
 (deftest arithmetic-and-logical-right-shifts-are-not-interchanged
   ;; `i64-shift-right` is arithmetic and `u64-shift-right` is logical, matching
