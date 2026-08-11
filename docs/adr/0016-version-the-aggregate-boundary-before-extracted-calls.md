@@ -3,7 +3,8 @@
 ## Status
 
 Accepted. Scalar-call hold superseded by ADR 0017; scalar variant hold
-superseded by ADR 0023; record hold remains.
+superseded by ADR 0023; flat record hold by ADR 0024; nested record hold by ADR
+0031.
 
 ## Context
 
@@ -57,6 +58,6 @@ At the time of this decision no new call or aggregate path was claimed. ADR
 0017 subsequently satisfied the four named prerequisites for scalar-only
 direct calls and advanced the contract to v2. Existing record calls still
 allocate pair cells and retain the 4,096-cell execution bound; extracted record
-boundaries remain `:held`. ADR 0023 subsequently admits the bounded scalar
-variant pair-handle boundary. None of these decisions makes the backend
+boundaries were later admitted by ADR 0024 and ADR 0031. ADR 0023 admits the
+bounded scalar variant pair-handle boundary. None of these decisions makes the backend
 Rust-speed, defines ownership/borrowing, or permits a Rust parity claim.

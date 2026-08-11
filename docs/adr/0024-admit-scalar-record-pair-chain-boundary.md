@@ -1,6 +1,6 @@
 # ADR 0024: Admit the scalar record pair-chain boundary
 
-Status: accepted
+Status: superseded by ADR 0031
 
 ## Decision
 

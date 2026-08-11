@@ -131,13 +131,14 @@ encoder preserves every non-destination allocator register and `rbx` around
 fixed-register instructions; no operation can fall through to the legacy ISA
 emitter.
 
-Non-escaping fixed records whose fields are only `:i64` or `:bool` use scalar
+Non-escaping flat records whose fields are only `:i64` or `:bool` use scalar
 replacement before GMIR. Construction evaluates every field in declaration
 order, bindings retain an ordered SSA bundle, projection selects one scalar,
 and record-valued `if` emits one phi per field. Acyclic field transport reaches
-the existing parallel-copy scheduler with no allocation or phi frame. Escaping,
-nested, and non-scalar-field records remain on the established boxed/flattened
-path until their ABI is migrated explicitly.
+the existing parallel-copy scheduler with no allocation or phi frame. Escaping
+and nested records use declaration-order pair chains: each nested record is
+itself one context-owned word handle, so recursive projection is a bounded
+composition of the existing `pair-first`/`pair-second` operations.
 
 Non-escaping sealed variants whose case payloads are only `:i64` or `:bool`
 use the same extracted path without a stack aggregate. Construction creates an
@@ -153,7 +154,8 @@ variants remain outside the extracted path.
 
 Function-boundary aggregates are described by the versioned portable contract
 in `resources/aggregate-abi.edn`. The established record ABI remains a single
-context-owned pair-chain handle with a 4,096-cell execution bound. Extracted
+context-owned pair-chain handle with a 4,096-cell execution bound and a maximum
+inline schema nesting depth of 32. Extracted
 scalar calls are admitted by ABI v2: GMIR/MIR/MC v3 own a module of independent
 functions, and a call-containing function backs every vreg with its own bounded
 frame. Register-resident arguments move in parallel into the target ABI
@@ -164,10 +166,11 @@ AArch64 call functions save and restore FP/LR. The correctness-first all-vreg
 policy remains the fail-closed path for remaining pressure without changing the
 v3 call contract.
 
-Word-field record pair chains and scalar variant handles are admitted by
-aggregate ABI v5. Local non-escaping aggregates retain scalar replacement; nested
-aggregates, indirect calls, varargs, and external linkage remain explicit
-non-native language boundaries. This is not a Rust-parity claim.
+Word-field record pair chains, recursively nested record handles, and scalar
+variant handles are admitted by aggregate ABI v6. Local non-escaping flat
+aggregates retain scalar replacement. Variant payload aggregates, indirect
+calls, varargs, and external linkage remain explicit non-native language
+boundaries. This is not a Rust-parity claim.
 
 Value-position scalar `if` uses GMIR/MIR v2 phi values. Each branch reaches an
 explicit predecessor exit. Single- and multi-phi joins lower through MIR's

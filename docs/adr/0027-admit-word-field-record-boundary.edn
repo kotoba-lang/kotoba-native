@@ -1,5 +1,6 @@
 {:adr/id 27
- :adr/status :accepted
+ :adr/status :superseded
+ :superseded-by 31
  :abi/version 5
  :boundary :word-field-record-pair-chain
  :field-representation :one-native-word

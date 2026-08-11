@@ -1,19 +1,22 @@
 (ns kotoba.native.aggregate-abi
   "Portable contract for aggregates that reach a native function boundary.
 
-  Word-field records and scalar variants cross extracted calls as one-word
-  context-owned pair handles. Local non-escaping aggregates remain replaced."
+  Word-field records, including recursively nested records, and scalar variants
+  cross extracted calls as one-word context-owned pair handles. Local flat
+  non-escaping aggregates remain replaced."
   (:require [clojure.set :as set]))
 
 (def contract
   {:abi/id :kotoba.native/aggregate-boundary
-   :abi/version 5
+   :abi/version 6
    :abi/word-bits 64
    :portable/record
    {:boundary/parameters :pair-chain-handle
     :boundary/results :pair-chain-handle
     :boundary/word-count 1
     :boundary/layout :declaration-order
+    :boundary/field-representation :recursive-word-handles
+    :boundary/max-nesting-depth 32
     :boundary/terminator 0
     :boundary/allocation :context-pair-arena
     :boundary/ownership :host-context
@@ -58,25 +61,44 @@
   (throw (ex-info (str "aggregate ABI rejected: " (name problem))
                   {:phase :aggregate-abi :problem problem :value value})))
 
+(def ^:private max-record-nesting-depth 32)
+
 (defn scalar-record-type?
   "True for a named, non-empty record whose unique fields each occupy one
-  native word. Nested record/variant layouts remain outside this boundary."
+  native word. A nested record occupies one word through its pair-chain handle;
+  nesting is bounded so adversarial schemas fail closed during admission."
   [type]
-  (letfn [(word-field-type? [field-type]
+  (letfn [(record-type? [candidate depth]
+            (and (< depth max-record-nesting-depth)
+                 (vector? candidate) (= 3 (count candidate))
+                 (= :record (first candidate))
+                 (keyword? (second candidate))
+                 (vector? (nth candidate 2)) (seq (nth candidate 2))
+                 (every? #(and (vector? %) (= 2 (count %))
+                               (keyword? (first %))
+                               (word-field-type? (second %) (inc depth)))
+                         (nth candidate 2))
+                 (= (count (nth candidate 2))
+                    (count (distinct (map first (nth candidate 2)))))))
+          (word-field-type? [field-type depth]
             (or (contains? #{:i64 :bool :f32 :f64 :string :keyword
                              :vector :vector-f64 :string-index}
                            field-type)
                 (and (vector? field-type)
                      (contains? #{:option :result :list :set :map :ref}
-                                (first field-type)))))]
-    (and (vector? type) (= 3 (count type)) (= :record (first type))
-         (keyword? (second type)) (vector? (nth type 2)) (seq (nth type 2))
-         (every? #(and (vector? %) (= 2 (count %))
-                       (keyword? (first %))
-                       (word-field-type? (second %)))
-                 (nth type 2))
-         (= (count (nth type 2))
-            (count (distinct (map first (nth type 2))))))))
+                                (first field-type)))
+                (record-type? field-type depth)))]
+    (record-type? type 0)))
+
+(defn nested-record-type?
+  "True when TYPE is admitted and contains at least one inline record field."
+  [type]
+  (and (scalar-record-type? type)
+       (boolean
+        (some (fn [[_ field-type]]
+                (and (vector? field-type)
+                     (= :record (first field-type))))
+              (nth type 2)))))
 
 (defn validate-contract!
   "Validate the published contract and return it unchanged."
@@ -87,12 +109,13 @@
                (set (keys value)))
     (reject! :non-canonical-contract value))
   (when-not (and (= :kotoba.native/aggregate-boundary (:abi/id value))
-                 (= 5 (:abi/version value))
+                 (= 6 (:abi/version value))
                  (= 64 (:abi/word-bits value)))
     (reject! :unsupported-contract-version value))
   (let [record (:portable/record value)]
     (when-not (and (= #{:boundary/parameters :boundary/results
                         :boundary/word-count :boundary/layout
+                        :boundary/field-representation :boundary/max-nesting-depth
                         :boundary/terminator :boundary/allocation
                         :boundary/ownership :boundary/arena-cell-limit}
                       (set (keys record)))
@@ -100,6 +123,8 @@
                    (= :pair-chain-handle (:boundary/results record))
                    (= 1 (:boundary/word-count record))
                    (= :declaration-order (:boundary/layout record))
+                   (= :recursive-word-handles (:boundary/field-representation record))
+                   (= 32 (:boundary/max-nesting-depth record))
                    (= 0 (:boundary/terminator record))
                    (= :context-pair-arena (:boundary/allocation record))
                    (= :host-context (:boundary/ownership record))

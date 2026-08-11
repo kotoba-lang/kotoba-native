@@ -449,45 +449,55 @@
                             0xd4200000])) ; brk #0
          code)
         "every branch must land on the BRK, or the check never fires")))
-;; A nested record is flattened, not represented
+;; Nested records use recursive one-word pair handles
 ;; ---------------------------------------------------------------------------
 
 (def ^:private inner '[:record :t/s [[:a :i64] [:b :i64]]])
 (def ^:private outer '[:record :t/n [[:i [:record :t/s [[:a :i64] [:b :i64]]]] [:m :i64]]])
 
-(deftest nested-records-fail-closed-at-the-production-boundary
-  ;; Nested aggregate ABI is not admitted yet. These shapes used to be tested
-  ;; only by switching the public emitters onto retired recursive code. The
-  ;; production contract is explicit rejection until GMIR owns the layout.
+(def ^:private boxed-inner '(pair 1 (pair 2 0)))
+(def ^:private boxed-outer (list 'pair boxed-inner '(pair 9 0)))
+
+(deftest nested-records-lower-to-the-versioned-recursive-pair-boundary
+  ;; Each nested record is a one-word handle. Compare the public production
+  ;; route byte-for-byte with the already executed pair primitives so this is
+  ;; evidence of the representation, not merely evidence that emission returns.
   (doseq [[label emit] emitters]
     (testing label
-      (doseq [[why body]
+      (doseq [[why body boxed]
               [["outer field of a let-bound nested record"
                 (list 'let ['r (list 'record-new outer (list 'record-new inner 1 2) 9)]
-                      (list 'record-get outer 'r :m))]
+                      (list 'record-get outer 'r :m))
+                (list 'let ['r boxed-outer] '(pair-first (pair-second r)))]
                ["chained into the inner record"
                 (list 'let ['r (list 'record-new outer (list 'record-new inner 1 2) 9)]
-                      (list 'record-get inner (list 'record-get outer 'r :i) :b))]
+                      (list 'record-get inner (list 'record-get outer 'r :i) :b))
+                (list 'let ['r boxed-outer]
+                      '(pair-first (pair-second (pair-first r))))]
                ["chained plus a sibling read"
                 (list 'let ['r (list 'record-new outer (list 'record-new inner 4 5) 6)]
                       (list '+ (list 'record-get inner (list 'record-get outer 'r :i) :a)
-                            (list 'record-get outer 'r :m)))]
+                            (list 'record-get outer 'r :m)))
+                (list 'let ['r '(pair (pair 4 (pair 5 0)) (pair 6 0))]
+                      '(+ (pair-first (pair-first r))
+                          (pair-first (pair-second r))))]
                ["construction, outer field"
-                (list 'record-get outer (list 'record-new outer (list 'record-new inner 1 2) 7) :m)]]]
-        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unsupported-record-type"
-                              (emit (program [] body)))
-            why)))))
+                (list 'record-get outer (list 'record-new outer (list 'record-new inner 1 2) 7) :m)
+                '(pair-first (pair-second (pair (pair 1 (pair 2 0)) (pair 7 0))))]]]
+        (let [actual (emit (program [] body))
+              expected (emit (program [] boxed))]
+          (is (seq (:code actual)) why)
+          (is (= expected actual) why))))))
 
-(deftest a-record-valued-projection-is-not-a-value
-  ;; Selecting a record-typed field yields a record, which is only meaningful as
-  ;; the operand of a further projection. Anywhere else there is no word to
-  ;; produce, so it must be refused rather than loading one of the slots.
+(deftest a-record-valued-projection-is-the-inner-one-word-handle
   (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
     (testing label
-      (is (thrown-with-msg?
-           clojure.lang.ExceptionInfo #"(record-valued projection may only appear|unsupported-record-type)"
-           (emit (program [] (list 'let ['r (list 'record-new outer (list 'record-new inner 1 2) 9)]
-                                   (list 'record-get outer 'r :i)))))))))
+      (let [projected (list 'let ['r (list 'record-new outer
+                                           (list 'record-new inner 1 2) 9)]
+                            (list 'record-get outer 'r :i))
+            walked (list 'let ['r boxed-outer] '(pair-first r))]
+        (is (= (emit (program [] walked))
+               (emit (program [] projected))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; A variant whose case payload is a record
