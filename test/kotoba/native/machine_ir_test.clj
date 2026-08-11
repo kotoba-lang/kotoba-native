@@ -449,6 +449,8 @@
 (deftest x86-privileged-operations-route-through-closed-machine-ir
   (let [cases
         [[[] '(kernel-boot-info) :boot-info [0x4d 0x8b 0x51 0x50]]
+         [[] '(kernel-read-cr0) :read-cr0 [0x41 0x0f 0x20 0xc2]]
+         [['a] '(kernel-write-cr0 a) :write-cr0 [0x41 0x0f 0x22 0xc2]]
          [[] '(kernel-read-cr2) :read-cr2 [0x41 0x0f 0x20 0xd2]]
          [[] '(kernel-read-cr3) :read-cr3 [0x41 0x0f 0x20 0xda]]
          [['a] '(kernel-write-cr3 a) :write-cr3 [0x41 0x0f 0x22 0xda]]

@@ -1523,6 +1523,9 @@
         (emit-kernel-store-u32 args 512 env ctx)
 
         (= op 'kernel-boot-info) [0x49 0x8b 0x41 0x50]
+        (= op 'kernel-read-cr0) [0x0f 0x20 0xc0]
+        (= op 'kernel-write-cr0)
+        (vec (concat (emit-expr (first args) env (assoc ctx :tail? false)) [0x0f 0x22 0xc0]))
         (= op 'kernel-read-cr2) [0x0f 0x20 0xd0]
         (= op 'kernel-read-cr3) [0x0f 0x20 0xd8]
         (= op 'kernel-write-cr3)
