@@ -9,6 +9,7 @@
 (def ^:private text-offset page-size)
 (def ^:private data-offset (* 2 page-size))
 (def ^:private kernel-data-offset (* 8 page-size))
+(def ^:private x86-kernel-data-offset (* 16 page-size))
 (def ^:private context-size 80)
 (def ^:private kernel-image-context-size 88)
 (def ^:private user-context-size 88)
@@ -247,26 +248,26 @@
     (when-not export
       (throw (ex-info "Kotoba kernel entry is not exported" {:entry source-entry})))
     (let [entry-address (+ image-base text-offset)
-          context-address (+ image-base kernel-data-offset)
+          context-address (+ image-base x86-kernel-data-offset)
           shim (entry-shim (+ entry-address 23 (:offset export)) context-address)
           text (into shim (:code artifact))
           context (into (vec (repeat 8 0))
                         (concat (le (artifact-fuel artifact) 8)
                                 (repeat (- kernel-image-context-size 16) 0)))
           names (mapv int (.getBytes "\u0000.text\u0000.data\u0000.shstrtab\u0000" "UTF-8"))
-          names-offset (+ kernel-data-offset kernel-image-context-size)
+          names-offset (+ x86-kernel-data-offset kernel-image-context-size)
           section-offset (+ names-offset (count names)
                             (mod (- 8 (mod (+ names-offset (count names)) 8)) 8))
           sections [(vec (repeat 64 0))
                     (section-header 1 1 0x6 entry-address text-offset (count text) 16)
-                    (section-header 7 1 0x3 context-address kernel-data-offset kernel-image-context-size 8)
+                    (section-header 7 1 0x3 context-address x86-kernel-data-offset kernel-image-context-size 8)
                     (section-header 13 3 0 0 names-offset (count names) 1)]
           header (elf-header entry-address 2 section-offset (count sections))
           phdrs (concat (program-header 0x5 text-offset entry-address (count text) (count text))
-                        (program-header 0x6 kernel-data-offset context-address
+                        (program-header 0x6 x86-kernel-data-offset context-address
                                         kernel-image-context-size kernel-image-context-size))
           before-text (padded (concat header phdrs) text-offset)
-          before-data (padded (concat before-text text) kernel-data-offset)
+          before-data (padded (concat before-text text) x86-kernel-data-offset)
           before-sections (padded (concat before-data context names) section-offset)
           bytes (vec (concat before-sections (mapcat identity sections)))]
       {:format :elf64/v1
