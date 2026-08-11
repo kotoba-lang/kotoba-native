@@ -278,6 +278,30 @@
         (is (seq (:code (machine/compile-kir-module target kir)))
             [target (:body function)])))))
 
+(deftest immutable-utf8-data-is-laid-out-after-machine-code
+  (doseq [form ["hello😀" :ready '(keyword-from-string "ready")
+                '(keyword-name :ready)]]
+    (let [lowered (machine/lower-kir-expression [] form)]
+      (is (some #(= :gmir/data-address (:gmir/op %))
+                (:gmir/instructions lowered)) (pr-str form))
+      (is (some #(= :pair (:gmir/runtime %))
+                (:gmir/instructions lowered)) (pr-str form))))
+  (let [content "hello😀"
+        bytes (mapv #(bit-and (int %) 0xff) (.getBytes content "UTF-8"))
+        kir {:format :kotoba.kir/v4 :exports ['main]
+             :functions [{:name 'main :params [] :param-types []
+                          :result :string :body content}]}]
+    (is (not (machine/pilot-expression? [] content))
+        "literal placement requires whole-module layout")
+    (is (machine/pilot-module? kir))
+    (doseq [target [:x86-64 :aarch64]]
+      (let [{:keys [code exports]} (machine/compile-kir-module target kir)
+            {:keys [offset length]} (get exports 'main)]
+        (is (= bytes (subvec code (- (count code) (count bytes)))) target)
+        (is (= 0 offset) target)
+        (is (= (- (count code) (count bytes)) length)
+            "export length excludes the immutable data pool")))))
+
 (deftest allocation-is-deterministic-and-fails-closed
   (is (= (machine/compile-gmir :x86-64 program)
          (machine/compile-gmir :x86-64 program)))
