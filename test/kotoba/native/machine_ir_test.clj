@@ -416,6 +416,43 @@
     (is (= 16384 (:gmir/maximum load)))
     (is (= :gmir/return (:gmir/op (last instructions))))))
 
+(deftest x86-privileged-operations-route-through-closed-machine-ir
+  (let [cases
+        [[[] '(kernel-boot-info) :boot-info [0x4d 0x8b 0x51 0x50]]
+         [[] '(kernel-read-cr2) :read-cr2 [0x41 0x0f 0x20 0xd2]]
+         [[] '(kernel-read-cr3) :read-cr3 [0x41 0x0f 0x20 0xda]]
+         [['a] '(kernel-write-cr3 a) :write-cr3 [0x41 0x0f 0x22 0xda]]
+         [['a] '(kernel-invlpg a) :invlpg [0x41 0x0f 0x01 0x3a]]
+         [[] '(kernel-cli) :cli [0xfa]]
+         [[] '(kernel-sti) :sti [0xfb]]
+         [[] '(kernel-hlt) :hlt [0xf4]]
+         [[] '(kernel-pause) :pause [0xf3 0x90]]
+         [['a 'b] '(kernel-out-u8 a b) :out-u8 [0xee]]
+         [['a 'b] '(kernel-out-u32 a b) :out-u32 [0xef]]
+         [['a] '(kernel-in-u8 a) :in-u8 [0xec]]
+         [['a] '(kernel-in-u32 a) :in-u32 [0xed]]
+         [['a] '(kernel-read-msr a) :read-msr [0x0f 0x32]]
+         [['a 'b] '(kernel-write-msr a b) :write-msr [0x0f 0x30]]
+         [['a 'b] '(kernel-cpuid-eax a b) :cpuid-eax [0x0f 0xa2]]
+         [['a 'b] '(kernel-cpuid-ebx a b) :cpuid-ebx [0x0f 0xa2]]
+         [['a 'b] '(kernel-cpuid-ecx a b) :cpuid-ecx [0x0f 0xa2]]
+         [['a 'b] '(kernel-cpuid-edx a b) :cpuid-edx [0x0f 0xa2]]]
+        contains-bytes? (fn [bytes needle]
+                          (boolean (some #{needle}
+                                         (partition (count needle) 1 bytes))))]
+    (doseq [[params form action needle] cases]
+      (testing (str form)
+        (is (machine/pilot-expression? params form))
+        (let [gmir (machine/lower-kir-expression params form)
+              operation (first (filter #(= :gmir/x86-privileged (:gmir/op %))
+                                       (:gmir/instructions gmir)))
+              bytes (machine/compile-expression :x86-64 params form)]
+          (is (= action (:gmir/action operation)))
+          (is (contains-bytes? bytes needle)))
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                              #"x86-privileged-target-mismatch"
+                              (machine/compile-expression :aarch64 params form)))))))
+
 (deftest parameters-are-materialized-before-expression-temporaries
   ;; AArch64 passes arguments in the same x0-x4 register set used by this
   ;; bounded allocator. If a constant is emitted first, it can overwrite an

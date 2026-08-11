@@ -183,19 +183,16 @@
         (is (= phase (:phase (ex-data thrown)))
             "the phase must be this backend, matching its other throws")))))
 
-(deftest the-x86-only-privileged-surface-reports-itself-as-unimplemented
-  ;; The load-bearing case. These are real operators the frontend admits, that
-  ;; x86-64 implements and AArch64 deliberately does not. Before this, asking
-  ;; for one on AArch64 said the program had called a function that does not
-  ;; exist. Now it names the operator, which is what makes the intentional
-  ;; asymmetry legible instead of looking like a broken program.
+(deftest the-x86-only-privileged-surface-is-rejected-at-target-selection
+  ;; These are closed GMIR operations now, but only x86-64 admits their target
+  ;; selection. AArch64 fails at MIR selection instead of falling through an
+  ;; ISA emitter or being mistaken for a source-level function call.
   (doseq [[params body] x86-only]
     (let [thrown (try (arm/emit-program (program params body)) nil
                       (catch clojure.lang.ExceptionInfo e e))]
       (is (some? thrown) (str body " must be rejected on AArch64"))
-      (is (= "operation not implemented on this backend" (ex-message thrown)))
-      (is (= (first body) (:operation (ex-data thrown)))
-          (str "the diagnostic must name " (first body))))))
+      (is (= :mir (:phase (ex-data thrown))))
+      (is (= :x86-privileged-target-mismatch (:problem (ex-data thrown)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; The u32 bound is four bytes wider than the u8 bound
