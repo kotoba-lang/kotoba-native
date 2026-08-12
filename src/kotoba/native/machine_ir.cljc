@@ -2426,12 +2426,25 @@
                    (bit-shift-left (a64-register (:mir/left instruction)) 5)
                    (a64-register (:mir/dst instruction))))
     (:aarch64/multiply-add :aarch64/multiply-subtract)
-    (u32le (bit-or (if (= :aarch64/multiply-add encoding)
-                     0x9b000000 0x9b008000)
-                   (bit-shift-left (a64-register (:mir/right instruction)) 16)
-                   (bit-shift-left (a64-register (:mir/addend instruction)) 10)
-                   (bit-shift-left (a64-register (:mir/left instruction)) 5)
-                   (a64-register (:mir/dst instruction))))
+    (if-let [shift (:native/a64-mersenne-shift instruction)]
+      (let [factor (a64-register (:native/a64-mersenne-factor instruction))
+            addend (a64-register (:mir/addend instruction))
+            dst (a64-register (:mir/dst instruction))]
+        (vec
+         (concat
+          ;; x17 = factor - (factor << shift) = -factor*(2^shift-1)
+          (u32le (bit-or 0xcb000000 (bit-shift-left factor 16)
+                         (bit-shift-left shift 10)
+                         (bit-shift-left factor 5) 17))
+          ;; dst = addend - factor*(2^shift-1)
+          (u32le (bit-or 0x8b000000 (bit-shift-left 17 16)
+                         (bit-shift-left addend 5) dst)))))
+      (u32le (bit-or (if (= :aarch64/multiply-add encoding)
+                       0x9b000000 0x9b008000)
+                     (bit-shift-left (a64-register (:mir/right instruction)) 16)
+                     (bit-shift-left (a64-register (:mir/addend instruction)) 10)
+                     (bit-shift-left (a64-register (:mir/left instruction)) 5)
+                     (a64-register (:mir/dst instruction)))))
     (:aarch64/subtract :aarch64/multiply
      :aarch64/bit-and :aarch64/bit-or :aarch64/bit-xor
      :aarch64/shift-left :aarch64/shift-right-signed
@@ -2622,6 +2635,59 @@
     :mir/base :mir/length :mir/index :mir/stored :mir/offset :mir/size
     :mir/arguments]))
 
+(defn- positive-mersenne-shift [value]
+  (let [candidate (+ (->wide value) wide-one)
+        two (+ wide-one wide-one)]
+    (when (> candidate wide-one)
+      (loop [remaining candidate, shift 0]
+        (cond
+          (= remaining wide-one) (when (<= 1 shift 63) shift)
+          (= wide-zero (wide-mod remaining two))
+          (recur (wide-quot remaining two) (inc shift))
+          :else nil)))))
+
+(defn- a64-strength-reduce-cached-mersenne [instruction cache]
+  (if-not (= :aarch64/multiply-subtract (:mc/encoding instruction))
+    instruction
+    (let [cached-values (into {} (map (fn [[value register]] [register value]) cache))
+          factor (cond
+                   (contains? cached-values (:mir/left instruction))
+                   (:mir/right instruction)
+                   (contains? cached-values (:mir/right instruction))
+                   (:mir/left instruction))
+          constant-register (cond
+                              (contains? cached-values (:mir/left instruction))
+                              (:mir/left instruction)
+                              (contains? cached-values (:mir/right instruction))
+                              (:mir/right instruction))
+          shift (some-> constant-register cached-values positive-mersenne-shift)]
+      (if shift
+        (assoc instruction
+               :native/a64-mersenne-shift shift
+               :native/a64-mersenne-factor factor)
+        instruction))))
+
+(def ^:private a64-cache-source-keys
+  [:mir/test :mir/value :mir/src :mir/input :mir/left :mir/right :mir/addend
+   :mir/base :mir/length :mir/index :mir/stored :mir/offset :mir/size
+   :mir/arguments])
+
+(defn- a64-used-source-registers [instructions]
+  (set
+   (mapcat (fn [instruction]
+             (let [keys (cond-> a64-cache-source-keys
+                          (:native/a64-mersenne-shift instruction)
+                          (->> (remove #{:mir/left :mir/right})))]
+               (concat
+                (when-let [factor (:native/a64-mersenne-factor instruction)] [factor])
+                (mapcat (fn [key]
+                       (let [value (get instruction key)]
+                         (cond (vector? value) value
+                               (keyword? value) [value]
+                               :else [])))
+                        keys))))
+           instructions)))
+
 (defn- a64-cache-leaf-constants [instructions]
   ;; The cache registers are caller-saved. Restrict the transform to one
   ;; branchless leaf so no call or alternate entry can invalidate their value.
@@ -2650,8 +2716,9 @@
           cache (into {} (map (fn [{:keys [value]} register]
                                 [value register])
                               selected a64-leaf-constant-registers))]
-      (:out
-       (reduce
+      (let [rewritten
+            (:out
+             (reduce
         (fn [{:keys [aliases loaded out]} {:mc/keys [encoding] :as instruction}]
           (if (and (= :aarch64/constant encoding)
                    (contains? cache (:mir/value instruction)))
@@ -2663,13 +2730,21 @@
               {:aliases (assoc aliases (:mir/dst instruction) register)
                :loaded (conj loaded value)
                :out emitted})
-            (let [rewritten (a64-cache-register-sources instruction aliases)
+            (let [rewritten (-> instruction
+                                (a64-cache-register-sources aliases)
+                                (a64-strength-reduce-cached-mersenne cache))
                   dst (:mir/dst instruction)]
               {:aliases (if dst (dissoc aliases dst) aliases)
                :loaded loaded
                :out (conj out rewritten)})))
-        {:aliases {} :loaded #{} :out []}
-        instructions)))))
+              {:aliases {} :loaded #{} :out []}
+              instructions))
+            used (a64-used-source-registers rewritten)
+            cache-registers (set (vals cache))]
+        (vec (remove #(and (= :aarch64/constant (:mc/encoding %))
+                           (contains? cache-registers (:mir/dst %))
+                           (not (contains? used (:mir/dst %))))
+                     rewritten))))))
 
 (def ^:private a64-x16-preserving-encodings
   #{:aarch64/argument :aarch64/constant :aarch64/data-address

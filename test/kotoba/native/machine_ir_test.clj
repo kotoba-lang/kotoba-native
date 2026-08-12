@@ -76,6 +76,45 @@
               '(let [a (quot n 7) b (quot a d)] (+ b (quot n 7)))))
         "an intervening guarded SDIV clobbers x16 and forces a reload")))
 
+(deftest aarch64-cached-mersenne-msub-uses-shifted-subtract
+  (let [instruction {:mc/op :mc/instruction
+                     :mc/encoding :aarch64/multiply-subtract
+                     :mir/dst :aarch64/x0 :mir/left :aarch64/x2
+                     :mir/right :aarch64/x13 :mir/addend :aarch64/x3
+                     :native/a64-mersenne-shift 31
+                     :native/a64-mersenne-factor :aarch64/x2}
+        bytes (#'machine/encode-selected
+               :aarch64 0 [0xc0 0x03 0x5f 0xd6] 0 true instruction)]
+    (is (= [[0x51 0x7c 0x02 0xcb] [0x60 0x00 0x11 0x8b]]
+           (mapv vec (partition 4 bytes)))
+        "SUB X17,X2,X2,LSL#31; ADD X0,X3,X17")))
+
+(deftest aarch64-strength-reduces-only-repeated-positive-mersenne-factors
+  (let [lower (fn [value]
+                (#'machine/a64-cache-leaf-constants
+                 [{:mc/op :mc/instruction :mc/encoding :aarch64/constant
+                   :mir/dst :aarch64/x1 :mir/value value}
+                  {:mc/op :mc/instruction :mc/encoding :aarch64/multiply-subtract
+                   :mir/dst :aarch64/x0 :mir/left :aarch64/x2
+                   :mir/right :aarch64/x1 :mir/addend :aarch64/x3}
+                  {:mc/op :mc/instruction :mc/encoding :aarch64/constant
+                   :mir/dst :aarch64/x1 :mir/value value}
+                  {:mc/op :mc/instruction :mc/encoding :aarch64/multiply-subtract
+                   :mir/dst :aarch64/x0 :mir/left :aarch64/x2
+                   :mir/right :aarch64/x1 :mir/addend :aarch64/x3}
+                  {:mc/op :mc/instruction :mc/encoding :aarch64/return
+                   :mir/value :aarch64/x0}]))
+        reduced (lower 2147483647)
+        small (lower 15)
+        ordinary (lower 14)]
+    (is (= [31 31] (mapv :native/a64-mersenne-shift (take 2 reduced))))
+    (is (= [4 4] (mapv :native/a64-mersenne-shift (take 2 small))))
+    (is (not-any? #(= :aarch64/constant (:mc/encoding %)) reduced)
+        "the now-unused divisor materialization is removed")
+    (is (= 1 (count (filter #(= :aarch64/constant (:mc/encoding %)) ordinary))))
+    (is (not-any? :native/a64-mersenne-shift ordinary)
+        "a non-Mersenne factor retains MSUB")))
+
 (deftest aarch64-fuses-safe-multiply-add-and-subtract-after-allocation
   (let [expression '(let [v (+ (* n 7) 1)] (- v (* n 3)))
         arm (machine/compile-gmir
