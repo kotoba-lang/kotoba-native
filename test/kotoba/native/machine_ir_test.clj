@@ -33,6 +33,49 @@
     (is (= 16 (count (encode 0x0001000200030004)))
         "non-bitmask constants retain their exact wide-move sequence")))
 
+(deftest aarch64-branchless-leaves-cache-repeated-constants
+  (let [leaf (mapv vec (partition 4
+                                (machine/compile-expression
+                                 :aarch64 ['n]
+                                 '(let [a (+ n 7) b (* a 7)] (+ b 7)))))
+        branched (mapv vec (partition 4
+                                    (machine/compile-expression
+                                     :aarch64 ['n]
+                                     '(if n (+ n 7) (+ n 7)))))
+        checked-memory (mapv vec (partition 4
+                                          (machine/compile-expression
+                                           :aarch64 ['base 'length]
+                                           '(+ (kernel-load-u8 base length 7)
+                                               (kernel-load-u8 base length 7)))))
+        movz-seven? #(= [0x00 0x80 0xd2] (subvec % 1))]
+    (is (= 1 (count (filter movz-seven? leaf)))
+        "three materializations share one reserved leaf register")
+    (is (= [0xed 0x00 0x80 0xd2] (first leaf)) "MOVZ X13,#7")
+    (is (= 2 (count (filter movz-seven? branched)))
+        "control flow disables the caller-saved leaf cache")
+    (is (= 2 (count (filter movz-seven? checked-memory)))
+        "encoders with private scratch conventions do not opt in")))
+
+(deftest aarch64-branchless-leaves-cache-a-reciprocal-multiplier
+  (let [module (fn [body]
+                 {:format :kotoba.kir/v3 :entry 'kernel :exports ['kernel]
+                  :functions [{:name 'kernel :params ['n 'd] :body body}]})
+        magic (:multiplier (machine/signed-division-magic 7))
+        needle (vec (partition 4 (#'machine/a64-constant :aarch64/x16 magic)))
+        occurrences (fn [body]
+                      (let [words (vec (partition 4
+                                                  (:code
+                                                   (machine/compile-kir-module
+                                                    :aarch64 (module body)))))
+                            width (count needle)]
+                        (count (filter #(= needle (subvec words % (+ % width)))
+                                       (range (inc (- (count words) width)))))))]
+    (is (= 1 (occurrences '(let [a (quot n 7)] (+ a (quot n 7)))))
+        "equal reciprocals load x16 once")
+    (is (= 2 (occurrences
+              '(let [a (quot n 7) b (quot a d)] (+ b (quot n 7)))))
+        "an intervening guarded SDIV clobbers x16 and forces a reload")))
+
 (deftest aarch64-fuses-safe-multiply-add-and-subtract-after-allocation
   (let [expression '(let [v (+ (* n 7) 1)] (- v (* n 3)))
         arm (machine/compile-gmir

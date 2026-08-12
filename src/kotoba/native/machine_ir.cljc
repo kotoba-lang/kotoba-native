@@ -1478,7 +1478,11 @@
 (def ^:private x86-arguments [:x86-64/rdi :x86-64/rsi :x86-64/rdx :x86-64/rcx :x86-64/r8])
 (def ^:private aarch64-register-code
   {:aarch64/x0 0 :aarch64/x1 1 :aarch64/x2 2 :aarch64/x3 3
-   :aarch64/x4 4 :aarch64/x7 7 :aarch64/x16 16 :aarch64/x17 17})
+   :aarch64/x4 4 :aarch64/x7 7
+   ;; x13-x15 are leaf-only constant-cache registers. x16-x17 remain the
+   ;; local encoder scratch pair and are never admitted to allocated MIR.
+   :aarch64/x13 13 :aarch64/x14 14 :aarch64/x15 15
+   :aarch64/x16 16 :aarch64/x17 17})
 
 (defn- byte-value [n] (bit-and (unchecked-int n) 0xff))
 
@@ -2097,12 +2101,12 @@
         (u32le (bit-or 0x14000000 2))
         (u32le 0xd4200000))))
 
-(defn- a64-quotient-constant [dst left divisor]
+(defn- a64-quotient-constant [dst left divisor load-multiplier?]
   (if-let [{:keys [multiplier shift add-numerator? subtract-numerator?]}
            (signed-division-magic divisor)]
     (vec
      (concat
-      (a64-constant :aarch64/x16 multiplier)
+      (when load-multiplier? (a64-constant :aarch64/x16 multiplier))
       ;; smulh x17,left,x16
       (u32le (bit-or 0x9b407c00
                      (bit-shift-left 16 16)
@@ -2121,11 +2125,12 @@
         (u32le (bit-or 0x9340fc00
                        (bit-shift-left shift 16)
                        (bit-shift-left 17 5) 17)))
-      ;; lsr x16,x17,#63 (UBFM), then add the truncation-toward-zero correction.
+      ;; Keep x16's multiplier live. The allocated destination is safe to use
+      ;; for the sign bit because all numerator corrections have completed.
       (u32le (bit-or 0xd340fc00 (bit-shift-left 63 16)
-                     (bit-shift-left 17 5) 16))
+                     (bit-shift-left 17 5) (a64-register dst)))
       (u32le (bit-or 0x8b000000
-                     (bit-shift-left 16 16)
+                     (bit-shift-left (a64-register dst) 16)
                      (bit-shift-left 17 5)
                      (a64-register dst)))))
     (vec (concat (a64-constant :aarch64/x17 divisor)
@@ -2310,7 +2315,7 @@
       (reject! :mc-encode :unknown-x86-privileged-action instruction))))
 
 (defn- encode-selected
-  [isa frame-bytes return-suffix instruction-index
+  [isa frame-bytes return-suffix instruction-index load-a64-multiplier?
    {:mc/keys [encoding] :as instruction}]
   (case encoding
     :x86-64/argument
@@ -2449,7 +2454,8 @@
                   (:mir/right instruction))
     :aarch64/quotient-constant
     (a64-quotient-constant (:mir/dst instruction) (:mir/left instruction)
-                           (:mir/divisor instruction))
+                           (:mir/divisor instruction)
+                           load-a64-multiplier?)
     (:aarch64/f64-add :aarch64/f64-subtract :aarch64/f64-multiply
      :aarch64/f64-divide :aarch64/f64-min :aarch64/f64-max)
     (a64-f64-binary (case encoding
@@ -2578,11 +2584,117 @@
 (defn- resolve-layout [tokens]
   (:code (resolve-program-layout tokens)))
 
+(def ^:private a64-leaf-constant-registers
+  [:aarch64/x13 :aarch64/x14 :aarch64/x15])
+
+(def ^:private a64-leaf-cache-safe-encodings
+  ;; Keep this closed: checked-memory and host-boundary encoders have their own
+  ;; private scratch conventions and must opt in only after proving x13-x15
+  ;; preservation.
+  #{:aarch64/argument :aarch64/constant :aarch64/data-address
+    :aarch64/add :aarch64/subtract :aarch64/multiply
+    :aarch64/multiply-add :aarch64/multiply-subtract
+    :aarch64/quotient :aarch64/quotient-constant
+    :aarch64/bit-and :aarch64/bit-or :aarch64/bit-xor
+    :aarch64/shift-left :aarch64/shift-right-signed
+    :aarch64/shift-right-unsigned
+    :aarch64/f64-add :aarch64/f64-subtract :aarch64/f64-multiply
+    :aarch64/f64-divide :aarch64/f64-min :aarch64/f64-max
+    :aarch64/f64-sqrt :aarch64/f64-equal :aarch64/f64-less-than
+    :aarch64/f64-less-or-equal :aarch64/f64-greater-than
+    :aarch64/f64-greater-or-equal :aarch64/f64-unordered
+    :aarch64/equal :aarch64/less-than :aarch64/greater-than
+    :aarch64/less-or-equal :aarch64/greater-or-equal
+    :aarch64/spill-load :aarch64/spill-store :aarch64/move :aarch64/return})
+
+(defn- a64-cache-register-sources [instruction aliases]
+  (reduce
+   (fn [out key]
+     (if-not (contains? out key)
+       out
+       (update out key
+               (fn [value]
+                 (if (vector? value)
+                   (mapv #(get aliases % %) value)
+                   (get aliases value value))))))
+   instruction
+   [:mir/test :mir/value :mir/src :mir/input :mir/left :mir/right :mir/addend
+    :mir/base :mir/length :mir/index :mir/stored :mir/offset :mir/size
+    :mir/arguments]))
+
+(defn- a64-cache-leaf-constants [instructions]
+  ;; The cache registers are caller-saved. Restrict the transform to one
+  ;; branchless leaf so no call or alternate entry can invalidate their value.
+  (if-not
+   (every? (fn [{:mc/keys [op encoding]}]
+             (and (= :mc/instruction op)
+                  (contains? a64-leaf-cache-safe-encodings encoding)
+                  (not (contains? #{"call" "tail-call"} (name encoding)))))
+           instructions)
+    instructions
+    (let [occurrences
+          (reduce (fn [out [index {:mc/keys [encoding] :as instruction}]]
+                    (if (= :aarch64/constant encoding)
+                      (update out (:mir/value instruction) (fnil conj []) index)
+                      out))
+                  {} (map-indexed vector instructions))
+          selected (->> occurrences
+                        (keep (fn [[value indexes]]
+                                (when (> (count indexes) 1)
+                                  {:value value :first (first indexes)
+                                   :saving (* (dec (count indexes))
+                                              (count (a64-constant
+                                                      :aarch64/x13 value)))})))
+                        (sort-by (juxt (comp - :saving) :first))
+                        (take (count a64-leaf-constant-registers)))
+          cache (into {} (map (fn [{:keys [value]} register]
+                                [value register])
+                              selected a64-leaf-constant-registers))]
+      (:out
+       (reduce
+        (fn [{:keys [aliases loaded out]} {:mc/keys [encoding] :as instruction}]
+          (if (and (= :aarch64/constant encoding)
+                   (contains? cache (:mir/value instruction)))
+            (let [value (:mir/value instruction)
+                  register (get cache value)
+                  emitted (if (contains? loaded value)
+                            out
+                            (conj out (assoc instruction :mir/dst register)))]
+              {:aliases (assoc aliases (:mir/dst instruction) register)
+               :loaded (conj loaded value)
+               :out emitted})
+            (let [rewritten (a64-cache-register-sources instruction aliases)
+                  dst (:mir/dst instruction)]
+              {:aliases (if dst (dissoc aliases dst) aliases)
+               :loaded loaded
+               :out (conj out rewritten)})))
+        {:aliases {} :loaded #{} :out []}
+        instructions)))))
+
+(def ^:private a64-x16-preserving-encodings
+  #{:aarch64/argument :aarch64/constant :aarch64/data-address
+    :aarch64/add :aarch64/subtract :aarch64/multiply
+    :aarch64/multiply-add :aarch64/multiply-subtract
+    :aarch64/bit-and :aarch64/bit-or :aarch64/bit-xor
+    :aarch64/shift-left :aarch64/shift-right-signed
+    :aarch64/shift-right-unsigned :aarch64/spill-load
+    :aarch64/spill-store :aarch64/move :aarch64/return})
+
 (defn- instruction-tokens
   [isa frame-bytes return-suffix tail-suffix callee-labels instructions]
-  (vec
-   (mapcat
-    (fn [instruction-index {:mc/keys [op test] :as instruction}]
+  (let [instructions (if (= :aarch64 isa)
+                       (a64-cache-leaf-constants instructions)
+                       instructions)]
+    (:out
+     (reduce
+      (fn [{:keys [out cached-a64-multiplier]}
+           [instruction-index {:mc/keys [op test encoding] :as instruction}]]
+        (let [magic (when (and (= isa :aarch64)
+                               (= encoding :aarch64/quotient-constant))
+                      (signed-division-magic (:mir/divisor instruction)))
+              multiplier (:multiplier magic)
+              load-multiplier? (not= multiplier cached-a64-multiplier)
+              tokens
       (if (layout/label-token? instruction)
         [instruction]
         (case op
@@ -2603,7 +2715,8 @@
                   (if (= :x86-64 isa)
                     :x86-64/call-rel32 :aarch64/bl-imm26)
                   label)]))
-            (encode-selected isa frame-bytes return-suffix instruction-index instruction))
+            (encode-selected isa frame-bytes return-suffix instruction-index
+                             load-multiplier? instruction))
           :mc/branch-zero
           (if (= :x86-64 isa)
             (concat (x86-rr 0x85 test test)
@@ -2616,8 +2729,18 @@
           [(layout/relative-branch
             (if (= :x86-64 isa) :x86-64/jmp-rel32 :aarch64/b-imm26)
             (:mc/target instruction))]
-          (reject! :mc-encode :unknown-operation instruction))))
-    (range) instructions)))
+          (reject! :mc-encode :unknown-operation instruction)))
+              next-multiplier
+              (cond
+                multiplier multiplier
+                (and (= :mc/instruction op)
+                     (contains? a64-x16-preserving-encodings encoding))
+                cached-a64-multiplier
+                :else nil)]
+          {:out (into out tokens)
+           :cached-a64-multiplier next-multiplier}))
+      {:out [] :cached-a64-multiplier nil}
+      (map-indexed vector instructions)))))
 
 (defn- qualify-function-locals [function-index tokens]
   (let [labels (->> tokens (filter layout/label-token?) (map :mir/id) set)
