@@ -19,7 +19,51 @@
   (throw (ex-info (str "machine IR rejected: " (name problem))
                   {:phase phase :problem problem :instruction instruction})))
 
+(defn- a64-fused-multiply [multiply consumer]
+  (let [product (:mir/dst multiply)
+        addend (cond
+                 (and (= :mir/add (:mir/op consumer))
+                      (= product (:mir/left consumer))) (:mir/right consumer)
+                 (and (= :mir/add (:mir/op consumer))
+                      (= product (:mir/right consumer))) (:mir/left consumer)
+                 (and (= :mir/subtract (:mir/op consumer))
+                      (= product (:mir/right consumer))) (:mir/left consumer))]
+    (when (and addend (not= product addend))
+      {:mir/op (if (= :mir/subtract (:mir/op consumer))
+                 :mir/multiply-subtract :mir/multiply-add)
+       :mir/dst (:mir/dst consumer)
+       :mir/left (:mir/left multiply)
+       :mir/right (:mir/right multiply)
+       :mir/addend addend})))
+
+(defn- a64-fuse-multiplies [instructions]
+  (loop [index 0, out []]
+    (if (>= index (count instructions))
+      (vec out)
+      (let [multiply (get instructions index)]
+        (if (= :mir/multiply (:mir/op multiply))
+          (let [after (inc index)
+                consumer-index
+                (loop [candidate after]
+                  (if (= :mir/constant (:mir/op (get instructions candidate)))
+                    (recur (inc candidate))
+                    candidate))
+                between (subvec instructions after consumer-index)
+                protected #{(:mir/dst multiply) (:mir/left multiply)
+                            (:mir/right multiply)}
+                unclobbered? (not-any? #(contains? protected (:mir/dst %)) between)
+                fused (when unclobbered?
+                        (a64-fused-multiply multiply
+                                            (get instructions consumer-index)))]
+            (if fused
+              (recur (inc consumer-index) (into out (concat between [fused])))
+              (recur (inc index) (conj out multiply))))
+          (recur (inc index) (conj out multiply)))))))
+
 (defn- lower-mc-instructions [isa instructions]
+  (let [instructions (if (= :aarch64 isa)
+                       (a64-fuse-multiplies instructions)
+                       instructions)]
   (mapv (fn [{:mir/keys [op id test] :as instruction}]
           (case op
             :mir/label (layout/label id)
@@ -31,7 +75,7 @@
             (into {:mc/op :mc/instruction
                    :mc/encoding (keyword (name isa) (name op))}
                   (remove (fn [[k _]] (= k :mir/op)) instruction))))
-        instructions))
+        instructions)))
 
 (defn lower-mc
   "Lower allocated MIR to explicit MC instruction/layout data.
@@ -2331,6 +2375,13 @@
     :aarch64/add
     (u32le (bit-or 0x8b000000
                    (bit-shift-left (a64-register (:mir/right instruction)) 16)
+                   (bit-shift-left (a64-register (:mir/left instruction)) 5)
+                   (a64-register (:mir/dst instruction))))
+    (:aarch64/multiply-add :aarch64/multiply-subtract)
+    (u32le (bit-or (if (= :aarch64/multiply-add encoding)
+                     0x9b000000 0x9b008000)
+                   (bit-shift-left (a64-register (:mir/right instruction)) 16)
+                   (bit-shift-left (a64-register (:mir/addend instruction)) 10)
                    (bit-shift-left (a64-register (:mir/left instruction)) 5)
                    (a64-register (:mir/dst instruction))))
     (:aarch64/subtract :aarch64/multiply
