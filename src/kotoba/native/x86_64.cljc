@@ -77,8 +77,9 @@
 
 (def ^:private page-fault-recovery-handler-bytes
   ;; Save the touched register set into fixed RW/NX context slots before using
-  ;; it, then construct the iretq frame on the dedicated fault stack. The CPU
-  ;; frame remains read-only on the interrupted stack.
+  ;; it, run the receipt path on the dedicated fault stack, then restore the
+  ;; interrupted stack, advance its exact saved RIP, and iretq through that
+  ;; CPU-created frame.
   [0xfa 0x48 0x89 0x04 0x25 0x10 0xc1 0x10 0x00
    0x48 0x89 0x14 0x25 0x18 0xc1 0x10 0x00
    0x4c 0x89 0x14 0x25 0x20 0xc1 0x10 0x00
