@@ -10,6 +10,19 @@
 (def v1 (gmir/vreg 1))
 (def v2 (gmir/vreg 2))
 
+(deftest aarch64-constants-use-the-shorter-wide-move-seed
+  (let [encode #(#'machine/a64-constant :aarch64/x0 %)]
+    (is (= [0x00 0x00 0x80 0xd2] (encode 0)) "zero is one MOVZ")
+    (is (= 4 (count (encode 48271))) "a low positive constant is one MOVZ")
+    (is (= [0x00 0x00 0x80 0x92] (encode -1)) "all ones is one MOVN")
+    (is (= 4 (count (encode Long/MIN_VALUE))) "a lone high lane is one MOVZ")
+    (is (= 8 (count (encode -281470681808896)))
+        "MOVN wins when most lanes are all ones")
+    (is (= 16 (count (encode 0x0001000200030004)))
+        "four distinct non-zero lanes still require four words"))
+  (is (= 16 (count (#'machine/a64-constant-fixed :aarch64/x0 1)))
+      "fixed-layout sites retain their reserved width"))
+
 (def spill-program
   (let [registers (mapv gmir/vreg (range 11))]
     {:gmir/version 1
@@ -674,10 +687,10 @@
         arm (machine/compile-expression :aarch64 ['p] '(if p 11 22))]
     (is (= [0x0f 0x84 0x0e 0x00 0x00 0x00] (subvec x86 6 12))
         "x86 jz skips the selected then arm using next-PC rel32")
-    (is (= [0xe0 0x00 0x00 0xb4] (subvec arm 0 4))
-        "AArch64 cbz x0 reaches the final else label at +28 bytes")
+    (is (= [0x80 0x00 0x00 0xb4] (subvec arm 0 4))
+        "AArch64 cbz x0 reaches the final else label at +16 bytes")
     (is (= 40 (count x86)))
-    (is (= 52 (count arm)))))
+    (is (= 28 (count arm)))))
 
 (deftest kir-to-gmir-boundary-rejects-unsupported-shapes
   (is (machine/pilot-expression? ['a] '(+ a (if a 1 2))))
@@ -837,12 +850,10 @@
                  (machine/lower-kir-expression
                   [] (list '+ (list 'variant-new scalar-variant-type :number 1) 3))))))
 
-(deftest full-signed-i64-immediates-have-fixed-wire-bytes
+(deftest full-signed-i64-immediates-have-canonical-wire-bytes
   (is (= [0x48 0xb8 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0x7f 0xc3]
          (machine/compile-expression :x86-64 [] Long/MAX_VALUE)))
-  (is (= [0xe0 0xff 0x9f 0xd2 0xe0 0xff 0xbf 0xf2
-          0xe0 0xff 0xdf 0xf2 0xe0 0xff 0xef 0xf2
-          0xc0 0x03 0x5f 0xd6]
+  (is (= [0x00 0x00 0xf0 0x92 0xc0 0x03 0x5f 0xd6]
          (machine/compile-expression :aarch64 [] Long/MAX_VALUE)))
   (is (thrown? clojure.lang.ExceptionInfo
                (machine/compile-expression :x86-64 [] (inc (bigint Long/MAX_VALUE))))))
