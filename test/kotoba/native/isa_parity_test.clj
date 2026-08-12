@@ -232,9 +232,9 @@
 ;; ---------------------------------------------------------------------------
 
 (deftest aarch64-bitwise-operators-use-the-logical-shifted-register-encodings
-  ;; Rm=x1, Rn=x0, Rd=x2: the extracted allocator keeps both arguments live and
-  ;; assigns the result to x2 before the return move to x0.
-  (doseq [[op word] {'bit-and 0x8a010002 'bit-or 0xaa010002 'bit-xor 0xca010002}]
+  ;; Rm=x1, Rn=x0, Rd=x0: the selected three-operand instruction writes the
+  ;; ABI return register directly after both inputs have been read.
+  (doseq [[op word] {'bit-and 0x8a010000 'bit-or 0xaa010000 'bit-xor 0xca010000}]
     (let [expected (mapv #(bit-and (unsigned-bit-shift-right word (* 8 %)) 0xff) (range 4))
           code (:code (arm/emit-program (program '[a b] (list op 'a 'b))))]
       (is (some #(= expected %) (partition 4 1 code))
@@ -264,10 +264,10 @@
   (testing "AArch64"
     (let [code #(:code (arm/emit-program (program '[a] %)))
           word (fn [w] (mapv #(bit-and (unsigned-bit-shift-right w (* 8 %)) 0xff) (range 4)))]
-      (is (some #(= (word 0xca010002) %) (partition 4 1 (code '(bit-not a)))))
-      (is (some #(= (word 0x9ac12002) %) (partition 4 1 (code '(i64-shift-left a 3)))))
-      (is (some #(= (word 0x9ac12802) %) (partition 4 1 (code '(i64-shift-right a 3)))))
-      (is (some #(= (word 0x9ac12402) %) (partition 4 1 (code '(u64-shift-right a 3))))))))
+      (is (some #(= (word 0xca010000) %) (partition 4 1 (code '(bit-not a)))))
+      (is (some #(= (word 0x9ac12000) %) (partition 4 1 (code '(i64-shift-left a 3)))))
+      (is (some #(= (word 0x9ac12800) %) (partition 4 1 (code '(i64-shift-right a 3)))))
+      (is (some #(= (word 0x9ac12400) %) (partition 4 1 (code '(u64-shift-right a 3))))))))
 
 (deftest arithmetic-and-logical-right-shifts-are-not-interchanged
   ;; `i64-shift-right` is arithmetic and `u64-shift-right` is logical, matching

@@ -134,6 +134,39 @@
     (is (= 1 (count (filter #{:aarch64/multiply-add}
                             (map :mc/encoding (:mc/instructions program))))))))
 
+(deftest aarch64-coalesces-phi-edge-and-return-moves-into-direct-results
+  (let [form '(+ 1 (if a (* a 2) (- a 3)))
+        arm (machine/compile-gmir
+             :aarch64 (machine/lower-kir-expression ['a] form))
+        x86 (machine/compile-gmir
+             :x86-64 (machine/lower-kir-expression ['a] form))]
+    (is (not-any? #{:aarch64/move}
+                  (keep :mc/encoding (:mc/instructions arm)))
+        "both phi edges write their destination directly")
+    (is (= 3 (count (filter #{:x86-64/move}
+                            (keep :mc/encoding (:mc/instructions x86)))))
+        "the AArch64 pass leaves x86 allocation unchanged")
+    (is (= 36 (count (machine/encode-mc arm)))
+        "two edge MOVs and the return MOV are absent")))
+
+(deftest aarch64-keeps-an-edge-move-when-its-source-is-live-at-the-join
+  (let [program
+        (machine/lower-mc
+         {:mir/version 1 :mir/target :aarch64 :mir/registers :physical
+          :mir/frame-slots 0
+          :mir/instructions
+          [{:mir/op :mir/add :mir/dst :aarch64/x2
+            :mir/left :aarch64/x0 :mir/right :aarch64/x1}
+           {:mir/op :mir/move :mir/dst :aarch64/x3 :mir/src :aarch64/x2}
+           {:mir/op :mir/jump :mir/target :test.label/join}
+           {:mir/op :mir/label :mir/id :test.label/join}
+           {:mir/op :mir/add :mir/dst :aarch64/x4
+            :mir/left :aarch64/x2 :mir/right :aarch64/x3}
+           {:mir/op :mir/return :mir/value :aarch64/x4}]})]
+    (is (= 1 (count (filter #{:aarch64/move}
+                            (keep :mc/encoding (:mc/instructions program)))))
+        "the target-block live-in prevents unsafe physical-register reuse")))
+
 (def spill-program
   (let [registers (mapv gmir/vreg (range 11))]
     {:gmir/version 1
@@ -514,8 +547,7 @@
           0x48 0x01 0xca             ; add rdx,rcx
           0x48 0x89 0xd0 0xc3]       ; mov rax,rdx; ret
          (machine/compile-expression :x86-64 ['a 'b] '(+ a b))))
-  (is (= [0x02 0x00 0x01 0x8b       ; add x2,x0,x1
-          0xe0 0x03 0x02 0xaa       ; mov x0,x2
+  (is (= [0x00 0x00 0x01 0x8b       ; add x0,x0,x1
           0xc0 0x03 0x5f 0xd6]      ; ret
          (machine/compile-expression :aarch64 ['a 'b] '(+ a b)))))
 
@@ -526,7 +558,7 @@
                 '(bit-xor a b 3 4)]]
     (is (seq (machine/compile-expression :x86-64 ['a 'b] form)) form)
     (is (seq (machine/compile-expression :aarch64 ['a 'b] form)) form))
-  (is (= [0x02 0x00 0x01 0xcb 0xe0 0x03 0x02 0xaa 0xc0 0x03 0x5f 0xd6]
+  (is (= [0x00 0x00 0x01 0xcb 0xc0 0x03 0x5f 0xd6]
          (machine/compile-expression :aarch64 ['a 'b] '(- a b))))
   (is (machine/pilot-expression? ['a 'b]
                                  '(+ (* a 6) (bit-xor (- a b) 3)))))
@@ -719,19 +751,19 @@
                 (mapv vec (partition 4
                                      (machine/compile-expression
                                       :aarch64 ['n] form))))]
-    (is (= [0x02 0x1c 0x00 0x91] (first (words '(+ n 7))))
-        "ADD X2,X0,#7")
-    (is (= [0x02 0x1c 0x00 0xd1] (first (words '(+ n -7))))
+    (is (= [0x00 0x1c 0x00 0x91] (first (words '(+ n 7))))
+        "ADD X0,X0,#7 writes the return register directly")
+    (is (= [0x00 0x1c 0x00 0xd1] (first (words '(+ n -7))))
         "negative ADD becomes SUB immediate")
-    (is (= [0x02 0x04 0x40 0xd1] (first (words '(- n 4096))))
-        "SUB X2,X0,#1,LSL#12")
-    (is (= [0x02 0x04 0x40 0x91] (first (words '(- n -4096))))
+    (is (= [0x00 0x04 0x40 0xd1] (first (words '(- n 4096))))
+        "SUB X0,X0,#1,LSL#12")
+    (is (= [0x00 0x04 0x40 0x91] (first (words '(- n -4096))))
         "negative SUB becomes ADD immediate")
-    (is (= 4 (count (words '(- 7 n))))
+    (is (= 3 (count (words '(- 7 n))))
         "constant-minus-register cannot use the immediate form")
-    (is (= 4 (count (words '(+ n 4097))))
+    (is (= 3 (count (words '(+ n 4097))))
         "a non-encodable immediate retains materialization")
-    (is (= 7 (count (words '(if n (+ n 7) (- n 7)))))
+    (is (= 5 (count (words '(if n (+ n 7) (- n 7)))))
         "each control-flow arm can fold its adjacent immediate")))
 
 (deftest aarch64-immediate-folding-preserves-repeated-constant-cache-and-x86
@@ -788,8 +820,8 @@
           0x48 0x39 0xc8 0x0f 0x9c 0xc2 0x48 0x0f 0xb6 0xd2
           0x48 0x89 0xd0 0xc3]
          (machine/compile-expression :x86-64 ['a 'b] '(< a b))))
-  (is (= [0x1f 0x00 0x01 0xeb 0xe2 0xa7 0x9f 0x9a
-          0xe0 0x03 0x02 0xaa 0xc0 0x03 0x5f 0xd6]
+  (is (= [0x1f 0x00 0x01 0xeb 0xe0 0xa7 0x9f 0x9a
+          0xc0 0x03 0x5f 0xd6]
          (machine/compile-expression :aarch64 ['a 'b] '(< a b)))))
 
 (deftest booleans-let-nested-tail-if-and-five-arguments-are-admitted
@@ -849,10 +881,10 @@
         arm (machine/compile-expression :aarch64 ['p] '(if p 11 22))]
     (is (= [0x0f 0x84 0x0e 0x00 0x00 0x00] (subvec x86 6 12))
         "x86 jz skips the selected then arm using next-PC rel32")
-    (is (= [0x80 0x00 0x00 0xb4] (subvec arm 0 4))
-        "AArch64 cbz x0 reaches the final else label at +16 bytes")
+    (is (= [0x60 0x00 0x00 0xb4] (subvec arm 0 4))
+        "AArch64 cbz x0 reaches the compact else label at +12 bytes")
     (is (= 40 (count x86)))
-    (is (= 28 (count arm)))))
+    (is (= 20 (count arm)))))
 
 (deftest kir-to-gmir-boundary-rejects-unsupported-shapes
   (is (machine/pilot-expression? ['a] '(+ a (if a 1 2))))
@@ -874,7 +906,7 @@
             instructions (:mc/instructions mc)]
         (is (zero? (:mc/frame-slots mc)) target)
         (is (not-any? #(= :mir/phi (:mir/op %)) instructions) target)
-        (is (= (if (= :x86-64 target) 3 2)
+        (is (= (if (= :x86-64 target) 3 0)
                (count (filter #(= (keyword (name target) "move")
                                      (:mc/encoding %))
                                 instructions))) target)
