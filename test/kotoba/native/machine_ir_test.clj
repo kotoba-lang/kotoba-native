@@ -23,6 +23,47 @@
   (is (= 16 (count (#'machine/a64-constant-fixed :aarch64/x0 1)))
       "fixed-layout sites retain their reserved width"))
 
+(deftest aarch64-fuses-safe-multiply-add-and-subtract-after-allocation
+  (let [expression '(let [v (+ (* n 7) 1)] (- v (* n 3)))
+        arm (machine/compile-gmir
+             :aarch64 (machine/lower-kir-expression ['n] expression))
+        x86 (machine/compile-gmir
+             :x86-64 (machine/lower-kir-expression ['n] expression))
+        encodings #(mapv :mc/encoding (:mc/instructions %))
+        words (mapv vec (partition 4 (machine/compile-expression
+                                      :aarch64 ['n] expression)))]
+    (is (= 1 (count (filter #{:aarch64/multiply-add} (encodings arm)))))
+    (is (= 1 (count (filter #{:aarch64/multiply-subtract} (encodings arm)))))
+    (is (not-any? #{:aarch64/multiply :aarch64/add :aarch64/subtract}
+                  (encodings arm)))
+    (is (= 2 (count (filter #{:x86-64/multiply} (encodings x86))))
+        "the AArch64 selection does not rewrite x86-64")
+    (is (some #{[0x01 0x0c 0x01 0x9b]} words) "MADD x1,x0,x1,x3")
+    (is (some #{[0x00 0x84 0x02 0x9b]} words) "MSUB x0,x0,x2,x1")))
+
+(deftest aarch64-fusion-rejects-input-clobbers-and-product-minus-addends
+  (let [lower (fn [instructions]
+                (machine/lower-mc
+                 {:mir/version 1 :mir/target :aarch64 :mir/registers :physical
+                  :mir/frame-slots 0 :mir/instructions (vec instructions)}))
+        multiply {:mir/op :mir/multiply :mir/dst :aarch64/x2
+                  :mir/left :aarch64/x0 :mir/right :aarch64/x1}
+        return {:mir/op :mir/return :mir/value :aarch64/x3}
+        clobbered (lower [multiply
+                          {:mir/op :mir/constant :mir/dst :aarch64/x0 :mir/value 9}
+                          {:mir/op :mir/add :mir/dst :aarch64/x3
+                           :mir/left :aarch64/x2 :mir/right :aarch64/x0}
+                          return])
+        wrong-order (lower [multiply
+                            {:mir/op :mir/subtract :mir/dst :aarch64/x3
+                             :mir/left :aarch64/x2 :mir/right :aarch64/x0}
+                            return])]
+    (doseq [program [clobbered wrong-order]]
+      (is (some #{:aarch64/multiply}
+                (map :mc/encoding (:mc/instructions program))))
+      (is (not-any? #{:aarch64/multiply-add :aarch64/multiply-subtract}
+                    (map :mc/encoding (:mc/instructions program)))))))
+
 (def spill-program
   (let [registers (mapv gmir/vreg (range 11))]
     {:gmir/version 1
