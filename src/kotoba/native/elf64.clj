@@ -9,7 +9,7 @@
 (def ^:private text-offset page-size)
 (def ^:private data-offset (* 2 page-size))
 (def ^:private kernel-data-offset (* 8 page-size))
-(def ^:private x86-kernel-data-offset (* 11 page-size))
+(def ^:private x86-kernel-data-offset (* 12 page-size))
 (def ^:private context-size 80)
 (def ^:private kernel-image-context-size 88)
 (def ^:private user-context-size 88)
