@@ -2420,10 +2420,17 @@
     [{:native/data-content (:mir/content instruction)
       :native/data-dst (:mir/dst instruction) :native/data-target :aarch64}]
     :aarch64/add
-    (u32le (bit-or 0x8b000000
-                   (bit-shift-left (a64-register (:mir/right instruction)) 16)
-                   (bit-shift-left (a64-register (:mir/left instruction)) 5)
-                   (a64-register (:mir/dst instruction))))
+    (if-let [immediate (:native/a64-immediate instruction)]
+      (u32le (bit-or (if (= :subtract (:native/a64-immediate-op instruction))
+                       0xd1000000 0x91000000)
+                     (bit-shift-left (:native/a64-immediate-shift instruction) 22)
+                     (bit-shift-left immediate 10)
+                     (bit-shift-left (a64-register (:mir/left instruction)) 5)
+                     (a64-register (:mir/dst instruction))))
+      (u32le (bit-or 0x8b000000
+                     (bit-shift-left (a64-register (:mir/right instruction)) 16)
+                     (bit-shift-left (a64-register (:mir/left instruction)) 5)
+                     (a64-register (:mir/dst instruction)))))
     (:aarch64/multiply-add :aarch64/multiply-subtract)
     (u32le (bit-or (if (= :aarch64/multiply-add encoding)
                      0x9b000000 0x9b008000)
@@ -2431,12 +2438,23 @@
                    (bit-shift-left (a64-register (:mir/addend instruction)) 10)
                    (bit-shift-left (a64-register (:mir/left instruction)) 5)
                    (a64-register (:mir/dst instruction))))
-    (:aarch64/subtract :aarch64/multiply
+    :aarch64/subtract
+    (if-let [immediate (:native/a64-immediate instruction)]
+      (u32le (bit-or (if (= :add (:native/a64-immediate-op instruction))
+                       0x91000000 0xd1000000)
+                     (bit-shift-left (:native/a64-immediate-shift instruction) 22)
+                     (bit-shift-left immediate 10)
+                     (bit-shift-left (a64-register (:mir/left instruction)) 5)
+                     (a64-register (:mir/dst instruction))))
+      (u32le (bit-or 0xcb000000
+                     (bit-shift-left (a64-register (:mir/right instruction)) 16)
+                     (bit-shift-left (a64-register (:mir/left instruction)) 5)
+                     (a64-register (:mir/dst instruction)))))
+    (:aarch64/multiply
      :aarch64/bit-and :aarch64/bit-or :aarch64/bit-xor
      :aarch64/shift-left :aarch64/shift-right-signed
      :aarch64/shift-right-unsigned)
     (let [base (case encoding
-                 :aarch64/subtract 0xcb000000
                  :aarch64/multiply 0x9b007c00
                  :aarch64/bit-and 0x8a000000
                  :aarch64/bit-or 0xaa000000
@@ -2621,6 +2639,80 @@
     :mir/base :mir/length :mir/index :mir/stored :mir/offset :mir/size
     :mir/arguments]))
 
+(def ^:private a64-source-keys
+  [:mir/test :mir/value :mir/src :mir/input :mir/left :mir/right :mir/addend
+   :mir/base :mir/length :mir/index :mir/stored :mir/offset :mir/size
+   :mir/arguments])
+
+(defn- a64-source-registers [instruction]
+  (mapcat (fn [key]
+            (let [value (get instruction key)]
+              (cond (vector? value) value
+                    (keyword? value) [value]
+                    :else [])))
+          a64-source-keys))
+
+(defn- a64-add-sub-immediate [op value]
+  (let [value (->wide value)
+        negative? (wide-neg? value)
+        magnitude (if negative? (- value) value)
+        [immediate shift]
+        (cond
+          (<= magnitude #?(:clj 4095N :cljs (js/BigInt 4095)))
+          [magnitude 0]
+          (and (= wide-zero
+                  (wide-mod magnitude #?(:clj 4096N :cljs (js/BigInt 4096))))
+               (<= (wide-quot magnitude #?(:clj 4096N :cljs (js/BigInt 4096)))
+                   #?(:clj 4095N :cljs (js/BigInt 4095))))
+          [(wide-quot magnitude #?(:clj 4096N :cljs (js/BigInt 4096))) 1]
+          :else nil)]
+    (when immediate
+      {:op (case [op negative?]
+             [:aarch64/add false] :add
+             [:aarch64/add true] :subtract
+             [:aarch64/subtract false] :subtract
+             [:aarch64/subtract true] :add)
+       :immediate #?(:clj (int immediate) :cljs (js/Number immediate))
+       :shift shift})))
+
+(defn- a64-fold-adjacent-add-sub-immediates [instructions]
+  (letfn [(uses-before-redefinition [instructions register]
+            (loop [remaining instructions, uses 0]
+              (if-let [instruction (first remaining)]
+                (let [uses (+ uses (count (filter #{register}
+                                                  (a64-source-registers instruction))))]
+                  (if (= register (:mir/dst instruction))
+                    uses
+                    (recur (next remaining) uses)))
+                uses)))]
+    (loop [remaining instructions, out []]
+      (if-let [constant (first remaining)]
+        (let [consumer (second remaining)
+              register (:mir/dst constant)
+              op (:mc/encoding consumer)
+              constant? (= :aarch64/constant (:mc/encoding constant))
+              operand
+              (cond
+                (and (= op :aarch64/add) (= register (:mir/right consumer)))
+                (:mir/left consumer)
+                (and (= op :aarch64/add) (= register (:mir/left consumer)))
+                (:mir/right consumer)
+                (and (= op :aarch64/subtract) (= register (:mir/right consumer)))
+                (:mir/left consumer))
+              selected (when (and constant? operand
+                                  (= 1 (uses-before-redefinition
+                                        (next remaining) register)))
+                         (a64-add-sub-immediate op (:mir/value constant)))]
+          (if selected
+            (recur (nnext remaining)
+                   (conj out (assoc consumer
+                                    :mir/left operand
+                                    :native/a64-immediate-op (:op selected)
+                                    :native/a64-immediate (:immediate selected)
+                                    :native/a64-immediate-shift (:shift selected))))
+            (recur (next remaining) (conj out constant))))
+        (vec out)))))
+
 (defn- a64-cache-leaf-constants [instructions]
   ;; The cache registers are caller-saved. Restrict the transform to one
   ;; branchless leaf so no call or alternate entry can invalidate their value.
@@ -2682,7 +2774,9 @@
 (defn- instruction-tokens
   [isa frame-bytes return-suffix tail-suffix callee-labels instructions]
   (let [instructions (if (= :aarch64 isa)
-                       (a64-cache-leaf-constants instructions)
+                       (-> instructions
+                           a64-cache-leaf-constants
+                           a64-fold-adjacent-add-sub-immediates)
                        instructions)]
     (:out
      (reduce
