@@ -49,8 +49,8 @@
                     (recur (inc candidate))
                     candidate))
                 between (subvec instructions after consumer-index)
-                protected #{(:mir/dst multiply) (:mir/left multiply)
-                            (:mir/right multiply)}
+                protected (set [(:mir/dst multiply) (:mir/left multiply)
+                                (:mir/right multiply)])
                 unclobbered? (not-any? #(contains? protected (:mir/dst %)) between)
                 fused (when unclobbered?
                         (a64-fused-multiply multiply
