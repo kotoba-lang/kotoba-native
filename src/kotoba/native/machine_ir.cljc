@@ -1788,21 +1788,55 @@
   (u32le (bit-or 0xaa0003e0 (bit-shift-left (a64-register src) 16)
                    (a64-register dst))))
 
+(defn- a64-constant-chunks [value]
+  #?(:clj (mapv #(bit-and (unsigned-bit-shift-right (long value) %) 0xffff)
+                 [0 16 32 48])
+     :cljs (let [u (js/BigInt.asUintN 64 (i64/->bigint value))
+                 base (js/BigInt 65536)
+                 mask (js/BigInt 65535)]
+             (loop [i 0, remaining u, out []]
+               (if (= i 4) out
+                   (recur (inc i) (/ remaining base)
+                          (conj out (js/Number (bit-and remaining mask)))))))))
+
+(defn- a64-wide-move [opcode rd chunk lane]
+  (u32le (bit-or opcode
+                 (bit-shift-left lane 21)
+                 (bit-shift-left chunk 5)
+                 rd)))
+
+(defn- a64-constant-fixed
+  "The legacy four-word form. Keep it only where an enclosing sequence has a
+  fixed local branch displacement or layout has reserved exactly 16 bytes."
+  [dst value]
+  (let [rd (a64-register dst)]
+    (vec (mapcat (fn [lane chunk]
+                   (a64-wide-move (if (zero? lane) 0xd2800000 0xf2800000)
+                                  rd chunk lane))
+                 (range 4) (a64-constant-chunks value)))))
+
 (defn- a64-constant [dst value]
   (let [rd (a64-register dst)
-        chunks #?(:clj (mapv #(bit-and (unsigned-bit-shift-right (long value) %) 0xffff)
-                              [0 16 32 48])
-                  :cljs (let [u (js/BigInt.asUintN 64 (i64/->bigint value))
-                              base (js/BigInt 65536)
-                              mask (js/BigInt 65535)]
-                          (loop [i 0, remaining u, out []]
-                            (if (= i 4) out
-                                (recur (inc i) (/ remaining base)
-                                       (conj out (js/Number (bit-and remaining mask))))))))]
-    (vec (mapcat (fn [chunk opcode]
-                   (u32le (bit-or opcode (bit-shift-left chunk 5) rd)))
-                 chunks
-                 [0xd2800000 0xf2a00000 0xf2c00000 0xf2e00000]))))
+        chunks (a64-constant-chunks value)
+        movz-lanes (keep-indexed #(when-not (zero? %2) %1) chunks)
+        movn-lanes (keep-indexed #(when-not (= 0xffff %2) %1) chunks)
+        movn? (< (max 1 (count movn-lanes)) (max 1 (count movz-lanes)))
+        lanes (if movn? movn-lanes movz-lanes)
+        first-lane (or (first lanes) 0)
+        fill (if movn? 0xffff 0)
+        first-chunk (nth chunks first-lane)
+        initial (a64-wide-move (if movn? 0x92800000 0xd2800000)
+                               rd (if movn? (bit-and (bit-not first-chunk) 0xffff)
+                                      first-chunk)
+                               first-lane)]
+    (vec
+     (concat
+      initial
+      (mapcat (fn [lane]
+                (when (and (not= lane first-lane)
+                           (not= fill (nth chunks lane)))
+                  (a64-wide-move 0xf2800000 rd (nth chunks lane) lane)))
+              (range 4))))))
 
 (defn- a64-compare [cset dst left right]
   (vec (concat
@@ -1976,12 +2010,12 @@
         ;; cbz right, trap (+15 instructions)
         (u32le (bit-or 0xb4000000 (bit-shift-left 15 5)
                        (a64-register right)))
-        (a64-constant :aarch64/x16 #?(:clj Long/MIN_VALUE :cljs i64/min-i64))
+        (a64-constant-fixed :aarch64/x16 #?(:clj Long/MIN_VALUE :cljs i64/min-i64))
         ;; cmp left,x16; b.ne divide (+7 instructions)
         (u32le (bit-or 0xeb00001f (bit-shift-left 16 16)
                        (bit-shift-left (a64-register left) 5)))
         (u32le (bit-or 0x54000001 (bit-shift-left 7 5)))
-        (a64-constant :aarch64/x16 -1)
+        (a64-constant-fixed :aarch64/x16 -1)
         ;; cmp right,x16; b.eq trap (+3 instructions)
         (u32le (bit-or 0xeb00001f (bit-shift-left 16 16)
                        (bit-shift-left (a64-register right) 5)))
@@ -2653,7 +2687,7 @@
                   (let [offset (get data-offsets content)]
                     (case (:native/data-target token)
                       :x86-64 (x86-mov-imm (:native/data-dst token) offset)
-                      :aarch64 (a64-constant (:native/data-dst token) offset)))
+                      :aarch64 (a64-constant-fixed (:native/data-dst token) offset)))
                   [token])))
         data (vec (mapcat utf8-bytes contents))]
     {:code (vec (concat code data)) :code-size code-size :labels labels}))
