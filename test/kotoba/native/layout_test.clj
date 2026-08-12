@@ -125,8 +125,8 @@
              :exports ['main]
              :functions [{:name 'main :params ['p] :body '(if p 11 22)}]}
         code (:code (arm/emit-program kir))]
-    (is (= 48 (count code)))
-    (is (= 1 (count (filter #(= [0x80 0x00 0x00 0xb4] %)
+    (is (= 40 (count code)))
+    (is (= 1 (count (filter #(= [0x60 0x00 0x00 0xb4] %)
                             (partition 4 1 code))))
         "cbz x0 uses final MC sizes to reach the returning else arm")
     (is (not-any? #(= [0x05 0x00 0x00 0x14] %)
