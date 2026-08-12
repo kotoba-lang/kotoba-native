@@ -140,6 +140,48 @@
             :else
             (recur (inc index) (conj out producer))))))))
 
+(defn- a64-rematerialize-single-spilled-constant
+  [{:mir/keys [frame-slots instructions] :as function}]
+  ;; The allocator's call-live policy spills every value live across a call.
+  ;; For a lone constant slot, recreating the value after the call is both
+  ;; semantically exact and cheaper than a 16-byte-aligned stack area plus a
+  ;; store/load pair. Keep this deliberately narrow until general spill-cost
+  ;; selection lives in the allocator itself.
+  (if-not (and (= 1 frame-slots)
+               (= 2 (count (filter #(contains? #{:mir/spill-store
+                                                 :mir/spill-load}
+                                               (:mir/op %))
+                                   instructions))))
+    function
+    (let [instructions (vec instructions)
+          match-index
+          (first
+           (keep (fn [index]
+                   (let [[constant store call load]
+                         (subvec instructions index (+ index 4))
+                         register (:mir/dst constant)]
+                     (when (and (= :mir/constant (:mir/op constant))
+                                (= :mir/spill-store (:mir/op store))
+                                (= register (:mir/src store))
+                                (zero? (:mir/slot store))
+                                (= :mir/call (:mir/op call))
+                                (not (some #{register} (:mir/arguments call)))
+                                (= :mir/spill-load (:mir/op load))
+                                (= register (:mir/dst load))
+                                (zero? (:mir/slot load)))
+                       index)))
+                 (range (max 0 (- (count instructions) 3)))))]
+      (if-not (some? match-index)
+        function
+        (let [[constant _ call _]
+              (subvec instructions match-index (+ match-index 4))]
+          (assoc function
+                 :mir/frame-slots 0
+                 :mir/instructions
+                 (vec (concat (subvec instructions 0 match-index)
+                              [call constant]
+                              (subvec instructions (+ match-index 4))))))))))
+
 (defn- lower-mc-instructions [isa instructions]
   (let [instructions (if (= :aarch64 isa)
                        (-> instructions
@@ -174,12 +216,16 @@
    (if (= 3 version)
      {:mc/version 3
       :mc/target target
-      :mc/entry entry
-      :mc/functions
-      (mapv (fn [{:mir/keys [name arity frame-slots frame-policy instructions]}]
-              {:mc/name name :mc/arity arity :mc/frame-slots frame-slots
-               :mc/frame-policy frame-policy
-               :mc/instructions (lower-mc-instructions target instructions)})
+     :mc/entry entry
+     :mc/functions
+      (mapv (fn [function]
+              (let [{:mir/keys [name arity frame-slots frame-policy instructions]}
+                    (if (= :aarch64 target)
+                      (a64-rematerialize-single-spilled-constant function)
+                      function)]
+                {:mc/name name :mc/arity arity :mc/frame-slots frame-slots
+                 :mc/frame-policy frame-policy
+                 :mc/instructions (lower-mc-instructions target instructions)}))
             functions)}
      {:mc/version 2
       :mc/target target

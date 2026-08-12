@@ -1187,16 +1187,51 @@
             caller (second (:mc/functions mc))]
         (is (= 3 (:mc/version mc)) target)
         (is (= :call-live (:mc/frame-policy caller)) target)
-        (is (= 1 (:mc/frame-slots caller)) target)
-        (is (= 1 (count (filter #(= (keyword (name target) "spill-store")
+        (is (= (if (= :aarch64 target) 0 1)
+               (:mc/frame-slots caller)) target)
+        (is (= (if (= :aarch64 target) 0 1)
+               (count (filter #(= (keyword (name target) "spill-store")
                                      (:mc/encoding %))
                                 (:mc/instructions caller)))) target)
-        (is (= 1 (count (filter #(= (keyword (name target) "spill-load")
+        (is (= (if (= :aarch64 target) 0 1)
+               (count (filter #(= (keyword (name target) "spill-load")
                                      (:mc/encoding %))
                                 (:mc/instructions caller)))) target)
         (is (= 1 (count (filter #(= (keyword (name target) "call")
                                      (:mc/encoding %))
                                 (:mc/instructions caller)))) target)))))
+
+(deftest aarch64-rematerializes-a-lone-constant-across-a-local-call
+  (let [caller (second (:mc/functions
+                        (->> scalar-call-kir machine/lower-kir-module
+                             (machine/compile-gmir :aarch64))))
+        instructions (:mc/instructions caller)
+        call-index (.indexOf (mapv :mc/encoding instructions) :aarch64/call)
+        constant-index (.indexOf (mapv :mc/encoding instructions)
+                                 :aarch64/constant)]
+    (is (zero? (:mc/frame-slots caller)))
+    (is (< call-index constant-index)
+        "the pure constant is recreated after the clobbering call")
+    (is (not-any? #(contains? #{:aarch64/spill-store :aarch64/spill-load}
+                              (:mc/encoding %))
+                  instructions))))
+
+(deftest aarch64-keeps-a-spill-when-the-constant-is-a-call-argument
+  (let [function
+        {:mir/name 'caller :mir/arity 1 :mir/frame-slots 1
+         :mir/frame-policy :call-live
+         :mir/instructions
+         [{:mir/op :mir/constant :mir/dst :aarch64/x1 :mir/value 10}
+          {:mir/op :mir/spill-store :mir/src :aarch64/x1 :mir/slot 0}
+          {:mir/op :mir/call :mir/arguments [:aarch64/x1]
+           :mir/dst :aarch64/x0 :mir/callee 'callee}
+          {:mir/op :mir/spill-load :mir/dst :aarch64/x1 :mir/slot 0}
+          {:mir/op :mir/add :mir/dst :aarch64/x0
+           :mir/left :aarch64/x0 :mir/right :aarch64/x1}
+          {:mir/op :mir/return :mir/value :aarch64/x0}]}
+        result (#'machine/a64-rematerialize-single-spilled-constant function)]
+    (is (= function result)
+        "removing a constant needed to marshal the call would be unsafe")))
 
 (deftest tail-position-direct-calls-lower-to-terminal-non-linking-transfer
   (let [gmir (machine/lower-kir-module four-argument-call-kir)
