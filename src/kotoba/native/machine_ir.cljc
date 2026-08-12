@@ -2125,12 +2125,11 @@
         (u32le (bit-or 0x9340fc00
                        (bit-shift-left shift 16)
                        (bit-shift-left 17 5) 17)))
-      ;; Keep x16's multiplier live. The allocated destination is safe to use
-      ;; for the sign bit because all numerator corrections have completed.
-      (u32le (bit-or 0xd340fc00 (bit-shift-left 63 16)
-                     (bit-shift-left 17 5) (a64-register dst)))
-      (u32le (bit-or 0x8b000000
-                     (bit-shift-left (a64-register dst) 16)
+      ;; ADD dst,x17,x17,LSR#63 combines extraction of the sign correction and
+      ;; truncation toward zero. x16 therefore keeps the cached multiplier.
+      (u32le (bit-or 0x8b400000
+                     (bit-shift-left 17 16)
+                     (bit-shift-left 63 10)
                      (bit-shift-left 17 5)
                      (a64-register dst)))))
     (vec (concat (a64-constant :aarch64/x17 divisor)
