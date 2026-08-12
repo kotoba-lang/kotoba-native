@@ -694,6 +694,17 @@
   (is (nil? (machine/signed-division-magic 1)))
   (is (nil? (machine/signed-division-magic -1))))
 
+(deftest aarch64-reciprocal-combines-the-sign-correction
+  (let [bytes (#'machine/a64-quotient-constant
+               :aarch64/x2 :aarch64/x0 2147483647 true)
+        words (mapv vec (partition 4 bytes))]
+    (is (= [0x22 0xfe 0x51 0x8b] (peek words))
+        "ADD X2,X17,X17,LSR#63")
+    (is (= 7 (count words))
+        "three-word magic plus SMULH, numerator ADD, ASR, shifted ADD")
+    (is (not-any? #{[0x30 0xfe 0x7f 0xd3]} words)
+        "the standalone LSR correction is gone")))
+
 (deftest v3-constant-division-selects-reciprocal-machine-code
   (let [kir {:format :kotoba.kir/v3 :entry 'kernel :exports ['kernel]
              :functions [{:name 'kernel :params ['n]
