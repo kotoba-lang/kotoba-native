@@ -16,12 +16,23 @@
     (is (= 4 (count (encode 48271))) "a low positive constant is one MOVZ")
     (is (= [0x00 0x00 0x80 0x92] (encode -1)) "all ones is one MOVN")
     (is (= 4 (count (encode Long/MIN_VALUE))) "a lone high lane is one MOVZ")
-    (is (= 8 (count (encode -281470681808896)))
-        "MOVN wins when most lanes are all ones")
+    (is (= 4 (count (encode -281470681808896)))
+        "a repeated mask beats the two-word MOVN sequence")
     (is (= 16 (count (encode 0x0001000200030004)))
         "four distinct non-zero lanes still require four words"))
   (is (= 16 (count (#'machine/a64-constant-fixed :aarch64/x0 1)))
       "fixed-layout sites retain their reserved width"))
+
+(deftest aarch64-constants-use-one-word-logical-immediates-when-shorter
+  (let [encode #(#'machine/a64-constant :aarch64/x0 %)]
+    (is (= [0xe0 0x7b 0x40 0xb2] (encode 0x7fffffff))
+        "the runtime kernel divisor is MOV X0,#0x7fffffff")
+    (is (= 4 (count (encode 0x00ff00ff00ff00ff)))
+        "replicated rotated bitmasks use one ORR-immediate word")
+    (is (= [0x00 0x00 0x80 0x92] (encode -1))
+        "the forbidden all-ones logical immediate stays one MOVN")
+    (is (= 16 (count (encode 0x0001000200030004)))
+        "non-bitmask constants retain their exact wide-move sequence")))
 
 (deftest aarch64-fuses-safe-multiply-add-and-subtract-after-allocation
   (let [expression '(let [v (+ (* n 7) 1)] (- v (* n 3)))

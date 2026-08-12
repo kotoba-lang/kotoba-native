@@ -1849,6 +1849,45 @@
                  (bit-shift-left chunk 5)
                  rd)))
 
+(defn- a64-logical-immediate-fields [chunks]
+  ;; AArch64 logical immediates are a rotated, non-empty/non-full run of ones
+  ;; in a power-of-two element, replicated to the register width. Work from
+  ;; the already exact four u16 chunks so this selector is identical on the
+  ;; JVM and in ClojureScript (where bitwise numbers are otherwise only i32).
+  (let [bit-at (fn [index]
+                 (not (zero? (bit-and (nth chunks (quot index 16))
+                                      (bit-shift-left 1 (mod index 16))))))
+        bits (mapv bit-at (range 64))]
+    (some
+     (fn [width]
+       (when (every? #(= (nth bits %) (nth bits (mod % width))) (range 64))
+         (some
+          (fn [ones]
+            (some
+             (fn [rotation]
+               (when (every? (fn [index]
+                               (= (nth bits index)
+                                  (< (mod (+ (mod index width) rotation) width)
+                                     ones)))
+                             (range 64))
+                 (let [len ({2 1, 4 2, 8 3, 16 4, 32 5, 64 6} width)]
+                   {:n (if (= width 64) 1 0)
+                    :immr rotation
+                    :imms (bit-or (bit-and (- (* 2 width)) 0x3f)
+                                  (dec ones))})))
+             (range width)))
+          (range 1 width))))
+     [2 4 8 16 32 64])))
+
+(defn- a64-logical-immediate [rd chunks]
+  (when-let [{:keys [n immr imms]} (a64-logical-immediate-fields chunks)]
+    ;; ORR Xd,XZR,#imm is the architectural MOV (bitmask immediate) alias.
+    (u32le (bit-or 0xb20003e0
+                   (bit-shift-left n 22)
+                   (bit-shift-left immr 16)
+                   (bit-shift-left imms 10)
+                   rd))))
+
 (defn- a64-constant-fixed
   "The legacy four-word form. Keep it only where an enclosing sequence has a
   fixed local branch displacement or layout has reserved exactly 16 bytes."
@@ -1872,15 +1911,19 @@
         initial (a64-wide-move (if movn? 0x92800000 0xd2800000)
                                rd (if movn? (bit-and (bit-not first-chunk) 0xffff)
                                       first-chunk)
-                               first-lane)]
-    (vec
-     (concat
-      initial
-      (mapcat (fn [lane]
-                (when (and (not= lane first-lane)
-                           (not= fill (nth chunks lane)))
-                  (a64-wide-move 0xf2800000 rd (nth chunks lane) lane)))
-              (range 4))))))
+                               first-lane)
+        wide (vec
+              (concat
+               initial
+               (mapcat (fn [lane]
+                         (when (and (not= lane first-lane)
+                                    (not= fill (nth chunks lane)))
+                           (a64-wide-move 0xf2800000 rd (nth chunks lane) lane)))
+                       (range 4))))
+        logical (a64-logical-immediate rd chunks)]
+    ;; Preserve the established wide-move spelling on ties. Apart from making
+    ;; output deterministic, MOVZ/MOVN is the simpler dependency-breaking form.
+    (if (and logical (< (count logical) (count wide))) logical wide)))
 
 (defn- a64-compare [cset dst left right]
   (vec (concat
