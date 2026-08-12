@@ -26,7 +26,7 @@
     (let [fuel 4096
           image (:bytes (package (sealed-kernel target fuel)))]
       (is (= fuel (le64 image (+ (if (= target :x86_64-aiueos-kernel-v1)
-                                    0xc000
+                                    0x10000
                                     0x8000)
                                  8)))
           (str target)))))
