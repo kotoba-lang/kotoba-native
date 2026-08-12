@@ -64,6 +64,21 @@
       (is (not-any? #{:aarch64/multiply-add :aarch64/multiply-subtract}
                     (map :mc/encoding (:mc/instructions program)))))))
 
+(deftest aarch64-fusion-allows-a-multiply-destination-to-alias-an-input
+  (let [program
+        (machine/lower-mc
+         {:mir/version 1 :mir/target :aarch64 :mir/registers :physical
+          :mir/frame-slots 0
+          :mir/instructions
+          [{:mir/op :mir/multiply :mir/dst :aarch64/x0
+            :mir/left :aarch64/x0 :mir/right :aarch64/x1}
+           {:mir/op :mir/constant :mir/dst :aarch64/x2 :mir/value 1}
+           {:mir/op :mir/add :mir/dst :aarch64/x3
+            :mir/left :aarch64/x0 :mir/right :aarch64/x2}
+           {:mir/op :mir/return :mir/value :aarch64/x3}]})]
+    (is (= 1 (count (filter #{:aarch64/multiply-add}
+                            (map :mc/encoding (:mc/instructions program))))))))
+
 (def spill-program
   (let [registers (mapv gmir/vreg (range 11))]
     {:gmir/version 1
