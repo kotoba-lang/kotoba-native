@@ -1287,5 +1287,14 @@
                  (cond-> exports
                    (contains? exported-names (:name function))
                    (assoc (:name function)
-                          {:offset offset :length (count body) :arity (count (:params function))}))))
+                          (cond-> {:offset offset :length (count body)
+                                   :arity (count (:params function))}
+                            (and (empty? (:params function))
+                                 (contains? #{:vector-i64 :vector-f64}
+                                            (:result function)))
+                            (assoc :marshal
+                                   {:format :kotoba.kexe-export/copy-v1
+                                    :result (:result function)
+                                    :ownership :invocation-copy
+                                    :maximum-items 16384}))))))
         {:code (vec (concat code literal-bytes)) :exports exports}))))

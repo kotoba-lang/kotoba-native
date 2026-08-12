@@ -23,6 +23,18 @@
 (defn- code [emit params body]
   (vec (:code (emit (program params body)))))
 
+(defn- exported-vector-program [vector-type]
+  (let [constructor (if (= :vector-f64 vector-type)
+                      'vector-f64-new 'vector-new)]
+    {:format :kotoba.kir/v4
+     :entry 'main
+     :exports ['main 'values]
+     :functions [{:name 'main :params [] :param-types []
+                  :result :i64 :effects #{} :body 0}
+                 {:name 'values :params [] :param-types []
+                  :result vector-type :effects #{}
+                  :body (list constructor 1 2)}]}))
+
 ;; `call qword ptr [r9+disp32]` -- the encoding emit-heap-call uses for every
 ;; offset above 127, which all six vector offsets are.
 (defn- x86-context-call [offset]
@@ -135,3 +147,24 @@
     (testing (str body)
       (is (seq (code x86/emit-program params body)) "x86-64")
       (is (seq (code arm/emit-program params body)) "AArch64"))))
+
+(deftest exported-vector-results-declare-the-copy-out-contract
+  (doseq [emit [x86/emit-program arm/emit-program]
+          vector-type [:vector-i64 :vector-f64]]
+    (let [exports (:exports (emit (exported-vector-program vector-type)))]
+      (testing (str vector-type " via " emit)
+        (is (nil? (:marshal (get exports 'main)))
+            "scalar exports retain their existing descriptor")
+        (is (= {:format :kotoba.kexe-export/copy-v1
+                :result vector-type
+                :ownership :invocation-copy
+                :maximum-items 16384}
+               (:marshal (get exports 'values))))))))
+
+(deftest copy-out-metadata-is-not-emitted-for-parameterized-vector-exports
+  (doseq [emit [x86/emit-program arm/emit-program]]
+    (let [program (-> (exported-vector-program :vector-i64)
+                      (assoc-in [:functions 1 :params] ['value])
+                      (assoc-in [:functions 1 :param-types] [:i64])
+                      (assoc-in [:functions 1 :body] '(vector-new value)))]
+      (is (nil? (get-in (emit program) [:exports 'values :marshal]))))))
