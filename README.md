@@ -1,8 +1,15 @@
 # kotoba-native
 
-Kotoba native backend — checked KIR to x86_64/aarch64 machine code and ELF64.
+Amu's native **綾** — checked KIR to x86_64/aarch64 machine code and ELF64.
 
-**Tier**: `T2`  **Role**: `backend`
+This is not a being. [`amu`](https://github.com/kotoba-lang/amu) weaves
+(編む); this repository is one pattern in that weave (the metal / ISA face).
+It does not run artifacts and does not decide grants. Execution and runtime
+linking are [`kototama`](https://github.com/kotoba-lang/kototama) (言霊).
+Authority is [`aiueos`](https://github.com/kotoba-lang/aiueos).
+See root ADR-2608139980.
+
+**Tier**: `T2`  **Role**: `backend` of amu
 
 Split out of the overloaded core repos by ADR-2607266000 so that each
 responsibility has exactly one owner and the dependency direction is
@@ -25,7 +32,7 @@ The production direction is one-way:
 
 ```text
 checked KIR -> kotoba-native machine semantics -> Amu artifacts/qualification
-            -> aiueos OS providers and QEMU evidence
+            -> kototama native host (tender-native) -> aiueos grants / QEMU evidence
 ```
 
 This repository owns instruction selection, encoding, freestanding entry ABI,
