@@ -10,6 +10,129 @@
 (def v1 (gmir/vreg 1))
 (def v2 (gmir/vreg 2))
 
+(deftest aarch64-constants-use-the-shorter-wide-move-seed
+  (let [encode #(#'machine/a64-constant :aarch64/x0 %)]
+    (is (= [0x00 0x00 0x80 0xd2] (encode 0)) "zero is one MOVZ")
+    (is (= 4 (count (encode 48271))) "a low positive constant is one MOVZ")
+    (is (= [0x00 0x00 0x80 0x92] (encode -1)) "all ones is one MOVN")
+    (is (= 4 (count (encode Long/MIN_VALUE))) "a lone high lane is one MOVZ")
+    (is (= 4 (count (encode -281470681808896)))
+        "a repeated mask beats the two-word MOVN sequence")
+    (is (= 16 (count (encode 0x0001000200030004)))
+        "four distinct non-zero lanes still require four words"))
+  (is (= 16 (count (#'machine/a64-constant-fixed :aarch64/x0 1)))
+      "fixed-layout sites retain their reserved width"))
+
+(deftest aarch64-constants-use-one-word-logical-immediates-when-shorter
+  (let [encode #(#'machine/a64-constant :aarch64/x0 %)]
+    (is (= [0xe0 0x7b 0x40 0xb2] (encode 0x7fffffff))
+        "the runtime kernel divisor is MOV X0,#0x7fffffff")
+    (is (= 4 (count (encode 0x00ff00ff00ff00ff)))
+        "replicated rotated bitmasks use one ORR-immediate word")
+    (is (= [0x00 0x00 0x80 0x92] (encode -1))
+        "the forbidden all-ones logical immediate stays one MOVN")
+    (is (= 16 (count (encode 0x0001000200030004)))
+        "non-bitmask constants retain their exact wide-move sequence")))
+
+(deftest aarch64-branchless-leaves-cache-repeated-constants
+  (let [leaf (mapv vec (partition 4
+                                (machine/compile-expression
+                                 :aarch64 ['n]
+                                 '(let [a (+ n 7) b (* a 7)] (+ b 7)))))
+        branched (mapv vec (partition 4
+                                    (machine/compile-expression
+                                     :aarch64 ['n]
+                                     '(if n (+ n 7) (+ n 7)))))
+        checked-memory (mapv vec (partition 4
+                                          (machine/compile-expression
+                                           :aarch64 ['base 'length]
+                                           '(+ (kernel-load-u8 base length 7)
+                                               (kernel-load-u8 base length 7)))))
+        movz-seven? #(= [0x00 0x80 0xd2] (subvec % 1))]
+    (is (= 1 (count (filter movz-seven? leaf)))
+        "three materializations share one reserved leaf register")
+    (is (= [0xed 0x00 0x80 0xd2] (first leaf)) "MOVZ X13,#7")
+    (is (= 2 (count (filter movz-seven? branched)))
+        "control flow disables the caller-saved leaf cache")
+    (is (= 2 (count (filter movz-seven? checked-memory)))
+        "encoders with private scratch conventions do not opt in")))
+
+(deftest aarch64-branchless-leaves-cache-a-reciprocal-multiplier
+  (let [module (fn [body]
+                 {:format :kotoba.kir/v3 :entry 'kernel :exports ['kernel]
+                  :functions [{:name 'kernel :params ['n 'd] :body body}]})
+        magic (:multiplier (machine/signed-division-magic 7))
+        needle (vec (partition 4 (#'machine/a64-constant :aarch64/x16 magic)))
+        occurrences (fn [body]
+                      (let [words (vec (partition 4
+                                                  (:code
+                                                   (machine/compile-kir-module
+                                                    :aarch64 (module body)))))
+                            width (count needle)]
+                        (count (filter #(= needle (subvec words % (+ % width)))
+                                       (range (inc (- (count words) width)))))))]
+    (is (= 1 (occurrences '(let [a (quot n 7)] (+ a (quot n 7)))))
+        "equal reciprocals load x16 once")
+    (is (= 2 (occurrences
+              '(let [a (quot n 7) b (quot a d)] (+ b (quot n 7)))))
+        "an intervening guarded SDIV clobbers x16 and forces a reload")))
+
+(deftest aarch64-fuses-safe-multiply-add-and-subtract-after-allocation
+  (let [expression '(let [v (+ (* n 7) 1)] (- v (* n 3)))
+        arm (machine/compile-gmir
+             :aarch64 (machine/lower-kir-expression ['n] expression))
+        x86 (machine/compile-gmir
+             :x86-64 (machine/lower-kir-expression ['n] expression))
+        encodings #(mapv :mc/encoding (:mc/instructions %))
+        words (mapv vec (partition 4 (machine/compile-expression
+                                      :aarch64 ['n] expression)))]
+    (is (= 1 (count (filter #{:aarch64/multiply-add} (encodings arm)))))
+    (is (= 1 (count (filter #{:aarch64/multiply-subtract} (encodings arm)))))
+    (is (not-any? #{:aarch64/multiply :aarch64/add :aarch64/subtract}
+                  (encodings arm)))
+    (is (= 2 (count (filter #{:x86-64/multiply} (encodings x86))))
+        "the AArch64 selection does not rewrite x86-64")
+    (is (some #{[0x01 0x0c 0x01 0x9b]} words) "MADD x1,x0,x1,x3")
+    (is (some #{[0x00 0x84 0x02 0x9b]} words) "MSUB x0,x0,x2,x1")))
+
+(deftest aarch64-fusion-rejects-input-clobbers-and-product-minus-addends
+  (let [lower (fn [instructions]
+                (machine/lower-mc
+                 {:mir/version 1 :mir/target :aarch64 :mir/registers :physical
+                  :mir/frame-slots 0 :mir/instructions (vec instructions)}))
+        multiply {:mir/op :mir/multiply :mir/dst :aarch64/x2
+                  :mir/left :aarch64/x0 :mir/right :aarch64/x1}
+        return {:mir/op :mir/return :mir/value :aarch64/x3}
+        clobbered (lower [multiply
+                          {:mir/op :mir/constant :mir/dst :aarch64/x0 :mir/value 9}
+                          {:mir/op :mir/add :mir/dst :aarch64/x3
+                           :mir/left :aarch64/x2 :mir/right :aarch64/x0}
+                          return])
+        wrong-order (lower [multiply
+                            {:mir/op :mir/subtract :mir/dst :aarch64/x3
+                             :mir/left :aarch64/x2 :mir/right :aarch64/x0}
+                            return])]
+    (doseq [program [clobbered wrong-order]]
+      (is (some #{:aarch64/multiply}
+                (map :mc/encoding (:mc/instructions program))))
+      (is (not-any? #{:aarch64/multiply-add :aarch64/multiply-subtract}
+                    (map :mc/encoding (:mc/instructions program)))))))
+
+(deftest aarch64-fusion-allows-a-multiply-destination-to-alias-an-input
+  (let [program
+        (machine/lower-mc
+         {:mir/version 1 :mir/target :aarch64 :mir/registers :physical
+          :mir/frame-slots 0
+          :mir/instructions
+          [{:mir/op :mir/multiply :mir/dst :aarch64/x0
+            :mir/left :aarch64/x0 :mir/right :aarch64/x1}
+           {:mir/op :mir/constant :mir/dst :aarch64/x2 :mir/value 1}
+           {:mir/op :mir/add :mir/dst :aarch64/x3
+            :mir/left :aarch64/x0 :mir/right :aarch64/x2}
+           {:mir/op :mir/return :mir/value :aarch64/x3}]})]
+    (is (= 1 (count (filter #{:aarch64/multiply-add}
+                            (map :mc/encoding (:mc/instructions program))))))))
+
 (def spill-program
   (let [registers (mapv gmir/vreg (range 11))]
     {:gmir/version 1
@@ -547,6 +670,70 @@
     (is (some #(= [0x02 0x0c 0xc1 0x9a] %) words)
         "the guarded operation remains sdiv x2,x0,x1 after allocation")))
 
+(defn- floor-div [left right]
+  (let [q (quot left right)
+        remainder (- left (* q right))]
+    (if (and (neg? left) (not (zero? remainder))) (dec q) q)))
+
+(defn- apply-signed-division-magic [numerator divisor]
+  (let [numerator (bigint numerator)
+        {:keys [multiplier shift add-numerator? subtract-numerator?]}
+        (machine/signed-division-magic divisor)
+        high (floor-div (* numerator multiplier)
+                        18446744073709551616N)
+        corrected (cond add-numerator? (+ high numerator)
+                        subtract-numerator? (- high numerator)
+                        :else high)
+        shifted (floor-div corrected (bit-shift-left 1 shift))]
+    (+ shifted (if (neg? shifted) 1 0))))
+
+(deftest signed-constant-division-reciprocals-match-i64-truncation
+  (let [divisors [2 3 5 7 10 31 127 255 1024 2147483647
+                  -2 -3 -5 -7 -10 -31 -127 -255 -1024 -2147483647
+                  Long/MAX_VALUE (- Long/MAX_VALUE)]
+        numerators [Long/MIN_VALUE (inc Long/MIN_VALUE) -1000000000000
+                    -1000 -1 0 1 2 1000 1000000000000
+                    (dec Long/MAX_VALUE) Long/MAX_VALUE]]
+    (doseq [divisor divisors, numerator numerators]
+      (is (= (quot numerator divisor)
+             (apply-signed-division-magic numerator divisor))
+          {:numerator numerator :divisor divisor})))
+  (is (nil? (machine/signed-division-magic 0)))
+  (is (nil? (machine/signed-division-magic 1)))
+  (is (nil? (machine/signed-division-magic -1))))
+
+(deftest v3-constant-division-selects-reciprocal-machine-code
+  (let [kir {:format :kotoba.kir/v3 :entry 'kernel :exports ['kernel]
+             :functions [{:name 'kernel :params ['n]
+                          :body '(quot n 2147483647)}]}
+        gmir (machine/lower-kir-module kir)]
+    (doseq [target [:x86-64 :aarch64]]
+      (let [mc (machine/compile-gmir target gmir)
+            instructions (mapcat :mc/instructions (:mc/functions mc))
+            quotient (first (filter #(= (keyword (name target)
+                                                 "quotient-constant")
+                                          (:mc/encoding %))
+                                    instructions))
+            code (:code (machine/compile-kir-module target kir))]
+        (is (= 2147483647 (:mir/divisor quotient)) target)
+        (is (not (contains? quotient :mir/right)) target)
+        (is (not-any? #(and (= (keyword (name target) "constant")
+                              (:mc/encoding %))
+                           (= 2147483647 (:mir/value %)))
+                      instructions)
+            "the consumed divisor has no materialize instruction")
+        (if (= :x86-64 target)
+          (do
+            (is (not-any? #{[0x48 0xf7 0xf9]} (partition 3 1 code))
+                "constant division emits no idiv")
+            (is (some #{[0x49 0xf7 0xea]} (partition 3 1 code))
+                "constant division uses signed multiply-high"))
+          (let [words (mapv vec (partition 4 code))]
+            (is (not-any? #{[0x02 0x0c 0xc1 0x9a]} words)
+                "constant division emits no SDIV family opcode")
+            (is (some #(= [0x11 0x7c 0x50 0x9b] %) words)
+                "constant division uses SMULH x17,x16 input allocation")))))))
+
 (deftest scalar-comparisons-and-predicates-reach-final-bytes-for-both-isas
   (doseq [form ['(= a b) '(< a b) '(> a b) '(<= a b) '(>= a b)
                 '(< a b 9) '(= a b 9)
@@ -618,10 +805,10 @@
         arm (machine/compile-expression :aarch64 ['p] '(if p 11 22))]
     (is (= [0x0f 0x84 0x0e 0x00 0x00 0x00] (subvec x86 6 12))
         "x86 jz skips the selected then arm using next-PC rel32")
-    (is (= [0xe0 0x00 0x00 0xb4] (subvec arm 0 4))
-        "AArch64 cbz x0 reaches the final else label at +28 bytes")
+    (is (= [0x80 0x00 0x00 0xb4] (subvec arm 0 4))
+        "AArch64 cbz x0 reaches the final else label at +16 bytes")
     (is (= 40 (count x86)))
-    (is (= 52 (count arm)))))
+    (is (= 28 (count arm)))))
 
 (deftest kir-to-gmir-boundary-rejects-unsupported-shapes
   (is (machine/pilot-expression? ['a] '(+ a (if a 1 2))))
@@ -781,12 +968,10 @@
                  (machine/lower-kir-expression
                   [] (list '+ (list 'variant-new scalar-variant-type :number 1) 3))))))
 
-(deftest full-signed-i64-immediates-have-fixed-wire-bytes
+(deftest full-signed-i64-immediates-have-canonical-wire-bytes
   (is (= [0x48 0xb8 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0x7f 0xc3]
          (machine/compile-expression :x86-64 [] Long/MAX_VALUE)))
-  (is (= [0xe0 0xff 0x9f 0xd2 0xe0 0xff 0xbf 0xf2
-          0xe0 0xff 0xdf 0xf2 0xe0 0xff 0xef 0xf2
-          0xc0 0x03 0x5f 0xd6]
+  (is (= [0x00 0x00 0xf0 0x92 0xc0 0x03 0x5f 0xd6]
          (machine/compile-expression :aarch64 [] Long/MAX_VALUE)))
   (is (thrown? clojure.lang.ExceptionInfo
                (machine/compile-expression :x86-64 [] (inc (bigint Long/MAX_VALUE))))))

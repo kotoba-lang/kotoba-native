@@ -95,6 +95,13 @@ The first variable-width rewrite reclaims the removed spill/reload bytes:
 x86-64 constant RHS materialization is 10 bytes and AArch64 is 16 bytes, with
 no architectural NOP padding. Final layout recomputes every affected branch.
 
+MIR v3 additionally selects signed division by an SSA constant into a closed
+constant-divisor operation. Both encoders derive the same exact reciprocal
+multiplier and replace `IDIV` / `SDIV` with signed multiply-high plus the
+required truncation-toward-zero corrections. Dynamic divisors and constant
+zero or plus/minus one retain the guarded hardware path, so division traps do
+not become optimizer assumptions.
+
 `kotoba-gmir` now owns the closed target-independent GMIR contract and
 `kotoba-mir` owns target selection plus explicit virtual/physical register
 state and deterministic allocation, including liveness-minimal straight-line
