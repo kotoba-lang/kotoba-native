@@ -1701,24 +1701,41 @@
 (defn- x86-quotient-constant [dst left divisor]
   (if-let [{:keys [multiplier shift add-numerator? subtract-numerator?]}
            (signed-division-magic divisor)]
-    (let [saved-slot {:x86-64/rdx 0 :x86-64/rax 1}
-          load-original (fn [target source]
-                          (if-some [slot (get saved-slot source)]
-                            (x86-stack-memory 0x8b target slot)
-                            (if (= target source) [] (x86-rr 0x89 target source))))]
+    ;; RAX and RDX are saved because `imul r10` writes both and MIR declares
+    ;; only `dst` as written, so whatever the allocator left in them has to come
+    ;; back. Neither of the two reads of the numerator needs to go through those
+    ;; saved slots, though:
+    ;;
+    ;; - the read BEFORE the multiply does not, because `push` does not modify
+    ;;   the register it pushes. When `left` is RAX the value is already in
+    ;;   place and the instruction is nothing at all; otherwise a register move
+    ;;   reaches it, since nothing has been clobbered yet.
+    ;; - the read AFTER the multiply does not either, if the numerator is put
+    ;;   in R11 first. R11 is outside MIR's allocator profile and is where the
+    ;;   result accumulates anyway, so `add r11,rdx` finishes the add-numerator
+    ;;   case with no separate move and no reload.
+    ;;
+    ;; Together that removes two eight-byte stack reads per division and, in
+    ;; the add-numerator case, the `mov r11,rdx` as well.
+    (let [numerator? (or add-numerator? subtract-numerator?)
+          move (fn [target source]
+                 (if (= target source) [] (x86-rr 0x89 target source)))]
       (vec
        (concat
         (x86-push :x86-64/rax)
         (x86-push :x86-64/rdx)
-        (load-original :x86-64/rax left)
+        (when numerator? (move :x86-64/r11 left))
+        (move :x86-64/rax left)
         (x86-mov-imm :x86-64/r10 multiplier)
         ;; imul r10: signed RDX:RAX = RAX * R10
         [0x49 0xf7 0xea]
-        (x86-rr 0x89 :x86-64/r11 :x86-64/rdx)
-        (when (or add-numerator? subtract-numerator?)
-          (load-original :x86-64/r10 left))
-        (when add-numerator? (x86-rr 0x01 :x86-64/r11 :x86-64/r10))
-        (when subtract-numerator? (x86-rr 0x29 :x86-64/r11 :x86-64/r10))
+        (cond
+          ;; r11 already holds the numerator; RDX holds the high half.
+          add-numerator? (x86-rr 0x01 :x86-64/r11 :x86-64/rdx)
+          ;; high - numerator, computed in RDX because it is already clobbered.
+          subtract-numerator? (concat (x86-rr 0x29 :x86-64/rdx :x86-64/r11)
+                                      (x86-rr 0x89 :x86-64/r11 :x86-64/rdx))
+          :else (x86-rr 0x89 :x86-64/r11 :x86-64/rdx))
         (when (pos? shift) [0x49 0xc1 0xfb shift]) ; sar r11,shift
         (x86-rr 0x89 :x86-64/r10 :x86-64/r11)
         [0x49 0xc1 0xea 0x3f] ; shr r10,63
