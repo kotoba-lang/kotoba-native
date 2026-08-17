@@ -42,17 +42,18 @@
         branched (mapv vec (partition 4
                                     (machine/compile-expression
                                      :aarch64 ['n]
-                                     '(if n (+ n 7) (+ n 7)))))
+                                     '(if n (+ n 4097) (+ n 4097)))))
         checked-memory (mapv vec (partition 4
                                           (machine/compile-expression
                                            :aarch64 ['base 'length]
                                            '(+ (kernel-load-u8 base length 7)
                                                (kernel-load-u8 base length 7)))))
-        movz-seven? #(= [0x00 0x80 0xd2] (subvec % 1))]
+        movz-seven? #(= [0x00 0x80 0xd2] (subvec % 1))
+        movz-4097? #(= [0x00 0x82 0xd2] (subvec % 1))]
     (is (= 1 (count (filter movz-seven? leaf)))
         "three materializations share one reserved leaf register")
     (is (= [0xed 0x00 0x80 0xd2] (first leaf)) "MOVZ X13,#7")
-    (is (= 2 (count (filter movz-seven? branched)))
+    (is (= 2 (count (filter movz-4097? branched)))
         "control flow disables the caller-saved leaf cache")
     (is (= 2 (count (filter movz-seven? checked-memory)))
         "encoders with private scratch conventions do not opt in")))
@@ -701,6 +702,49 @@
   (is (nil? (machine/signed-division-magic 0)))
   (is (nil? (machine/signed-division-magic 1)))
   (is (nil? (machine/signed-division-magic -1))))
+
+(deftest aarch64-reciprocal-combines-the-sign-correction
+  (let [bytes (#'machine/a64-quotient-constant
+               :aarch64/x2 :aarch64/x0 2147483647 true)
+        words (mapv vec (partition 4 bytes))]
+    (is (= [0x22 0xfe 0x51 0x8b] (peek words))
+        "ADD X2,X17,X17,LSR#63")
+    (is (= 7 (count words))
+        "three-word magic plus SMULH, numerator ADD, ASR, shifted ADD")
+    (is (not-any? #{[0x30 0xfe 0x7f 0xd3]} words)
+        "the standalone LSR correction is gone")))
+
+(deftest aarch64-folds-single-use-add-sub-immediates
+  (let [words (fn [form]
+                (mapv vec (partition 4
+                                     (machine/compile-expression
+                                      :aarch64 ['n] form))))]
+    (is (= [0x02 0x1c 0x00 0x91] (first (words '(+ n 7))))
+        "ADD X2,X0,#7")
+    (is (= [0x02 0x1c 0x00 0xd1] (first (words '(+ n -7))))
+        "negative ADD becomes SUB immediate")
+    (is (= [0x02 0x04 0x40 0xd1] (first (words '(- n 4096))))
+        "SUB X2,X0,#1,LSL#12")
+    (is (= [0x02 0x04 0x40 0x91] (first (words '(- n -4096))))
+        "negative SUB becomes ADD immediate")
+    (is (= 4 (count (words '(- 7 n))))
+        "constant-minus-register cannot use the immediate form")
+    (is (= 4 (count (words '(+ n 4097))))
+        "a non-encodable immediate retains materialization")
+    (is (= 7 (count (words '(if n (+ n 7) (- n 7)))))
+        "each control-flow arm can fold its adjacent immediate")))
+
+(deftest aarch64-immediate-folding-preserves-repeated-constant-cache-and-x86
+  (let [form '(let [a (+ n 7)] (+ a 7))
+        arm (mapv vec (partition 4
+                               (machine/compile-expression :aarch64 ['n] form)))
+        x86 (machine/compile-expression :x86-64 ['n] '(+ n 7))]
+    (is (= [0xed 0x00 0x80 0xd2] (first arm))
+        "a repeated constant remains in the reserved leaf cache")
+    (is (= 4 (count arm)))
+    (is (= [0x48 0xb9 0x07 0x00 0x00 0x00 0x00 0x00 0x00 0x00]
+           (subvec x86 3 13))
+        "AArch64 selection does not rewrite x86-64")))
 
 (deftest v3-constant-division-selects-reciprocal-machine-code
   (let [kir {:format :kotoba.kir/v3 :entry 'kernel :exports ['kernel]
