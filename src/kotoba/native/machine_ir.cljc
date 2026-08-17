@@ -19,7 +19,51 @@
   (throw (ex-info (str "machine IR rejected: " (name problem))
                   {:phase phase :problem problem :instruction instruction})))
 
+(defn- a64-fused-multiply [multiply consumer]
+  (let [product (:mir/dst multiply)
+        addend (cond
+                 (and (= :mir/add (:mir/op consumer))
+                      (= product (:mir/left consumer))) (:mir/right consumer)
+                 (and (= :mir/add (:mir/op consumer))
+                      (= product (:mir/right consumer))) (:mir/left consumer)
+                 (and (= :mir/subtract (:mir/op consumer))
+                      (= product (:mir/right consumer))) (:mir/left consumer))]
+    (when (and addend (not= product addend))
+      {:mir/op (if (= :mir/subtract (:mir/op consumer))
+                 :mir/multiply-subtract :mir/multiply-add)
+       :mir/dst (:mir/dst consumer)
+       :mir/left (:mir/left multiply)
+       :mir/right (:mir/right multiply)
+       :mir/addend addend})))
+
+(defn- a64-fuse-multiplies [instructions]
+  (loop [index 0, out []]
+    (if (>= index (count instructions))
+      (vec out)
+      (let [multiply (get instructions index)]
+        (if (= :mir/multiply (:mir/op multiply))
+          (let [after (inc index)
+                consumer-index
+                (loop [candidate after]
+                  (if (= :mir/constant (:mir/op (get instructions candidate)))
+                    (recur (inc candidate))
+                    candidate))
+                between (subvec instructions after consumer-index)
+                protected (set [(:mir/dst multiply) (:mir/left multiply)
+                                (:mir/right multiply)])
+                unclobbered? (not-any? #(contains? protected (:mir/dst %)) between)
+                fused (when unclobbered?
+                        (a64-fused-multiply multiply
+                                            (get instructions consumer-index)))]
+            (if fused
+              (recur (inc consumer-index) (into out (concat between [fused])))
+              (recur (inc index) (conj out multiply))))
+          (recur (inc index) (conj out multiply)))))))
+
 (defn- lower-mc-instructions [isa instructions]
+  (let [instructions (if (= :aarch64 isa)
+                       (a64-fuse-multiplies instructions)
+                       instructions)]
   (mapv (fn [{:mir/keys [op id test] :as instruction}]
           (case op
             :mir/label (layout/label id)
@@ -31,7 +75,7 @@
             (into {:mc/op :mc/instruction
                    :mc/encoding (keyword (name isa) (name op))}
                   (remove (fn [[k _]] (= k :mir/op)) instruction))))
-        instructions))
+        instructions)))
 
 (defn lower-mc
   "Lower allocated MIR to explicit MC instruction/layout data.
@@ -1452,7 +1496,11 @@
 (def ^:private x86-arguments [:x86-64/rdi :x86-64/rsi :x86-64/rdx :x86-64/rcx :x86-64/r8])
 (def ^:private aarch64-register-code
   {:aarch64/x0 0 :aarch64/x1 1 :aarch64/x2 2 :aarch64/x3 3
-   :aarch64/x4 4 :aarch64/x7 7 :aarch64/x16 16 :aarch64/x17 17})
+   :aarch64/x4 4 :aarch64/x7 7
+   ;; x13-x15 are leaf-only constant-cache registers. x16-x17 remain the
+   ;; local encoder scratch pair and are never admitted to allocated MIR.
+   :aarch64/x13 13 :aarch64/x14 14 :aarch64/x15 15
+   :aarch64/x16 16 :aarch64/x17 17})
 
 (defn- byte-value [n] (bit-and (unchecked-int n) 0xff))
 
@@ -1471,7 +1519,83 @@
 (defn- align16 [n]
   (* 16 (quot (+ n 15) 16)))
 
-(declare a64-register)
+;; Hacker's Delight signed reciprocal construction. All arithmetic here is
+;; wider than i64: the returned multiplier is normalized back to one signed
+;; word only after the exact recurrence terminates. Keeping this computation
+;; in the encoder means GMIR retains the source operation and the independent
+;; verifier can deterministically re-derive the same selected bytes.
+(def ^:private wide-zero #?(:clj 0N :cljs (js/BigInt 0)))
+(def ^:private wide-one #?(:clj 1N :cljs (js/BigInt 1)))
+(def ^:private wide-two63
+  #?(:clj 9223372036854775808N :cljs (js/BigInt "9223372036854775808")))
+(def ^:private wide-two64
+  #?(:clj 18446744073709551616N :cljs (js/BigInt "18446744073709551616")))
+(def ^:private wide-max-i64
+  #?(:clj 9223372036854775807N :cljs (js/BigInt "9223372036854775807")))
+(def ^:private wide-min-i64
+  #?(:clj -9223372036854775808N :cljs (js/BigInt "-9223372036854775808")))
+
+(defn- ->wide [value]
+  #?(:clj (bigint value) :cljs (i64/->bigint value)))
+
+(defn- wide-quot [left right]
+  #?(:clj (quot left right) :cljs (/ left right)))
+
+(defn- wide-mod [left right]
+  (- left (* (wide-quot left right) right)))
+
+(defn- wide-neg? [value] (< value wide-zero))
+
+(defn signed-division-magic
+  "Return the exact signed reciprocal multiplier and post-shift for DIVISOR.
+
+  Zero and +/-1 deliberately stay on the guarded hardware path. For every
+  other i64 divisor the result implements truncation toward zero using one
+  signed multiply-high, an optional numerator correction, an arithmetic
+  shift, and a final sign correction."
+  [divisor]
+  (let [divisor (->wide divisor)]
+    (when (and (not= divisor wide-zero)
+               (not= divisor wide-one)
+               (not= divisor (- wide-one)))
+      (let [negative-divisor? (wide-neg? divisor)
+            absolute-divisor (if negative-divisor? (- divisor) divisor)
+            t (+ wide-two63 (if negative-divisor? wide-one wide-zero))
+            anc (- t wide-one (wide-mod t absolute-divisor))
+            initial-q1 (wide-quot wide-two63 anc)
+            initial-q2 (wide-quot wide-two63 absolute-divisor)]
+        (loop [power 63
+               q1 initial-q1, r1 (- wide-two63 (* initial-q1 anc))
+               q2 initial-q2, r2 (- wide-two63 (* initial-q2 absolute-divisor))]
+          (let [power (inc power)
+                doubled-q1 (* (+ wide-one wide-one) q1)
+                doubled-r1 (* (+ wide-one wide-one) r1)
+                [q1 r1] (if (>= doubled-r1 anc)
+                          [(+ doubled-q1 wide-one) (- doubled-r1 anc)]
+                          [doubled-q1 doubled-r1])
+                doubled-q2 (* (+ wide-one wide-one) q2)
+                doubled-r2 (* (+ wide-one wide-one) r2)
+                [q2 r2] (if (>= doubled-r2 absolute-divisor)
+                          [(+ doubled-q2 wide-one)
+                           (- doubled-r2 absolute-divisor)]
+                          [doubled-q2 doubled-r2])
+                delta (- absolute-divisor r2)]
+            (if (or (< q1 delta) (and (= q1 delta) (= r1 wide-zero)))
+              (recur power q1 r1 q2 r2)
+              (let [multiplier (+ q2 wide-one)
+                    multiplier (if negative-divisor? (- multiplier) multiplier)
+                    multiplier (cond
+                                 (> multiplier wide-max-i64) (- multiplier wide-two64)
+                                 (< multiplier wide-min-i64) (+ multiplier wide-two64)
+                                 :else multiplier)]
+                {:multiplier multiplier
+                 :shift (- power 64)
+                 :add-numerator? (and (not negative-divisor?)
+                                      (wide-neg? multiplier))
+                 :subtract-numerator? (and negative-divisor?
+                                            (not (wide-neg? multiplier)))}))))))))
+
+(declare a64-register x86-mov-imm)
 
 (defn- x86-stack-memory [opcode register slot]
   (let [code (get x86-register-code register)
@@ -1573,6 +1697,41 @@
                  (load-operand :x86-64/rax left)
                  [0x48 0x99 0x48 0xf7 0xf9]
                  restore))))
+
+(defn- x86-quotient-constant [dst left divisor]
+  (if-let [{:keys [multiplier shift add-numerator? subtract-numerator?]}
+           (signed-division-magic divisor)]
+    (let [saved-slot {:x86-64/rdx 0 :x86-64/rax 1}
+          load-original (fn [target source]
+                          (if-some [slot (get saved-slot source)]
+                            (x86-stack-memory 0x8b target slot)
+                            (if (= target source) [] (x86-rr 0x89 target source))))]
+      (vec
+       (concat
+        (x86-push :x86-64/rax)
+        (x86-push :x86-64/rdx)
+        (load-original :x86-64/rax left)
+        (x86-mov-imm :x86-64/r10 multiplier)
+        ;; imul r10: signed RDX:RAX = RAX * R10
+        [0x49 0xf7 0xea]
+        (x86-rr 0x89 :x86-64/r11 :x86-64/rdx)
+        (when (or add-numerator? subtract-numerator?)
+          (load-original :x86-64/r10 left))
+        (when add-numerator? (x86-rr 0x01 :x86-64/r11 :x86-64/r10))
+        (when subtract-numerator? (x86-rr 0x29 :x86-64/r11 :x86-64/r10))
+        (when (pos? shift) [0x49 0xc1 0xfb shift]) ; sar r11,shift
+        (x86-rr 0x89 :x86-64/r10 :x86-64/r11)
+        [0x49 0xc1 0xea 0x3f] ; shr r10,63
+        (x86-rr 0x01 :x86-64/r11 :x86-64/r10)
+        (x86-pop :x86-64/rdx)
+        (x86-pop :x86-64/rax)
+        (when-not (= dst :x86-64/r11)
+          (x86-rr 0x89 dst :x86-64/r11)))))
+    ;; Zero and +/-1 retain the established hardware guards. They are uncommon
+    ;; in real optimized code and keeping one path prevents special-case trap
+    ;; semantics from drifting between the two ISAs.
+    (vec (concat (x86-mov-imm :x86-64/r11 divisor)
+                 (x86-quotient dst left :x86-64/r11)))))
 
 (defn- x86-shift [subop dst left right]
   ;; Variable-count shifts require CL. r11 is outside MIR's allocator profile,
@@ -1677,21 +1836,98 @@
   (u32le (bit-or 0xaa0003e0 (bit-shift-left (a64-register src) 16)
                    (a64-register dst))))
 
+(defn- a64-constant-chunks [value]
+  #?(:clj (mapv #(bit-and (unsigned-bit-shift-right (long value) %) 0xffff)
+                 [0 16 32 48])
+     :cljs (let [u (js/BigInt.asUintN 64 (i64/->bigint value))
+                 base (js/BigInt 65536)
+                 mask (js/BigInt 65535)]
+             (loop [i 0, remaining u, out []]
+               (if (= i 4) out
+                   (recur (inc i) (/ remaining base)
+                          (conj out (js/Number (bit-and remaining mask)))))))))
+
+(defn- a64-wide-move [opcode rd chunk lane]
+  (u32le (bit-or opcode
+                 (bit-shift-left lane 21)
+                 (bit-shift-left chunk 5)
+                 rd)))
+
+(defn- a64-logical-immediate-fields [chunks]
+  ;; AArch64 logical immediates are a rotated, non-empty/non-full run of ones
+  ;; in a power-of-two element, replicated to the register width. Work from
+  ;; the already exact four u16 chunks so this selector is identical on the
+  ;; JVM and in ClojureScript (where bitwise numbers are otherwise only i32).
+  (let [bit-at (fn [index]
+                 (not (zero? (bit-and (nth chunks (quot index 16))
+                                      (bit-shift-left 1 (mod index 16))))))
+        bits (mapv bit-at (range 64))]
+    (some
+     (fn [width]
+       (when (every? #(= (nth bits %) (nth bits (mod % width))) (range 64))
+         (some
+          (fn [ones]
+            (some
+             (fn [rotation]
+               (when (every? (fn [index]
+                               (= (nth bits index)
+                                  (< (mod (+ (mod index width) rotation) width)
+                                     ones)))
+                             (range 64))
+                 (let [len ({2 1, 4 2, 8 3, 16 4, 32 5, 64 6} width)]
+                   {:n (if (= width 64) 1 0)
+                    :immr rotation
+                    :imms (bit-or (bit-and (- (* 2 width)) 0x3f)
+                                  (dec ones))})))
+             (range width)))
+          (range 1 width))))
+     [2 4 8 16 32 64])))
+
+(defn- a64-logical-immediate [rd chunks]
+  (when-let [{:keys [n immr imms]} (a64-logical-immediate-fields chunks)]
+    ;; ORR Xd,XZR,#imm is the architectural MOV (bitmask immediate) alias.
+    (u32le (bit-or 0xb20003e0
+                   (bit-shift-left n 22)
+                   (bit-shift-left immr 16)
+                   (bit-shift-left imms 10)
+                   rd))))
+
+(defn- a64-constant-fixed
+  "The legacy four-word form. Keep it only where an enclosing sequence has a
+  fixed local branch displacement or layout has reserved exactly 16 bytes."
+  [dst value]
+  (let [rd (a64-register dst)]
+    (vec (mapcat (fn [lane chunk]
+                   (a64-wide-move (if (zero? lane) 0xd2800000 0xf2800000)
+                                  rd chunk lane))
+                 (range 4) (a64-constant-chunks value)))))
+
 (defn- a64-constant [dst value]
   (let [rd (a64-register dst)
-        chunks #?(:clj (mapv #(bit-and (unsigned-bit-shift-right (long value) %) 0xffff)
-                              [0 16 32 48])
-                  :cljs (let [u (js/BigInt.asUintN 64 (i64/->bigint value))
-                              base (js/BigInt 65536)
-                              mask (js/BigInt 65535)]
-                          (loop [i 0, remaining u, out []]
-                            (if (= i 4) out
-                                (recur (inc i) (/ remaining base)
-                                       (conj out (js/Number (bit-and remaining mask))))))))]
-    (vec (mapcat (fn [chunk opcode]
-                   (u32le (bit-or opcode (bit-shift-left chunk 5) rd)))
-                 chunks
-                 [0xd2800000 0xf2a00000 0xf2c00000 0xf2e00000]))))
+        chunks (a64-constant-chunks value)
+        movz-lanes (keep-indexed #(when-not (zero? %2) %1) chunks)
+        movn-lanes (keep-indexed #(when-not (= 0xffff %2) %1) chunks)
+        movn? (< (max 1 (count movn-lanes)) (max 1 (count movz-lanes)))
+        lanes (if movn? movn-lanes movz-lanes)
+        first-lane (or (first lanes) 0)
+        fill (if movn? 0xffff 0)
+        first-chunk (nth chunks first-lane)
+        initial (a64-wide-move (if movn? 0x92800000 0xd2800000)
+                               rd (if movn? (bit-and (bit-not first-chunk) 0xffff)
+                                      first-chunk)
+                               first-lane)
+        wide (vec
+              (concat
+               initial
+               (mapcat (fn [lane]
+                         (when (and (not= lane first-lane)
+                                    (not= fill (nth chunks lane)))
+                           (a64-wide-move 0xf2800000 rd (nth chunks lane) lane)))
+                       (range 4))))
+        logical (a64-logical-immediate rd chunks)]
+    ;; Preserve the established wide-move spelling on ties. Apart from making
+    ;; output deterministic, MOVZ/MOVN is the simpler dependency-breaking form.
+    (if (and logical (< (count logical) (count wide))) logical wide)))
 
 (defn- a64-compare [cset dst left right]
   (vec (concat
@@ -1865,12 +2101,12 @@
         ;; cbz right, trap (+15 instructions)
         (u32le (bit-or 0xb4000000 (bit-shift-left 15 5)
                        (a64-register right)))
-        (a64-constant :aarch64/x16 #?(:clj Long/MIN_VALUE :cljs i64/min-i64))
+        (a64-constant-fixed :aarch64/x16 #?(:clj Long/MIN_VALUE :cljs i64/min-i64))
         ;; cmp left,x16; b.ne divide (+7 instructions)
         (u32le (bit-or 0xeb00001f (bit-shift-left 16 16)
                        (bit-shift-left (a64-register left) 5)))
         (u32le (bit-or 0x54000001 (bit-shift-left 7 5)))
-        (a64-constant :aarch64/x16 -1)
+        (a64-constant-fixed :aarch64/x16 -1)
         ;; cmp right,x16; b.eq trap (+3 instructions)
         (u32le (bit-or 0xeb00001f (bit-shift-left 16 16)
                        (bit-shift-left (a64-register right) 5)))
@@ -1882,6 +2118,40 @@
                        (a64-register dst)))
         (u32le (bit-or 0x14000000 2))
         (u32le 0xd4200000))))
+
+(defn- a64-quotient-constant [dst left divisor load-multiplier?]
+  (if-let [{:keys [multiplier shift add-numerator? subtract-numerator?]}
+           (signed-division-magic divisor)]
+    (vec
+     (concat
+      (when load-multiplier? (a64-constant :aarch64/x16 multiplier))
+      ;; smulh x17,left,x16
+      (u32le (bit-or 0x9b407c00
+                     (bit-shift-left 16 16)
+                     (bit-shift-left (a64-register left) 5)
+                     17))
+      (when add-numerator?
+        (u32le (bit-or 0x8b000000
+                       (bit-shift-left (a64-register left) 16)
+                       (bit-shift-left 17 5) 17)))
+      (when subtract-numerator?
+        (u32le (bit-or 0xcb000000
+                       (bit-shift-left (a64-register left) 16)
+                       (bit-shift-left 17 5) 17)))
+      ;; asr x17,x17,#shift (SBFM), omitted when the reciprocal needs no shift.
+      (when (pos? shift)
+        (u32le (bit-or 0x9340fc00
+                       (bit-shift-left shift 16)
+                       (bit-shift-left 17 5) 17)))
+      ;; ADD dst,x17,x17,LSR#63 combines extraction of the sign correction and
+      ;; truncation toward zero. x16 therefore keeps the cached multiplier.
+      (u32le (bit-or 0x8b400000
+                     (bit-shift-left 17 16)
+                     (bit-shift-left 63 10)
+                     (bit-shift-left 17 5)
+                     (a64-register dst)))))
+    (vec (concat (a64-constant :aarch64/x17 divisor)
+                 (a64-quotient dst left :aarch64/x17)))))
 
 (defn- x86-runtime-call
   [frame-bytes {:mir/keys [context-offset] :as instruction}]
@@ -2255,7 +2525,7 @@
       (reject! :mc-encode :unknown-x86-privileged-action instruction))))
 
 (defn- encode-selected
-  [isa frame-bytes return-suffix instruction-index
+  [isa frame-bytes return-suffix instruction-index load-a64-multiplier?
    {:mc/keys [encoding] :as instruction}]
   (case encoding
     :x86-64/argument
@@ -2282,6 +2552,9 @@
     :x86-64/quotient
     (x86-quotient (:mir/dst instruction) (:mir/left instruction)
                   (:mir/right instruction))
+    :x86-64/quotient-constant
+    (x86-quotient-constant (:mir/dst instruction) (:mir/left instruction)
+                           (:mir/divisor instruction))
     :x86-64/bit-and
     (let [dst (:mir/dst instruction) left (:mir/left instruction) right (:mir/right instruction)]
       (vec (concat (when-not (= dst left) (x86-rr 0x89 dst left))
@@ -2358,16 +2631,41 @@
     [{:native/data-content (:mir/content instruction)
       :native/data-dst (:mir/dst instruction) :native/data-target :aarch64}]
     :aarch64/add
-    (u32le (bit-or 0x8b000000
+    (if-let [immediate (:native/a64-immediate instruction)]
+      (u32le (bit-or (if (= :subtract (:native/a64-immediate-op instruction))
+                       0xd1000000 0x91000000)
+                     (bit-shift-left (:native/a64-immediate-shift instruction) 22)
+                     (bit-shift-left immediate 10)
+                     (bit-shift-left (a64-register (:mir/left instruction)) 5)
+                     (a64-register (:mir/dst instruction))))
+      (u32le (bit-or 0x8b000000
+                     (bit-shift-left (a64-register (:mir/right instruction)) 16)
+                     (bit-shift-left (a64-register (:mir/left instruction)) 5)
+                     (a64-register (:mir/dst instruction)))))
+    (:aarch64/multiply-add :aarch64/multiply-subtract)
+    (u32le (bit-or (if (= :aarch64/multiply-add encoding)
+                     0x9b000000 0x9b008000)
                    (bit-shift-left (a64-register (:mir/right instruction)) 16)
+                   (bit-shift-left (a64-register (:mir/addend instruction)) 10)
                    (bit-shift-left (a64-register (:mir/left instruction)) 5)
                    (a64-register (:mir/dst instruction))))
-    (:aarch64/subtract :aarch64/multiply
+    :aarch64/subtract
+    (if-let [immediate (:native/a64-immediate instruction)]
+      (u32le (bit-or (if (= :add (:native/a64-immediate-op instruction))
+                       0x91000000 0xd1000000)
+                     (bit-shift-left (:native/a64-immediate-shift instruction) 22)
+                     (bit-shift-left immediate 10)
+                     (bit-shift-left (a64-register (:mir/left instruction)) 5)
+                     (a64-register (:mir/dst instruction))))
+      (u32le (bit-or 0xcb000000
+                     (bit-shift-left (a64-register (:mir/right instruction)) 16)
+                     (bit-shift-left (a64-register (:mir/left instruction)) 5)
+                     (a64-register (:mir/dst instruction)))))
+    (:aarch64/multiply
      :aarch64/bit-and :aarch64/bit-or :aarch64/bit-xor
      :aarch64/shift-left :aarch64/shift-right-signed
      :aarch64/shift-right-unsigned)
     (let [base (case encoding
-                 :aarch64/subtract 0xcb000000
                  :aarch64/multiply 0x9b007c00
                  :aarch64/bit-and 0x8a000000
                  :aarch64/bit-or 0xaa000000
@@ -2382,6 +2680,10 @@
     :aarch64/quotient
     (a64-quotient (:mir/dst instruction) (:mir/left instruction)
                   (:mir/right instruction))
+    :aarch64/quotient-constant
+    (a64-quotient-constant (:mir/dst instruction) (:mir/left instruction)
+                           (:mir/divisor instruction)
+                           load-a64-multiplier?)
     (:aarch64/f64-add :aarch64/f64-subtract :aarch64/f64-multiply
      :aarch64/f64-divide :aarch64/f64-min :aarch64/f64-max)
     (a64-f64-binary (case encoding
@@ -2502,7 +2804,7 @@
                   (let [offset (get data-offsets content)]
                     (case (:native/data-target token)
                       :x86-64 (x86-mov-imm (:native/data-dst token) offset)
-                      :aarch64 (a64-constant (:native/data-dst token) offset)))
+                      :aarch64 (a64-constant-fixed (:native/data-dst token) offset)))
                   [token])))
         data (vec (mapcat utf8-bytes contents))]
     {:code (vec (concat code data)) :code-size code-size :labels labels}))
@@ -2510,11 +2812,193 @@
 (defn- resolve-layout [tokens]
   (:code (resolve-program-layout tokens)))
 
+(def ^:private a64-leaf-constant-registers
+  [:aarch64/x13 :aarch64/x14 :aarch64/x15])
+
+(def ^:private a64-leaf-cache-safe-encodings
+  ;; Keep this closed: checked-memory and host-boundary encoders have their own
+  ;; private scratch conventions and must opt in only after proving x13-x15
+  ;; preservation.
+  #{:aarch64/argument :aarch64/constant :aarch64/data-address
+    :aarch64/add :aarch64/subtract :aarch64/multiply
+    :aarch64/multiply-add :aarch64/multiply-subtract
+    :aarch64/quotient :aarch64/quotient-constant
+    :aarch64/bit-and :aarch64/bit-or :aarch64/bit-xor
+    :aarch64/shift-left :aarch64/shift-right-signed
+    :aarch64/shift-right-unsigned
+    :aarch64/f64-add :aarch64/f64-subtract :aarch64/f64-multiply
+    :aarch64/f64-divide :aarch64/f64-min :aarch64/f64-max
+    :aarch64/f64-sqrt :aarch64/f64-equal :aarch64/f64-less-than
+    :aarch64/f64-less-or-equal :aarch64/f64-greater-than
+    :aarch64/f64-greater-or-equal :aarch64/f64-unordered
+    :aarch64/equal :aarch64/less-than :aarch64/greater-than
+    :aarch64/less-or-equal :aarch64/greater-or-equal
+    :aarch64/spill-load :aarch64/spill-store :aarch64/move :aarch64/return})
+
+(defn- a64-cache-register-sources [instruction aliases]
+  (reduce
+   (fn [out key]
+     (if-not (contains? out key)
+       out
+       (update out key
+               (fn [value]
+                 (if (vector? value)
+                   (mapv #(get aliases % %) value)
+                   (get aliases value value))))))
+   instruction
+   [:mir/test :mir/value :mir/src :mir/input :mir/left :mir/right :mir/addend
+    :mir/base :mir/length :mir/index :mir/stored :mir/offset :mir/size
+    :mir/arguments]))
+
+(def ^:private a64-source-keys
+  [:mir/test :mir/value :mir/src :mir/input :mir/left :mir/right :mir/addend
+   :mir/base :mir/length :mir/index :mir/stored :mir/offset :mir/size
+   :mir/arguments])
+
+(defn- a64-source-registers [instruction]
+  (mapcat (fn [key]
+            (let [value (get instruction key)]
+              (cond (vector? value) value
+                    (keyword? value) [value]
+                    :else [])))
+          a64-source-keys))
+
+(defn- a64-add-sub-immediate [op value]
+  (let [value (->wide value)
+        negative? (wide-neg? value)
+        magnitude (if negative? (- value) value)
+        [immediate shift]
+        (cond
+          (<= magnitude #?(:clj 4095N :cljs (js/BigInt 4095)))
+          [magnitude 0]
+          (and (= wide-zero
+                  (wide-mod magnitude #?(:clj 4096N :cljs (js/BigInt 4096))))
+               (<= (wide-quot magnitude #?(:clj 4096N :cljs (js/BigInt 4096)))
+                   #?(:clj 4095N :cljs (js/BigInt 4095))))
+          [(wide-quot magnitude #?(:clj 4096N :cljs (js/BigInt 4096))) 1]
+          :else nil)]
+    (when immediate
+      {:op (case [op negative?]
+             [:aarch64/add false] :add
+             [:aarch64/add true] :subtract
+             [:aarch64/subtract false] :subtract
+             [:aarch64/subtract true] :add)
+       :immediate #?(:clj (int immediate) :cljs (js/Number immediate))
+       :shift shift})))
+
+(defn- a64-fold-adjacent-add-sub-immediates [instructions]
+  (letfn [(uses-before-redefinition [instructions register]
+            (loop [remaining instructions, uses 0]
+              (if-let [instruction (first remaining)]
+                (let [uses (+ uses (count (filter #{register}
+                                                  (a64-source-registers instruction))))]
+                  (if (= register (:mir/dst instruction))
+                    uses
+                    (recur (next remaining) uses)))
+                uses)))]
+    (loop [remaining instructions, out []]
+      (if-let [constant (first remaining)]
+        (let [consumer (second remaining)
+              register (:mir/dst constant)
+              op (:mc/encoding consumer)
+              constant? (= :aarch64/constant (:mc/encoding constant))
+              operand
+              (cond
+                (and (= op :aarch64/add) (= register (:mir/right consumer)))
+                (:mir/left consumer)
+                (and (= op :aarch64/add) (= register (:mir/left consumer)))
+                (:mir/right consumer)
+                (and (= op :aarch64/subtract) (= register (:mir/right consumer)))
+                (:mir/left consumer))
+              selected (when (and constant? operand
+                                  (= 1 (uses-before-redefinition
+                                        (next remaining) register)))
+                         (a64-add-sub-immediate op (:mir/value constant)))]
+          (if selected
+            (recur (nnext remaining)
+                   (conj out (assoc consumer
+                                    :mir/left operand
+                                    :native/a64-immediate-op (:op selected)
+                                    :native/a64-immediate (:immediate selected)
+                                    :native/a64-immediate-shift (:shift selected))))
+            (recur (next remaining) (conj out constant))))
+        (vec out)))))
+
+(defn- a64-cache-leaf-constants [instructions]
+  ;; The cache registers are caller-saved. Restrict the transform to one
+  ;; branchless leaf so no call or alternate entry can invalidate their value.
+  (if-not
+   (every? (fn [{:mc/keys [op encoding]}]
+             (and (= :mc/instruction op)
+                  (contains? a64-leaf-cache-safe-encodings encoding)
+                  (not (contains? #{"call" "tail-call"} (name encoding)))))
+           instructions)
+    instructions
+    (let [occurrences
+          (reduce (fn [out [index {:mc/keys [encoding] :as instruction}]]
+                    (if (= :aarch64/constant encoding)
+                      (update out (:mir/value instruction) (fnil conj []) index)
+                      out))
+                  {} (map-indexed vector instructions))
+          selected (->> occurrences
+                        (keep (fn [[value indexes]]
+                                (when (> (count indexes) 1)
+                                  {:value value :first (first indexes)
+                                   :saving (* (dec (count indexes))
+                                              (count (a64-constant
+                                                      :aarch64/x13 value)))})))
+                        (sort-by (juxt (comp - :saving) :first))
+                        (take (count a64-leaf-constant-registers)))
+          cache (into {} (map (fn [{:keys [value]} register]
+                                [value register])
+                              selected a64-leaf-constant-registers))]
+      (:out
+       (reduce
+        (fn [{:keys [aliases loaded out]} {:mc/keys [encoding] :as instruction}]
+          (if (and (= :aarch64/constant encoding)
+                   (contains? cache (:mir/value instruction)))
+            (let [value (:mir/value instruction)
+                  register (get cache value)
+                  emitted (if (contains? loaded value)
+                            out
+                            (conj out (assoc instruction :mir/dst register)))]
+              {:aliases (assoc aliases (:mir/dst instruction) register)
+               :loaded (conj loaded value)
+               :out emitted})
+            (let [rewritten (a64-cache-register-sources instruction aliases)
+                  dst (:mir/dst instruction)]
+              {:aliases (if dst (dissoc aliases dst) aliases)
+               :loaded loaded
+               :out (conj out rewritten)})))
+        {:aliases {} :loaded #{} :out []}
+        instructions)))))
+
+(def ^:private a64-x16-preserving-encodings
+  #{:aarch64/argument :aarch64/constant :aarch64/data-address
+    :aarch64/add :aarch64/subtract :aarch64/multiply
+    :aarch64/multiply-add :aarch64/multiply-subtract
+    :aarch64/bit-and :aarch64/bit-or :aarch64/bit-xor
+    :aarch64/shift-left :aarch64/shift-right-signed
+    :aarch64/shift-right-unsigned :aarch64/spill-load
+    :aarch64/spill-store :aarch64/move :aarch64/return})
+
 (defn- instruction-tokens
   [isa frame-bytes return-suffix tail-suffix callee-labels instructions]
-  (vec
-   (mapcat
-    (fn [instruction-index {:mc/keys [op test] :as instruction}]
+  (let [instructions (if (= :aarch64 isa)
+                       (-> instructions
+                           a64-cache-leaf-constants
+                           a64-fold-adjacent-add-sub-immediates)
+                       instructions)]
+    (:out
+     (reduce
+      (fn [{:keys [out cached-a64-multiplier]}
+           [instruction-index {:mc/keys [op test encoding] :as instruction}]]
+        (let [magic (when (and (= isa :aarch64)
+                               (= encoding :aarch64/quotient-constant))
+                      (signed-division-magic (:mir/divisor instruction)))
+              multiplier (:multiplier magic)
+              load-multiplier? (not= multiplier cached-a64-multiplier)
+              tokens
       (if (layout/label-token? instruction)
         [instruction]
         (case op
@@ -2535,7 +3019,8 @@
                   (if (= :x86-64 isa)
                     :x86-64/call-rel32 :aarch64/bl-imm26)
                   label)]))
-            (encode-selected isa frame-bytes return-suffix instruction-index instruction))
+            (encode-selected isa frame-bytes return-suffix instruction-index
+                             load-multiplier? instruction))
           :mc/branch-zero
           (if (= :x86-64 isa)
             (concat (x86-rr 0x85 test test)
@@ -2548,8 +3033,18 @@
           [(layout/relative-branch
             (if (= :x86-64 isa) :x86-64/jmp-rel32 :aarch64/b-imm26)
             (:mc/target instruction))]
-          (reject! :mc-encode :unknown-operation instruction))))
-    (range) instructions)))
+          (reject! :mc-encode :unknown-operation instruction)))
+              next-multiplier
+              (cond
+                multiplier multiplier
+                (and (= :mc/instruction op)
+                     (contains? a64-x16-preserving-encodings encoding))
+                cached-a64-multiplier
+                :else nil)]
+          {:out (into out tokens)
+           :cached-a64-multiplier next-multiplier}))
+      {:out [] :cached-a64-multiplier nil}
+      (map-indexed vector instructions)))))
 
 (defn- qualify-function-locals [function-index tokens]
   (let [labels (->> tokens (filter layout/label-token?) (map :mir/id) set)
