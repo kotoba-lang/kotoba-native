@@ -2,13 +2,13 @@
  :deps {org.clojure/clojure {:mvn/version "1.12.0"}
         io.github.kotoba-lang/kotoba-kir
         {:git/url "https://github.com/kotoba-lang/kotoba-kir.git"
-         :git/sha "3263edd9c87f8bf14c0a076a43559bcdbcbf3ae4"}
+         :git/sha "f3d255b52f85040815057426f5da557714b09b3a"}
         io.github.kotoba-lang/kotoba-gmir
         {:git/url "https://github.com/kotoba-lang/kotoba-gmir.git"
-         :git/sha "fda440881495fef64dcc15d0265d6326a1cc75f9"}
+         :git/sha "820a3d01c80a4e38753632e2945f86e716ce054b"}
         io.github.kotoba-lang/kotoba-mir
         {:git/url "https://github.com/kotoba-lang/kotoba-mir.git"
-         :git/sha "3d2673472b6100d2928ac998c02709b4238c0058"}
+         :git/sha "dd7bbfdc364e1314f961ef90c223b17ac95eaea6"}
         io.github.kotoba-lang/kotoba-codegen
         {:git/url "https://github.com/kotoba-lang/kotoba-codegen.git"
          :git/sha "c85088bfe9dd85e9c6a65d986f34a651b2af7d13"}
