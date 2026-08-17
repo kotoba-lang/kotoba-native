@@ -136,12 +136,21 @@
 ;; own copy of the loop.
 (deftest the-argument-walk-pushes-once-per-argument
   (let [emit-pushed-arguments @#'kotoba.native.x86-64/emit-pushed-arguments
+        load-constant @#'kotoba.native.x86-64/load-constant
+        ;; The width of one argument is DERIVED from the encoding that emits it
+        ;; -- the constant, then one byte of `push rax` -- rather than written
+        ;; as a literal. It used to read 11, for `movabs rax,imm64` plus the
+        ;; push; `load-constant` now picks the narrowest form, so a literal
+        ;; here would have to be edited every time the encoder improves, and
+        ;; whoever edited it would be choosing a number that makes the test
+        ;; pass. Deriving it keeps the assertion exact -- a walk that skipped a
+        ;; push still fails -- without pinning a width nobody promised.
+        per-argument (+ (count (load-constant 0 0)) 1)
         ctx {:param-count 0 :pad? true :temp-depth 0 :tail? false
              :function-name 'main :function-names #{'main}}]
     (doseq [argc (range 1 6)]
       (testing (str argc " boolean arguments")
-        ;; Ten bytes of `movabs rax,imm64` plus one of `push rax`, per argument.
-        (is (= (* 11 argc)
+        (is (= (* per-argument argc)
                (count (emit-pushed-arguments (vec (repeat argc false)) {} ctx 0)))
             "every `false` argument is pushed")
         (is (= (count (emit-pushed-arguments (vec (repeat argc true)) {} ctx 0))

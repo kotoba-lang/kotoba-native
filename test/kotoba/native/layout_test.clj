@@ -113,8 +113,12 @@
              :exports ['main]
              :functions [{:name 'main :params ['p] :body '(if p 11 22)}]}
         code (:code (x86/emit-program kir))]
-    (is (= 53 (count code)))
-    (is (= 1 (count (filter #(= [0x0f 0x84 0x0e 0x00 0x00 0x00] %)
+    ;; 43 rather than 53, and a displacement of 9 rather than 14, because both
+    ;; arms materialize their constant with `mov r32,imm32` instead of `movabs
+    ;; r64,imm64`. The jz still lands on the else arm, which is the point: the
+    ;; displacement is taken from the sizes selection actually chose.
+    (is (= 43 (count code)))
+    (is (= 1 (count (filter #(= [0x0f 0x84 0x09 0x00 0x00 0x00] %)
                             (partition 6 1 code))))
         "jz uses final MC sizes to reach the returning else arm")
     (is (not-any? #(= 0xe9 %) code)

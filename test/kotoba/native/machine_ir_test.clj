@@ -781,8 +781,11 @@
     (is (= [0xed 0x00 0x80 0xd2] (first arm))
         "a repeated constant remains in the reserved leaf cache")
     (is (= 4 (count arm)))
-    (is (= [0x48 0xb9 0x07 0x00 0x00 0x00 0x00 0x00 0x00 0x00]
-           (subvec x86 3 13))
+    ;; `mov ecx,7` rather than `movabs rcx,7`: 7 fits in an unsigned 32-bit
+    ;; immediate and the narrower form zero-extends. The property this asserts
+    ;; is unchanged — the AArch64 leaf-constant cache did not reach across and
+    ;; rewrite the x86-64 selection — only the width x86-64 chooses for itself.
+    (is (= [0xb9 0x07 0x00 0x00 0x00] (subvec x86 3 8))
         "AArch64 selection does not rewrite x86-64")))
 
 (deftest v3-constant-division-selects-reciprocal-machine-code
@@ -886,11 +889,15 @@
 (deftest final-layout-resolves-branches-after-selected-instruction-sizes
   (let [x86 (machine/compile-expression :x86-64 ['p] '(if p 11 22))
         arm (machine/compile-expression :aarch64 ['p] '(if p 11 22))]
-    (is (= [0x0f 0x84 0x0e 0x00 0x00 0x00] (subvec x86 6 12))
+    ;; The displacement is 9 rather than 14 because the then arm is `mov
+    ;; eax,11` now instead of `movabs rax,11` — five bytes narrower. That the
+    ;; jz followed it is the property under test: layout resolved the branch
+    ;; from the final selected sizes, not from a width assumed beforehand.
+    (is (= [0x0f 0x84 0x09 0x00 0x00 0x00] (subvec x86 6 12))
         "x86 jz skips the selected then arm using next-PC rel32")
     (is (= [0x80 0x00 0x00 0xb4] (subvec arm 0 4))
         "AArch64 cbz x0 reaches the final else label at +16 bytes")
-    (is (= 40 (count x86)))
+    (is (= 30 (count x86)))
     (is (= 28 (count arm)))))
 
 (deftest kir-to-gmir-boundary-rejects-unsupported-shapes

@@ -56,6 +56,54 @@
                  out
                  (recur (inc i) (/ rem base) (conj out (js/Number (bit-and rem (js/BigInt 0xff))))))))))
 
+;; The narrowest x86-64 encoding that materializes VALUE into a low register.
+;; `movabs r64,imm64` is ten bytes whatever the value is, so a literal 1 costs
+;; the same as a literal 2^63. Two shorter forms cover almost every constant a
+;; program actually contains:
+;;
+;;   0 <= v <= 0xFFFFFFFF   mov r32,imm32     five bytes, zero-extends to 64
+;;   -2^31 <= v < 0         mov r64,imm32     seven bytes, sign-extends
+;;
+;; Both are chosen over `xor r32,r32` for zero on purpose: `xor` writes flags
+;; and every site here sits in an undelimited byte stream whose later
+;; instructions were written expecting a `mov`, which writes none. Five bytes
+;; that cannot change behaviour beat two that can.
+;;
+;; Shortening is only sound because every intra-function branch is a
+;; `kotoba.codegen.layout` token, so displacements are resolved after the final
+;; token sizes are known (see `kotoba.native.peephole`'s namespace docstring).
+;; The older comment on `emit-rhs-window` predates that and is corrected there.
+(defn- le32-of-i64
+  "The low four bytes of an i64 VALUE. Distinct from `le32`, which takes a
+  plain 32-bit number: a KIR i64 arrives as a BigInt under :cljs, where the
+  bitwise operators `le32` uses would throw."
+  [n]
+  #?(:clj (mapv #(bit-and (unsigned-bit-shift-right (long n) (* 8 %)) 0xff) (range 4))
+     :cljs (let [u (js/BigInt.asUintN 32 (i64/->bigint n))
+                 base (js/BigInt 256)]
+             (loop [i 0 rem u out []]
+               (if (= i 4)
+                 out
+                 (recur (inc i) (/ rem base) (conj out (js/Number (bit-and rem (js/BigInt 0xff))))))))))
+
+(defn- constant-width [n]
+  #?(:clj (let [v (long n)]
+            (cond (and (<= 0 v) (<= v 0xFFFFFFFF)) :zero-extended
+                  (and (<= -2147483648 v) (neg? v)) :sign-extended
+                  :else :full))
+     :cljs (let [v (i64/->bigint n)]
+             (cond (and (>= v (js/BigInt 0)) (<= v (js/BigInt "4294967295"))) :zero-extended
+                   (and (>= v (js/BigInt "-2147483648")) (< v (js/BigInt 0))) :sign-extended
+                   :else :full))))
+
+;; REGISTER is the 3-bit encoding (rax 0, rcx 1, ...); only the low eight are
+;; used by callers here, so no REX.B is needed for the zero-extended form.
+(defn- load-constant [register value]
+  (case (constant-width value)
+    :zero-extended (into [(+ 0xb8 register)] (le32-of-i64 value))
+    :sign-extended (into [0x48 0xc7 (+ 0xc0 register)] (le32-of-i64 value))
+    :full (into [0x48 (+ 0xb8 register)] (le64 value))))
+
 (def ^:private param-pushes [[0x57] [0x56] [0x52] [0x51] [0x41 0x50]])
 (def ^:private arg-pops [[0x5f] [0x5e] [0x5a] [0x59] [0x41 0x58]])
 (declare fresh-label)
@@ -300,7 +348,7 @@
 (defn- emit-rhs-window [right env ctx]
   (let [constant (peephole/constant-operand right)]
     (if (some? constant)
-      (into [0x48 0xb9] (le64 constant))
+      (load-constant 1 constant)
       (vec (concat binary-spill
                    (emit-expr right env (update ctx :temp-depth inc))
                    binary-reload)))))
@@ -858,7 +906,7 @@
   (let [length (count (utf8-bytes content))
         align? (even? temp-depth)]
     (vec (concat [{:string-literal content}] [0x50]       ; push offset (rax)
-                 (into [0x48 0xb8] (le64 length)) [0x50]    ; push length (rax)
+                 (load-constant 0 length) [0x50]    ; push length (rax)
                  [0x5a] [0x5e]                               ; pop rdx=length; pop rsi=offset
                  [0x41 0x51] (when align? [0x50])
                  [0x4c 0x89 0xcf 0x41 0xff 0x51 56]          ; rdi=r9; call [r9+56] (pair_new)
@@ -1248,7 +1296,7 @@
         payload-slots (reduce max 1 (map #(type-slot-width (:payload-type %)) branch-specs))
         [payload-code _ payload-end] (expand-binding '$variant-payload payload-expr env tail-ctx payload-depth)
         push-payload (vec (concat payload-code
-                                  (mapcat (fn [_] (concat (into [0x48 0xb8] (le64 0)) [0x50]))
+                                  (mapcat (fn [_] (concat (load-constant 0 0) [0x50]))
                                           (range (max 0 (- payload-slots (- payload-end payload-depth)))))))
         dispatch-depth (+ temp-depth 1 payload-slots)
         load-tag (load-let temp-depth dispatch-depth)
@@ -1333,7 +1381,7 @@
     ;; `kotoba.kir.cljs-i64`'s own namespace docstring) -- mirrors
     ;; `kotoba.wasm.core`'s identical dispatch guard.
     #?(:clj (integer? form) :cljs (or (i64/bigint-value? form) (integer? form)))
-    (into [0x48 0xb8] (le64 form))
+    (load-constant 0 form)
     ;; A literal `true`/`false` -- the only source of a genuine `:bool`
     ;; VALUE in this frontend's type system (see
     ;; `emit-record-get-of-new`'s own doc comment above) -- is just the i64
@@ -1342,7 +1390,7 @@
     ;; width from a full 8-byte word anywhere else. MUST be checked before
     ;; the generic `:else`, which would otherwise try to sequentially
     ;; destructure a bare boolean (`(let [[op & args] true])`) and throw.
-    (boolean? form) (into [0x48 0xb8] (le64 (if form 1 0)))
+    (boolean? form) (load-constant 0 (if form 1 0))
     (string? form) (emit-string-literal form ctx)
 
 ;; A keyword is carried as the same one-word `pair(offset,length)` handle a
@@ -1933,7 +1981,7 @@
          (let [content (:string-literal token) offset (get literal-offsets content)]
            (when-not offset
              (throw (ex-info "unknown x86-64 string literal" {:content content})))
-           (into [0x48 0xb8] (le64 offset)))
+           (load-constant 0 offset))
 
          :else [token])))))
 
