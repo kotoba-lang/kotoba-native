@@ -372,6 +372,48 @@
     (doseq [target [:x86-64 :aarch64]]
       (is (seq (:mc/functions (machine/compile-gmir target gmir))) target))))
 
+(deftest dataspace-provider-contract-lowers-through-the-module-pipeline
+  (let [request [:variant :kotoba.dataspace/request
+                 [[:assert [:record :kotoba.dataspace/assert
+                            [[:assertion :document] [:facet :i64]]]]
+                  [:retract [:record :kotoba.dataspace/retract
+                             [[:assertion :document] [:facet :i64]]]]
+                  [:observe [:record :kotoba.dataspace/observe
+                             [[:pattern :document] [:facet :i64]]]]
+                  [:facet-enter :bool]
+                  [:facet-leave :i64]]]
+        asserted [:record :kotoba.dataspace/asserted
+                  [[:count :i64] [:notices :document]]]
+        retracted [:record :kotoba.dataspace/retracted [[:count :i64]]]
+        matches [:record :kotoba.dataspace/matches
+                 [[:bindings :document] [:notices :document]]]
+        facet [:record :kotoba.dataspace/facet [[:id :i64]]]
+        error [:record :kotoba.dataspace/error
+               [[:code :keyword] [:message :string]]]
+        result [:variant :kotoba.dataspace/result
+                [[:asserted asserted] [:retracted retracted]
+                 [:matches matches] [:facet facet] [:error error]]]
+        body (list 'let ['answer
+                         (list 'typed-cap-call 24 request result
+                               (list 'variant-new request :facet-enter false))]
+                   (list 'variant-match result 'answer
+                         [[:asserted 'a (list 'record-get asserted 'a :count)]
+                          [:retracted 'r (list 'record-get retracted 'r :count)]
+                          [:matches 'm 0]
+                          [:facet 'f (list 'record-get facet 'f :id)]
+                          [:error 'e 0]]))
+        module {:format :kotoba.kir/v4 :entry 'main :exports ['main]
+                :functions [{:name 'main :params [] :param-types []
+                             :result :i64 :body body}]}
+        gmir (machine/lower-kir-module module)
+        calls (filter #(= :gmir/capability-call (:gmir/op %))
+                      (get-in gmir [:gmir/functions 0 :gmir/instructions]))]
+    (is (machine/pilot-module? module))
+    (is (= 1 (count calls)))
+    (is (= :dataspace-v1 (:gmir/kind (first calls))))
+    (doseq [target [:x86-64 :aarch64]]
+      (is (seq (:mc/functions (machine/compile-gmir target gmir))) target))))
+
 (deftest capability-call-encoders-check-policy-before-the-host-call
   (let [x86-scalar (machine/compile-expression :x86-64 '[x] '(cap-call 7 x))
         x86-typed (machine/compile-expression

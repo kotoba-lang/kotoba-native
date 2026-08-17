@@ -230,12 +230,59 @@
     [:monotonic native-clock-monotonic-type]
     [:error native-clock-error-type]]])
 
+(def ^:private native-dataspace-assert-type
+  [:record :kotoba.dataspace/assert
+   [[:assertion :document] [:facet :i64]]])
+
+(def ^:private native-dataspace-retract-type
+  [:record :kotoba.dataspace/retract
+   [[:assertion :document] [:facet :i64]]])
+
+(def ^:private native-dataspace-observe-type
+  [:record :kotoba.dataspace/observe
+   [[:pattern :document] [:facet :i64]]])
+
+(def ^:private native-dataspace-request-type
+  [:variant :kotoba.dataspace/request
+   [[:assert native-dataspace-assert-type]
+    [:retract native-dataspace-retract-type]
+    [:observe native-dataspace-observe-type]
+    [:facet-enter :bool]
+    [:facet-leave :i64]]])
+
+(def ^:private native-dataspace-asserted-type
+  [:record :kotoba.dataspace/asserted
+   [[:count :i64] [:notices :document]]])
+
+(def ^:private native-dataspace-retracted-type
+  [:record :kotoba.dataspace/retracted [[:count :i64]]])
+
+(def ^:private native-dataspace-matches-type
+  [:record :kotoba.dataspace/matches
+   [[:bindings :document] [:notices :document]]])
+
+(def ^:private native-dataspace-facet-type
+  [:record :kotoba.dataspace/facet [[:id :i64]]])
+
+(def ^:private native-dataspace-error-type
+  [:record :kotoba.dataspace/error
+   [[:code :keyword] [:message :string]]])
+
+(def ^:private native-dataspace-result-type
+  [:variant :kotoba.dataspace/result
+   [[:asserted native-dataspace-asserted-type]
+    [:retracted native-dataspace-retracted-type]
+    [:matches native-dataspace-matches-type]
+    [:facet native-dataspace-facet-type]
+    [:error native-dataspace-error-type]]])
+
 (def ^:private typed-capability-kinds
   {[:i64 :i64] :i64
    [:string :string] :string
    [:option-i64 :option-i64] :option-i64
    [:result-i64 :result-i64] :result-i64
-   [native-clock-request-type native-clock-result-type] :clock-v1})
+   [native-clock-request-type native-clock-result-type] :clock-v1
+   [native-dataspace-request-type native-dataspace-result-type] :dataspace-v1})
 
 (defn- capability-id
   "Return the closed host representation of an admitted capability id.
@@ -255,7 +302,7 @@
   "True for result descriptors represented by one native word. Escaping
   records and variants retain their explicit aggregate ABI boundary."
   [type]
-  (or (contains? #{nil :i64 :bool :f32 :f64 :string :keyword
+  (or (contains? #{nil :i64 :bool :f32 :f64 :string :keyword :document
                    :option-i64 :result-i64
                    :vector :vector-f64 :string-index} type)
       (and (vector? type)
@@ -289,12 +336,18 @@
 
 (defn- provider-record-fields [type]
   (when (contains? #{native-clock-wall-type native-clock-monotonic-type
-                     native-clock-error-type}
+                     native-clock-error-type
+                     native-dataspace-assert-type native-dataspace-retract-type
+                     native-dataspace-observe-type native-dataspace-asserted-type
+                     native-dataspace-retracted-type native-dataspace-matches-type
+                     native-dataspace-facet-type native-dataspace-error-type}
                    type)
     (nth type 2)))
 
 (defn- provider-variant-cases [type]
-  (when (contains? #{native-clock-request-type native-clock-result-type} type)
+  (when (contains? #{native-clock-request-type native-clock-result-type
+                     native-dataspace-request-type native-dataspace-result-type}
+                   type)
     (nth type 2)))
 
 (defn- variant-value? [value]
@@ -415,6 +468,12 @@
                           string-index-contains 2 string-index-get 2
                           string-index-assoc 3} op)))
            (normalize-surface-operations (string-index/lower op args))
+           ;; Native `:document` is a string-shaped pair handle over UTF-8
+           ;; EDN bytes. These casts are identity at the ABI; the host
+           ;; inject reads and interns the same pair.
+           (and (contains? '#{document-edn-read document-edn-print} op)
+                (= 1 (count args)))
+           (first args)
            :else form))))
    body))
 
@@ -639,9 +698,10 @@
    (some (fn [form]
            (and (seq? form) (= 'typed-cap-call (first form))
                 (= 5 (count form))
-                (= :clock-v1
-                   (get typed-capability-kinds [(nth form 2) (nth form 3)]))
-                (= 7 (second form))))
+                (let [kind (get typed-capability-kinds
+                                [(nth form 2) (nth form 3)])]
+                  (or (and (= :clock-v1 kind) (= 7 (second form)))
+                      (and (= :dataspace-v1 kind) (= 24 (second form)))))))
          (tree-seq coll? seq functions))))
 
 (defn- tail-constructed-record-types
