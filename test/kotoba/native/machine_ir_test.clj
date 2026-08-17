@@ -781,12 +781,16 @@
     (is (= [0xed 0x00 0x80 0xd2] (first arm))
         "a repeated constant remains in the reserved leaf cache")
     (is (= 4 (count arm)))
-    ;; `mov ecx,7` rather than `movabs rcx,7`: 7 fits in an unsigned 32-bit
-    ;; immediate and the narrower form zero-extends. The property this asserts
-    ;; is unchanged — the AArch64 leaf-constant cache did not reach across and
-    ;; rewrite the x86-64 selection — only the width x86-64 chooses for itself.
-    (is (= [0xb9 0x07 0x00 0x00 0x00] (subvec x86 3 8))
-        "AArch64 selection does not rewrite x86-64")))
+    ;; x86-64 no longer materializes the 7 at all: it folds into `add rdx,7`.
+    ;; The property under test is unchanged — the AArch64 leaf-constant cache
+    ;; did not reach across and impose its shape on x86-64 — but the evidence
+    ;; for it is now that x86-64 shows its OWN selection, an add-immediate,
+    ;; where AArch64 shows a cached constant register.
+    (is (= [0x48 0x89 0xc2 0x48 0x81 0xc2 0x07 0x00 0x00 0x00]
+           (subvec x86 3 13))
+        "x86-64 selects its own add-immediate rather than AArch64's shape")
+    (is (not-any? #{0xb8 0xb9} (subvec x86 3 13))
+        "and materializes no constant register on the way")))
 
 (deftest v3-constant-division-selects-reciprocal-machine-code
   (let [kir {:format :kotoba.kir/v3 :entry 'kernel :exports ['kernel]

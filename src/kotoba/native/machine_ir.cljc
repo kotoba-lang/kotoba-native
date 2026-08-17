@@ -1852,6 +1852,37 @@
 ;; offset that later encodes in five and trip the reserved-width check — which
 ;; is precisely what it is there to catch. Compile-time constants have no such
 ;; problem: their value is final before anything is sized.
+;; x86-64 folds a constant straight into add, sub and multiply, so the separate
+;; `mov reg,imm` that fed them disappears along with the register it occupied.
+;; Every one of these immediates is a sign-extended imm32, so a value outside
+;; the signed 32-bit range keeps the two-instruction form.
+;;
+;;   add r64,imm32   REX.W 81 /0 id
+;;   sub r64,imm32   REX.W 81 /5 id
+;;   imul r64,r64,imm32   REX.W 69 /r id   -- three-operand, so dst may differ
+;;                                            from the source and no move is
+;;                                            needed ahead of it either
+(defn- x86-imm32? [value]
+  #?(:clj (let [v (long value)] (and (<= -2147483648 v) (<= v 2147483647)))
+     :cljs (let [v (i64/->bigint value)]
+             (and (>= v (js/BigInt "-2147483648")) (<= v (js/BigInt "2147483647"))))))
+
+(defn- x86-alu-imm [slash dst value]
+  (let [d (get x86-register-code dst)]
+    (when-not (some? d) (reject! :mc-encode :unsupported-register {:dst dst}))
+    (into [(bit-or 0x48 (if (>= d 8) 1 0)) 0x81
+           (bit-or 0xc0 (bit-shift-left slash 3) (bit-and d 7))]
+          (x86-le32 value))))
+
+(defn- x86-imul-imm [dst src value]
+  (let [d (get x86-register-code dst)
+        s (get x86-register-code src)]
+    (when-not (and (some? d) (some? s))
+      (reject! :mc-encode :unsupported-register {:dst dst :src src}))
+    (into [(bit-or 0x48 (if (>= d 8) 4 0) (if (>= s 8) 1 0)) 0x69
+           (bit-or 0xc0 (bit-shift-left (bit-and d 7) 3) (bit-and s 7))]
+          (x86-le32 value))))
+
 (defn- x86-mov-imm-fixed [dst value]
   (let [d (get x86-register-code dst)]
     (when-not (some? d) (reject! :mc-encode :unsupported-register {:dst dst}))
@@ -2592,16 +2623,26 @@
       :native/data-dst (:mir/dst instruction) :native/data-target :x86-64}]
     :x86-64/add
     (let [dst (:mir/dst instruction) left (:mir/left instruction) right (:mir/right instruction)]
-      (vec (concat (when-not (= dst left) (x86-rr 0x89 dst left))
-                   (x86-rr 0x01 dst right))))
+      (if-let [immediate (:native/x86-immediate instruction)]
+        (vec (concat (when-not (= dst left) (x86-rr 0x89 dst left))
+                     (x86-alu-imm 0 dst immediate)))
+        (vec (concat (when-not (= dst left) (x86-rr 0x89 dst left))
+                     (x86-rr 0x01 dst right)))))
     :x86-64/subtract
     (let [dst (:mir/dst instruction) left (:mir/left instruction) right (:mir/right instruction)]
-      (vec (concat (when-not (= dst left) (x86-rr 0x89 dst left))
-                   (x86-rr 0x29 dst right))))
+      (if-let [immediate (:native/x86-immediate instruction)]
+        (vec (concat (when-not (= dst left) (x86-rr 0x89 dst left))
+                     (x86-alu-imm 5 dst immediate)))
+        (vec (concat (when-not (= dst left) (x86-rr 0x89 dst left))
+                     (x86-rr 0x29 dst right)))))
     :x86-64/multiply
     (let [dst (:mir/dst instruction) left (:mir/left instruction) right (:mir/right instruction)]
-      (vec (concat (when-not (= dst left) (x86-rr 0x89 dst left))
-                   (x86-rr-two-byte 0xaf dst right))))
+      (if-let [immediate (:native/x86-immediate instruction)]
+        ;; Three-operand imul reads `left` and writes `dst` in one instruction,
+        ;; so unlike add and sub it needs no move even when they differ.
+        (x86-imul-imm dst left immediate)
+        (vec (concat (when-not (= dst left) (x86-rr 0x89 dst left))
+                     (x86-rr-two-byte 0xaf dst right)))))
     :x86-64/quotient
     (x86-quotient (:mir/dst instruction) (:mir/left instruction)
                   (:mir/right instruction))
@@ -3048,6 +3089,51 @@
                         keys))))
            instructions)))
 
+;; The x86-64 sibling of `a64-fold-adjacent-add-sub-immediates`, extended to
+;; multiply because x86-64 has a three-operand `imul r64,r64,imm32` where
+;; AArch64 does not. Same shape and same safety condition: a constant may fold
+;; into the instruction that follows it only when that instruction is its one
+;; and only reader before the register is written again. Anything else — the
+;; register read twice, read later, or never — leaves both instructions alone.
+(defn- x86-fold-adjacent-immediates [instructions]
+  (letfn [(uses-before-redefinition [instructions register]
+            (loop [remaining instructions, uses 0]
+              (if-let [instruction (first remaining)]
+                (let [uses (+ uses (count (filter #{register}
+                                                  (a64-source-registers instruction))))]
+                  (if (= register (:mir/dst instruction))
+                    uses
+                    (recur (next remaining) uses)))
+                uses)))]
+    (loop [remaining instructions, out []]
+      (if-let [constant (first remaining)]
+        (let [consumer (second remaining)
+              register (:mir/dst constant)
+              op (:mc/encoding consumer)
+              constant? (= :x86-64/constant (:mc/encoding constant))
+              ;; `operand` is what survives as the instruction's own source once
+              ;; the constant is gone. Subtraction is not commutative, so only a
+              ;; constant on the right may fold; add and multiply take either.
+              operand
+              (cond
+                (and (#{:x86-64/add :x86-64/multiply} op) (= register (:mir/right consumer)))
+                (:mir/left consumer)
+                (and (#{:x86-64/add :x86-64/multiply} op) (= register (:mir/left consumer)))
+                (:mir/right consumer)
+                (and (= op :x86-64/subtract) (= register (:mir/right consumer)))
+                (:mir/left consumer))
+              foldable? (and constant?
+                             operand
+                             (x86-imm32? (:mir/value constant))
+                             (= 1 (uses-before-redefinition (next remaining) register)))]
+          (if foldable?
+            (recur (nnext remaining)
+                   (conj out (assoc consumer
+                                    :mir/left operand
+                                    :native/x86-immediate (:mir/value constant))))
+            (recur (next remaining) (conj out constant))))
+        (vec out)))))
+
 (defn- a64-cache-leaf-constants [instructions]
   ;; The cache registers are caller-saved. Restrict the transform to one
   ;; branchless leaf so no call or alternate entry can invalidate their value.
@@ -3117,10 +3203,11 @@
 
 (defn- instruction-tokens
   [isa frame-bytes return-suffix tail-suffix callee-labels instructions]
-  (let [instructions (if (= :aarch64 isa)
-                       (-> instructions
-                           a64-cache-leaf-constants
-                           a64-fold-adjacent-add-sub-immediates)
+  (let [instructions (case isa
+                       :aarch64 (-> instructions
+                                    a64-cache-leaf-constants
+                                    a64-fold-adjacent-add-sub-immediates)
+                       :x86-64 (x86-fold-adjacent-immediates instructions)
                        instructions)]
     (:out
      (reduce
