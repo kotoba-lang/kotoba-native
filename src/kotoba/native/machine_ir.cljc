@@ -1595,7 +1595,7 @@
                  :subtract-numerator? (and negative-divisor?
                                             (not (wide-neg? multiplier)))}))))))))
 
-(declare a64-register x86-mov-imm)
+(declare a64-register x86-mov-imm x86-mov-imm-fixed)
 
 (defn- x86-stack-memory [opcode register slot]
   (let [code (get x86-register-code register)
@@ -1811,10 +1811,63 @@
                                     (bit-and (get x86-register-code dst) 7))]))
                  (x86-movzx-byte dst)))))
 
-(defn- x86-mov-imm [dst value]
+;; `movabs r64,imm64` is ten bytes (eleven for r8-r15) whatever the value is,
+;; so a literal 1 costs exactly what 2^63 costs. Two narrower forms cover
+;; almost every constant a program contains:
+;;
+;;   0 <= v <= 0xFFFFFFFF   mov r32,imm32   five bytes, zero-extends to 64
+;;   -2^31 <= v < 0         mov r64,imm32   seven bytes, sign-extends
+;;
+;; `xor r32,r32` would encode zero in two, and is deliberately not used: it
+;; writes flags where a `mov` writes none, and these bytes land in a stream
+;; whose later instructions were emitted expecting no flag change.
+;;
+;; Narrowing is sound because every intra-function branch is a
+;; `kotoba.codegen.layout` token, so displacements resolve after final token
+;; sizes are known.
+(defn- x86-immediate-form [value]
+  #?(:clj (let [v (long value)]
+            (cond (and (<= 0 v) (<= v 0xFFFFFFFF)) :zero-extended
+                  (and (<= -2147483648 v) (neg? v)) :sign-extended
+                  :else :full))
+     :cljs (let [v (i64/->bigint value)]
+             (cond (and (>= v (js/BigInt 0)) (<= v (js/BigInt "4294967295"))) :zero-extended
+                   (and (>= v (js/BigInt "-2147483648")) (< v (js/BigInt 0))) :sign-extended
+                   :else :full))))
+
+(defn- x86-le32 [n]
+  #?(:clj (mapv #(bit-and (unsigned-bit-shift-right (long n) (* 8 %)) 0xff) (range 4))
+     :cljs (let [u (js/BigInt.asUintN 32 (i64/->bigint n))
+                 base (js/BigInt 256)]
+             (loop [i 0 rem u out []]
+               (if (= i 4)
+                 out
+                 (recur (inc i) (/ rem base)
+                        (conj out (js/Number (bit-and rem (js/BigInt 0xff))))))))))
+
+;; The full-width form, for values that are NOT final when their width is
+;; chosen. `resolve-program-layout` reserves a token's width from a first pass
+;; and then demands exactly that many bytes back; a data address is not known
+;; until the layout resolves, so narrowing it would reserve ten bytes for an
+;; offset that later encodes in five and trip the reserved-width check — which
+;; is precisely what it is there to catch. Compile-time constants have no such
+;; problem: their value is final before anything is sized.
+(defn- x86-mov-imm-fixed [dst value]
   (let [d (get x86-register-code dst)]
     (when-not (some? d) (reject! :mc-encode :unsupported-register {:dst dst}))
     (into [(bit-or 0x48 (if (>= d 8) 1 0)) (+ 0xb8 (bit-and d 7))] (le64 value))))
+
+(defn- x86-mov-imm [dst value]
+  (let [d (get x86-register-code dst)]
+    (when-not (some? d) (reject! :mc-encode :unsupported-register {:dst dst}))
+    (case (x86-immediate-form value)
+      :zero-extended (into (if (>= d 8) [0x41 (+ 0xb8 (bit-and d 7))] [(+ 0xb8 d)])
+                           (x86-le32 value))
+      :sign-extended (into [(bit-or 0x48 (if (>= d 8) 1 0)) 0xc7
+                            (bit-or 0xc0 (bit-and d 7))]
+                           (x86-le32 value))
+      :full (into [(bit-or 0x48 (if (>= d 8) 1 0)) (+ 0xb8 (bit-and d 7))]
+                  (le64 value)))))
 
 (defn- x86-compare [condition dst left right]
   (let [d (get x86-register-code dst)]
@@ -2822,7 +2875,7 @@
                 (if-let [content (:native/data-content token)]
                   (let [offset (get data-offsets content)]
                     (case (:native/data-target token)
-                      :x86-64 (x86-mov-imm (:native/data-dst token) offset)
+                      :x86-64 (x86-mov-imm-fixed (:native/data-dst token) offset)
                       :aarch64 (a64-constant-fixed (:native/data-dst token) offset)))
                   [token])))
         data (vec (mapcat utf8-bytes contents))]
