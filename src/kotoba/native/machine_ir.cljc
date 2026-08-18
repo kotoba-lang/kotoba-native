@@ -3201,6 +3201,46 @@
 ;; into the instruction that follows it only when that instruction is its one
 ;; and only reader before the register is written again. Anything else — the
 ;; register read twice, read later, or never — leaves both instructions alone.
+;; Once a constant is folded, the instruction that carries it reads its source
+;; through a form that accepts any register: three-operand `imul r64,r64,imm32`
+;; and `lea r64,[r64+disp32]` both name their source explicitly rather than
+;; operating in place. A copy feeding such an instruction is therefore
+;; redundant — `mov rcx,r11` then `imul r8,rcx,M` is `imul r8,r11,M`.
+;;
+;; The safety condition is the one the immediate folding already uses: the
+;; copy's destination must be read exactly once before it is written again. If
+;; anything else reads it, or reads it later, the copy is doing work and stays.
+;;
+;; Restricted to instructions that carry an immediate on purpose. Without one,
+;; add and subtract lower in place and genuinely need the copy; propagating
+;; into them would change which register the result lands in.
+(defn- x86-propagate-copies [instructions]
+  (letfn [(uses-before-redefinition [instructions register]
+            (loop [remaining instructions, uses 0]
+              (if-let [instruction (first remaining)]
+                (let [uses (+ uses (count (filter #{register}
+                                                  (a64-source-registers instruction))))]
+                  (if (= register (:mir/dst instruction))
+                    uses
+                    (recur (next remaining) uses)))
+                uses)))]
+    (loop [remaining instructions, out []]
+      (if-let [copy (first remaining)]
+        (let [consumer (second remaining)
+              copied (:mir/dst copy)
+              propagable? (and (= :x86-64/move (:mc/encoding copy))
+                               (some? (:mir/src copy))
+                               (contains? #{:x86-64/multiply :x86-64/add :x86-64/subtract}
+                                          (:mc/encoding consumer))
+                               (some? (:native/x86-immediate consumer))
+                               (= copied (:mir/left consumer))
+                               (= 1 (uses-before-redefinition (next remaining) copied)))]
+          (if propagable?
+            (recur (nnext remaining)
+                   (conj out (assoc consumer :mir/left (:mir/src copy))))
+            (recur (next remaining) (conj out copy))))
+        (vec out)))))
+
 (defn- x86-fold-adjacent-immediates [instructions]
   (letfn [(uses-before-redefinition [instructions register]
             (loop [remaining instructions, uses 0]
@@ -3313,7 +3353,9 @@
                        :aarch64 (-> instructions
                                     a64-cache-leaf-constants
                                     a64-fold-adjacent-add-sub-immediates)
-                       :x86-64 (x86-fold-adjacent-immediates instructions)
+                       :x86-64 (-> instructions
+                                 x86-fold-adjacent-immediates
+                                 x86-propagate-copies)
                        instructions)]
     (:out
      (reduce

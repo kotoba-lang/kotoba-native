@@ -823,19 +823,23 @@
     (is (= [0xed 0x00 0x80 0xd2] (first arm))
         "a repeated constant remains in the reserved leaf cache")
     (is (= 4 (count arm)))
-    ;; x86-64 no longer materializes the 7 at all: it folds into `add rdx,7`.
-    ;; The property under test is unchanged — the AArch64 leaf-constant cache
-    ;; did not reach across and impose its shape on x86-64 — but the evidence
-    ;; for it is now that x86-64 shows its OWN selection, an add-immediate,
-    ;; where AArch64 shows a cached constant register.
-    ;; `lea rdx,[rax+7]` rather than `mov rdx,rax` then `add rdx,7`: one
-    ;; instruction and seven bytes instead of two and ten. Still x86-64's own
-    ;; selection, which is what this guards; AArch64 shows a cached constant
-    ;; register here and reaches nothing on this side.
-    (is (= [0x48 0x8d 0x90 0x07 0x00 0x00 0x00]
-           (subvec x86 3 10))
+    ;; The whole function, stated whole, because it is now small enough to be:
+    ;;
+    ;;   lea rdx,[rdi+7]   the parameter read straight into address arithmetic
+    ;;   mov rax,rdx       the result into the return register
+    ;;   ret
+    ;;
+    ;; It began as a constant materialized into a register, a copy, and an add.
+    ;; Folding removed the materialization, `lea` removed the add, and copy
+    ;; propagation removed the copy — three passes, each of which left this
+    ;; assertion stale, which is why it is now the entire body rather than a
+    ;; window at an offset that moves every time the code gets shorter.
+    ;;
+    ;; What it guards is unchanged: AArch64 shows a cached constant register
+    ;; here, and none of that reaches x86-64, which selects for itself.
+    (is (= [0x48 0x8d 0x97 0x07 0x00 0x00 0x00 0x48 0x89 0xd0 0xc3] x86)
         "x86-64 selects its own address arithmetic rather than AArch64's shape")
-    (is (not-any? #{0xb8 0xb9} (subvec x86 3 13))
+    (is (not-any? #{0xb8 0xb9} x86)
         "and materializes no constant register on the way")))
 
 (deftest v3-constant-division-selects-reciprocal-machine-code
