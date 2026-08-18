@@ -60,9 +60,91 @@
               (recur (inc index) (conj out multiply))))
           (recur (inc index) (conj out multiply)))))))
 
+(def ^:private a64-direct-result-ops
+  ;; These instructions read every source before writing dst and accept any
+  ;; allocated GPR as that destination. Keep the set closed: calls, checked
+  ;; memory, and private-scratch encoders need their own aliasing proof.
+  #{:mir/constant :mir/add :mir/subtract :mir/multiply
+    :mir/multiply-add :mir/multiply-subtract :mir/quotient-constant
+    :mir/bit-and :mir/bit-or :mir/bit-xor
+    :mir/shift-left :mir/shift-right-signed :mir/shift-right-unsigned
+    :mir/equal :mir/less-than :mir/greater-than
+    :mir/less-or-equal :mir/greater-or-equal})
+
+(defn- a64-source-registers-mir [instruction]
+  (mapcat (fn [key]
+            (let [value (get instruction key)]
+              (cond (vector? value) value
+                    (keyword? value) [value]
+                    :else [])))
+          [:mir/test :mir/value :mir/src :mir/input :mir/left :mir/right
+           :mir/addend :mir/base :mir/length :mir/index :mir/stored
+           :mir/offset :mir/size :mir/arguments]))
+
+(defn- a64-used-before-definition?
+  [instructions register]
+  (loop [remaining instructions]
+    (when-let [instruction (first remaining)]
+      (cond
+        (some #{register} (a64-source-registers-mir instruction)) true
+        (= register (:mir/dst instruction)) false
+        :else (recur (next remaining))))))
+
+(defn- a64-coalesce-direct-results [instructions]
+  ;; Phi elimination leaves a producer, an optional edge label, a move into
+  ;; the phi register, and an unconditional jump. AArch64's three-operand
+  ;; forms can write the phi register directly. The target-block liveness
+  ;; check is essential: the physical source register may name another live
+  ;; allocation after the join even though the edge move is adjacent.
+  (let [instructions (vec instructions)
+        labels (into {} (keep-indexed (fn [index instruction]
+                                        (when (= :mir/label (:mir/op instruction))
+                                          [(:mir/id instruction) index]))
+                                      instructions))]
+    (loop [index 0, out []]
+      (if (>= index (count instructions))
+        (vec out)
+        (let [producer (get instructions index)
+              after-labels (loop [candidate (inc index)]
+                             (if (= :mir/label
+                                    (:mir/op (get instructions candidate)))
+                               (recur (inc candidate))
+                               candidate))
+              move (get instructions after-labels)
+              jump (get instructions (inc after-labels))
+              source (:mir/dst producer)
+              target-index (get labels (:mir/target jump))
+              edge? (and (contains? a64-direct-result-ops (:mir/op producer))
+                         (= :mir/move (:mir/op move))
+                         (= source (:mir/src move))
+                         (= :mir/jump (:mir/op jump))
+                         target-index
+                         (not (a64-used-before-definition?
+                               (subvec instructions (inc target-index)) source)))
+              return (get instructions (inc index))
+              return? (and (contains? a64-direct-result-ops (:mir/op producer))
+                           (= :mir/return (:mir/op return))
+                           (= source (:mir/value return)))]
+          (cond
+            edge?
+            (recur (inc after-labels)
+                   (into out
+                         (concat [(assoc producer :mir/dst (:mir/dst move))]
+                                 (subvec instructions (inc index) after-labels))))
+
+            return?
+            (recur (+ index 2)
+                   (conj out (assoc producer :mir/dst :aarch64/x0)
+                         (assoc return :mir/value :aarch64/x0)))
+
+            :else
+            (recur (inc index) (conj out producer))))))))
+
 (defn- lower-mc-instructions [isa instructions]
   (let [instructions (if (= :aarch64 isa)
-                       (a64-fuse-multiplies instructions)
+                       (-> instructions
+                           a64-fuse-multiplies
+                           a64-coalesce-direct-results)
                        instructions)]
   (mapv (fn [{:mir/keys [op id test] :as instruction}]
           (case op
