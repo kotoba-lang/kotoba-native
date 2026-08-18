@@ -1320,6 +1320,15 @@
     {:name 'main :params ['x] :result :i64
      :body '(let [live 10] (+ live (add-one x)))}]})
 
+(def scalar-call-branch-kir
+  {:format :kotoba.kir/v4
+   :exports ['main]
+   :functions
+   [{:name 'add-one :params ['x] :result :i64 :body '(+ x 1)}
+    {:name 'main :params ['x] :result :i64
+     :body '(let [live 10]
+              (if (= x 0) 0 (+ live (add-one x))))}]})
+
 (def four-argument-call-kir
   {:format :kotoba.kir/v4
    :exports ['main]
@@ -1457,6 +1466,22 @@
         (is (= 1 (count (filter #(= (keyword (name target) "call")
                                      (:mc/encoding %))
                                 (:mc/instructions caller)))) target)))))
+
+(deftest kir-call-with-control-flow-stays-on-the-call-live-frame
+  (let [gmir (machine/lower-kir-module scalar-call-branch-kir)]
+    (doseq [target [:x86-64 :aarch64]]
+      (let [mc (machine/compile-gmir target gmir)
+            caller (second (:mc/functions mc))
+            straight (second (:mc/functions
+                              (machine/compile-gmir target
+                                                    (machine/lower-kir-module
+                                                     scalar-call-kir))))]
+        (is (= :call-live (:mc/frame-policy caller)) target)
+        (is (< (:mc/frame-slots caller) 6) target)
+        (is (<= (:mc/frame-slots caller) (+ 2 (:mc/frame-slots straight)))
+            (str target " does not inflate the frame to all-vreg because of one if"))
+        (is (seq (:code (machine/compile-kir-module target scalar-call-branch-kir)))
+            target)))))
 
 (deftest tail-position-direct-calls-lower-to-terminal-non-linking-transfer
   (let [gmir (machine/lower-kir-module four-argument-call-kir)
