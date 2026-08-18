@@ -1758,7 +1758,7 @@
                  [0x48 0x99 0x48 0xf7 0xf9]
                  restore))))
 
-(defn- x86-quotient-constant [dst left divisor reciprocal-live?]
+(defn- x86-quotient-constant [dst left divisor reciprocal-live? result-in-r11?]
   (if-let [{:keys [multiplier shift add-numerator? subtract-numerator?]}
            (signed-division-magic divisor)]
     ;; RAX and RDX are saved because `imul r10` writes both and MIR declares
@@ -1805,7 +1805,7 @@
         (x86-rr 0x01 :x86-64/r11 :x86-64/rdx)
         (x86-pop :x86-64/rdx)
         (x86-pop :x86-64/rax)
-        (when-not (= dst :x86-64/r11)
+        (when-not (or result-in-r11? (= dst :x86-64/r11))
           (x86-rr 0x89 dst :x86-64/r11)))))
     ;; Zero and +/-1 retain the established hardware guards. They are uncommon
     ;; in real optimized code and keeping one path prevents special-case trap
@@ -2758,7 +2758,8 @@
     :x86-64/quotient-constant
     (x86-quotient-constant (:mir/dst instruction) (:mir/left instruction)
                            (:mir/divisor instruction)
-                           (:native/x86-reciprocal-live instruction))
+                           (:native/x86-reciprocal-live instruction)
+                           (:native/x86-result-in-r11 instruction))
     :x86-64/bit-and
     (let [dst (:mir/dst instruction) left (:mir/left instruction) right (:mir/right instruction)]
       (vec (concat (when-not (= dst left) (x86-rr 0x89 dst left))
@@ -3218,6 +3219,52 @@
 ;; Restricted to instructions that carry an immediate on purpose. Without one,
 ;; add and subtract lower in place and genuinely need the copy; propagating
 ;; into them would change which register the result lands in.
+;; A constant division leaves its answer in R11 and then moves it to whatever
+;; `dst` the allocator chose. That move sits on the dependency chain — the next
+;; instruction cannot start until it retires — and it is unnecessary whenever
+;; the reader is a form that names its source explicitly, which the folded
+;; three-operand shapes all are.
+;;
+;; So: when the division's destination is read exactly once, by the instruction
+;; immediately after it, in a slot that accepts any register, the reader is
+;; pointed at R11 and the division is told to skip its move. R11 is outside the
+;; allocator's four registers, and the reader writes its own `dst`, so nothing
+;; can be holding R11 across the gap.
+(defn- x86-quotient-result-in-place [instructions]
+  (letfn [(uses-before-redefinition [instructions register]
+            (loop [remaining instructions, uses 0]
+              (if-let [instruction (first remaining)]
+                (let [uses (+ uses (count (filter #{register}
+                                                  (a64-source-registers instruction))))]
+                  (if (= register (:mir/dst instruction))
+                    uses
+                    (recur (next remaining) uses)))
+                uses)))]
+    (loop [remaining instructions, out []]
+      (if-let [division (first remaining)]
+        (let [reader (second remaining)
+              produced (:mir/dst division)
+              slot (cond (= produced (:mir/left reader)) :mir/left
+                         (= produced (:mir/right reader)) :mir/right)
+              in-place?
+              (and (= :x86-64/quotient-constant (:mc/encoding division))
+                   (not= :x86-64/r11 produced)
+                   (contains? #{:x86-64/multiply :x86-64/add :x86-64/subtract}
+                              (:mc/encoding reader))
+                   (some? (:native/x86-immediate reader))
+                   ;; only `left` is a free source slot on the folded forms;
+                   ;; `right` is the operand the immediate replaced and is not read
+                   (= :mir/left slot)
+                   (not= :x86-64/r11 (:mir/dst reader))
+                   (= 1 (uses-before-redefinition (next remaining) produced)))]
+          (if in-place?
+            (recur (nnext remaining)
+                   (conj out
+                         (assoc division :native/x86-result-in-r11 true)
+                         (assoc reader :mir/left :x86-64/r11)))
+            (recur (next remaining) (conj out division))))
+        (vec out)))))
+
 (def ^:private x86-reciprocal-cache-safe-encodings
   ;; Closed on purpose, the way `a64-leaf-cache-safe-encodings` is closed. R10
   ;; survives from one constant division to the next only across encodings that
@@ -3401,6 +3448,7 @@
                        :x86-64 (-> instructions
                                  x86-fold-adjacent-immediates
                                  x86-propagate-copies
+                                 x86-quotient-result-in-place
                                  x86-hoist-repeated-reciprocal)
                        instructions)]
     (:out
