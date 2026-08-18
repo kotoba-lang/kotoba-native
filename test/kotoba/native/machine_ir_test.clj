@@ -39,7 +39,8 @@
   (let [leaf (mapv vec (partition 4
                                 (machine/compile-expression
                                  :aarch64 ['n]
-                                 '(let [a (+ n 7) b (* a 7)] (+ b 7)))))
+                                 '(let [a (bit-and n 7) b (bit-or a 7)]
+                                    (bit-xor b 7)))))
         branched (mapv vec (partition 4
                                     (machine/compile-expression
                                      :aarch64 ['n]
@@ -154,15 +155,29 @@
             (= ra 31) :mul
             :else :madd))))
 
+(deftest aarch64-fusion-rejects-a-multiply-with-two-add-users
+  (let [program
+        (machine/lower-mc
+         {:mir/version 1 :mir/target :aarch64 :mir/registers :physical
+          :mir/frame-slots 0
+          :mir/instructions
+          [{:mir/op :mir/multiply :mir/dst :aarch64/x2
+            :mir/left :aarch64/x0 :mir/right :aarch64/x1}
+           {:mir/op :mir/add :mir/dst :aarch64/x3
+            :mir/left :aarch64/x2 :mir/right :aarch64/x4}
+           {:mir/op :mir/add :mir/dst :aarch64/x5
+            :mir/left :aarch64/x2 :mir/right :aarch64/x6}
+           {:mir/op :mir/return :mir/value :aarch64/x5}]})]
+    (is (some #{:aarch64/multiply}
+              (map :mc/encoding (:mc/instructions program))))
+    (is (not-any? #{:aarch64/multiply-add}
+                  (map :mc/encoding (:mc/instructions program))))))
+
 (deftest aarch64-fuses-multiply-add-after-leaf-cache-on-offset-lanes
-  ;; `(+ (* (+ n k) C) 1)` across several k reuses C and 1. Before the leaf
-  ;; cache those constants land on the multiply's own registers and MIR
-  ;; fusion refuses the "clobber". The cache later pins them in x13-x15 and
-  ;; deletes the duplicates, so the bytes are adjacent mul+add. Encoding
-  ;; fusion after the cache emits MADD. Serial `v = v*C+1` already fused at
-  ;; MIR; the offset-lane shape is what kernel_wide.kotoba actually emits.
-  ;; Discriminate on encoded bytes: `:mc/instructions` still shows the
-  ;; MIR-time refusal (validate! cannot see x13-x15).
+  ;; `(+ (* (+ n k) C) 1)` across several k reuses C and 1. Distribute
+  ;; `(n+k)*C` to `n*C+(k*C)`, fold the trailing +1, and GVN the shared
+  ;; `n*C`. Round 1 is then 1 MUL and 8 constant adds — the product has
+  ;; eight users, so fusion must refuse (wrong-code if it madds).
   (let [form '(let [a (+ (* n 48271) 1)
                     b (+ (* (+ n 1) 48271) 1)
                     c (+ (* (+ n 2) 48271) 1)
@@ -172,22 +187,27 @@
                     g (+ (* (+ n 6) 48271) 1)
                     h (+ (* (+ n 7) 48271) 1)]
                 (+ (+ (+ a b) (+ c d)) (+ (+ e f) (+ g h))))
-        arm (machine/compile-gmir
-             :aarch64 (machine/lower-kir-expression ['n] form))
-        encodings (keep :mc/encoding (:mc/instructions arm))
+        gmir (machine/lower-kir-expression ['n] form)
+        insts (:gmir/instructions gmir)
+        arg (some #(when (= :gmir/argument (:gmir/op %)) (:gmir/dst %)) insts)
+        muls (filterv #(= :gmir/multiply (:gmir/op %)) insts)
         kinds (keep a64-mul-kind
                     (a64-le-words (machine/compile-expression :aarch64 ['n] form)))]
-    (is (pos? (count (filter #{:aarch64/multiply} encodings)))
-        "MIR fusion still refuses the offset lanes; the cache has not run")
-    (is (= 8 (count (filter #{:madd} kinds)))
-        "each of the eight lanes is a MADD in the encoded bytes")
-    (is (zero? (count (filter #{:mul} kinds)))
-        "no unfused multiply remains once 48271 and 1 are cached")))
+    (is (= 1 (count muls)) "eight lanes share one n*C")
+    (is (contains? #{(:gmir/left (first muls)) (:gmir/right (first muls))} arg)
+        "the multiply's non-constant operand is the argument, not n+k")
+    (is (some #(= 337898 (:gmir/value %)) insts)
+        "lane k=7 folds to the wrapping i64 7*48271+1")
+    (is (= 1 (count (filter #{:mul} kinds)))
+        "encoded bytes keep the shared product")
+    (is (zero? (count (filter #{:madd} kinds)))
+        "fusing a reused product would drop the mul while later adds read it")))
 
-(deftest aarch64-kernel-wide-encodes-sixteen-madds-after-leaf-cache
+(deftest aarch64-kernel-wide-encodes-one-mul-and-eight-madds-after-reassoc
   ;; Production path: compile-kir-module, not the v2 expression helper.
-  ;; Sixteen Lehmer steps (8 lanes × 2 rounds). Remainder is SMULH/MSUB and
-  ;; must not be counted as MUL. Break: 15 of the 16 steps stay mul+add.
+  ;; Round 1 CSEs to one n*C (MUL, eight constant adds). Round 2 is still
+  ;; unique-use serial a0*C+1 (8 MADD). Remainder is SMULH/MSUB and must
+  ;; not be counted as MUL.
   (let [body '(let [v_a0 (+ (* n 48271) 1)
                     a0 (- v_a0 (* (quot v_a0 2147483647) 2147483647))
                     v_b0 (+ (* (+ n 1) 48271) 1)
@@ -226,8 +246,38 @@
         kinds (keep a64-mul-kind
                     (a64-le-words
                      (:code (machine/compile-kir-module :aarch64 kir))))]
-    (is (= 16 (count (filter #{:madd} kinds))))
-    (is (zero? (count (filter #{:mul} kinds))))))
+    (is (= 8 (count (filter #{:madd} kinds)))
+        "round 2 remains unique-use madd")
+    (is (= 1 (count (filter #{:mul} kinds)))
+        "round 1 is one shared n*C")))
+
+(deftest gmir-keeps-an-independently-live-offset-add
+  (let [form '(let [s (+ n 1)] (+ s (* s 48271)))
+        insts (:gmir/instructions (machine/lower-kir-expression ['n] form))
+        arg (some #(when (= :gmir/argument (:gmir/op %)) (:gmir/dst %)) insts)
+        const-1 (some (fn [instruction]
+                        (when (and (= :gmir/constant (:gmir/op instruction))
+                                   (= 1 (:gmir/value instruction)))
+                          (:gmir/dst instruction)))
+                      insts)]
+    (is (some (fn [instruction]
+                (when (= :gmir/add (:gmir/op instruction))
+                  (let [ops #{(:gmir/left instruction) (:gmir/right instruction)}]
+                    (and (contains? ops arg)
+                         (contains? ops const-1)))))
+              insts)
+        "distribution of s*C does not delete the live n+1")
+    (is (= 1 (count (filter #(= :gmir/multiply (:gmir/op %)) insts))))))
+
+(deftest gmir-distributes-offset-mul-with-wrapping-i64
+  (let [form '(* (+ n 2) 9223372036854775807)
+        insts (:gmir/instructions (machine/lower-kir-expression ['n] form))
+        arg (some #(when (= :gmir/argument (:gmir/op %)) (:gmir/dst %)) insts)
+        muls (filterv #(= :gmir/multiply (:gmir/op %)) insts)]
+    (is (= 1 (count muls)))
+    (is (contains? #{(:gmir/left (first muls)) (:gmir/right (first muls))} arg))
+    (is (some #(= -2 (:gmir/value %)) insts)
+        "2*Long/MAX_VALUE wraps to -2; Clojure * would become a BigInt")))
 
 
 (deftest aarch64-coalesces-phi-edge-and-return-moves-into-direct-results
@@ -960,9 +1010,9 @@
         arm (mapv vec (partition 4
                                (machine/compile-expression :aarch64 ['n] form)))
         x86 (machine/compile-expression :x86-64 ['n] '(+ n 7))]
-    (is (= [0xed 0x00 0x80 0xd2] (first arm))
-        "a repeated constant remains in the reserved leaf cache")
-    (is (= 4 (count arm)))
+    (is (= [0x00 0x38 0x00 0x91] (first arm))
+        "add-of-add-const folds to ADD X0,X0,#14; 7 is no longer repeated")
+    (is (= 2 (count arm)))
     ;; The whole function, stated whole, because it is now small enough to be:
     ;;
     ;;   lea rdx,[rdi+7]   the parameter read straight into address arithmetic

@@ -47,6 +47,28 @@
                                  :mir/multiply-subtract
                                  :mir/multiply-add)))))))
 
+(declare a64-source-registers-mir)
+
+(defn- a64-product-use-count
+  "Uses of `product` after `after`, stopping when a later dst kills it.
+
+  Physical registers are reused. Counting to the end of the function
+  treats a later live-range as a use of this product and would refuse
+  a unique-use MADD (the `(+ (* n 7) 1)` then `(- v (* n 3))` shape)."
+  [instructions after product]
+  (loop [remaining (seq (subvec (vec instructions) after))
+         uses 0]
+    (if-not remaining
+      uses
+      (let [instruction (first remaining)
+            used? (boolean (some #{product} (a64-source-registers-mir instruction)))
+            killed? (= product (:mir/dst instruction))]
+        (cond
+          (and used? killed?) (inc uses)
+          killed? uses
+          used? (recur (next remaining) (inc uses))
+          :else (recur (next remaining) uses))))))
+
 (defn- a64-fuse-multiplies [instructions]
   (loop [index 0, out []]
     (if (>= index (count instructions))
@@ -64,7 +86,9 @@
                 protected (set [(:mir/dst multiply) (:mir/left multiply)
                                 (:mir/right multiply)])
                 unclobbered? (not-any? #(contains? protected (:mir/dst %)) between)
-                fused (when unclobbered?
+                product (:mir/dst multiply)
+                unique-use? (= 1 (a64-product-use-count instructions after product))
+                fused (when (and unclobbered? unique-use?)
                         (a64-fused-multiply multiply
                                             (get instructions consumer-index)))]
             (if fused
@@ -829,6 +853,205 @@
       (reject! :record-boundary :result-schema-mismatch
                {:function name :result result :constructed type}))))
 
+(defn- i64-mul [a b]
+  #?(:clj (unchecked-multiply (long a) (long b))
+     :cljs (i64/wrap-i64 (* (i64/->bigint a) (i64/->bigint b)))))
+
+(defn- i64-add [a b]
+  #?(:clj (unchecked-add (long a) (long b))
+     :cljs (i64/wrap-i64 (+ (i64/->bigint a) (i64/->bigint b)))))
+
+(def ^:private gmir-source-keys
+  [:gmir/test :gmir/value :gmir/src :gmir/input :gmir/left :gmir/right
+   :gmir/addend :gmir/base :gmir/length :gmir/index :gmir/stored
+   :gmir/offset :gmir/size :gmir/arguments])
+
+(def ^:private gmir-block-boundary
+  #{:gmir/label :gmir/branch-zero :gmir/jump})
+
+(def ^:private gmir-dce-ops
+  ;; Only drop the arithmetic this pass introduces. Quotient and other
+  ;; trapping ops stay even when their dst is unread (ordered `do`).
+  #{:gmir/constant :gmir/add})
+
+(defn- gmir-source-registers [instruction]
+  (concat
+   (mapcat (fn [key]
+             (let [value (get instruction key)]
+               (cond (vector? value) (filter gmir/vreg? value)
+                     (gmir/vreg? value) [value]
+                     :else [])))
+           gmir-source-keys)
+   (keep (fn [incoming]
+           (when (gmir/vreg? (:gmir/value incoming))
+             (:gmir/value incoming)))
+         (:gmir/incomings instruction))))
+
+(defn- gmir-defs [instructions]
+  (into {} (keep (fn [instruction]
+                   (when-let [dst (:gmir/dst instruction)]
+                     [dst instruction]))
+                 instructions)))
+
+(defn- const-i64 [defs v]
+  (let [instruction (get defs v)]
+    (when (and instruction
+               (= :gmir/constant (:gmir/op instruction))
+               (gmir/i64-value? (:gmir/value instruction)))
+      (:gmir/value instruction))))
+
+(defn- add-const-base [defs v]
+  (let [instruction (get defs v)]
+    (when (and instruction (= :gmir/add (:gmir/op instruction)))
+      (let [left (:gmir/left instruction)
+            right (:gmir/right instruction)
+            left-k (const-i64 defs left)
+            right-k (const-i64 defs right)]
+        (cond (and (some? right-k) (nil? left-k)) [left right-k]
+              (and (some? left-k) (nil? right-k)) [right left-k]
+              :else nil)))))
+
+(defn- remap-gmir-sources [instruction aliases]
+  (let [rename (fn [v] (get aliases v v))
+        rename-maybe (fn [v]
+                       (cond (vector? v) (mapv rename v)
+                             (gmir/vreg? v) (rename v)
+                             :else v))]
+    (cond-> (reduce (fn [out key]
+                      (if (contains? out key)
+                        (update out key rename-maybe)
+                        out))
+                    instruction
+                    gmir-source-keys)
+      (:gmir/incomings instruction)
+      (update :gmir/incomings
+              (fn [incomings]
+                (mapv (fn [incoming]
+                        (if (gmir/vreg? (:gmir/value incoming))
+                          (update incoming :gmir/value rename)
+                          incoming))
+                      incomings))))))
+
+(defn- distribute-const-offset-multiplies [instructions next-reg]
+  (let [defs (gmir-defs instructions)]
+    (vec
+     (mapcat
+      (fn [instruction]
+        (if-not (= :gmir/multiply (:gmir/op instruction))
+          [instruction]
+          (let [left (:gmir/left instruction)
+                right (:gmir/right instruction)
+                left-k (const-i64 defs left)
+                right-k (const-i64 defs right)
+                offset (cond (and (some? right-k) (nil? left-k))
+                             (when-let [base (add-const-base defs left)]
+                               {:base (first base) :k (second base)
+                                :c right-k :c-reg right})
+                             (and (some? left-k) (nil? right-k))
+                             (when-let [base (add-const-base defs right)]
+                               {:base (first base) :k (second base)
+                                :c left-k :c-reg left}))]
+            (if-not offset
+              [instruction]
+              (let [product (next-reg)
+                    folded (next-reg)
+                    kC (i64-mul (:k offset) (:c offset))]
+                [{:gmir/op :gmir/multiply :gmir/dst product
+                  :gmir/left (:base offset) :gmir/right (:c-reg offset)}
+                 {:gmir/op :gmir/constant :gmir/dst folded :gmir/value kC}
+                 {:gmir/op :gmir/add :gmir/dst (:gmir/dst instruction)
+                  :gmir/left product :gmir/right folded}])))))
+      instructions))))
+
+(defn- fold-add-of-add-const [instructions next-reg]
+  (let [defs (gmir-defs instructions)]
+    (vec
+     (mapcat
+      (fn [instruction]
+        (if-not (= :gmir/add (:gmir/op instruction))
+          [instruction]
+          (let [left (:gmir/left instruction)
+                right (:gmir/right instruction)
+                left-k (const-i64 defs left)
+                right-k (const-i64 defs right)
+                inner (cond (some? right-k) (add-const-base defs left)
+                            (some? left-k) (add-const-base defs right)
+                            :else nil)
+                outer-k (or right-k left-k)]
+            (if-not (and inner (some? outer-k))
+              [instruction]
+              (let [folded (next-reg)
+                    sum (i64-add (second inner) outer-k)]
+                [{:gmir/op :gmir/constant :gmir/dst folded :gmir/value sum}
+                 {:gmir/op :gmir/add :gmir/dst (:gmir/dst instruction)
+                  :gmir/left (first inner) :gmir/right folded}])))))
+      instructions))))
+
+(defn- gvn-const-multiplies [instructions]
+  (loop [remaining instructions
+         mul-by {}
+         aliases {}
+         out []]
+    (if-not (seq remaining)
+      (->> out
+           (mapv #(remap-gmir-sources % aliases)))
+      (let [instruction (first remaining)]
+        (cond
+          (contains? gmir-block-boundary (:gmir/op instruction))
+          (recur (next remaining) {} aliases (conj out instruction))
+
+          (not= :gmir/multiply (:gmir/op instruction))
+          (recur (next remaining) mul-by aliases (conj out instruction))
+
+          :else
+          (let [defs (gmir-defs (concat out remaining))
+                left (:gmir/left instruction)
+                right (:gmir/right instruction)
+                left-k (const-i64 defs left)
+                right-k (const-i64 defs right)
+                key (cond (some? right-k) [left right-k]
+                          (some? left-k) [right left-k])]
+            (if-not key
+              (recur (next remaining) mul-by aliases (conj out instruction))
+              (if-let [canonical (get mul-by key)]
+                (recur (next remaining) mul-by
+                       (assoc aliases (:gmir/dst instruction) canonical)
+                       out)
+                (recur (next remaining)
+                       (assoc mul-by key (:gmir/dst instruction))
+                       aliases
+                       (conj out instruction))))))))))
+
+(defn- dce-gmir [instructions]
+  (loop [current (vec instructions)]
+    (let [used (set (mapcat gmir-source-registers current))
+          kept (filterv (fn [instruction]
+                          (or (not (contains? gmir-dce-ops (:gmir/op instruction)))
+                              (contains? used (:gmir/dst instruction))))
+                        current)]
+      (if (= kept current) kept (recur kept)))))
+
+(defn- rewrite-offset-multiplies
+  "LLVM's first-round trick on `(n+k)*C+1`: distribute a constant offset
+  through the multiply, fold the now-constant addend, and reuse `n*C`.
+
+  Valid wrapping i64: (n+k)*C+1 = n*C+(k*C+1). The add that produced n+k
+  is left in place if it still has other readers."
+  [instructions]
+  (let [max-index (reduce max -1 (keep (fn [instruction]
+                                         (when-let [dst (:gmir/dst instruction)]
+                                           (when (gmir/vreg? dst)
+                                             #?(:clj (Long/parseLong (name dst))
+                                                :cljs (js/parseInt (name dst) 10)))))
+                                       instructions))
+        next-reg (let [counter (atom max-index)]
+                   #(gmir/vreg (swap! counter inc)))]
+    (-> instructions
+        (distribute-const-offset-multiplies next-reg)
+        (fold-add-of-add-const next-reg)
+        gvn-const-multiplies
+        dce-gmir)))
+
 (defn lower-kir-expression
   "Lower a closed pure tail-expression subset to GMIR.
 
@@ -1404,7 +1627,8 @@
                 (let [[code result-value] (value form env)
                       result (scalar-register! result-value form)]
                   (conj code {:gmir/op :gmir/return :gmir/value result}))))]
-      (let [instructions (into parameter-code (tail body parameter-env))]
+      (let [instructions (rewrite-offset-multiplies
+                          (into parameter-code (tail body parameter-env)))]
         {:gmir/version (cond
                          (some #(contains? #{:gmir/call :gmir/tail-call}
                                             (:gmir/op %)) instructions) 3
@@ -3555,12 +3779,10 @@
   (let [instructions (case isa
                        :aarch64 (-> instructions
                                     a64-cache-leaf-constants
-                                    ;; Offset-lane `(* (+ n k) C)+1` materializes C
-                                    ;; and 1 onto the multiply's own registers until
-                                    ;; the cache pins them in x13-x15. MIR fusion
-                                    ;; already ran and refused those "clobbers";
-                                    ;; after the cache the stream is mul+add and
-                                    ;; this second pass emits MADD.
+                                    ;; Unique-use mul+add becomes MADD. A product
+                                    ;; reused by several constant adds (CSE of
+                                    ;; `(n+k)*C`) stays MUL; fusing it would drop
+                                    ;; the multiply while later adds still read it.
                                     a64-fuse-multiplies
                                     a64-fold-adjacent-add-sub-immediates)
                        :x86-64 (-> instructions
