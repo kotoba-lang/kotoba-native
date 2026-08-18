@@ -8,7 +8,7 @@
          :git/sha "820a3d01c80a4e38753632e2945f86e716ce054b"}
         io.github.kotoba-lang/kotoba-mir
         {:git/url "https://github.com/kotoba-lang/kotoba-mir.git"
-         :git/sha "dd7bbfdc364e1314f961ef90c223b17ac95eaea6"}
+         :git/sha "10a92c779b1414fbe075d12f216de7272c774430"}
         io.github.kotoba-lang/kotoba-codegen
         {:git/url "https://github.com/kotoba-lang/kotoba-codegen.git"
          :git/sha "c85088bfe9dd85e9c6a65d986f34a651b2af7d13"}

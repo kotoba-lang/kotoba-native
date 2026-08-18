@@ -1634,15 +1634,29 @@
 (def ^:private x86-register-code
   {:x86-64/rax 0 :x86-64/rcx 1 :x86-64/rdx 2 :x86-64/rbx 3 :x86-64/r8 8
    :x86-64/r9 9 :x86-64/r10 10 :x86-64/r11 11
+   ;; R12-R15 are callee-saved and enter allocated MIR through the preserved
+   ;; tier. Every encoder here selects REX.B/REX.R from `(>= code 8)` and the
+   ;; ModRM field from `(bit-and code 7)`, so they need no special case: R12's
+   ;; low three bits are RSP's, but a SIB byte follows only when mod is not 11,
+   ;; and register-to-register forms are always mod 11.
+   :x86-64/r12 12 :x86-64/r13 13 :x86-64/r14 14 :x86-64/r15 15
    :x86-64/rdi 7 :x86-64/rsi 6})
 (def ^:private x86-arguments [:x86-64/rdi :x86-64/rsi :x86-64/rdx :x86-64/rcx :x86-64/r8])
 (def ^:private aarch64-register-code
   {:aarch64/x0 0 :aarch64/x1 1 :aarch64/x2 2 :aarch64/x3 3
-   :aarch64/x4 4 :aarch64/x7 7
+   :aarch64/x4 4 :aarch64/x5 5 :aarch64/x6 6 :aarch64/x7 7
+   ;; x8-x12 are caller-saved temporaries and reach allocated MIR through the
+   ;; leaf tier, which is offered only to functions that call nothing.
+   :aarch64/x8 8 :aarch64/x9 9 :aarch64/x10 10 :aarch64/x11 11
+   :aarch64/x12 12
    ;; x13-x15 are leaf-only constant-cache registers. x16-x17 remain the
    ;; local encoder scratch pair and are never admitted to allocated MIR.
+   ;; x18 is the reserved platform register and is deliberately absent.
    :aarch64/x13 13 :aarch64/x14 14 :aarch64/x15 15
-   :aarch64/x16 16 :aarch64/x17 17})
+   :aarch64/x16 16 :aarch64/x17 17
+   ;; x19-x26 are callee-saved and enter through the preserved tier.
+   :aarch64/x19 19 :aarch64/x20 20 :aarch64/x21 21 :aarch64/x22 22
+   :aarch64/x23 23 :aarch64/x24 24 :aarch64/x25 25 :aarch64/x26 26})
 
 (defn- byte-value [n] (bit-and (unchecked-int n) 0xff))
 
@@ -1812,7 +1826,11 @@
                        (if-some [slot (get saved-slot src)]
                          (x86-stack-memory 0x8b dst slot)
                          (if (= dst src) [] (x86-rr 0x89 dst src))))
-        restore (case dst
+        ;; The three registers `idiv` writes or reads implicitly each need their
+        ;; own unwinding. Every other allocated register -- the whole leaf and
+        ;; preserved tiers included -- takes the same shape: move the quotient
+        ;; out of RAX, then pop all three back.
+        restore (condp = dst
                   :x86-64/rax
                   (concat (x86-pop :x86-64/rcx)
                           (x86-pop :x86-64/rdx)
@@ -1827,8 +1845,7 @@
                           (x86-pop :x86-64/rcx)
                           (x86-adjust-stack 0xc4 8)
                           (x86-pop :x86-64/rax))
-                  :x86-64/r8
-                  (concat (x86-rr 0x89 :x86-64/r8 :x86-64/rax)
+                  (concat (x86-rr 0x89 dst :x86-64/rax)
                           (x86-pop :x86-64/rcx)
                           (x86-pop :x86-64/rdx)
                           (x86-pop :x86-64/rax)))]
@@ -3608,30 +3625,87 @@
 (defn- call-frame-policy? [frame-policy]
   (contains? #{:all-vregs :call-live} frame-policy))
 
-(defn- function-frame [target frame-slots frame-policy]
-  (let [storage-bytes (align16 (* 8 frame-slots))]
+;; ── callee-saved registers ───────────────────────────────────────────────────
+;;
+;; The allocator's preserved tier is callee-saved by both ABIs, so a function
+;; that names one of those registers owes its caller the original value back.
+;; The frame pays exactly that debt: it saves the registers the body actually
+;; names and no others, so a function small enough to stay in the scratch tier
+;; carries no save at all.
+;;
+;; Which registers those are is derived from the instruction stream about to be
+;; emitted rather than carried alongside it. A carried list has to be kept equal
+;; to the body, and when it drifts it drifts toward omitting a save -- which is
+;; a corrupted caller, observed far from here.
+
+(defn- x86-saved-frame
+  "Pre-index the stack by eight when an odd number of pushes would otherwise
+   leave RSP misaligned. The padding sits above the pushes so that FRAME-BYTES,
+   which the context slot is measured from, stays exactly as computed."
+  [saved]
+  (let [pad (if (odd? (count saved)) 8 0)]
+    {:save (vec (concat (x86-adjust-stack 0xec pad)
+                        (mapcat x86-push saved)))
+     :restore (vec (concat (mapcat x86-pop (reverse saved))
+                           (x86-adjust-stack 0xc4 pad)))}))
+
+(defn- a64-stack-pair
+  "STP/LDP of two registers across one 16-byte stack step, or STR/LDP of one
+   when the count is odd -- SP has to stay 16-byte aligned either way, so an
+   odd save spends the same sixteen bytes as a pair."
+  [opcode a b]
+  (u32le (bit-or opcode
+                 (if b (bit-shift-left (get aarch64-register-code b) 10) 0)
+                 (bit-shift-left 31 5)
+                 (get aarch64-register-code a))))
+
+(defn- a64-saved-frame [saved]
+  (let [pairs (partition-all 2 saved)]
+    {:save (vec (mapcat (fn [[a b]]
+                          (if b
+                            (a64-stack-pair 0xa9bf0000 a b)   ; stp a, b, [sp, #-16]!
+                            (a64-stack-pair 0xf81f0c00 a nil))) ; str a, [sp, #-16]!
+                        pairs))
+     :restore (vec (mapcat (fn [[a b]]
+                             (if b
+                               (a64-stack-pair 0xa8c10000 a b)   ; ldp a, b, [sp], #16
+                               (a64-stack-pair 0xf8410400 a nil))) ; ldr a, [sp], #16
+                           (reverse pairs)))}))
+
+(defn- function-frame [target frame-slots frame-policy instructions]
+  (let [storage-bytes (align16 (* 8 frame-slots))
+        saved (mir/saved-registers target instructions)]
     (case target
       :x86-64
-      (let [frame-bytes (+ storage-bytes (if (call-frame-policy? frame-policy) 8 0))]
+      (let [frame-bytes (+ storage-bytes (if (call-frame-policy? frame-policy) 8 0))
+            {:keys [save restore]} (x86-saved-frame saved)]
         {:frame-bytes frame-bytes
-         :prologue (x86-adjust-stack 0xec frame-bytes)
-         :tail-suffix (x86-adjust-stack 0xc4 frame-bytes)
-         :return-suffix (vec (concat (x86-adjust-stack 0xc4 frame-bytes) [0xc3]))})
+         :saved-registers saved
+         :prologue (vec (concat save (x86-adjust-stack 0xec frame-bytes)))
+         :tail-suffix (vec (concat (x86-adjust-stack 0xc4 frame-bytes) restore))
+         :return-suffix (vec (concat (x86-adjust-stack 0xc4 frame-bytes)
+                                     restore [0xc3]))})
 
       :aarch64
-      (if (call-frame-policy? frame-policy)
-        {:frame-bytes storage-bytes
-         :prologue (vec (concat (u32le 0xa9bf7bfd) (u32le 0x910003fd)
-                                (a64-adjust-stack 0xd10003ff storage-bytes)))
-         :tail-suffix (vec (concat (a64-adjust-stack 0x910003ff storage-bytes)
-                                   (u32le 0xa8c17bfd)))
-         :return-suffix (vec (concat (a64-adjust-stack 0x910003ff storage-bytes)
-                                     (u32le 0xa8c17bfd) (u32le 0xd65f03c0)))}
-        {:frame-bytes storage-bytes
-         :prologue (a64-adjust-stack 0xd10003ff storage-bytes)
-         :tail-suffix (a64-adjust-stack 0x910003ff storage-bytes)
-         :return-suffix (vec (concat (a64-adjust-stack 0x910003ff storage-bytes)
-                                     (u32le 0xd65f03c0)))}))))
+      (let [{:keys [save restore]} (a64-saved-frame saved)]
+        (if (call-frame-policy? frame-policy)
+          {:frame-bytes storage-bytes
+           :saved-registers saved
+           :prologue (vec (concat save (u32le 0xa9bf7bfd) (u32le 0x910003fd)
+                                  (a64-adjust-stack 0xd10003ff storage-bytes)))
+           :tail-suffix (vec (concat (a64-adjust-stack 0x910003ff storage-bytes)
+                                     (u32le 0xa8c17bfd) restore))
+           :return-suffix (vec (concat (a64-adjust-stack 0x910003ff storage-bytes)
+                                       (u32le 0xa8c17bfd) restore
+                                       (u32le 0xd65f03c0)))}
+          {:frame-bytes storage-bytes
+           :saved-registers saved
+           :prologue (vec (concat save
+                                  (a64-adjust-stack 0xd10003ff storage-bytes)))
+           :tail-suffix (vec (concat (a64-adjust-stack 0x910003ff storage-bytes)
+                                     restore))
+           :return-suffix (vec (concat (a64-adjust-stack 0x910003ff storage-bytes)
+                                       restore (u32le 0xd65f03c0)))})))))
 
 (defn encode-mc-module
   "Encode an allocated MC v3 module. PREFIXES is an optional function-name to
@@ -3658,7 +3732,7 @@
           (mapcat
            (fn [index {:mc/keys [name frame-slots frame-policy instructions]}]
              (let [{:keys [frame-bytes prologue return-suffix tail-suffix]}
-                   (function-frame target frame-slots frame-policy)
+                   (function-frame target frame-slots frame-policy instructions)
                    local (vec (concat (get prefixes name []) prologue
                                       (instruction-tokens target frame-bytes return-suffix tail-suffix
                                                           callee-labels instructions)))]
@@ -3702,7 +3776,8 @@
                          instructions)
         {:keys [frame-bytes prologue return-suffix tail-suffix]}
         (function-frame target frame-slots
-                        (if host-call? :call-live :allocator))]
+                        (if host-call? :call-live :allocator)
+                        instructions)]
     (resolve-layout
      (vec (concat prologue
                   (instruction-tokens target frame-bytes return-suffix tail-suffix {}

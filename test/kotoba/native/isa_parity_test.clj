@@ -422,15 +422,22 @@
 
 (deftest x86-64-kernel-subregion-encodes-its-checks
   (let [code (emitted x86/emit-program '[b l o s] '(kernel-subregion b l o s))]
+    ;; The destination is RDI rather than RAX, and the displacements are three
+    ;; bytes longer for the move that puts it back, because `kernel-subregion`
+    ;; carries its operands under their own names and so has no `:mir/left` for
+    ;; the allocator to coalesce onto. Four live arguments used to exhaust the
+    ;; scratch tier at that point and send the whole body to the all-vreg path:
+    ;; the bytes this replaces were recorded from a version that spilled four
+    ;; values and reloaded five. This one touches no stack at all.
     (is (subsequence?
          [0x48 0x85 0xc0                          ; test rax,rax
-          0x0f 0x84 0x20 0x00 0x00 0x00           ; jz  -> ud2 at +32
+          0x0f 0x84 0x23 0x00 0x00 0x00           ; jz  -> ud2 at +35
           0x48 0x39 0xca                          ; cmp rdx,rcx
-          0x0f 0x87 0x17 0x00 0x00 0x00           ; ja  -> ud2 at +23
+          0x0f 0x87 0x1a 0x00 0x00 0x00           ; ja  -> ud2 at +26
           0x49 0x89 0xca 0x49 0x29 0xd2           ; r10 = length-offset
           0x4d 0x39 0xd0                          ; cmp r8,r10
-          0x0f 0x87 0x08 0x00 0x00 0x00           ; ja  -> ud2 at +8
-          0x48 0x01 0xd0                          ; add rax,rdx
+          0x0f 0x87 0x0b 0x00 0x00 0x00           ; ja  -> ud2 at +11
+          0x48 0x89 0xc7 0x48 0x01 0xd7           ; mov rdi,rax / add rdi,rdx
           0xe9 0x02 0x00 0x00 0x00 0x0f 0x0b]    ; jmp +2 / ud2
          code)
         "every branch must land on the UD2, or the check never fires")))
@@ -446,7 +453,7 @@
                             0xcb020030   ; sub x16,x1,x2 (remaining)
                             0xeb10007f   ; cmp x3,x16    (sublen vs remaining)
                             0x54000068   ; b.hi +12
-                            0x8b020000   ; add x0,x0,x2
+                            0x8b020005   ; add x5,x0,x2
                             0x14000002   ; b +8
                             0xd4200000])) ; brk #0
          code)
