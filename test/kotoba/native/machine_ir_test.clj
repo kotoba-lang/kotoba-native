@@ -1831,3 +1831,51 @@
     (is (= x86-fuel-cmp (subvec x86-code 0 5)))
     (is (= {'down [:fuel]} prefixes))))
 
+
+(defn- lcg-rounds-form
+  "N rounds of `x <- (x*48271 + 1) mod 2147483647`, the shape of
+  `bench/runtime-comparison/kernel.kotoba`. Each round contributes two constant
+  multiplies with a fresh left operand, so the GVN map grows by two per round
+  and shares nothing."
+  [n]
+  (let [bindings
+        (vec (mapcat (fn [i]
+                       (let [v (symbol (str "v" i))
+                             x (symbol (str "x" i))
+                             prev (if (= i 1) 'n (symbol (str "x" (dec i))))]
+                         [v (list '+ (list '* prev 48271) 1)
+                          x (list '- v (list '* (list 'quot v 2147483647) 2147483647))]))
+                     (range 1 (inc n))))]
+    (list 'let bindings (symbol (str "x" n)))))
+
+(deftest gvn-constant-multiply-keys-carry-no-raw-i64
+  ;; ClojureScript represents an i64 as a JS BigInt and `hash` on a BigInt
+  ;; throws `Cannot create property 'closure_uid_…' on bigint`, so the constant
+  ;; inside a GVN map key must not be the raw value. Below nine entries the map
+  ;; is a PersistentArrayMap and compares with `=` without ever hashing, which
+  ;; is why the failure appeared only past a size: measured 2026-08-18 with this
+  ;; repository pinned at d4b050ae, four rounds compiled under nbb and five
+  ;; answered `internal compiler error`, while both compiled on the JVM.
+  ;;
+  ;; A JVM Long hashes fine, so this assertion can only pin the SHAPE of the
+  ;; key. The host-level gate is amu's JDK-free native conformance, which
+  ;; compiles the five-round form above through the plain-Node front.
+  (testing "the key component is a string on every host"
+    (is (string? (#'machine/const-key 48271)))
+    (is (= (#'machine/const-key 48271) (#'machine/const-key 48271)))
+    (is (not= (#'machine/const-key 48271) (#'machine/const-key 48272))))
+  (testing "a kernel past the array-map boundary still lowers and encodes"
+    (doseq [rounds [4 5 8]]
+      (let [form (lcg-rounds-form rounds)]
+        (is (machine/pilot-expression? '[n] form) rounds)
+        (is (seq (machine/compile-expression :x86-64 '[n] form)) rounds)
+        (is (seq (machine/compile-expression :aarch64 '[n] form)) rounds)))))
+
+(deftest gvn-still-shares-a-repeated-constant-multiply
+  ;; The stringified key must not stop the pass doing its job: two multiplies of
+  ;; the same register by the same constant remain one instruction.
+  (let [form '(let [p (* n 48271) q (* n 48271)] (+ p q))
+        operations (mapv :gmir/op (:gmir/instructions
+                                   (machine/lower-kir-expression '[n] form)))]
+    (is (= 1 (count (filter #{:gmir/multiply} operations)))
+        "the second product is aliased to the first")))

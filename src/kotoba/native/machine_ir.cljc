@@ -987,6 +987,28 @@
                   :gmir/left (first inner) :gmir/right folded}])))))
       instructions))))
 
+(defn- const-key
+  "An i64 constant in a form that can sit inside a map KEY on both hosts.
+
+  ClojureScript represents an i64 as a JS BigInt, and `hash` on a BigInt throws
+  `Cannot create property 'closure_uid_…' on bigint` -- `goog.getUid` cannot
+  attach a property to a primitive. The throw is invisible until the map grows:
+  eight or fewer entries is a PersistentArrayMap, which compares with `=` and
+  never hashes, so a small function passes and a larger one does not.
+
+  Measured 2026-08-18 against amu@29e8386 with this repository pinned at
+  d4b050ae: a four-round i64 kernel compiled under nbb, a five-round one -- nine
+  distinct constant multiplies, one past the array-map boundary -- answered
+  `internal compiler error`, and the same source compiled through the JVM front.
+  `bench/runtime-comparison/kernel.kotoba`, the benchmark this repository's own
+  codegen work is measured on, is eight rounds, so `amu compile --target
+  x86_64` of it could not run at all on the JDK-free front.
+
+  Stringifying is enough: only intra-run uniqueness matters, and the decimal
+  form of an integer is injective on both hosts."
+  [value]
+  (str value))
+
 (defn- gvn-const-multiplies [instructions]
   (loop [remaining instructions
          mul-by {}
@@ -1009,8 +1031,10 @@
                 right (:gmir/right instruction)
                 left-k (const-i64 defs left)
                 right-k (const-i64 defs right)
-                key (cond (some? right-k) [left right-k]
-                          (some? left-k) [right left-k])]
+                ;; The constant is stringified because this vector becomes a
+                ;; map key; see `const-key`.
+                key (cond (some? right-k) [left (const-key right-k)]
+                          (some? left-k) [right (const-key left-k)])]
             (if-not key
               (recur (next remaining) mul-by aliases (conj out instruction))
               (if-let [canonical (get mul-by key)]
