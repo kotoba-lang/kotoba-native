@@ -614,22 +614,25 @@
           arm-mc (machine/compile-gmir :aarch64 spill-program)
           x86 (machine/encode-mc x86-mc)
           arm (machine/encode-mc arm-mc)]
-      (is (= 11 (:mc/frame-slots x86-mc)))
-      (is (= 11 (:mc/frame-slots arm-mc)))
+      ;; Eleven values in a four-register profile take two slots, not
+      ;; eleven: the allocator spills the two it cannot keep and leaves the
+      ;; rest in registers. A 16-byte frame rather than 96.
+      (is (= 2 (:mc/frame-slots x86-mc)))
+      (is (= 2 (:mc/frame-slots arm-mc)))
       (doseq [mc [x86-mc arm-mc]]
         (is (some #(= "spill-store" (some-> % :mc/encoding name))
                   (:mc/instructions mc)))
         (is (some #(= "spill-load" (some-> % :mc/encoding name))
                   (:mc/instructions mc))))
-      (is (= [0x48 0x81 0xec 0x60 0x00 0x00 0x00]
+      (is (= [0x48 0x81 0xec 0x10 0x00 0x00 0x00]
              (subvec x86 0 7)))
-      (is (= [0x48 0x81 0xc4 0x60 0x00 0x00 0x00 0xc3]
+      (is (= [0x48 0x81 0xc4 0x10 0x00 0x00 0x00 0xc3]
              (subvec x86 (- (count x86) 8))))
       (is (= [0xc0 0x03 0x5f 0xd6]
              (subvec arm (- (count arm) 4))))
-      (is (= [0xff 0x83 0x01 0xd1]
+      (is (= [0xff 0x43 0x00 0xd1]
              (subvec arm 0 4)))
-      (is (= [0xff 0x83 0x01 0x91 0xc0 0x03 0x5f 0xd6]
+      (is (= [0xff 0x43 0x00 0x91 0xc0 0x03 0x5f 0xd6]
              (subvec arm (- (count arm) 8)))))))
 
 (deftest kir-expression-slice-encodes-final-bytes-for-both-isas
