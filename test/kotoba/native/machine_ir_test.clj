@@ -1,6 +1,7 @@
 (ns kotoba.native.machine-ir-test
   (:require [clojure.test :refer [deftest is testing]]
             [kotoba.gmir :as gmir]
+            [kotoba.mir :as mir]
             [kotoba.native.aggregate-abi :as aggregate-abi]
             [kotoba.native.machine-ir :as machine]
             [kotoba.native.string-index :as string-index]
@@ -565,28 +566,39 @@
                  (machine/encode-mc
                   (assoc-in mc [:mc/instructions 0 :ambient/policy] true))))))
 
+(defmacro with-scratch-tier-only
+  "Run BODY with only the always-available scratch tier on offer. Tests that
+  pin what happens once the profile is exhausted have to be able to exhaust it;
+  widening the pool would otherwise turn them into tests of nothing that keep
+  passing under their original names."
+  [& body]
+  `(with-redefs [mir/leaf-registers {:x86-64 [] :aarch64 []}
+                 mir/preserved-registers {:x86-64 [] :aarch64 []}]
+     ~@body))
+
 (deftest exhausted-register-profile-encodes-bounded-spills-for-both-isas
-  (let [x86-mc (machine/compile-gmir :x86-64 spill-program)
-        arm-mc (machine/compile-gmir :aarch64 spill-program)
-        x86 (machine/encode-mc x86-mc)
-        arm (machine/encode-mc arm-mc)]
-    (is (= 11 (:mc/frame-slots x86-mc)))
-    (is (= 11 (:mc/frame-slots arm-mc)))
-    (doseq [mc [x86-mc arm-mc]]
-      (is (some #(= "spill-store" (some-> % :mc/encoding name))
-                (:mc/instructions mc)))
-      (is (some #(= "spill-load" (some-> % :mc/encoding name))
-                (:mc/instructions mc))))
-    (is (= [0x48 0x81 0xec 0x60 0x00 0x00 0x00]
-           (subvec x86 0 7)))
-    (is (= [0x48 0x81 0xc4 0x60 0x00 0x00 0x00 0xc3]
-           (subvec x86 (- (count x86) 8))))
-    (is (= [0xc0 0x03 0x5f 0xd6]
-           (subvec arm (- (count arm) 4))))
-    (is (= [0xff 0x83 0x01 0xd1]
-           (subvec arm 0 4)))
-    (is (= [0xff 0x83 0x01 0x91 0xc0 0x03 0x5f 0xd6]
-           (subvec arm (- (count arm) 8))))))
+  (with-scratch-tier-only
+    (let [x86-mc (machine/compile-gmir :x86-64 spill-program)
+          arm-mc (machine/compile-gmir :aarch64 spill-program)
+          x86 (machine/encode-mc x86-mc)
+          arm (machine/encode-mc arm-mc)]
+      (is (= 11 (:mc/frame-slots x86-mc)))
+      (is (= 11 (:mc/frame-slots arm-mc)))
+      (doseq [mc [x86-mc arm-mc]]
+        (is (some #(= "spill-store" (some-> % :mc/encoding name))
+                  (:mc/instructions mc)))
+        (is (some #(= "spill-load" (some-> % :mc/encoding name))
+                  (:mc/instructions mc))))
+      (is (= [0x48 0x81 0xec 0x60 0x00 0x00 0x00]
+             (subvec x86 0 7)))
+      (is (= [0x48 0x81 0xc4 0x60 0x00 0x00 0x00 0xc3]
+             (subvec x86 (- (count x86) 8))))
+      (is (= [0xc0 0x03 0x5f 0xd6]
+             (subvec arm (- (count arm) 4))))
+      (is (= [0xff 0x83 0x01 0xd1]
+             (subvec arm 0 4)))
+      (is (= [0xff 0x83 0x01 0x91 0xc0 0x03 0x5f 0xd6]
+             (subvec arm (- (count arm) 8)))))))
 
 (deftest kir-expression-slice-encodes-final-bytes-for-both-isas
   (is (= [0x48 0x89 0xf8             ; mov rax,rdi
@@ -1416,25 +1428,26 @@
           target))))
 
 (deftest five-live-entry-arguments-encode-one-bounded-lazy-spill
-  (doseq [target [:x86-64 :aarch64]]
-    (let [mc (->> five-argument-call-kir machine/lower-kir-module
-                  (machine/compile-gmir target))
-          [callee caller] (:mc/functions mc)
-          spill-store (keyword (name target) "spill-store")
-          spill-load (keyword (name target) "spill-load")
-          compiled (machine/compile-kir-module target five-argument-call-kir)]
-      (is (= [:allocator :call-live]
-             (mapv :mc/frame-policy [callee caller])) target)
-      (is (= [1 1] (mapv :mc/frame-slots [callee caller])) target)
-      (doseq [function [callee caller]]
-        (is (= 1 (count (filter #(= spill-store (:mc/encoding %))
-                                (:mc/instructions function))))
-            [target (:mc/name function)])
-        (is (= 1 (count (filter #(= spill-load (:mc/encoding %))
-                                (:mc/instructions function))))
-            [target (:mc/name function)]))
-      (is (= (if (= :x86-64 target) 114 68)
-             (count (:code compiled))) target))))
+  (with-scratch-tier-only
+    (doseq [target [:x86-64 :aarch64]]
+      (let [mc (->> five-argument-call-kir machine/lower-kir-module
+                    (machine/compile-gmir target))
+            [callee caller] (:mc/functions mc)
+            spill-store (keyword (name target) "spill-store")
+            spill-load (keyword (name target) "spill-load")
+            compiled (machine/compile-kir-module target five-argument-call-kir)]
+        (is (= [:allocator :call-live]
+               (mapv :mc/frame-policy [callee caller])) target)
+        (is (= [1 1] (mapv :mc/frame-slots [callee caller])) target)
+        (doseq [function [callee caller]]
+          (is (= 1 (count (filter #(= spill-store (:mc/encoding %))
+                                  (:mc/instructions function))))
+              [target (:mc/name function)])
+          (is (= 1 (count (filter #(= spill-load (:mc/encoding %))
+                                  (:mc/instructions function))))
+              [target (:mc/name function)]))
+        (is (= (if (= :x86-64 target) 114 68)
+               (count (:code compiled))) target)))))
 
 (deftest word-call-module-boundary-supports-multiple-exports-and-fails-closed
   (let [multi-export (assoc scalar-call-kir :exports ['main 'add-one])]
@@ -1468,3 +1481,115 @@
                  (machine/lower-kir-module
                   (assoc-in scalar-call-kir [:functions 0 :result]
                             too-deep))))))
+
+;; ── the callee-saved frame ───────────────────────────────────────────────────
+;;
+;; A frame that saves a callee-saved register and forgets to restore it is
+;; silent at the point of the defect: the caller keeps running with a corrupted
+;; register and the wrong number turns up somewhere else entirely. So assert the
+;; two halves against each other rather than against a recorded byte string.
+
+;; The window in which a target reaches the preserved tier is bounded on both
+;; sides: below it the leaf tier still has room, above it the allocator gives up
+;; and every value takes a stack slot. x86-64 offers four scratch, two leaf and
+;; five preserved, so its window is seven to eleven live values; AArch64 offers
+;; four, seven and eight, so its window is twelve to nineteen. The windows do
+;; not overlap, and a single body cannot exercise both.
+
+(def ^:private preserved-tier-body
+  {:x86-64 '(let [a (+ (* n 3) 1) b (+ (* n 5) 2) c (+ (* n 7) 3) d (+ (* n 11) 4)
+                  e (+ (* n 13) 5) f (+ (* n 17) 6) g (+ (* n 19) 7) h (+ (* n 23) 8)]
+              (+ (+ (+ a b) (+ c d)) (+ (+ e f) (+ g h))))
+   :aarch64 '(let [a (+ (* n 3) 1) b (+ (* n 5) 2) c (+ (* n 7) 3) d (+ (* n 11) 4)
+                   e (+ (* n 13) 5) f (+ (* n 17) 6) g (+ (* n 19) 7) h (+ (* n 23) 8)
+                   i (+ (* n 29) 9) j (+ (* n 31) 10) k (+ (* n 37) 11)
+                   l (+ (* n 41) 12) m (+ (* n 43) 13) o (+ (* n 47) 14)]
+               (+ (+ (+ (+ a b) (+ c d)) (+ (+ e f) (+ g h)))
+                  (+ (+ (+ i j) (+ k l)) (+ m o))))})
+
+(def ^:private scratch-tier-body '(+ (* n 3) 1))
+
+(def ^:private x86-push-code
+  {:x86-64/rbx [0x53] :x86-64/r12 [0x41 0x54] :x86-64/r13 [0x41 0x55]
+   :x86-64/r14 [0x41 0x56] :x86-64/r15 [0x41 0x57]})
+
+(def ^:private x86-pop-code
+  {:x86-64/rbx [0x5b] :x86-64/r12 [0x41 0x5c] :x86-64/r13 [0x41 0x5d]
+   :x86-64/r14 [0x41 0x5e] :x86-64/r15 [0x41 0x5f]})
+
+(defn- allocated-instructions [target body]
+  (:mir/instructions
+   (mir/allocate-registers
+    (mir/select-target target (machine/lower-kir-expression '[n] body)))))
+
+(deftest x86-64-frame-saves-and-restores-exactly-the-preserved-registers-it-uses
+  (let [body (get preserved-tier-body :x86-64)
+        saved (mir/saved-registers :x86-64 (allocated-instructions :x86-64 body))
+        code (mapv #(bit-and % 0xff)
+                   (machine/compile-expression :x86-64 '[n] body))
+        ;; An odd number of pushes would leave RSP misaligned, so the frame
+        ;; pre-indexes the stack by eight. That padding sits above the pushes,
+        ;; which is why it comes first here and last on the way out.
+        pad (if (odd? (count saved)) [0x48 0x81 0xec 0x08 0x00 0x00 0x00] [])
+        unpad (if (odd? (count saved)) [0x48 0x81 0xc4 0x08 0x00 0x00 0x00] [])
+        pushes (vec (mapcat x86-push-code saved))
+        pops (vec (mapcat x86-pop-code (reverse saved)))]
+    (is (seq saved) "this body has to reach the preserved tier for the rest to mean anything")
+    (is (= (into (vec pad) pushes)
+           (subvec code 0 (+ (count pad) (count pushes))))
+        "the prologue pushes exactly the preserved registers the body names, in pool order")
+    (let [expected (-> pops (into unpad) (conj 0xc3))]
+      (is (= expected (subvec code (- (count code) (count expected))))
+          "and the epilogue undoes exactly that, in reverse, before returning"))))
+
+(deftest a-body-inside-the-scratch-tier-carries-no-frame-save
+  (doseq [target mir/targets]
+    (let [saved (mir/saved-registers
+                 target (allocated-instructions target scratch-tier-body))]
+      (is (empty? saved) target))))
+
+(deftest saved-registers-follows-the-body-rather-than-a-recorded-list
+  ;; The narrow body and the wide one differ only in how many values are live;
+  ;; if the save set were a constant, or keyed off the target alone, these two
+  ;; would agree.
+  (doseq [target mir/targets]
+    (let [narrow (mir/saved-registers
+                  target (allocated-instructions target scratch-tier-body))
+          wide (mir/saved-registers
+                target (allocated-instructions target (get preserved-tier-body target)))]
+      (is (not= narrow wide) target)
+      (is (every? (set (get mir/preserved-registers target)) wide) target)
+      (is (= wide (filterv (set wide) (get mir/preserved-registers target)))
+          "reported in pool order, so save-in-order/restore-in-reverse needs no sort"))))
+
+(defn- a64-code [register] (parse-long (subs (name register) 1)))
+
+(defn- a64-words [bytes]
+  (mapv (fn [[a b c d]] (+ a (* b 256) (* c 65536) (* d 16777216)))
+        (partition 4 (mapv #(bit-and % 0xff) bytes))))
+
+(deftest aarch64-frame-saves-and-restores-exactly-the-preserved-registers-it-uses
+  (let [body (get preserved-tier-body :aarch64)
+        saved (mir/saved-registers :aarch64 (allocated-instructions :aarch64 body))
+        words (a64-words (machine/compile-expression :aarch64 '[n] body))
+        ;; SP has to stay 16-byte aligned, so registers go down in pairs and an
+        ;; odd one spends the same sixteen bytes on its own.
+        pairs (partition-all 2 saved)
+        save (mapv (fn [[a b]]
+                     (if b
+                       (bit-or 0xa9bf0000 (bit-shift-left (a64-code b) 10)
+                               (bit-shift-left 31 5) (a64-code a))
+                       (bit-or 0xf81f0c00 (bit-shift-left 31 5) (a64-code a))))
+                   pairs)
+        restore (mapv (fn [[a b]]
+                        (if b
+                          (bit-or 0xa8c10000 (bit-shift-left (a64-code b) 10)
+                                  (bit-shift-left 31 5) (a64-code a))
+                          (bit-or 0xf8410400 (bit-shift-left 31 5) (a64-code a))))
+                      (reverse pairs))]
+    (is (seq saved) "this body has to reach the preserved tier for the rest to mean anything")
+    (is (= save (subvec words 0 (count save)))
+        "the prologue saves exactly the preserved registers the body names, in pool order")
+    (let [expected (conj restore 0xd65f03c0)]
+      (is (= expected (subvec words (- (count words) (count expected))))
+          "and the epilogue restores exactly those, in reverse, before returning"))))
