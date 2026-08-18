@@ -97,8 +97,8 @@
   (doseq [[why haystack needle] contains-rows]
     (testing why
       (let [op (list 'string-contains? haystack needle)]
-        (is (= (run (program :i64 op))
-               (run (rewritten :i64 op (search/lower-contains [haystack needle]))))
+        (is (= (run (program :bool op))
+               (run (rewritten :bool op (search/lower-contains [haystack needle]))))
             (str "the rewrite must answer what `string-contains?` answers: "
                  (pr-str haystack) " / " (pr-str needle)))))))
 
@@ -107,10 +107,10 @@
     (testing label
       (doseq [[why haystack needle] contains-rows]
         (let [op (list 'string-contains? haystack needle)
-              emitted (:code (emit (program :i64 op)))]
+              emitted (:code (emit (program :bool op)))]
           (is (seq emitted) why)
           (is (= emitted
-                 (:code (emit (rewritten :i64 op (search/lower-contains [haystack needle])))))
+                 (:code (emit (rewritten :bool op (search/lower-contains [haystack needle])))))
               (str why " must emit exactly the written-out rewrite")))))))
 
 ;; ---------------------------------------------------------------------------
@@ -302,11 +302,11 @@
   (let [module {:format :kotoba.kir/v4 :exports ['main]
                 :functions (search/augment-functions
                             [{:name 'main :params '[h n]
-                              :param-types [:string :string] :result :i64
+                              :param-types [:string :string] :result :bool
                               :body '(string-contains? h n)}])}
         oracle {:format :kotoba.kir/v4 :exports ['main]
                 :functions [{:name 'main :params '[h n]
-                             :param-types [:string :string] :result :i64
+                             :param-types [:string :string] :result :bool
                              :body '(string-contains? h n)}]}
         lowered (assoc-in (vec (:functions module)) [0 :body]
                           (search/lower-contains ['h 'n]))]
