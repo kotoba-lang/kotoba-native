@@ -4,6 +4,8 @@
             [kotoba.mir :as mir]
             [kotoba.native.aggregate-abi :as aggregate-abi]
             [kotoba.native.machine-ir :as machine]
+            [kotoba.native.aarch64 :as arm]
+            [kotoba.native.x86-64 :as x86]
             [kotoba.native.string-index :as string-index]
             [kotoba.native.string-search :as string-search]))
 
@@ -1771,3 +1773,36 @@
     (let [expected (conj restore 0xd65f03c0)]
       (is (= expected (subvec words (- (count words) (count expected))))
           "and the epilogue restores exactly those, in reverse, before returning"))))
+
+(def ^:private a64-fuel-ldr 0xf94004f0)
+(def ^:private x86-fuel-cmp [0x49 0x83 0x79 0x08 0x00])
+
+(deftest production-acyclic-leaf-omits-entry-fuel
+  ;; emit-program used to prefix every function. The 100k C harness then paid
+  ;; a load, a decrement, and a store on every kernel_wide call. An acyclic
+  ;; leaf cannot re-enter guest code; fuel does not bound it. Break: put the
+  ;; prefix back on every name and this assertion is false.
+  (let [kir {:format :kotoba.kir/v4 :exports ['kernel]
+             :functions [{:name 'kernel :params ['n] :result :i64
+                          :body '(+ (* n 48271) 1)}]}
+        arm (vec (:code (arm/emit-program kir)))
+        x86-code (vec (:code (x86/emit-program kir)))]
+    (is (not= a64-fuel-ldr (first (a64-le-words arm)))
+        "AArch64 leaf does not start with ldr x16,[x7,#8]")
+    (is (not= x86-fuel-cmp (subvec x86-code 0 5))
+        "x86-64 leaf does not start with cmp qword [r9+8],0")
+    (is (empty? (machine/entry-fuel-prefixes kir (constantly [:fuel]))))))
+
+(deftest production-self-call-keeps-entry-fuel
+  ;; The bound is for functions that can run unbounded work. Break: skip the
+  ;; prefix for every name and a 512-deep countdown no longer traps.
+  (let [kir {:format :kotoba.kir/v4 :exports ['down]
+             :functions [{:name 'down :params ['n] :result :i64
+                          :body '(if (< n 1) n (down (- n 1)))}]}
+        arm (vec (:code (arm/emit-program kir)))
+        x86-code (vec (:code (x86/emit-program kir)))
+        prefixes (machine/entry-fuel-prefixes kir (constantly [:fuel]))]
+    (is (= a64-fuel-ldr (first (a64-le-words arm))))
+    (is (= x86-fuel-cmp (subvec x86-code 0 5)))
+    (is (= {'down [:fuel]} prefixes))))
+

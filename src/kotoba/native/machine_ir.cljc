@@ -4024,6 +4024,30 @@
                   (instruction-tokens target frame-bytes return-suffix tail-suffix {}
                                       instructions))))))
 
+(def ^:private guest-reentry-ops
+  ;; A function that contains one of these can run unbounded guest or host
+  ;; work after entry. Fuel is the bound. Arithmetic, `if`, `let`, and `do`
+  ;; are finite without it.
+  #{:gmir/call :gmir/tail-call :gmir/runtime-call :gmir/capability-call})
+
+(defn function-reenters-guest?
+  "True when lowered instructions can invoke more guest or host work."
+  [instructions]
+  (boolean (some #(contains? guest-reentry-ops (:gmir/op %)) instructions)))
+
+(defn entry-fuel-prefixes
+  "Production fuel map: only functions that can re-enter. TOKENS-FOR is
+  called with the function name for each such function and must return a
+  token vector. Acyclic leaves are omitted — charging them is what the
+  100k C harness was paying on `kernel_wide`."
+  [kir tokens-for]
+  (let [module (lower-kir-module kir)]
+    (into {}
+          (keep (fn [{:gmir/keys [name instructions]}]
+                  (when (function-reenters-guest? instructions)
+                    [name (vec (tokens-for name))]))
+                (:gmir/functions module)))))
+
 (defn compile-kir-module
   "End-to-end scalar direct-call slice: checked KIR module through GMIR v3,
   MIR v3 allocation, MC v3 and final function/call layout."
