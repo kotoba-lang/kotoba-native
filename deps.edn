@@ -6,17 +6,15 @@
         io.github.kotoba-lang/kotoba-gmir
         {:git/url "https://github.com/kotoba-lang/kotoba-gmir.git"
          :git/sha "820a3d01c80a4e38753632e2945f86e716ce054b"}
-        ;; ⚠ 7f7c556 (kotoba-mir ADR 0012, call clobbers in the linear scanner)
-        ;; MISCOMPILES functions that have a call, control flow, and a loop.
-        ;; `(defn main [] (if (string-contains? "abcdef" "def") 1 0))` returns 0.
-        ;; Measured through amu, which executes: 62 failures, 30 on AArch64 and
-        ;; 30 on x86-64 -- an even split across two independent encoders, so the
-        ;; fault is in the shared allocator. Neither this repository nor
-        ;; kotoba-mir can see it: neither runs a compiled program.
-        ;; DO NOT advance amu onto this until kotoba-mir ADR 0012 is fixed.
+        ;; Candidate fix for ADR 0012: kotoba-mir ac14016d (back-edge? plus
+        ;; drop backed assignments at each label). 7f7c556 miscompiled
+        ;; `(defn main [] (if (string-contains? "abcdef" "def") 1 0))` to 0.
+        ;; This repository still does not execute compiled programs, so a green
+        ;; native suite is not the measurement. Do not advance amu until
+        ;; native-executor-test and isa-execution-test are green there.
         io.github.kotoba-lang/kotoba-mir
         {:git/url "https://github.com/kotoba-lang/kotoba-mir.git"
-         :git/sha "7f7c55691697ba25abf6d732870a159433ce1fab"}
+         :git/sha "ac14016d1cb07a9d0a4c1942452c6340814cbaae"}
         io.github.kotoba-lang/kotoba-codegen
         {:git/url "https://github.com/kotoba-lang/kotoba-codegen.git"
          :git/sha "c85088bfe9dd85e9c6a65d986f34a651b2af7d13"}
