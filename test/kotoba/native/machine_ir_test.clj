@@ -828,9 +828,13 @@
     ;; did not reach across and impose its shape on x86-64 — but the evidence
     ;; for it is now that x86-64 shows its OWN selection, an add-immediate,
     ;; where AArch64 shows a cached constant register.
-    (is (= [0x48 0x89 0xc2 0x48 0x81 0xc2 0x07 0x00 0x00 0x00]
-           (subvec x86 3 13))
-        "x86-64 selects its own add-immediate rather than AArch64's shape")
+    ;; `lea rdx,[rax+7]` rather than `mov rdx,rax` then `add rdx,7`: one
+    ;; instruction and seven bytes instead of two and ten. Still x86-64's own
+    ;; selection, which is what this guards; AArch64 shows a cached constant
+    ;; register here and reaches nothing on this side.
+    (is (= [0x48 0x8d 0x90 0x07 0x00 0x00 0x00]
+           (subvec x86 3 10))
+        "x86-64 selects its own address arithmetic rather than AArch64's shape")
     (is (not-any? #{0xb8 0xb9} (subvec x86 3 13))
         "and materializes no constant register on the way")))
 

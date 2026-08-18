@@ -1951,6 +1951,32 @@
            (bit-or 0xc0 (bit-shift-left slash 3) (bit-and d 7))]
           (x86-le32 value))))
 
+;; `lea dst,[src+disp]` computes what `mov dst,src` then `add dst,imm` computes,
+;; in one instruction, when the destination differs from the source. It is sound
+;; here because it writes no flags and nothing reads the flags the `add` wrote:
+;; every flag consumer this backend emits carries its own producer in the same
+;; unit — `x86-compare` puts `cmp` immediately before `setcc`, and
+;; `:mc/branch-zero` puts `test reg,reg` immediately before `jz`. No flag ever
+;; travels between two MIR instructions.
+;;
+;; Returns nil when the base register would need a SIB byte (RSP and R12 encode
+;; rm=100, which means "SIB follows"), leaving the caller on the two-instruction
+;; form rather than emitting a different addressing mode than it intended.
+(defn- x86-lea-disp32 [dst src displacement]
+  (let [d (get x86-register-code dst)
+        s (get x86-register-code src)]
+    (when (and (some? d) (some? s) (not= 4 (bit-and s 7)))
+      (into [(bit-or 0x48 (if (>= d 8) 4 0) (if (>= s 8) 1 0)) 0x8d
+             (bit-or 0x80 (bit-shift-left (bit-and d 7) 3) (bit-and s 7))]
+            (x86-le32 displacement)))))
+
+(defn- x86-negatable-imm32?
+  "A displacement may be negated for `sub`; the one signed 32-bit value whose
+   negation does not fit is the minimum."
+  [value]
+  #?(:clj (> (long value) -2147483648)
+     :cljs (> (i64/->bigint value) (js/BigInt "-2147483648"))))
+
 (defn- x86-imul-imm [dst src value]
   (let [d (get x86-register-code dst)
         s (get x86-register-code src)]
@@ -2701,15 +2727,18 @@
     :x86-64/add
     (let [dst (:mir/dst instruction) left (:mir/left instruction) right (:mir/right instruction)]
       (if-let [immediate (:native/x86-immediate instruction)]
-        (vec (concat (when-not (= dst left) (x86-rr 0x89 dst left))
-                     (x86-alu-imm 0 dst immediate)))
+        (or (when-not (= dst left) (x86-lea-disp32 dst left immediate))
+            (vec (concat (when-not (= dst left) (x86-rr 0x89 dst left))
+                         (x86-alu-imm 0 dst immediate))))
         (vec (concat (when-not (= dst left) (x86-rr 0x89 dst left))
                      (x86-rr 0x01 dst right)))))
     :x86-64/subtract
     (let [dst (:mir/dst instruction) left (:mir/left instruction) right (:mir/right instruction)]
       (if-let [immediate (:native/x86-immediate instruction)]
-        (vec (concat (when-not (= dst left) (x86-rr 0x89 dst left))
-                     (x86-alu-imm 5 dst immediate)))
+        (or (when (and (not= dst left) (x86-negatable-imm32? immediate))
+              (x86-lea-disp32 dst left (- immediate)))
+            (vec (concat (when-not (= dst left) (x86-rr 0x89 dst left))
+                         (x86-alu-imm 5 dst immediate))))
         (vec (concat (when-not (= dst left) (x86-rr 0x89 dst left))
                      (x86-rr 0x29 dst right)))))
     :x86-64/multiply
