@@ -1758,7 +1758,7 @@
                  [0x48 0x99 0x48 0xf7 0xf9]
                  restore))))
 
-(defn- x86-quotient-constant [dst left divisor]
+(defn- x86-quotient-constant [dst left divisor reciprocal-live?]
   (if-let [{:keys [multiplier shift add-numerator? subtract-numerator?]}
            (signed-division-magic divisor)]
     ;; RAX and RDX are saved because `imul r10` writes both and MIR declares
@@ -1786,7 +1786,7 @@
         (x86-push :x86-64/rdx)
         (when numerator? (move :x86-64/r11 left))
         (move :x86-64/rax left)
-        (x86-mov-imm :x86-64/r10 multiplier)
+        (when-not reciprocal-live? (x86-mov-imm :x86-64/r10 multiplier))
         ;; imul r10: signed RDX:RAX = RAX * R10
         [0x49 0xf7 0xea]
         (cond
@@ -1797,9 +1797,12 @@
                                       (x86-rr 0x89 :x86-64/r11 :x86-64/rdx))
           :else (x86-rr 0x89 :x86-64/r11 :x86-64/rdx))
         (when (pos? shift) [0x49 0xc1 0xfb shift]) ; sar r11,shift
-        (x86-rr 0x89 :x86-64/r10 :x86-64/r11)
-        [0x49 0xc1 0xea 0x3f] ; shr r10,63
-        (x86-rr 0x01 :x86-64/r11 :x86-64/r10)
+        ;; RDX rather than R10: it is dead here in every branch above and the
+        ;; pop restores it regardless, which leaves R10 free to keep carrying
+        ;; the reciprocal into the next division.
+        (x86-rr 0x89 :x86-64/rdx :x86-64/r11)
+        [0x48 0xc1 0xea 0x3f] ; shr rdx,63
+        (x86-rr 0x01 :x86-64/r11 :x86-64/rdx)
         (x86-pop :x86-64/rdx)
         (x86-pop :x86-64/rax)
         (when-not (= dst :x86-64/r11)
@@ -2754,7 +2757,8 @@
                   (:mir/right instruction))
     :x86-64/quotient-constant
     (x86-quotient-constant (:mir/dst instruction) (:mir/left instruction)
-                           (:mir/divisor instruction))
+                           (:mir/divisor instruction)
+                           (:native/x86-reciprocal-live instruction))
     :x86-64/bit-and
     (let [dst (:mir/dst instruction) left (:mir/left instruction) right (:mir/right instruction)]
       (vec (concat (when-not (= dst left) (x86-rr 0x89 dst left))
@@ -3214,6 +3218,47 @@
 ;; Restricted to instructions that carry an immediate on purpose. Without one,
 ;; add and subtract lower in place and genuinely need the copy; propagating
 ;; into them would change which register the result lands in.
+(def ^:private x86-reciprocal-cache-safe-encodings
+  ;; Closed on purpose, the way `a64-leaf-cache-safe-encodings` is closed. R10
+  ;; survives from one constant division to the next only across encodings that
+  ;; are known not to write it. Measured on this file: the only emitters that
+  ;; touch R10 are `x86-quotient-constant` itself, `x86-privileged`, the
+  ;; kernel-memory pair and the fault-handler addresses — none of which are
+  ;; listed here, and an encoding nobody has checked is not listed either, so a
+  ;; sequence containing one simply does not qualify.
+  #{:x86-64/argument :x86-64/constant :x86-64/move
+    :x86-64/add :x86-64/subtract :x86-64/multiply
+    :x86-64/quotient-constant :x86-64/return
+    :x86-64/bit-and :x86-64/bit-or :x86-64/bit-xor
+    :x86-64/equal :x86-64/less-than :x86-64/less-or-equal
+    :x86-64/greater-than :x86-64/greater-or-equal})
+
+;; Every constant division by the same divisor loads the same ten-byte
+;; reciprocal into R10. Loading it once is worth seven of those ten-byte loads
+;; on a kernel that divides eight times, and costs nothing: R10 is outside the
+;; allocator's four registers, and the sign correction that used to borrow it
+;; now borrows RDX, which is dead at that point in every branch and is restored
+;; by the pop regardless.
+;;
+;; Only in a straight-line run of qualifying encodings, and only for divisions
+;; after the first with that exact divisor. A branch would let control reach the
+;; second division without passing the first.
+(defn- x86-hoist-repeated-reciprocal [instructions]
+  (if-not (every? #(contains? x86-reciprocal-cache-safe-encodings (:mc/encoding %))
+                  instructions)
+    instructions
+    (first
+     (reduce (fn [[out loaded] instruction]
+               (if (= :x86-64/quotient-constant (:mc/encoding instruction))
+                 (let [divisor (:mir/divisor instruction)]
+                   (if (contains? loaded divisor)
+                     [(conj out (assoc instruction :native/x86-reciprocal-live true))
+                      loaded]
+                     [(conj out instruction) (conj loaded divisor)]))
+                 [(conj out instruction) loaded]))
+             [[] #{}]
+             instructions))))
+
 (defn- x86-propagate-copies [instructions]
   (letfn [(uses-before-redefinition [instructions register]
             (loop [remaining instructions, uses 0]
@@ -3355,7 +3400,8 @@
                                     a64-fold-adjacent-add-sub-immediates)
                        :x86-64 (-> instructions
                                  x86-fold-adjacent-immediates
-                                 x86-propagate-copies)
+                                 x86-propagate-copies
+                                 x86-hoist-repeated-reciprocal)
                        instructions)]
     (:out
      (reduce
