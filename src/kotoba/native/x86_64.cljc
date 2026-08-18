@@ -2004,6 +2004,5 @@
                       (assoc % :exports (mapv :name (:functions %))))))]
     (machine-ir/compile-kir-module
      :x86-64 kir
-     (into {} (map (fn [{:keys [name]}]
-                     [name (vec (fuel-charge-tokens (atom -1)))])
-                   (:functions kir))))))
+     (machine-ir/entry-fuel-prefixes
+      kir (fn [_] (fuel-charge-tokens (atom -1)))))))
