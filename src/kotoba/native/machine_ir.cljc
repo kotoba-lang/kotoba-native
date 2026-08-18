@@ -19,33 +19,45 @@
   (throw (ex-info (str "machine IR rejected: " (name problem))
                   {:phase phase :problem problem :instruction instruction})))
 
+(defn- a64-op [instruction]
+  (or (:mc/encoding instruction) (:mir/op instruction)))
+
 (defn- a64-fused-multiply [multiply consumer]
   (let [product (:mir/dst multiply)
+        consumer-op (a64-op consumer)
         addend (cond
-                 (and (= :mir/add (:mir/op consumer))
+                 (and (contains? #{:mir/add :aarch64/add} consumer-op)
                       (= product (:mir/left consumer))) (:mir/right consumer)
-                 (and (= :mir/add (:mir/op consumer))
+                 (and (contains? #{:mir/add :aarch64/add} consumer-op)
                       (= product (:mir/right consumer))) (:mir/left consumer)
-                 (and (= :mir/subtract (:mir/op consumer))
+                 (and (contains? #{:mir/subtract :aarch64/subtract} consumer-op)
                       (= product (:mir/right consumer))) (:mir/left consumer))]
     (when (and addend (not= product addend))
-      {:mir/op (if (= :mir/subtract (:mir/op consumer))
-                 :mir/multiply-subtract :mir/multiply-add)
-       :mir/dst (:mir/dst consumer)
-       :mir/left (:mir/left multiply)
-       :mir/right (:mir/right multiply)
-       :mir/addend addend})))
+      (let [subtract? (contains? #{:mir/subtract :aarch64/subtract} consumer-op)
+            fused {:mir/dst (:mir/dst consumer)
+                   :mir/left (:mir/left multiply)
+                   :mir/right (:mir/right multiply)
+                   :mir/addend addend}]
+        (if (:mc/encoding multiply)
+          (assoc fused :mc/op :mc/instruction
+                 :mc/encoding (if subtract?
+                                :aarch64/multiply-subtract
+                                :aarch64/multiply-add))
+          (assoc fused :mir/op (if subtract?
+                                 :mir/multiply-subtract
+                                 :mir/multiply-add)))))))
 
 (defn- a64-fuse-multiplies [instructions]
   (loop [index 0, out []]
     (if (>= index (count instructions))
       (vec out)
       (let [multiply (get instructions index)]
-        (if (= :mir/multiply (:mir/op multiply))
+        (if (contains? #{:mir/multiply :aarch64/multiply} (a64-op multiply))
           (let [after (inc index)
                 consumer-index
                 (loop [candidate after]
-                  (if (= :mir/constant (:mir/op (get instructions candidate)))
+                  (if (contains? #{:mir/constant :aarch64/constant}
+                                 (a64-op (get instructions candidate)))
                     (recur (inc candidate))
                     candidate))
                 between (subvec instructions after consumer-index)
@@ -146,18 +158,18 @@
                            a64-fuse-multiplies
                            a64-coalesce-direct-results)
                        instructions)]
-  (mapv (fn [{:mir/keys [op id test] :as instruction}]
-          (case op
-            :mir/label (layout/label id)
-            :mir/branch-zero
-            {:mc/op :mc/branch-zero :mc/test test
-             :mc/target (:mir/target instruction)}
-            :mir/jump
-            {:mc/op :mc/jump :mc/target (:mir/target instruction)}
-            (into {:mc/op :mc/instruction
-                   :mc/encoding (keyword (name isa) (name op))}
-                  (remove (fn [[k _]] (= k :mir/op)) instruction))))
-        instructions)))
+    (mapv (fn [{:mir/keys [op id test] :as instruction}]
+            (case op
+              :mir/label (layout/label id)
+              :mir/branch-zero
+              {:mc/op :mc/branch-zero :mc/test test
+               :mc/target (:mir/target instruction)}
+              :mir/jump
+              {:mc/op :mc/jump :mc/target (:mir/target instruction)}
+              (into {:mc/op :mc/instruction
+                     :mc/encoding (keyword (name isa) (name op))}
+                    (remove (fn [[k _]] (= k :mir/op)) instruction))))
+          instructions)))
 
 (defn lower-mc
   "Lower allocated MIR to explicit MC instruction/layout data.
@@ -3543,6 +3555,13 @@
   (let [instructions (case isa
                        :aarch64 (-> instructions
                                     a64-cache-leaf-constants
+                                    ;; Offset-lane `(* (+ n k) C)+1` materializes C
+                                    ;; and 1 onto the multiply's own registers until
+                                    ;; the cache pins them in x13-x15. MIR fusion
+                                    ;; already ran and refused those "clobbers";
+                                    ;; after the cache the stream is mul+add and
+                                    ;; this second pass emits MADD.
+                                    a64-fuse-multiplies
                                     a64-fold-adjacent-add-sub-immediates)
                        :x86-64 (-> instructions
                                  x86-fold-adjacent-immediates

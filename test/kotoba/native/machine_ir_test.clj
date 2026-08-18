@@ -136,6 +136,100 @@
     (is (some #{[0x01 0x0c 0x01 0x9b]} words) "MADD x1,x0,x1,x3")
     (is (some #{[0x00 0x84 0x02 0x9b]} words) "MSUB x0,x0,x2,x1")))
 
+(defn- a64-le-words [code]
+  (mapv (fn [[b0 b1 b2 b3]]
+          (bit-or b0
+                  (bit-shift-left b1 8)
+                  (bit-shift-left b2 16)
+                  (bit-shift-left b3 24)))
+        (partition 4 code)))
+
+(defn- a64-mul-kind
+  "64-bit MADD/MUL/MSUB (bits 31-21 = 10011011000). SMULH is 10011011010."
+  [word]
+  (when (= (bit-and word 0xffe00000) 0x9b000000)
+    (let [ra (bit-and (unsigned-bit-shift-right word 10) 0x1f)
+          o0 (bit-and (unsigned-bit-shift-right word 15) 0x1)]
+      (cond (pos? o0) :msub
+            (= ra 31) :mul
+            :else :madd))))
+
+(deftest aarch64-fuses-multiply-add-after-leaf-cache-on-offset-lanes
+  ;; `(+ (* (+ n k) C) 1)` across several k reuses C and 1. Before the leaf
+  ;; cache those constants land on the multiply's own registers and MIR
+  ;; fusion refuses the "clobber". The cache later pins them in x13-x15 and
+  ;; deletes the duplicates, so the bytes are adjacent mul+add. Encoding
+  ;; fusion after the cache emits MADD. Serial `v = v*C+1` already fused at
+  ;; MIR; the offset-lane shape is what kernel_wide.kotoba actually emits.
+  ;; Discriminate on encoded bytes: `:mc/instructions` still shows the
+  ;; MIR-time refusal (validate! cannot see x13-x15).
+  (let [form '(let [a (+ (* n 48271) 1)
+                    b (+ (* (+ n 1) 48271) 1)
+                    c (+ (* (+ n 2) 48271) 1)
+                    d (+ (* (+ n 3) 48271) 1)
+                    e (+ (* (+ n 4) 48271) 1)
+                    f (+ (* (+ n 5) 48271) 1)
+                    g (+ (* (+ n 6) 48271) 1)
+                    h (+ (* (+ n 7) 48271) 1)]
+                (+ (+ (+ a b) (+ c d)) (+ (+ e f) (+ g h))))
+        arm (machine/compile-gmir
+             :aarch64 (machine/lower-kir-expression ['n] form))
+        encodings (keep :mc/encoding (:mc/instructions arm))
+        kinds (keep a64-mul-kind
+                    (a64-le-words (machine/compile-expression :aarch64 ['n] form)))]
+    (is (pos? (count (filter #{:aarch64/multiply} encodings)))
+        "MIR fusion still refuses the offset lanes; the cache has not run")
+    (is (= 8 (count (filter #{:madd} kinds)))
+        "each of the eight lanes is a MADD in the encoded bytes")
+    (is (zero? (count (filter #{:mul} kinds)))
+        "no unfused multiply remains once 48271 and 1 are cached")))
+
+(deftest aarch64-kernel-wide-encodes-sixteen-madds-after-leaf-cache
+  ;; Production path: compile-kir-module, not the v2 expression helper.
+  ;; Sixteen Lehmer steps (8 lanes × 2 rounds). Remainder is SMULH/MSUB and
+  ;; must not be counted as MUL. Break: 15 of the 16 steps stay mul+add.
+  (let [body '(let [v_a0 (+ (* n 48271) 1)
+                    a0 (- v_a0 (* (quot v_a0 2147483647) 2147483647))
+                    v_b0 (+ (* (+ n 1) 48271) 1)
+                    b0 (- v_b0 (* (quot v_b0 2147483647) 2147483647))
+                    v_c0 (+ (* (+ n 2) 48271) 1)
+                    c0 (- v_c0 (* (quot v_c0 2147483647) 2147483647))
+                    v_d0 (+ (* (+ n 3) 48271) 1)
+                    d0 (- v_d0 (* (quot v_d0 2147483647) 2147483647))
+                    v_e0 (+ (* (+ n 4) 48271) 1)
+                    e0 (- v_e0 (* (quot v_e0 2147483647) 2147483647))
+                    v_f0 (+ (* (+ n 5) 48271) 1)
+                    f0 (- v_f0 (* (quot v_f0 2147483647) 2147483647))
+                    v_g0 (+ (* (+ n 6) 48271) 1)
+                    g0 (- v_g0 (* (quot v_g0 2147483647) 2147483647))
+                    v_h0 (+ (* (+ n 7) 48271) 1)
+                    h0 (- v_h0 (* (quot v_h0 2147483647) 2147483647))
+                    v_a1 (+ (* a0 48271) 1)
+                    a1 (- v_a1 (* (quot v_a1 2147483647) 2147483647))
+                    v_b1 (+ (* b0 48271) 1)
+                    b1 (- v_b1 (* (quot v_b1 2147483647) 2147483647))
+                    v_c1 (+ (* c0 48271) 1)
+                    c1 (- v_c1 (* (quot v_c1 2147483647) 2147483647))
+                    v_d1 (+ (* d0 48271) 1)
+                    d1 (- v_d1 (* (quot v_d1 2147483647) 2147483647))
+                    v_e1 (+ (* e0 48271) 1)
+                    e1 (- v_e1 (* (quot v_e1 2147483647) 2147483647))
+                    v_f1 (+ (* f0 48271) 1)
+                    f1 (- v_f1 (* (quot v_f1 2147483647) 2147483647))
+                    v_g1 (+ (* g0 48271) 1)
+                    g1 (- v_g1 (* (quot v_g1 2147483647) 2147483647))
+                    v_h1 (+ (* h0 48271) 1)
+                    h1 (- v_h1 (* (quot v_h1 2147483647) 2147483647))]
+                (+ (+ (+ a1 b1) (+ c1 d1)) (+ (+ e1 f1) (+ g1 h1))))
+        kir {:format :kotoba.kir/v3 :entry 'kernel :exports ['kernel]
+             :functions [{:name 'kernel :params ['n] :body body}]}
+        kinds (keep a64-mul-kind
+                    (a64-le-words
+                     (:code (machine/compile-kir-module :aarch64 kir))))]
+    (is (= 16 (count (filter #{:madd} kinds))))
+    (is (zero? (count (filter #{:mul} kinds))))))
+
+
 (deftest aarch64-coalesces-phi-edge-and-return-moves-into-direct-results
   (let [form '(+ 1 (if a (* a 2) (- a 3)))
         arm (machine/compile-gmir
