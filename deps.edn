@@ -6,13 +6,12 @@
         io.github.kotoba-lang/kotoba-gmir
         {:git/url "https://github.com/kotoba-lang/kotoba-gmir.git"
          :git/sha "820a3d01c80a4e38753632e2945f86e716ce054b"}
-        ;; kotoba-mir b37b19e: ADR 0012 accepted after Judah executed
-        ;; native-executor-test + isa-execution-test (74/841/0) on amu 30370f07.
+        ;; kotoba-mir 767d3c0: call+loop uses the scanner (:call-live).
         ;; This repository still does not execute compiled programs. A green
         ;; native suite here is encodings only, not that measurement.
         io.github.kotoba-lang/kotoba-mir
         {:git/url "https://github.com/kotoba-lang/kotoba-mir.git"
-         :git/sha "b37b19e768490fac2a2fc667e432af90af2ae279"}
+         :git/sha "767d3c0b418f85d1d177f78b0648c106a79bfb62"}
         io.github.kotoba-lang/kotoba-codegen
         {:git/url "https://github.com/kotoba-lang/kotoba-codegen.git"
          :git/sha "c85088bfe9dd85e9c6a65d986f34a651b2af7d13"}
