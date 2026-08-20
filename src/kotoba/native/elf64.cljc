@@ -127,6 +127,25 @@
    ;; than whatever a caller passes.
    'aiueos-msr-read {:arity 1 :symbol "kotoba_aiueos_msr_read"}
    'aiueos-msr-write {:arity 2 :symbol "kotoba_aiueos_msr_write"}
+   ;; The value runtime's two entries whose contracts name their own symbol:
+   ;; `contracts/value-runtime-syscall-plan-v1.edn` and
+   ;; `contracts/value-runtime-cas-verify-v1.edn` each carry
+   ;; `:native {:export "..."}`, so these are transcribed rather than chosen.
+   ;;
+   ;; Until they were listed, `package-kernel-object` had no entry for them and
+   ;; they took the probe's contract, which is how aiueos ADR-0054 came to
+   ;; measure three objects all exporting `kotoba_aiueos_probe`. Listing them
+   ;; is the other half of making that table an allowlist: refusing an unknown
+   ;; name is only useful if a known one can be added.
+   ;;
+   ;; `value-handle-plan` is deliberately NOT here. Its contract carries no
+   ;; `:native` block, so there is no declared symbol to transcribe and this
+   ;; table will not invent one; its failure is a different phase's
+   ;; ("planner object export is not exact") and belongs to aiueos.
+   'aiueos-value-runtime-syscall-plan
+   {:arity 5 :symbol "kotoba_aiueos_value_runtime_syscall_plan"}
+   'aiueos-value-runtime-cas-verify
+   {:arity 5 :symbol "kotoba_aiueos_value_runtime_cas_verify"}
    ;; IDT gate construction. Splitting a 64-bit handler address across an
    ;; interrupt descriptor's three offset fields is bit-packing, and getting it
    ;; wrong points a vector at the wrong address -- which is a silent, exploitable
