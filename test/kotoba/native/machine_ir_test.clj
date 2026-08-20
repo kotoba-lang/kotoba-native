@@ -1879,3 +1879,77 @@
                                    (machine/lower-kir-expression '[n] form)))]
     (is (= 1 (count (filter #{:gmir/multiply} operations)))
         "the second product is aliased to the first")))
+
+;; ---------------------------------------------------------------------------
+;; kernel-try-lock-u32 / kernel-unlock-u32 (amu#625)
+;; ---------------------------------------------------------------------------
+
+;; These two are the only atomic read-modify-write in the native profile, and
+;; both encodings are written by hand here rather than by an assembler, so the
+;; instruction words are pinned as literals. That is not belt-and-braces: the
+;; STLXR word was wrong on the first attempt -- 0x8811fe00 hand-carried to
+;; 0x8910fe00 -- and it assembled, laid out, and emitted a program of exactly
+;; the right length. Only a disassembler said "invalid". A length check or a
+;; round-trip through our own encoder would both have passed.
+;;
+;; The bytes below were taken from clang (`ldaxr w17, [x16]` -> 885ffe11,
+;; `stlxr w17, w3, [x16]` -> 8811fe03, `clrex` -> d5033f5f) and from an
+;; independent disassembly of the emitted program, not from re-running the
+;; arithmetic in `machine-ir` a second time.
+
+(defn- lock-program [body]
+  {:format :kotoba.kir/v4 :exports ['main]
+   :functions [{:name 'main :params '[b l i] :body body}]})
+
+(defn- contains-subvector? [haystack needle]
+  (boolean (some #(= needle (subvec (vec haystack) % (+ % (count needle))))
+                 (range (inc (- (count haystack) (count needle)))))))
+
+(deftest x86-lock-is-one-lock-cmpxchg-with-rax-saved-around-it
+  (let [code (fn [body] (vec (:code (x86/emit-program (lock-program body)))))
+        acquire (code '(kernel-try-lock-u32 b l i))
+        release (code '(kernel-unlock-u32 b l i))]
+    (testing "the atomic itself: lock cmpxchg dword [r11], r10d"
+      (doseq [[label bytes] [["acquire" acquire] ["release" release]]]
+        (is (contains-subvector? bytes [0xf0 0x45 0x0f 0xb1 0x13])
+            (str label " must carry the LOCK-prefixed CMPXCHG"))))
+    (testing "RAX is the fixed comparand, so it is pushed and popped"
+      (is (contains-subvector? acquire [0x50]) "push rax")
+      (is (contains-subvector? acquire [0x58]) "pop rax")
+      (is (< (.indexOf ^java.util.List acquire (int 0x50))
+             (.indexOf ^java.util.List acquire (int 0x58)))
+          "the push precedes the pop"))
+    (testing "the comparand and replacement are the operation's, not the guest's"
+      ;; mov eax, imm32 / mov r10d, imm32
+      (is (contains-subvector? acquire [0xb8 0x00 0x00 0x00 0x00]) "acquire expects 0")
+      (is (contains-subvector? acquire [0x41 0xba 0x01 0x00 0x00 0x00]) "acquire writes 1")
+      (is (contains-subvector? release [0xb8 0x01 0x00 0x00 0x00]) "release expects 1")
+      (is (contains-subvector? release [0x41 0xba 0x00 0x00 0x00 0x00]) "release writes 0"))
+    (testing "acquire and release differ only in those two immediates"
+      (is (= (count acquire) (count release)))
+      (is (= 2 (count (remove zero? (map #(if (= %1 %2) 0 1) acquire release))))
+          "exactly two bytes differ, and they are the two constants"))))
+
+(deftest aarch64-lock-is-the-exclusive-monitor-pair-with-a-retry
+  (let [code (fn [body] (vec (:code (arm/emit-program (lock-program body)))))
+        acquire (code '(kernel-try-lock-u32 b l i))
+        release (code '(kernel-unlock-u32 b l i))
+        word (fn [w] [(bit-and w 0xff) (bit-and (bit-shift-right w 8) 0xff)
+                      (bit-and (bit-shift-right w 16) 0xff)
+                      (bit-and (bit-shift-right w 24) 0xff)])]
+    (testing "LDAXR/STLXR, and CLREX on the path that loses the race"
+      (doseq [[label bytes] [["acquire" acquire] ["release" release]]]
+        (is (contains-subvector? bytes (word 0x885ffe11))
+            (str label " must LDAXR w17 from [x16]"))
+        (is (contains-subvector? bytes (word 0x8811fe03))
+            (str label " must STLXR w17, w3, [x16] -- 0x8910fe03 decodes as nothing"))
+        (is (contains-subvector? bytes (word 0xd5033f5f))
+            (str label " must CLREX rather than leave the monitor set"))))
+    (testing "a failed store retries, which means a backward branch"
+      ;; B.NE with a negative displacement: the top byte of the word is 0x54
+      ;; and the imm19 field is all ones at the high end.
+      (is (contains-subvector? acquire (word 0x54ffff41))
+            "the store-failed branch must target the LDAXR, not fall through"))
+    (testing "the comparand is the operation's"
+      (is (contains-subvector? acquire (word 0xf100023f)) "acquire compares against 0")
+      (is (contains-subvector? release (word 0xf100063f)) "release compares against 1"))))
