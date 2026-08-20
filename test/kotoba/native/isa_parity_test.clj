@@ -69,6 +69,12 @@
    [['b 'l 'i 'v] '(kernel-store-u8 b l i v)]
    [['b 'l 'i 'v] '(kernel-store-u8-4k b l i v)]
    [['b 'l 'i 'v] '(kernel-store-u32 b l i v)]
+   ;; The lock pair. Both ISAs, no exception: this names an atomic
+   ;; read-modify-write, and AArch64 has one (LDAXR/STLXR) even though it has
+   ;; no CAS below ARMv8.1-LSE. It is deliberately NOT in the x86-only list
+   ;; below, which is for facilities the other ISA genuinely lacks.
+   [['b 'l 'i] '(kernel-try-lock-u32 b l i)]
+   [['b 'l 'i] '(kernel-unlock-u32 b l i)]
    [['b 'l 'o 's] '(kernel-subregion b l o s)]
    ;; vector-i64 and vector-f64. Both families lower to the same six host
    ;; calls, so a gap on one ISA would be a gap on every one of the fourteen

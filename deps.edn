@@ -2,19 +2,19 @@
  :deps {org.clojure/clojure {:mvn/version "1.12.0"}
         io.github.kotoba-lang/kotoba-kir
         {:git/url "https://github.com/kotoba-lang/kotoba-kir.git"
-         :git/sha "f3d255b52f85040815057426f5da557714b09b3a"}
+         :git/sha "136a62e0ad93585c5ecfa6755c82aa4ac2637e14"}
         io.github.kotoba-lang/kotoba-gmir
         {:git/url "https://github.com/kotoba-lang/kotoba-gmir.git"
-         :git/sha "820a3d01c80a4e38753632e2945f86e716ce054b"}
+         :git/sha "5fe05d1c729858553e2e518be395db7dfe1598a6"}
         ;; kotoba-mir 767d3c0: call+loop uses the scanner (:call-live).
         ;; This repository still does not execute compiled programs. A green
         ;; native suite here is encodings only, not that measurement.
         io.github.kotoba-lang/kotoba-mir
         {:git/url "https://github.com/kotoba-lang/kotoba-mir.git"
-         :git/sha "767d3c0b418f85d1d177f78b0648c106a79bfb62"}
+         :git/sha "e89b4860cba44e69b6588bc535acc1ae9608654a"}
         io.github.kotoba-lang/kotoba-codegen
         {:git/url "https://github.com/kotoba-lang/kotoba-codegen.git"
-         :git/sha "c85088bfe9dd85e9c6a65d986f34a651b2af7d13"}
+         :git/sha "568650d9d183a1e2642edd6ab8330d435fc07abe"}
         io.github.kotoba-lang/kotoba-object
         {:git/url "https://github.com/kotoba-lang/kotoba-object.git"
          :git/sha "eb460265e15743b85a37f4432277173ad5cedc06"}

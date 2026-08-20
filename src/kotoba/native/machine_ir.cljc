@@ -264,7 +264,12 @@
    'kernel-store-u8 [:gmir/kernel-store-u8 512]
    'kernel-store-u8-4k [:gmir/kernel-store-u8 4096]
    'kernel-load-u32 [:gmir/kernel-load-u32 512]
-   'kernel-store-u32 [:gmir/kernel-store-u32 512]})
+   'kernel-store-u32 [:gmir/kernel-store-u32 512]
+   ;; 4096 because the lock word this names lives at offset 0 of a page, and
+   ;; its callers declare lengths of both 512 and 4096. A 512 ceiling would
+   ;; trap the 4096 ones on the length check before reaching the shared word.
+   'kernel-try-lock-u32 [:gmir/kernel-try-lock-u32 4096]
+   'kernel-unlock-u32 [:gmir/kernel-unlock-u32 4096]})
 
 (def ^:private kir-x86-privileged-ops
   {'kernel-boot-info :boot-info
@@ -2527,27 +2532,84 @@
   (keyword "kotoba.native.kernel-memory"
            (str suffix "-" instruction-index)))
 
+(defn- x86-kernel-bounds-check
+  "The shared preamble for every checked kernel access: the declared length is
+  within this operation's ceiling, the base is not null, the index is inside
+  the length, and a 32-bit access has four bytes left after it. Branches to
+  `trap` on any violation, and otherwise leaves R11 holding base+index. R10 is
+  scratch here and dead afterwards, which is what lets the lock sequence below
+  borrow it without saving anything."
+  [trap width {:mir/keys [base length index maximum]}]
+  (vec (concat
+        (x86-cmp-imm32 length maximum)
+        [(layout/relative-branch :x86-64/ja-rel32 trap)]
+        (x86-rr 0x85 base base)
+        [(layout/relative-branch :x86-64/jz-rel32 trap)]
+        (x86-rr 0x39 index length)
+        [(layout/relative-branch :x86-64/jae-rel32 trap)]
+        (when (= 32 width)
+          (concat (x86-rr 0x89 :x86-64/r10 length)
+                  (x86-rr 0x29 :x86-64/r10 index)
+                  (x86-cmp-imm32 :x86-64/r10 4)
+                  [(layout/relative-branch :x86-64/jl-rel32 trap)]))
+        (x86-rr 0x89 :x86-64/r11 base)
+        (x86-rr 0x01 :x86-64/r11 index))))
+
+(defn- x86-set-zero-flag
+  "`sete dst8` then zero-extend, the tail `x86-compare` already uses. Written
+  once here because the lock sequence needs the same two instructions and the
+  REX bookkeeping for a high register is easy to get subtly wrong twice."
+  [dst]
+  (let [d (get x86-register-code dst)]
+    (when-not (some? d)
+      (reject! :mc-encode :unsupported-register {:dst dst}))
+    (vec (concat (when (>= d 8) [0x41])
+                 [0x0f 0x94 (bit-or 0xc0 (bit-and d 7))
+                  (bit-or 0x48 (if (>= d 8) 5 0)) 0x0f 0xb6
+                  (bit-or 0xc0
+                          (bit-shift-left (bit-and d 7) 3)
+                          (bit-and d 7))]))))
+
 (defn- x86-kernel-memory
-  [instruction-index width store? {:mir/keys [dst base length index stored maximum]}]
+  [instruction-index width store? {:mir/keys [dst stored] :as instruction}]
   (let [trap (memory-label instruction-index "trap")
         done (memory-label instruction-index "done")
         result (if store? stored dst)]
     (vec (concat
-          (x86-cmp-imm32 length maximum)
-          [(layout/relative-branch :x86-64/ja-rel32 trap)]
-          (x86-rr 0x85 base base)
-          [(layout/relative-branch :x86-64/jz-rel32 trap)]
-          (x86-rr 0x39 index length)
-          [(layout/relative-branch :x86-64/jae-rel32 trap)]
-          (when (= 32 width)
-            (concat (x86-rr 0x89 :x86-64/r10 length)
-                    (x86-rr 0x29 :x86-64/r10 index)
-                    (x86-cmp-imm32 :x86-64/r10 4)
-                    [(layout/relative-branch :x86-64/jl-rel32 trap)]))
-          (x86-rr 0x89 :x86-64/r11 base)
-          (x86-rr 0x01 :x86-64/r11 index)
+          (x86-kernel-bounds-check trap width instruction)
           (x86-memory-access (keyword (str (if store? "store" "load")
                                            "-u" width)) result)
+          [(layout/relative-branch :x86-64/jmp-rel32 done)
+           (layout/label trap)]
+          [0x0f 0x0b]
+          [(layout/label done)]))))
+
+(defn- x86-kernel-lock
+  "One atomic compare-and-swap of the u32 at base+index, against a comparand
+  and a replacement that the OPERATION fixes rather than the guest. `dst`
+  receives 1 when this call performed the swap and 0 when it did not.
+
+  `lock cmpxchg` reads its comparand from EAX and writes the observed word
+  back there, and RAX is allocatable in this profile, so it is pushed and
+  popped around the sequence -- the same thing `x86-quotient` does for its own
+  RAX/RDX pair. R10 carries the replacement: it is dead after the bounds
+  check, so nothing allocated is disturbed. POP does not touch the flags, so
+  RAX is restored before ZF is read, and `dst` may safely alias any of the
+  three sources because all of them were consumed by the preamble."
+  [instruction-index expected desired {:mir/keys [dst] :as instruction}]
+  (let [trap (memory-label instruction-index "lock-trap")
+        done (memory-label instruction-index "lock-done")]
+    (vec (concat
+          (x86-kernel-bounds-check trap 32 instruction)
+          (x86-push :x86-64/rax)
+          (x86-mov-imm :x86-64/rax expected)
+          (x86-mov-imm :x86-64/r10 desired)
+          ;; lock cmpxchg [r11], r10d -- REX.R for r10, REX.B for r11, and
+          ;; ModRM mod=00 rm=011 is a bare [R11] because 011 is neither the
+          ;; SIB escape nor the RIP-relative form.
+          [0xf0 0x45 0x0f 0xb1 0x13]
+          (x86-pop :x86-64/rax)
+          (x86-set-zero-flag dst)
           [(layout/relative-branch :x86-64/jmp-rel32 done)
            (layout/label trap)]
           [0x0f 0x0b]
@@ -2573,34 +2635,90 @@
           [0x0f 0x0b]
           [(layout/label done)]))))
 
+(defn- a64-kernel-bounds-check
+  "AArch64's half of the shared preamble. Same four checks as the x86 side,
+  leaving x16 holding base+index. x16/x17 are the encoder scratch pair and are
+  never admitted to allocated MIR, so neither can collide with an operand."
+  [trap width {:mir/keys [base length index maximum]}]
+  (vec (concat
+        (a64-constant :aarch64/x16 maximum)
+        (u32le (bit-or 0xeb00001f (bit-shift-left 16 16)
+                       (bit-shift-left (a64-register length) 5)))
+        [(layout/relative-branch :aarch64/b-hi-imm19 trap)
+         (layout/relative-branch :aarch64/cbz-imm19 trap
+                                 [(a64-register base)])]
+        (u32le (bit-or 0xeb00001f
+                       (bit-shift-left (a64-register length) 16)
+                       (bit-shift-left (a64-register index) 5)))
+        [(layout/relative-branch :aarch64/b-hs-imm19 trap)]
+        (when (= 32 width)
+          (concat
+           (u32le (bit-or 0xcb000000
+                          (bit-shift-left (a64-register index) 16)
+                          (bit-shift-left (a64-register length) 5) 16))
+           (u32le (bit-or 0xf100001f (bit-shift-left 4 10)
+                          (bit-shift-left 16 5)))
+           [(layout/relative-branch :aarch64/b-lt-imm19 trap)]))
+        (u32le (bit-or 0x8b000000
+                       (bit-shift-left (a64-register index) 16)
+                       (bit-shift-left (a64-register base) 5) 16)))))
+
+(defn- a64-kernel-lock
+  "The AArch64 lock. There is no CAS below ARMv8.1-LSE, so this is the
+  exclusive-monitor pair: LDAXR the word, compare it against the comparand the
+  OPERATION fixes, and STLXR the replacement back. STLXR may fail without
+  contention -- the monitor is cleared by an interrupt or an unrelated store to
+  the same granule -- so a failed store retries. That retry is bounded in the
+  only sense that matters here: it re-runs only when the word still held the
+  comparand, and a caller that loses the race leaves through `fail` rather than
+  spinning. Keeping it inside one selection is the reason this is a lock and
+  not a general compare-exchange, which would put the same loop in the guest as
+  control flow across basic blocks.
+
+  `clrex` on the mismatch path drops the monitor rather than leaving it set
+  across the branch. x17 carries the loaded word and then the store status;
+  `dst` carries the replacement and then the result."
+  [instruction-index expected desired {:mir/keys [dst] :as instruction}]
+  (let [trap (memory-label instruction-index "lock-trap")
+        retry (memory-label instruction-index "lock-retry")
+        fail (memory-label instruction-index "lock-fail")
+        done (memory-label instruction-index "lock-done")]
+    (vec (concat
+          (a64-kernel-bounds-check trap 32 instruction)
+          [(layout/label retry)]
+          ;; ldaxr w17, [x16]
+          (u32le 0x885ffe11)
+          ;; cmp x17, #expected  (LDAXR zero-extends, so the 64-bit form is exact)
+          (u32le (bit-or 0xf100001f (bit-shift-left expected 10)
+                         (bit-shift-left 17 5)))
+          [(layout/relative-branch :aarch64/b-ne-imm19 fail)]
+          (a64-constant dst desired)
+          ;; stlxr w17, w<dst>, [x16] -- 0x8800fc00 is the bare STLXR word,
+          ;; plus Rs=17 at bits 20-16 and Rn=16 at bits 9-5. Checked against
+          ;; the assembler rather than derived twice: an earlier hand carry
+          ;; produced 0x8910fe00, which decodes as nothing at all.
+          (u32le (bit-or 0x8811fe00 (a64-register dst)))
+          ;; cmp x17, #0 -- a non-zero status is a failed store, not a lost race
+          (u32le (bit-or 0xf100001f (bit-shift-left 17 5)))
+          [(layout/relative-branch :aarch64/b-ne-imm19 retry)]
+          (a64-constant dst 1)
+          [(layout/relative-branch :aarch64/b-imm26 done)
+           (layout/label fail)]
+          ;; clrex
+          (u32le 0xd5033f5f)
+          (a64-constant dst 0)
+          [(layout/relative-branch :aarch64/b-imm26 done)
+           (layout/label trap)]
+          (u32le 0xd4200000)
+          [(layout/label done)]))))
+
 (defn- a64-kernel-memory
-  [instruction-index width store? {:mir/keys [dst base length index stored maximum]}]
+  [instruction-index width store? {:mir/keys [dst stored] :as instruction}]
   (let [trap (memory-label instruction-index "trap")
         done (memory-label instruction-index "done")
-        result (if store? stored dst)
-        address :aarch64/x16]
+        result (if store? stored dst)]
     (vec (concat
-          (a64-constant :aarch64/x16 maximum)
-          (u32le (bit-or 0xeb00001f (bit-shift-left 16 16)
-                         (bit-shift-left (a64-register length) 5)))
-          [(layout/relative-branch :aarch64/b-hi-imm19 trap)
-           (layout/relative-branch :aarch64/cbz-imm19 trap
-                                   [(a64-register base)])]
-          (u32le (bit-or 0xeb00001f
-                         (bit-shift-left (a64-register length) 16)
-                         (bit-shift-left (a64-register index) 5)))
-          [(layout/relative-branch :aarch64/b-hs-imm19 trap)]
-          (when (= 32 width)
-            (concat
-             (u32le (bit-or 0xcb000000
-                            (bit-shift-left (a64-register index) 16)
-                            (bit-shift-left (a64-register length) 5) 16))
-             (u32le (bit-or 0xf100001f (bit-shift-left 4 10)
-                            (bit-shift-left 16 5)))
-             [(layout/relative-branch :aarch64/b-lt-imm19 trap)]))
-          (u32le (bit-or 0x8b000000
-                         (bit-shift-left (a64-register index) 16)
-                         (bit-shift-left (a64-register base) 5) 16))
+          (a64-kernel-bounds-check trap width instruction)
           (u32le (case [store? width]
                    [false 8] (bit-or 0x39400000 (bit-shift-left 16 5)
                                      (a64-register result))
@@ -3157,6 +3275,10 @@
     :x86-64/kernel-store-u8 (x86-kernel-memory instruction-index 8 true instruction)
     :x86-64/kernel-load-u32 (x86-kernel-memory instruction-index 32 false instruction)
     :x86-64/kernel-store-u32 (x86-kernel-memory instruction-index 32 true instruction)
+    ;; Acquire moves the word 0 -> 1; release moves it 1 -> 0. The comparand
+    ;; and the replacement are the operation's, not the guest's.
+    :x86-64/kernel-try-lock-u32 (x86-kernel-lock instruction-index 0 1 instruction)
+    :x86-64/kernel-unlock-u32 (x86-kernel-lock instruction-index 1 0 instruction)
     :x86-64/kernel-subregion (x86-kernel-subregion instruction-index instruction)
     (:x86-64/equal :x86-64/less-than :x86-64/greater-than
      :x86-64/less-or-equal :x86-64/greater-or-equal)
@@ -3300,6 +3422,8 @@
     :aarch64/kernel-store-u8 (a64-kernel-memory instruction-index 8 true instruction)
     :aarch64/kernel-load-u32 (a64-kernel-memory instruction-index 32 false instruction)
     :aarch64/kernel-store-u32 (a64-kernel-memory instruction-index 32 true instruction)
+    :aarch64/kernel-try-lock-u32 (a64-kernel-lock instruction-index 0 1 instruction)
+    :aarch64/kernel-unlock-u32 (a64-kernel-lock instruction-index 1 0 instruction)
     :aarch64/kernel-subregion (a64-kernel-subregion instruction-index instruction)
     (:aarch64/equal :aarch64/less-than :aarch64/greater-than
      :aarch64/less-or-equal :aarch64/greater-or-equal)
@@ -3352,6 +3476,12 @@
                    (bit-shift-left (bit-and (quot displacement 4) 0x7ffff) 5)))
     :aarch64/b-hs-imm19
     (u32le (bit-or 0x54000002
+                   (bit-shift-left (bit-and (quot displacement 4) 0x7ffff) 5)))
+    ;; B.NE, cond 0001. The legacy `kotoba.native.aarch64` emitter has carried
+    ;; this branch for a long time; this table had never needed it, because
+    ;; nothing in production MIR branched on inequality until the lock did.
+    :aarch64/b-ne-imm19
+    (u32le (bit-or 0x54000001
                    (bit-shift-left (bit-and (quot displacement 4) 0x7ffff) 5)))
     :aarch64/b-lt-imm19
     (u32le (bit-or 0x5400000b
