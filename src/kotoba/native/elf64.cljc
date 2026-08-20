@@ -138,10 +138,12 @@
    ;; is the other half of making that table an allowlist: refusing an unknown
    ;; name is only useful if a known one can be added.
    ;;
-   ;; `value-handle-plan` is deliberately NOT here. Its contract carries no
-   ;; `:native` block, so there is no declared symbol to transcribe and this
-   ;; table will not invent one; its failure is a different phase's
-   ;; ("planner object export is not exact") and belongs to aiueos.
+   ;; `value-handle-plan` was deliberately NOT here while its contract carried
+   ;; no `:native` block: there was no declared symbol to transcribe, and this
+   ;; table does not invent one. aiueos added the block on 2026-08-20 -- the
+   ;; symbol had always been required, by a hardcoded comparison in
+   ;; `verify-value-handle-plan`, and was simply never declared where a
+   ;; producer could read it. Now that it is, this row transcribes it.
    ;;
    ;; `value-handle-arena` IS here, and the difference is exactly that: its
    ;; contract declares `:export "kotoba_aiueos_value_handle_arena"`, so this
@@ -149,6 +151,8 @@
    ;; with amu#625's lock landed, the arena stopped failing on
    ;; `kernel-compare-exchange-u32` and started failing on the export refusal
    ;; instead -- the second failure was there all along, behind the first.
+   'aiueos-value-handle-plan
+   {:arity 5 :symbol "kotoba_aiueos_value_handle_plan"}
    'aiueos-value-handle-arena
    {:arity 5 :symbol "kotoba_aiueos_value_handle_arena"}
    'aiueos-value-runtime-syscall-plan
