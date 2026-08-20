@@ -142,6 +142,15 @@
    ;; `:native` block, so there is no declared symbol to transcribe and this
    ;; table will not invent one; its failure is a different phase's
    ;; ("planner object export is not exact") and belongs to aiueos.
+   ;;
+   ;; `value-handle-arena` IS here, and the difference is exactly that: its
+   ;; contract declares `:export "kotoba_aiueos_value_handle_arena"`, so this
+   ;; row transcribes a symbol rather than choosing one. Measured 2026-08-20:
+   ;; with amu#625's lock landed, the arena stopped failing on
+   ;; `kernel-compare-exchange-u32` and started failing on the export refusal
+   ;; instead -- the second failure was there all along, behind the first.
+   'aiueos-value-handle-arena
+   {:arity 5 :symbol "kotoba_aiueos_value_handle_arena"}
    'aiueos-value-runtime-syscall-plan
    {:arity 5 :symbol "kotoba_aiueos_value_runtime_syscall_plan"}
    'aiueos-value-runtime-cas-verify
