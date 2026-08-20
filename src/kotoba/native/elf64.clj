@@ -325,7 +325,7 @@
           context (into (vec (repeat 8 0))
                         (concat (le (artifact-fuel artifact) 8)
                                 (repeat (- kernel-image-context-size 16) 0)))
-          names (mapv int (.getBytes " .text .data .shstrtab " "UTF-8"))
+          names (mapv int (.getBytes "\u0000.text\u0000.data\u0000.shstrtab\u0000" "UTF-8"))
           names-offset (+ kernel-data-offset kernel-image-context-size)
           section-offset (+ names-offset (count names)
                             (mod (- 8 (mod (+ names-offset (count names)) 8)) 8))
