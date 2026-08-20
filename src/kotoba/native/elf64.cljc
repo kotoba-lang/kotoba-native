@@ -1,7 +1,16 @@
 (ns kotoba.native.elf64
   (:require [clojure.string :as str]
             [kotoba.artifact.core :as artifact]
-            [kotoba.object.elf64 :as object-elf]))
+            [kotoba.object.elf64 :as object-elf]
+            #?(:cljs [kotoba.kir.cljs-i64 :as i64])))
+
+;; Mirrors `kotoba.native.aarch64`'s helper of the same name: `.getBytes` is
+;; JVM-only and cljs has no `String`/`Charset`, so `TextEncoder` is the
+;; UTF-8-safe peer. Every string this is applied to here is an ASCII
+;; section-name or symbol-name table, so the two agree byte for byte.
+(defn- utf8-bytes [s]
+  #?(:clj (.getBytes ^String s "UTF-8")
+     :cljs (js/Array.from (.encode (js/TextEncoder.) s))))
 
 (def ^:private kernel-target :x86_64-aiueos-kernel-v1)
 (def ^:private user-target :x86_64-aiueos-user-v1)
@@ -225,7 +234,7 @@
 (defn- artifact-fuel [artifact]
   (let [fuel (get-in artifact [:limits :fuel])
         abi-fuel (get-in artifact [:fuel-abi :initial])]
-    (when-not (and (integer? fuel) (pos? fuel) (<= fuel Long/MAX_VALUE)
+    (when-not (and (integer? fuel) (pos? fuel) (<= fuel #?(:clj Long/MAX_VALUE :cljs i64/max-i64))
                    (= fuel abi-fuel))
       (throw (ex-info "ELF64 kernel packaging requires one valid sealed fuel bound"
                       {:fuel fuel :fuel-abi-initial abi-fuel})))
@@ -255,7 +264,7 @@
           context (into (vec (repeat 8 0))
                         (concat (le (artifact-fuel artifact) 8)
                                 (repeat (- kernel-image-context-size 16) 0)))
-          names (mapv int (.getBytes "\u0000.text\u0000.data\u0000.shstrtab\u0000" "UTF-8"))
+          names (mapv int (utf8-bytes "\u0000.text\u0000.data\u0000.shstrtab\u0000"))
           names-offset (+ x86-kernel-data-offset kernel-image-context-size)
           section-offset (+ names-offset (count names)
                             (mod (- 8 (mod (+ names-offset (count names)) 8)) 8))
@@ -326,7 +335,7 @@
           context (into (vec (repeat 8 0))
                         (concat (le (artifact-fuel artifact) 8)
                                 (repeat (- kernel-image-context-size 16) 0)))
-          names (mapv int (.getBytes "\u0000.text\u0000.data\u0000.shstrtab\u0000" "UTF-8"))
+          names (mapv int (utf8-bytes "\u0000.text\u0000.data\u0000.shstrtab\u0000"))
           names-offset (+ kernel-data-offset kernel-image-context-size)
           section-offset (+ names-offset (count names)
                             (mod (- 8 (mod (+ names-offset (count names)) 8)) 8))
@@ -374,7 +383,7 @@
           context (vec (concat (repeat 8 0) (le 512 8) bitmap
                                (le callback 8) (repeat 24 0)
                                (repeat 8 0)))
-          names (mapv int (.getBytes "\u0000.text\u0000.data\u0000.shstrtab\u0000" "UTF-8"))
+          names (mapv int (utf8-bytes "\u0000.text\u0000.data\u0000.shstrtab\u0000"))
           names-offset (+ data-offset user-context-size)
           section-offset (+ names-offset (count names)
                             (mod (- 8 (mod (+ names-offset (count names)) 8)) 8))
@@ -615,8 +624,8 @@
           context (vec (concat (repeat 8 0) (le 512 8)
                                (repeat (- context-size 16) 0)))
           shstr "\u0000.text\u0000.data\u0000.rela.text\u0000.symtab\u0000.strtab\u0000.shstrtab\u0000"
-          shstr-bytes (mapv int (.getBytes shstr "UTF-8"))
-          strtab (mapv int (.getBytes (str "\u0000" public-symbol "\u0000kotoba_source_entry\u0000") "UTF-8"))
+          shstr-bytes (mapv int (utf8-bytes shstr))
+          strtab (mapv int (utf8-bytes (str "\u0000" public-symbol "\u0000kotoba_source_entry\u0000")))
           text-off 64
           data-off (+ text-off (count text))
           rela-off (+ data-off (count context))
