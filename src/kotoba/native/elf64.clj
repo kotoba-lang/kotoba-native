@@ -1,5 +1,6 @@
 (ns kotoba.native.elf64
-  (:require [kotoba.artifact.core :as artifact]
+  (:require [clojure.string :as str]
+            [kotoba.artifact.core :as artifact]
             [kotoba.object.elf64 :as object-elf]))
 
 (def ^:private kernel-target :x86_64-aiueos-kernel-v1)
@@ -407,6 +408,22 @@
     :value value
     :size size}))
 
+(def ^:private admitted-entry-prefix
+  "The prefix every `kernel-object-entries` key carries, checked against the
+  table rather than merely written down beside it. `package-kernel-object`
+  uses it to decide whether a source is claiming a kernel object identity, so
+  an entry added under a different prefix must not silently widen what gets a
+  symbol without being in the table -- this throws at load instead."
+  (let [prefix "aiueos-"
+        offenders (->> (keys kernel-object-entries)
+                       (map name)
+                       (remove #(str/starts-with? % prefix))
+                       sort vec)]
+    (when (seq offenders)
+      (throw (ex-info "kernel-object-entries keys must all carry the admitted prefix"
+                      {:prefix prefix :offenders offenders})))
+    prefix))
+
 (defn- reloc-section-header [name type flags offset size link info alignment entry-size]
   (object-elf/encode-section-header
    {:name-offset name
@@ -438,7 +455,43 @@
                                (keys kernel-object-entries))
                          source-entry)
         export (get-in artifact [:exports object-entry])
-        contract (get kernel-object-entries object-entry {:arity 0 :symbol "kotoba_aiueos_probe"})
+        ;; `kernel-object-entries` is the WHOLE rule for an object's public
+        ;; symbol, and it is an allowlist. A source that declares an
+        ;; `aiueos-*` public function and is NOT in it has no symbol of its
+        ;; own, and this function does not know what that symbol should be.
+        ;;
+        ;; It used to take the probe's contract as the `get` default, which is
+        ;; a different claim: that every unlisted object IS the probe. Three
+        ;; of aiueos's `value-*` objects each compiled to a valid-looking
+        ;; ET_REL exporting `kotoba_aiueos_probe`, colliding with
+        ;; `kernel-probe` and with each other, and nothing in the compile said
+        ;; so. The rule was then not derivable from the sources that depend on
+        ;; it, precisely because the miss was silent -- amu#626, aiueos
+        ;; ADR-0054, which records that every minimal source anyone wrote to
+        ;; find the rule got the generic symbol and the real file did not.
+        ;;
+        ;; The discriminator is the `aiueos-` prefix every one of the table's
+        ;; keys carries. It separates a kernel object that MEANT to be linked
+        ;; under its own name from the two things that legitimately reach the
+        ;; probe contract: aiueos's own `kernel-probe.kotoba`, whose entire
+        ;; source is `(defn main [] 42)`, and this compiler's own codegen
+        ;; tests, whose sources export helpers (`fact`) and generated loop
+        ;; functions (`__kotoba_loop_1`) and never claim an aiueos name.
+        ;;
+        ;; Refusing is the only answer here that is not a guess, and a
+        ;; colliding symbol is worse than no object: it links.
+        unlisted-aiueos-exports (->> (keys (:exports artifact))
+                                     (filter #(str/starts-with? (name %) admitted-entry-prefix))
+                                     (remove kernel-object-entries)
+                                     sort vec)
+        contract (or (get kernel-object-entries object-entry)
+                     (when (empty? unlisted-aiueos-exports)
+                       {:arity 0 :symbol "kotoba_aiueos_probe"}))
+        _ (when-not contract
+            (throw (ex-info "Kotoba kernel object declares an aiueos export with no admitted symbol"
+                            {:entry object-entry
+                             :unlisted-exports unlisted-aiueos-exports
+                             :admitted-entry-count (count kernel-object-entries)})))
         public-symbol (:symbol contract)]
     (when-not (and export (= (:arity export) (:arity contract)))
       (throw (ex-info "Kotoba kernel object entry has an invalid SysV arity"
