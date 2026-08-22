@@ -102,6 +102,75 @@
    ;; that is not the four bytes the caller asked for; presence is the
    ;; admission's decision, not this one's.
    'aiueos-dhcp-option-u32 {:arity 3 :symbol "kotoba_aiueos_dhcp_option_u32"}
+   ;; Consuming the lease, and resolving a name with it (aiueos ADR-0078).
+   ;; Three entries, all three on the reason-code convention the two DHCP
+   ;; entries above introduced: zero admits, and non-zero is never a truthy
+   ;; success.
+   ;;
+   ;; `aiueos-net-config-admit` is the first entry on this list that reads no
+   ;; memory at all. It judges the four numbers a DHCP ACK carried -- address,
+   ;; mask, router, resolver -- AGAINST EACH OTHER, which is the question
+   ;; `aiueos-dhcp-reply-valid` could not ask: that object never sees the router
+   ;; or the resolver, because the extractor that reads them runs after it. A
+   ;; router outside the leased subnet can never be ARPed for and a resolver of
+   ;; 0.0.0.0 is a datagram sent nowhere; both are well-formed 32-bit numbers,
+   ;; so nothing before this point had grounds to refuse them.
+   ;;
+   ;;     0  admitted
+   ;;     1  address and mask are not a usable host address on a usable subnet
+   ;;     2  the router is not a usable unicast address
+   ;;     3  the router is not reachable: outside the subnet, or this machine
+   ;;     4  the resolver is not a usable unicast address
+   ;;
+   ;; Taking no frame is also what gives it an OFF-TARGET ORACLE. Every other
+   ;; network entry here reads through `kernel-load-u8-4k`, which the KIR
+   ;; interpreter refuses with `:kernel-memory-unavailable` by design, so those
+   ;; objects can only be exercised by booting. This one is executable in the
+   ;; interpreter, and aiueos runs its refusals as vectors.
+   'aiueos-net-config-admit {:arity 4 :symbol "kotoba_aiueos_net_config_admit"}
+   ;; DNS. A resolver parses attacker-controlled, self-describing,
+   ;; length-prefixed data -- the same shape as a DHCP options block with a
+   ;; sharper edge, because RFC 1035 §4.1.4 names may contain COMPRESSION
+   ;; POINTERS, and a pointer that points at itself is the classic resolver
+   ;; hang. This object refuses rather than iterating: a pointer's target must
+   ;; be strictly below every target already followed in the same name, so the
+   ;; targets strictly decrease, the walk cannot revisit one, and termination is
+   ;; structural rather than budgeted.
+   ;;
+   ;;     0  admitted
+   ;;     1  frame length, or the query this boot sent, outside its range
+   ;;     2  not IPv4, or the IPv4 header checksum does not verify
+   ;;     3  not UDP, or the datagram does not fit the frame
+   ;;     4  not 53 -> this client's port, or the UDP length or checksum is wrong
+   ;;     5  the reply did not come from the resolver the lease named
+   ;;     6  the DNS message is shorter than a 12-octet header
+   ;;     7  the transaction id is not the one the query carried
+   ;;     8  QR is clear: a query reflected back is not an answer
+   ;;     9  the opcode is not the one the query asked under
+   ;;    10  TC is set: the answer is truncated and this client has no TCP retry
+   ;;    11  RCODE names a server failure
+   ;;    12  RCODE is NXDOMAIN -- an ANSWER, and a different outcome from 11
+   ;;    13  QDCOUNT is not 1, or the question does not echo the one asked
+   ;;    14  a name does not parse, or a pointer is not strictly backwards
+   ;;    15  a record's fixed fields or RDLENGTH run past the end
+   ;;    16  no answer is an IN A record for the name that was asked
+   ;;
+   ;; 11 and 12 are deliberately not one code. SERVFAIL is a failure and
+   ;; NXDOMAIN is an answer -- the name does not exist, and that is the fact the
+   ;; caller asked for. Collapsing them is the same defect as collapsing 404 and
+   ;; 500, and a client that treats NXDOMAIN as a failure walks its whole server
+   ;; list for every typo.
+   ;;
+   ;; It takes the QUERY as a second region rather than a compiled-in name, so
+   ;; the transaction id, the question and the opcode it checks against are the
+   ;; ones actually sent rather than ones a caller asserts.
+   'aiueos-dns-response-valid {:arity 5 :symbol "kotoba_aiueos_dns_response_valid"}
+   ;; The extractor, on the same terms as `aiueos-dhcp-option-u32`: it re-walks
+   ;; the answer section under its own bounds rather than being told where the
+   ;; record sits, because a record's location is not a fact a caller can pass
+   ;; in. Returns the A record's four RDATA bytes as a big-endian integer, or 0
+   ;; when there is no such record -- presence is the admission's decision.
+   'aiueos-dns-answer-a {:arity 4 :symbol "kotoba_aiueos_dns_answer_a"}
    ;; PCI configuration space, the first MECHANISM to move out of C rather than
    ;; another decision. It is expressible only because `kernel-in-u32` now
    ;; exists: config access is a write to 0xCF8 followed by a READ of 0xCFC, and
