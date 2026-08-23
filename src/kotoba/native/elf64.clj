@@ -121,6 +121,11 @@
    ;; performance one -- see the object's own header for what that does and
    ;; does not guarantee in this subset.
    'aiueos-x25519 {:arity 4 :symbol "kotoba_aiueos_x25519"}
+   ;; Guest IME (aiueos ADR-0090). Romaji pair → kana codepoint. Hosted
+   ;; JVM `aiueos.compositor.ime` does not count. C prints the vector;
+   ;; this object owns the conversion. Nested if, not a map — native
+   ;; word types only (temporary; not a language ceiling).
+   'aiueos-ime-commit {:arity 2 :symbol "kotoba_aiueos_ime_commit"}
    ;; MMIO mapping admission. The page-table walk stays C -- it allocates
    ;; directory slots and writes PTEs -- but WHETHER a physical range may be
    ;; mapped at all is a decision, and it was the last one still living in
