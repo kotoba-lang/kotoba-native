@@ -132,6 +132,11 @@
    ;; kotobase.net CertVerify). x86 kernel images already use the 16-page
    ;; data offset; this entry does not change layout.
    'aiueos-ecdsa-p256-sha256-verify {:arity 5 :symbol "kotoba_aiueos_ecdsa_p256_sha256_verify"}
+   ;; Guest IME (aiueos ADR-0090). Romaji pair → kana codepoint. Hosted
+   ;; JVM `aiueos.compositor.ime` does not count. C prints the vector;
+   ;; this object owns the conversion. Nested if, not a map — native
+   ;; word types only (temporary; not a language ceiling).
+   'aiueos-ime-commit {:arity 2 :symbol "kotoba_aiueos_ime_commit"}
    ;; MMIO mapping admission. The page-table walk stays C -- it allocates
    ;; directory slots and writes PTEs -- but WHETHER a physical range may be
    ;; mapped at all is a decision, and it was the last one still living in
