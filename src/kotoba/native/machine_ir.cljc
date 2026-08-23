@@ -106,6 +106,13 @@
 
 (def ^:private kir-x86-privileged-ops
   {'kernel-boot-info :boot-info
+   'kernel-publish-current-domain :publish-current-domain
+   'kernel-value-runtime-capability-table :value-runtime-capability-table
+   'kernel-value-provider-queue :value-provider-queue
+   'kernel-value-runtime-arena :value-runtime-arena
+   'kernel-value-runtime-cas-scratch :value-runtime-cas-scratch
+   'kernel-publish-value-provider-status :publish-value-provider-status
+   'kernel-value-provider-status :value-provider-status
    'kernel-read-cr2 :read-cr2
    'kernel-read-cr3 :read-cr3
    'kernel-write-cr3 :write-cr3
@@ -123,7 +130,8 @@
    'kernel-cpuid-eax :cpuid-eax
    'kernel-cpuid-ebx :cpuid-ebx
    'kernel-cpuid-ecx :cpuid-ecx
-   'kernel-cpuid-edx :cpuid-edx})
+   'kernel-cpuid-edx :cpuid-edx
+   'kernel-compare-exchange-u32 :compare-exchange-u32})
 
 (def ^:private kir-runtime-ops
   {'pair :pair
@@ -2074,8 +2082,56 @@
           (a64-stack-memory 0xf9400000 :aarch64/x7 0)
           (a64-adjust-stack 0x910003ff 16)))))
 
+(defn- x86-kernel-compare-exchange-u32
+  [instruction-index [base length index expected desired]]
+  (let [trap (memory-label instruction-index "compare-exchange-trap")
+        done (memory-label instruction-index "compare-exchange-done")]
+    (vec
+     (concat
+      ;; Match kernel-load/store-u32 exactly: a non-null base, a declared
+      ;; window no larger than 4 KiB, and index+4 <= length. The remaining
+      ;; comparison avoids an overflow-prone index+4 calculation.
+      (x86-cmp-imm32 length 4096)
+      [(layout/relative-branch :x86-64/ja-rel32 trap)]
+      (x86-rr 0x85 base base)
+      [(layout/relative-branch :x86-64/jz-rel32 trap)]
+      (x86-rr 0x39 index length)
+      [(layout/relative-branch :x86-64/jae-rel32 trap)]
+      (x86-rr 0x89 :x86-64/r11 length)
+      (x86-rr 0x29 :x86-64/r11 index)
+      (x86-cmp-imm32 :x86-64/r11 4)
+      [(layout/relative-branch :x86-64/jl-rel32 trap)]
+      ;; EXPECTED and DESIRED are semantically u32, not silently truncated
+      ;; i64s. Reject either high half before touching memory.
+      (x86-rr 0x89 :x86-64/r10 expected)
+      [0x49 0xc1 0xea 0x20]
+      (x86-rr 0x85 :x86-64/r10 :x86-64/r10)
+      [(layout/relative-branch :x86-64/ja-rel32 trap)]
+      (x86-rr 0x89 :x86-64/r10 desired)
+      [0x49 0xc1 0xea 0x20]
+      (x86-rr 0x85 :x86-64/r10 :x86-64/r10)
+      [(layout/relative-branch :x86-64/ja-rel32 trap)]
+      ;; r10d holds DESIRED across loading EXPECTED into eax. r11 then becomes
+      ;; the checked address. LOCK CMPXCHG returns the observed u32 in eax on
+      ;; failure and leaves EXPECTED there on success; mov eax,eax makes the
+      ;; success path's zero-extension explicit too.
+      (x86-rr 0x89 :x86-64/r10 desired)
+      (x86-push :x86-64/rax)
+      (x86-rr 0x89 :x86-64/rax expected)
+      [0x89 0xc0]
+      (x86-rr 0x89 :x86-64/r11 base)
+      (x86-rr 0x01 :x86-64/r11 index)
+      [0xf0 0x45 0x0f 0xb1 0x13]
+      [0x89 0xc0]
+      (x86-rr 0x89 :x86-64/r10 :x86-64/rax)
+      (x86-pop :x86-64/rax)
+      [(layout/relative-branch :x86-64/jmp-rel32 done)
+       (layout/label trap)]
+      [0x0f 0x0b]
+      [(layout/label done)]))))
+
 (defn- x86-privileged
-  [{:mir/keys [dst action arguments] :as instruction}]
+  [instruction-index {:mir/keys [dst action arguments] :as instruction}]
   (let [copy-to (fn [register value]
                   (if (= register value) [] (x86-rr 0x89 register value)))
         finish (fn [bytes result]
@@ -2084,6 +2140,23 @@
     (case action
       :boot-info
       (finish [0x4d 0x8b 0x51 0x50] :x86-64/r10)
+      :publish-current-domain
+      (finish (concat (copy-to :x86-64/r10 a)
+                      [0x45 0x89 0x91 0x10 0x01 0x00 0x00])
+              :x86-64/r10)
+      :value-runtime-capability-table
+      (finish [0x4d 0x8d 0x91 0x00 0x10 0x00 0x00] :x86-64/r10)
+      :value-provider-queue
+      (finish [0x4d 0x8d 0x91 0x00 0x04 0x00 0x00] :x86-64/r10)
+      :value-runtime-arena
+      (finish [0x4d 0x8d 0x91 0x00 0x20 0x00 0x00] :x86-64/r10)
+      :value-runtime-cas-scratch
+      (finish [0x4d 0x8d 0x91 0x00 0x06 0x00 0x00] :x86-64/r10)
+      :publish-value-provider-status
+      (finish (concat (copy-to :x86-64/r10 a)
+                      [0x45 0x89 0x91 0x38 0x01 0x00 0x00]) :x86-64/r10)
+      :value-provider-status
+      (finish [0x45 0x8b 0x91 0x38 0x01 0x00 0x00] :x86-64/r10)
       :read-cr2
       (finish [0x41 0x0f 0x20 0xd2] :x86-64/r10)
       :read-cr3
@@ -2164,6 +2237,9 @@
                (x86-pop :x86-64/rdx) (x86-pop :x86-64/rcx)
                (x86-pop :x86-64/rbx) (x86-pop :x86-64/rax))
        :x86-64/r10)
+      :compare-exchange-u32
+      (finish (x86-kernel-compare-exchange-u32 instruction-index arguments)
+              :x86-64/r10)
       (reject! :mc-encode :unknown-x86-privileged-action instruction))))
 
 (defn- encode-selected
@@ -2256,7 +2332,7 @@
       (x86-rr 0x89 (:mir/dst instruction) (:mir/src instruction)))
     :x86-64/runtime-call (x86-runtime-call frame-bytes instruction)
     :x86-64/capability-call (x86-capability-call frame-bytes instruction)
-    :x86-64/x86-privileged (x86-privileged instruction)
+    :x86-64/x86-privileged (x86-privileged instruction-index instruction)
     :x86-64/return
     (vec (concat (when-not (= :x86-64/rax (:mir/value instruction))
                    (x86-rr 0x89 :x86-64/rax (:mir/value instruction)))

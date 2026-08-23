@@ -8,11 +8,38 @@
 (def ^:private image-base 0x100000)
 (def ^:private text-offset page-size)
 (def ^:private data-offset (* 2 page-size))
-(def ^:private kernel-data-offset (* 8 page-size))
+(def ^:private minimum-kernel-data-offset (* 8 page-size))
 (def ^:private context-size 80)
 (def ^:private kernel-image-context-size 88)
+(def ^:private kernel-gdt-offset 96)
+(def ^:private kernel-gdtr-offset 152)
+(def ^:private kernel-tss-offset 168)
+(def ^:private kernel-current-domain-offset 0x110)
+(def ^:private kernel-saved-rsp-offset 0x118)
+(def ^:private kernel-saved-rip-offset 0x120)
+(def ^:private kernel-saved-rflags-offset 0x128)
+(def ^:private kernel-request-pointer-offset 0x130)
+(def ^:private kernel-request-offset 0x200)
+(def ^:private kernel-capability-table-offset 0x1000)
+(def ^:private kernel-arena-offset 0x2000)
+(def ^:private kernel-stack-offset 0x3000)
+(def ^:private kernel-stack-bytes 65536)
+(def ^:private kernel-runtime-data-size (+ kernel-stack-offset kernel-stack-bytes))
+(def ^:private live-boot-shim-size 144)
+(def ^:private live-syscall-shim-size 192)
 (def ^:private user-context-size 88)
 (def ^:private user-image-base 0x1e0000)
+
+(defn- kernel-data-offset-for [text-size]
+  (max minimum-kernel-data-offset
+       (* page-size (quot (+ text-offset text-size (dec page-size)) page-size))))
+(def ^:private value-runtime-operations
+  '#{value-intern value-hydrate value-resolve value-cid-of value-release})
+
+(defn- uses-value-runtime? [artifact]
+  (boolean
+   (some #(and (seq? %) (contains? value-runtime-operations (first %)))
+         (tree-seq coll? seq (get-in artifact [:program :functions])))))
 
 (def ^:private journal-entry 'aiueos-journal-plan)
 (def ^:private kernel-object-entries
@@ -31,6 +58,18 @@
    'aiueos-syscall-range-valid {:arity 4 :symbol "kotoba_aiueos_syscall_range_valid"}
    'aiueos-copy-in {:arity 5 :symbol "kotoba_aiueos_copy_in"}
    'aiueos-capability-plan {:arity 5 :symbol "kotoba_aiueos_capability_plan"}
+   'aiueos-value-handle-plan {:arity 5 :symbol "kotoba_aiueos_value_handle_plan"}
+   'aiueos-value-handle-arena {:arity 5 :symbol "kotoba_aiueos_value_handle_arena"}
+   'aiueos-value-runtime-dispatch {:arity 5 :symbol "kotoba_aiueos_value_runtime_dispatch"}
+   'aiueos-value-runtime-entry {:arity 5 :symbol "kotoba_aiueos_value_runtime_entry"}
+   'aiueos-value-runtime-syscall-plan {:arity 5 :symbol "kotoba_aiueos_value_runtime_syscall_plan"}
+   'aiueos-value-runtime-publish-domain {:arity 1 :symbol "kotoba_aiueos_value_runtime_publish_domain"}
+   'aiueos-value-runtime-capability-mutate {:arity 5 :symbol "kotoba_aiueos_value_runtime_capability_mutate"}
+   'aiueos-value-runtime-provider-status {:arity 2 :symbol "kotoba_aiueos_value_runtime_provider_status"}
+   'aiueos-value-runtime-capability-grant {:arity 5 :symbol "kotoba_aiueos_value_runtime_capability_grant"}
+   'aiueos-value-runtime-provider-claim {:arity 0 :symbol "kotoba_aiueos_value_runtime_provider_claim"}
+   'aiueos-value-runtime-provider-complete {:arity 5 :symbol "kotoba_aiueos_value_runtime_provider_complete"}
+   'aiueos-value-runtime-cas-verify {:arity 5 :symbol "kotoba_aiueos_value_runtime_cas_verify"}
    'aiueos-capability-mutation-plan {:arity 5 :symbol "kotoba_aiueos_capability_mutation_plan"}
    'aiueos-service-lifecycle {:arity 4 :symbol "kotoba_aiueos_service_lifecycle"}
    'aiueos-service-registry-build {:arity 5 :symbol "kotoba_aiueos_service_registry_build"}
@@ -181,17 +220,140 @@
     :size size
     :alignment alignment}))
 
-(defn- entry-shim [main-address context-address]
-  ;; Preserve the loader's SysV rdi boot-info pointer in context+80, then
-  ;; initialize r9 and call the zero-arity Kotoba entry.
+(defn- tss-descriptor [base]
+  (let [limit 103]
+    [(bit-and limit 255) (bit-and (quot limit 256) 255)
+     (bit-and base 255) (bit-and (quot base 256) 255)
+     (bit-and (quot base 65536) 255) 0x89 0
+     (bit-and (quot base 16777216) 255)
+     (bit-and (quot base 4294967296) 255)
+     (bit-and (quot base 1099511627776) 255)
+     (bit-and (quot base 281474976710656) 255)
+     (bit-and (quot base 72057594037927936) 255) 0 0 0 0]))
+
+(defn- kernel-runtime-data [fuel context-address]
+  (let [gdt-address (+ context-address kernel-gdt-offset)
+        tss-address (+ context-address kernel-tss-offset)
+        stack-top (+ context-address kernel-runtime-data-size)
+        context (vec (concat (repeat 8 0) (le fuel 8)
+                             (repeat (- kernel-image-context-size 16) 0)))
+        gdt (vec (concat (le 0 8)
+                         (le 0x00af9a000000ffff 8)
+                         (le 0x00cf92000000ffff 8)
+                         (le 0x00cff2000000ffff 8)
+                         (le 0x00affa000000ffff 8)
+                         (tss-descriptor tss-address)))
+        gdtr (vec (concat (le (dec (count gdt)) 2) (le gdt-address 8)))
+        tss (vec (concat (repeat 4 0) (le stack-top 8)
+                         (repeat (- 102 12) 0) (le 104 2)))]
+    (-> context
+        (padded kernel-gdt-offset)
+        (into gdt)
+        (padded kernel-gdtr-offset)
+        (into gdtr)
+        (padded kernel-tss-offset)
+        (into tss)
+        (padded kernel-runtime-data-size))))
+
+(defn- entry-shim [main-address context-address syscall-address]
+  ;; Enter on an image-owned 64 KiB stack, install the closed GDT/TSS, reload
+  ;; all segment selectors, preserve the loader boot-info pointer, initialize
+  ;; r9 and call the zero-arity Kotoba entry. The TSS RSP0 names the same stack.
   (let [shim-address (+ image-base text-offset)
-        after-store (+ shim-address 7)
-        after-lea (+ shim-address 14)
-        after-call (+ shim-address 19)]
-    (vec (concat [0x48 0x89 0x3d] (le (- (+ context-address 80) after-store) 4)
-                 [0x4c 0x8d 0x0d] (le (- context-address after-lea) 4)
-                 [0xe8] (le (- main-address after-call) 4)
-                 [0xfa 0xf4 0xeb 0xfd]))))
+        stack-top (+ context-address kernel-runtime-data-size)
+        gdtr-address (+ context-address kernel-gdtr-offset)
+        prefix (vec (concat [0xfa
+                  0x48 0x8d 0x25] (le (- stack-top (+ shim-address 8)) 4)
+                 [0x48 0x83 0xe4 0xf0
+                  0x0f 0x01 0x15] (le (- gdtr-address (+ shim-address 19)) 4)
+                 [0x6a 0x08
+                  0x48 0x8d 0x05] (le 3 4)
+                 [0x50 0x48 0xcb
+                  0x66 0xb8 0x10 0x00
+                  0x8e 0xd8 0x8e 0xc0 0x8e 0xd0
+                  0x31 0xc0 0x8e 0xe0 0x8e 0xe8
+                  0x66 0xb8 0x28 0x00 0x0f 0x00 0xd8
+                  0x48 0x89 0x3d] (le (- (+ context-address 80) (+ shim-address 61)) 4)
+                 [0x4c 0x8d 0x0d] (le (- context-address (+ shim-address 68)) 4)))
+        msrs (when syscall-address
+               (vec (concat
+                     ;; IA32_EFER.SCE, STAR, LSTAR and FMASK. STAR selects
+                     ;; kernel CS 0x08 and SYSRET user SS/CS 0x1b/0x23.
+                     [0xb9 0x80 0x00 0x00 0xc0 0x0f 0x32 0x83 0xc8 0x01 0x0f 0x30
+                      0xb9 0x81 0x00 0x00 0xc0 0x31 0xc0
+                      0xba 0x08 0x00 0x10 0x00 0x0f 0x30
+                      0xb9 0x82 0x00 0x00 0xc0 0xb8]
+                     (le (bit-and syscall-address 0xffffffff) 4)
+                     [0xba] (le (quot syscall-address 4294967296) 4)
+                     [0x0f 0x30
+                      0xb9 0x84 0x00 0x00 0xc0
+                      ;; Mask TF/IF/DF, IOPL, NT and AC in kernel RFLAGS.
+                      0xb8 0x00 0x77 0x04 0x00 0x31 0xd2 0x0f 0x30])))
+        before-call (vec (concat prefix msrs))
+        call-site (+ shim-address (count before-call))
+        bytes (vec (concat before-call [0xe8]
+                           (le (- main-address (+ call-site 5)) 4)
+                           [0xfa 0xf4 0xeb 0xfd]))]
+    (if syscall-address (padded bytes live-boot-shim-size) bytes)))
+
+(defn- live-syscall-shim
+  [shim-address context-address planner-address runtime-entry-address]
+  ;; SYSCALL leaves the user RIP/RFLAGS in RCX/R11 and does not switch RSP.
+  ;; Save its untrusted state before selecting the image-owned stack. Kotoba's
+  ;; planner admits the complete envelope and return state before the bounded
+  ;; entry receives any pointer.
+  (let [slot (fn [offset next-ip]
+               (le (- (+ context-address offset) next-ip) 4))
+        stack-top (+ context-address kernel-runtime-data-size)
+        arena (+ context-address kernel-arena-offset)
+        request (+ context-address kernel-request-offset)
+        cap-table (+ context-address kernel-capability-table-offset)
+        prefix (vec
+                (concat
+                 [0x48 0x89 0x25] (slot kernel-saved-rsp-offset (+ shim-address 7))
+                 [0x48 0x89 0x0d] (slot kernel-saved-rip-offset (+ shim-address 14))
+                 [0x4c 0x89 0x1d] (slot kernel-saved-rflags-offset (+ shim-address 21))
+                 [0x48 0x89 0x3d] (slot kernel-request-pointer-offset (+ shim-address 28))
+                 [0x48 0x8d 0x25] (le (- stack-top (+ shim-address 35)) 4)
+                 [0x48 0x83 0xe4 0xf0
+                  0x49 0xb9] (le context-address 8)
+                 [0x48 0x89 0xc7
+                  0x41 0x8b 0xb1 0x10 0x01 0x00 0x00
+                  0x49 0x8b 0x91 0x30 0x01 0x00 0x00
+                  0x49 0x8b 0x89 0x20 0x01 0x00 0x00
+                  0x4d 0x8b 0x81 0x18 0x01 0x00 0x00]))
+        planner-call-site (+ shim-address (count prefix))
+        through-plan (vec
+                      (concat prefix [0xe8]
+                              (le (- planner-address (+ planner-call-site 5)) 4)
+                              [0x48 0x85 0xc0
+                               ;; accepted is seven bytes after the branch.
+                               0x0f 0x85 0x07 0x00 0x00 0x00
+                               0x31 0xc0
+                               ;; Skip the 52-byte accepted-call sequence.
+                               0xe9 0x34 0x00 0x00 0x00
+                               0x48 0x89 0xc6
+                               0x48 0xbf] (le arena 8)
+                              [0x49 0x8b 0x91 0x30 0x01 0x00 0x00
+                               0x48 0x81 0xe2 0x00 0xf0 0xff 0xff
+                               0x48 0xb9] (le request 8)
+                              [0x49 0xb8] (le cap-table 8)))
+        entry-call-site (+ shim-address (count through-plan))
+        bytes (vec
+               (concat through-plan [0xe8]
+                       (le (- runtime-entry-address (+ entry-call-site 5)) 4)
+                       [0x49 0x8b 0x89 0x20 0x01 0x00 0x00
+                        0x4d 0x8b 0x99 0x28 0x01 0x00 0x00
+                        ;; Whitelist arithmetic flags plus IF and force bit 1;
+                        ;; IOPL/NT/RF/VM/AC never reach SYSRET.
+                        0x41 0x81 0xe3 0xd5 0x0a 0x00 0x00
+                        0x41 0x83 0xcb 0x02
+                        0x49 0x8b 0xa1 0x18 0x01 0x00 0x00
+                        0x48 0x0f 0x07]))]
+    (when (> (count bytes) live-syscall-shim-size)
+      (throw (ex-info "ValueRuntime SYSCALL shim exceeds its sealed slot"
+                      {:bytes (count bytes) :maximum live-syscall-shim-size})))
+    (padded bytes live-syscall-shim-size)))
 
 (defn- user-entry-shim [main-address context-address]
   (let [entry-address (+ user-image-base text-offset)
@@ -243,30 +405,47 @@
     (throw (ex-info "ELF64 kernel packaging requires a freestanding profile"
                     {:target-profile (:target-profile artifact)})))
   (let [source-entry (get-in artifact [:program :entry])
-        export (get-in artifact [:exports source-entry])]
+        export (get-in artifact [:exports source-entry])
+        planner (get-in artifact [:exports 'aiueos-value-runtime-syscall-plan])
+        runtime-entry (get-in artifact [:exports 'aiueos-value-runtime-entry])]
     (when-not export
       (throw (ex-info "Kotoba kernel entry is not exported" {:entry source-entry})))
-    (let [entry-address (+ image-base text-offset)
-          context-address (+ image-base kernel-data-offset)
-          shim (entry-shim (+ entry-address 23 (:offset export)) context-address)
-          text (into shim (:code artifact))
-          context (into (vec (repeat 8 0))
-                        (concat (le (artifact-fuel artifact) 8)
-                                (repeat (- kernel-image-context-size 16) 0)))
+    (when (and planner runtime-entry
+               (not= [5 5] [(:arity planner) (:arity runtime-entry)]))
+      (throw (ex-info "ValueRuntime kernel syscall exports have invalid arity"
+                      {:planner (:arity planner) :entry (:arity runtime-entry)})))
+    (let [live? (boolean (and planner runtime-entry))
+          entry-address (+ image-base text-offset)
+          boot-size (if live? live-boot-shim-size 77)
+          syscall-size (if live? live-syscall-shim-size 0)
+          prefix-size (+ boot-size syscall-size)
+          artifact-address (+ entry-address prefix-size)
+          data-offset (kernel-data-offset-for (+ prefix-size (count (:code artifact))))
+          context-address (+ image-base data-offset)
+          syscall-address (when live? (+ entry-address boot-size))
+          boot (entry-shim (+ artifact-address (:offset export))
+                           context-address syscall-address)
+          syscall (when live?
+                    (live-syscall-shim
+                     syscall-address context-address
+                     (+ artifact-address (:offset planner))
+                     (+ artifact-address (:offset runtime-entry))))
+          text (vec (concat boot syscall (:code artifact)))
+          context (kernel-runtime-data (artifact-fuel artifact) context-address)
           names (mapv int (.getBytes "\u0000.text\u0000.data\u0000.shstrtab\u0000" "UTF-8"))
-          names-offset (+ kernel-data-offset kernel-image-context-size)
+          names-offset (+ data-offset kernel-runtime-data-size)
           section-offset (+ names-offset (count names)
                             (mod (- 8 (mod (+ names-offset (count names)) 8)) 8))
           sections [(vec (repeat 64 0))
                     (section-header 1 1 0x6 entry-address text-offset (count text) 16)
-                    (section-header 7 1 0x3 context-address kernel-data-offset kernel-image-context-size 8)
+                    (section-header 7 1 0x3 context-address data-offset kernel-runtime-data-size 4096)
                     (section-header 13 3 0 0 names-offset (count names) 1)]
           header (elf-header entry-address 2 section-offset (count sections))
           phdrs (concat (program-header 0x5 text-offset entry-address (count text) (count text))
-                        (program-header 0x6 kernel-data-offset context-address
-                                        kernel-image-context-size kernel-image-context-size))
+                        (program-header 0x6 data-offset context-address
+                                        kernel-runtime-data-size kernel-runtime-data-size))
           before-text (padded (concat header phdrs) text-offset)
-          before-data (padded (concat before-text text) kernel-data-offset)
+          before-data (padded (concat before-text text) data-offset)
           before-sections (padded (concat before-data context names) section-offset)
           bytes (vec (concat before-sections (mapcat identity sections)))]
       {:format :elf64/v1
@@ -274,6 +453,8 @@
        :entry :aiueos_kernel_entry
        :source-entry source-entry
        :entry-address entry-address
+       :syscall-entry-address syscall-address
+       :value-runtime-live? live?
        :sections [:text :data :shstrtab]
        :imports []
        :interpreter nil
@@ -317,7 +498,8 @@
     (when-not export
       (throw (ex-info "Kotoba kernel entry is not exported" {:entry source-entry})))
     (let [entry-address (+ image-base text-offset)
-          context-address (+ image-base kernel-data-offset)
+          data-offset (kernel-data-offset-for (+ 16 (count (:code artifact))))
+          context-address (+ image-base data-offset)
           ;; the aarch64 shim is 16 bytes (4 instructions).
           shim (entry-shim-aarch64 (+ entry-address 16 (:offset export)) context-address)
           text (into shim (:code artifact))
@@ -325,19 +507,19 @@
                         (concat (le (artifact-fuel artifact) 8)
                                 (repeat (- kernel-image-context-size 16) 0)))
           names (mapv int (.getBytes " .text .data .shstrtab " "UTF-8"))
-          names-offset (+ kernel-data-offset kernel-image-context-size)
+          names-offset (+ data-offset kernel-image-context-size)
           section-offset (+ names-offset (count names)
                             (mod (- 8 (mod (+ names-offset (count names)) 8)) 8))
           sections [(vec (repeat 64 0))
                     (section-header 1 1 0x6 entry-address text-offset (count text) 16)
-                    (section-header 7 1 0x3 context-address kernel-data-offset kernel-image-context-size 8)
+                    (section-header 7 1 0x3 context-address data-offset kernel-image-context-size 8)
                     (section-header 13 3 0 0 names-offset (count names) 1)]
           header (elf-header* :aarch64 entry-address 2 section-offset (count sections))
           phdrs (concat (program-header 0x5 text-offset entry-address (count text) (count text))
-                        (program-header 0x6 kernel-data-offset context-address
+                        (program-header 0x6 data-offset context-address
                                         kernel-image-context-size kernel-image-context-size))
           before-text (padded (concat header phdrs) text-offset)
-          before-data (padded (concat before-text text) kernel-data-offset)
+          before-data (padded (concat before-text text) data-offset)
           before-sections (padded (concat before-data context names) section-offset)
           bytes (vec (concat before-sections (mapcat identity sections)))]
       {:format :elf64/v1
@@ -358,6 +540,15 @@
   (when-not (= user-target (:target artifact))
     (throw (ex-info "ELF64 user packaging requires the aiueos user target"
                     {:target (:target artifact)})))
+  ;; ValueRuntime persistence must cross aiueos' typed capability broker and
+  ;; local operations need a process-owned bounded arena. runtime-v2 supplies
+  ;; neither yet. Refuse even a manually sealed artifact here so the hosted C
+  ;; context ABI can never become an accidental production fallback.
+  (when (uses-value-runtime? artifact)
+    (throw (ex-info "aiueos ValueRuntime provider is not qualified"
+                    {:target user-target
+                     :execution-surface :aiueos-c-free-bare-metal-v1
+                     :required-transport :typed-capability-syscall})))
   (let [source-entry (get-in artifact [:program :entry])
         export (get-in artifact [:exports source-entry])]
     (when-not (and export (zero? (:arity export)))

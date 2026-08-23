@@ -115,6 +115,13 @@
 ;; backend alone shows up as a failure rather than as silence.
 (def ^:private x86-only
   [[[] '(kernel-boot-info)]
+   [['v] '(kernel-publish-current-domain v)]
+   [[] '(kernel-value-runtime-capability-table)]
+   [[] '(kernel-value-provider-queue)]
+   [[] '(kernel-value-runtime-arena)]
+   [[] '(kernel-value-runtime-cas-scratch)]
+   [['v] '(kernel-publish-value-provider-status v)]
+   [[] '(kernel-value-provider-status)]
    [[] '(kernel-read-cr2)]
    [[] '(kernel-read-cr3)]
    [['v] '(kernel-write-cr3 v)]

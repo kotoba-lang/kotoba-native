@@ -449,6 +449,22 @@
 (deftest x86-privileged-operations-route-through-closed-machine-ir
   (let [cases
         [[[] '(kernel-boot-info) :boot-info [0x4d 0x8b 0x51 0x50]]
+         [['a] '(kernel-publish-current-domain a) :publish-current-domain
+          [0x45 0x89 0x91 0x10 0x01 0x00 0x00]]
+         [[] '(kernel-value-runtime-capability-table)
+          :value-runtime-capability-table
+          [0x4d 0x8d 0x91 0x00 0x10 0x00 0x00]]
+         [[] '(kernel-value-provider-queue) :value-provider-queue
+          [0x4d 0x8d 0x91 0x00 0x04 0x00 0x00]]
+         [[] '(kernel-value-runtime-arena) :value-runtime-arena
+          [0x4d 0x8d 0x91 0x00 0x20 0x00 0x00]]
+         [[] '(kernel-value-runtime-cas-scratch) :value-runtime-cas-scratch
+          [0x4d 0x8d 0x91 0x00 0x06 0x00 0x00]]
+         [['a] '(kernel-publish-value-provider-status a)
+          :publish-value-provider-status
+          [0x45 0x89 0x91 0x38 0x01 0x00 0x00]]
+         [[] '(kernel-value-provider-status) :value-provider-status
+          [0x45 0x8b 0x91 0x38 0x01 0x00 0x00]]
          [[] '(kernel-read-cr2) :read-cr2 [0x41 0x0f 0x20 0xd2]]
          [[] '(kernel-read-cr3) :read-cr3 [0x41 0x0f 0x20 0xda]]
          [['a] '(kernel-write-cr3 a) :write-cr3 [0x41 0x0f 0x22 0xda]]
@@ -466,7 +482,10 @@
          [['a 'b] '(kernel-cpuid-eax a b) :cpuid-eax [0x0f 0xa2]]
          [['a 'b] '(kernel-cpuid-ebx a b) :cpuid-ebx [0x0f 0xa2]]
          [['a 'b] '(kernel-cpuid-ecx a b) :cpuid-ecx [0x0f 0xa2]]
-         [['a 'b] '(kernel-cpuid-edx a b) :cpuid-edx [0x0f 0xa2]]]
+         [['a 'b] '(kernel-cpuid-edx a b) :cpuid-edx [0x0f 0xa2]]
+         [['base 'length 'index 'expected 'desired]
+          '(kernel-compare-exchange-u32 base length index expected desired)
+          :compare-exchange-u32 [0xf0 0x45 0x0f 0xb1 0x13]]]
         contains-bytes? (fn [bytes needle]
                           (boolean (some #{needle}
                                          (partition (count needle) 1 bytes))))]
