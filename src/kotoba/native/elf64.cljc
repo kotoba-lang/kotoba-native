@@ -124,6 +124,14 @@
    ;; performance one -- see the object's own header for what that does and
    ;; does not guarantee in this subset.
    'aiueos-x25519 {:arity 4 :symbol "kotoba_aiueos_x25519"}
+   ;; ECDSA P-256 / SHA-256 admission for TLS 1.3 CertificateVerify.
+   ;; Hashing the handshake bytes without this object is not verification.
+   ;; RSA-2048 PKCS#1 is the wrong scheme (PSS or ECDSA). Affine verify
+   ;; exhausted the imm32 fuel ceiling (vector 6). Jacobian + NIST Solinas
+   ;; reduction completes under that ceiling (measured: RFC 6979 + live
+   ;; kotobase.net CertVerify). x86 kernel images already use the 16-page
+   ;; data offset; this entry does not change layout.
+   'aiueos-ecdsa-p256-sha256-verify {:arity 5 :symbol "kotoba_aiueos_ecdsa_p256_sha256_verify"}
    ;; MMIO mapping admission. The page-table walk stays C -- it allocates
    ;; directory slots and writes PTEs -- but WHETHER a physical range may be
    ;; mapped at all is a decision, and it was the last one still living in
@@ -603,6 +611,10 @@
           ;; unexpected-vector (vector 6 is `ud2`).
           rsa-fuel? (contains? '#{aiueos-rsa2048-sha256-verify aiueos-x25519}
                                object-entry)
+          ;; Two Jacobian scalar muls plus inverses. The RSA/X25519
+          ;; 250,000,000 tier is unmeasured for this object. Affine exhausted
+          ;; this imm32 ceiling; Solinas Jacobian completed inside it.
+          ecdsa-fuel? (= 'aiueos-ecdsa-p256-sha256-verify object-entry)
           context-fuel? (contains? '#{aiueos-user-context-build
                                      aiueos-kernel-context-build}
                                    object-entry)
@@ -692,6 +704,7 @@
           ;; FOURTH CALL -- three service-registry journal writes per boot, and
           ;; the fourth `ud2`s partway through leaving the sector half written.
           replenish (cond
+                      ecdsa-fuel? [0x49 0xc7 0x41 0x08 0xff 0xff 0xff 0x7f] ; 2,147,483,647
                       rsa-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000
                       sha-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
                       context-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x01 0x00] ; 65,536
