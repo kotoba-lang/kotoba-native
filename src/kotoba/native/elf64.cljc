@@ -137,6 +137,11 @@
    ;; this object owns the conversion. Nested if, not a map — native
    ;; word types only (temporary; not a language ceiling).
    'aiueos-ime-commit {:arity 2 :symbol "kotoba_aiueos_ime_commit"}
+   ;; Guest WM (aiueos ADR-0091). Two overlapping boot-desktop rects,
+   ;; z-front hit-test. Hosted `clojure -M:compositor wm` does not count.
+   ;; C prints the four vectors; this object owns which surface is hit.
+   ;; Nested if, word types only (temporary; not a language ceiling).
+   'aiueos-wm-hit {:arity 4 :symbol "kotoba_aiueos_wm_hit"}
    ;; MMIO mapping admission. The page-table walk stays C -- it allocates
    ;; directory slots and writes PTEs -- but WHETHER a physical range may be
    ;; mapped at all is a decision, and it was the last one still living in
