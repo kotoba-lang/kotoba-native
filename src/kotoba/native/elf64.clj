@@ -142,6 +142,12 @@
    ;; clipboard scratch; this object owns whether the op is granted.
    ;; Nested if, word types only (temporary; not a language ceiling).
    'aiueos-broker-admit {:arity 2 :symbol "kotoba_aiueos_broker_admit"}
+   ;; Guest session restore (aiueos ADR-0098). Packed boot session
+   ;; word -> front window id. Hosted JVM compositor does not count.
+   ;; C applies the restored front to wm-hit; this object owns which
+   ;; front the sealed session admits. Nested if, word types only
+   ;; (temporary; not a language ceiling).
+   'aiueos-session-restore {:arity 1 :symbol "kotoba_aiueos_session_restore"}
    ;; MMIO mapping admission. The page-table walk stays C -- it allocates
    ;; directory slots and writes PTEs -- but WHETHER a physical range may be
    ;; mapped at all is a decision, and it was the last one still living in
