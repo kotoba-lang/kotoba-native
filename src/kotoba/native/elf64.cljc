@@ -142,6 +142,12 @@
    ;; C prints the four vectors; this object owns which surface is hit.
    ;; Nested if, word types only (temporary; not a language ceiling).
    'aiueos-wm-hit {:arity 4 :symbol "kotoba_aiueos_wm_hit"}
+   ;; Guest scanout-two (aiueos ADR-0095). Bind a second virtio-gpu
+   ;; scanout when two 2D resources and two enabled modes exist.
+   ;; Hosted `clojure -M:compositor wm` does not count. C SET_SCANOUT
+   ;; is mechanism; this object owns how many scanouts to bind.
+   ;; Nested if, word types only (temporary; not a language ceiling).
+   'aiueos-scanout-bind {:arity 2 :symbol "kotoba_aiueos_scanout_bind"}
    ;; MMIO mapping admission. The page-table walk stays C -- it allocates
    ;; directory slots and writes PTEs -- but WHETHER a physical range may be
    ;; mapped at all is a decision, and it was the last one still living in
