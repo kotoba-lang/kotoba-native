@@ -148,6 +148,11 @@
    ;; is mechanism; this object owns how many scanouts to bind.
    ;; Nested if, word types only (temporary; not a language ceiling).
    'aiueos-scanout-bind {:arity 2 :symbol "kotoba_aiueos_scanout_bind"}
+   ;; Guest permission broker (aiueos ADR-0096). Clipboard/file-picker
+   ;; admit. Hosted JVM compositor does not count. C copies the
+   ;; clipboard scratch; this object owns whether the op is granted.
+   ;; Nested if, word types only (temporary; not a language ceiling).
+   'aiueos-broker-admit {:arity 2 :symbol "kotoba_aiueos_broker_admit"}
    ;; MMIO mapping admission. The page-table walk stays C -- it allocates
    ;; directory slots and writes PTEs -- but WHETHER a physical range may be
    ;; mapped at all is a decision, and it was the last one still living in
