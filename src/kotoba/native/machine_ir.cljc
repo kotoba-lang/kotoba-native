@@ -399,13 +399,33 @@
     [:facet native-dataspace-facet-type]
     [:error native-dataspace-error-type]]])
 
+(def ^:private native-ui-parent-type [:option :keyword])
+(def ^:private native-ui-node-type
+  [:record :kotoba.ui/node
+   [[:id :keyword] [:parent native-ui-parent-type]
+    [:kind :keyword] [:text :string]]])
+(def ^:private native-ui-node-set-type [:set native-ui-node-type])
+(def ^:private native-ui-commit-request-type
+  [:record :kotoba.ui/commit-request
+   [[:base-revision :i64] [:nodes native-ui-node-set-type]]])
+(def ^:private native-ui-commit-result-type
+  [:record :kotoba.ui/commit-result [[:revision :i64] [:node-count :i64]]])
+(def ^:private native-ui-event-request-type
+  [:record :kotoba.ui/event-request [[:after-revision :i64]]])
+(def ^:private native-ui-event-type
+  [:record :kotoba.ui/event
+   [[:revision :i64] [:target :keyword] [:kind :keyword] [:value :string]]])
+(def ^:private native-ui-event-result-type [:option native-ui-event-type])
+
 (def ^:private typed-capability-kinds
   {[:i64 :i64] :i64
    [:string :string] :string
    [:option-i64 :option-i64] :option-i64
    [:result-i64 :result-i64] :result-i64
    [native-clock-request-type native-clock-result-type] :clock-v1
-   [native-dataspace-request-type native-dataspace-result-type] :dataspace-v1})
+   [native-dataspace-request-type native-dataspace-result-type] :dataspace-v1
+   [native-ui-commit-request-type native-ui-commit-result-type] :ui-commit-v1
+   [native-ui-event-request-type native-ui-event-result-type] :ui-event-v1})
 
 (defn- capability-id
   "Return the closed host representation of an admitted capability id.
@@ -463,7 +483,10 @@
                      native-dataspace-assert-type native-dataspace-retract-type
                      native-dataspace-observe-type native-dataspace-asserted-type
                      native-dataspace-retracted-type native-dataspace-matches-type
-                     native-dataspace-facet-type native-dataspace-error-type}
+                     native-dataspace-facet-type native-dataspace-error-type
+                     native-ui-node-type native-ui-commit-request-type
+                     native-ui-commit-result-type native-ui-event-request-type
+                     native-ui-event-type}
                    type)
     (nth type 2)))
 
@@ -563,6 +586,15 @@
            (contains? '#{vector-new vector-f64-new} op)
            (reduce (fn [items item] (list 'vector-conj items item))
                    (list 'vector-new-empty) args)
+           (= op 'typed-set-new)
+           (reduce (fn [items item] (list 'vector-conj items item))
+                   (list 'vector-new-empty) (rest args))
+           (and (= op 'typed-set-conj) (= 3 (count args)))
+           (list 'vector-conj (second args) (nth args 2))
+           (and (= op 'typed-set-count) (= 2 (count args)))
+           (list 'vector-count (second args))
+           (and (= op 'typed-set-nth) (= 3 (count args)))
+           (list 'vector-at (second args) (nth args 2))
            (and (contains? '#{vector-get vector-f64-get} op)
                 (= 3 (count args)))
            (let [[items-form index-form fallback] args
@@ -824,7 +856,9 @@
                 (let [kind (get typed-capability-kinds
                                 [(nth form 2) (nth form 3)])]
                   (or (and (= :clock-v1 kind) (= 7 (second form)))
-                      (and (= :dataspace-v1 kind) (= 24 (second form)))))))
+                      (and (= :dataspace-v1 kind) (= 24 (second form)))
+                      (and (= :ui-commit-v1 kind) (= 9 (second form)))
+                      (and (= :ui-event-v1 kind) (= 10 (second form)))))))
          (tree-seq coll? seq functions))))
 
 (defn- tail-constructed-record-types
