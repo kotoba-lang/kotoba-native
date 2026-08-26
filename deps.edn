@@ -2,10 +2,10 @@
  :deps {org.clojure/clojure {:mvn/version "1.12.0"}
         io.github.kotoba-lang/kotoba-kir
         {:git/url "https://github.com/kotoba-lang/kotoba-kir.git"
-         :git/sha "136a62e0ad93585c5ecfa6755c82aa4ac2637e14"}
+         :git/sha "d3da5ce4153d01bed6cde6850b08907fd8fabbdc"}
         io.github.kotoba-lang/kotoba-gmir
         {:git/url "https://github.com/kotoba-lang/kotoba-gmir.git"
-         :git/sha "5fe05d1c729858553e2e518be395db7dfe1598a6"}
+         :git/sha "ffbf8489b635c670dd892d75874e1ef44b38603d"}
         ;; kotoba-mir 767d3c0: call+loop uses the scanner (:call-live).
         ;; This repository still does not execute compiled programs. A green
         ;; native suite here is encodings only, not that measurement.

@@ -123,6 +123,11 @@
    0x66 0xba 0xe9 0x00 0xee 0x44 0x89 0xc0
    0x66 0xba 0xf4 0x00 0xef 0xf4 0xeb 0xfd])
 
+(def ^:private rt-timer-handler-bytes
+  [0x48 0xff 0x04 0x25 0x00 0x02 0x11 0x00
+   0xc7 0x04 0x25 0xb0 0x00 0xe0 0xfe 0x00 0x00 0x00 0x00
+   0x48 0xcf])
+
 (def ^:private page-fault-recovery-handler-bytes
   ;; Save the touched register set into fixed RW/NX context slots before using
   ;; it, run the receipt path on the dedicated fault stack, then restore the
@@ -1699,6 +1704,10 @@
         (= op 'kernel-page-fault-handler-address)
         (let [n (count page-fault-handler-bytes)]
           (vec (concat [0xe9] (le32 n) page-fault-handler-bytes
+                       [0x48 0x8d 0x05] (le32 (- (+ n 7))))))
+        (= op 'kernel-rt-timer-handler-address)
+        (let [n (count rt-timer-handler-bytes)]
+          (vec (concat [0xe9] (le32 n) rt-timer-handler-bytes
                        [0x48 0x8d 0x05] (le32 (- (+ n 7))))))
         (= op 'kernel-page-fault-recovery-handler-address)
         (let [n (count page-fault-recovery-handler-bytes)]
