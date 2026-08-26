@@ -593,6 +593,46 @@
     (doseq [target [:x86-64 :aarch64]]
       (is (seq (:mc/functions (machine/compile-gmir target gmir))) target))))
 
+(deftest ui-provider-contract-lowers-through-the-module-pipeline
+  (let [parent [:option :keyword]
+        node [:record :kotoba.ui/node
+              [[:id :keyword] [:parent parent] [:kind :keyword] [:text :string]]]
+        nodes [:set node]
+        request [:record :kotoba.ui/commit-request
+                 [[:base-revision :i64] [:nodes nodes]]]
+        result [:record :kotoba.ui/commit-result
+                [[:revision :i64] [:node-count :i64]]]
+        event-request [:record :kotoba.ui/event-request [[:after-revision :i64]]]
+        event [:record :kotoba.ui/event
+               [[:revision :i64] [:target :keyword] [:kind :keyword] [:value :string]]]
+        event-result [:option event]
+        body (list 'let ['nodes
+                         (list 'typed-set-conj nodes
+                               (list 'typed-set-new nodes)
+                               (list 'record-new node :view/title
+                                     (list 'option-none-of parent)
+                                     :ui/text "ready"))
+                         'committed
+                         (list 'typed-cap-call 9 request result
+                               (list 'record-new request 0 'nodes))
+                         'pending
+                         (list 'typed-cap-call 10 event-request event-result
+                               (list 'record-new event-request 0))]
+                   (list '+ (list 'record-get result 'committed :revision)
+                         (list 'option-match event-result 'pending
+                               0 'e (list 'record-get event 'e :revision))))
+        module {:format :kotoba.kir/v4 :entry 'main :exports ['main]
+                :functions [{:name 'main :params [] :param-types []
+                             :result :i64 :body body}]}
+        gmir (machine/lower-kir-module module)
+        calls (filter #(= :gmir/capability-call (:gmir/op %))
+                      (get-in gmir [:gmir/functions 0 :gmir/instructions]))]
+    (is (machine/pilot-module? module))
+    (is (= 2 (count calls)))
+    (is (= #{:ui-commit-v1 :ui-event-v1} (set (map :gmir/kind calls))))
+    (doseq [target [:x86-64 :aarch64]]
+      (is (seq (:mc/functions (machine/compile-gmir target gmir))) target))))
+
 (deftest capability-call-encoders-check-policy-before-the-host-call
   (let [x86-scalar (machine/compile-expression :x86-64 '[x] '(cap-call 7 x))
         x86-typed (machine/compile-expression
