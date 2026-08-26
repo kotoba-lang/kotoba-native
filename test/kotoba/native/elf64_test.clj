@@ -25,10 +25,7 @@
            [:aarch64-aiueos-kernel-v1 elf64/package-kernel-aarch64]]]
     (let [fuel 4096
           image (:bytes (package (sealed-kernel target fuel)))]
-      (is (= fuel (le64 image (+ (if (= target :x86_64-aiueos-kernel-v1)
-                                    0x10000
-                                    0x8000)
-                                 8)))
+      (is (= fuel (le64 image (+ 0x8000 8)))
           (str target)))))
 
 (deftest x86-kernel-image-owns-gdt-tss-and-rsp0-stack
@@ -122,3 +119,25 @@
     (is (thrown-with-msg? clojure.lang.ExceptionInfo
                           #"ValueRuntime provider is not qualified"
                           (elf64/package-user value)))))
+
+;; amu#626 / aiueos ADR-0054. The JVM loads this file's twin `.clj`, not
+;; `.cljc`. Until ADR-0036 the `.clj` path still defaulted missing names to
+;; the probe symbol, so amu's refuse test compiled a colliding ET_REL.
+(deftest kernel-object-with-an-unlisted-aiueos-export-is-refused-not-given-the-probe-symbol
+  (testing "an unlisted aiueos-* export is refused, and names itself"
+    (let [artifact (-> (sealed-kernel :x86_64-aiueos-kernel-v1 512)
+                       (assoc :exports {'aiueos-not-in-the-table {:offset 0 :arity 1}
+                                        'main {:offset 1 :arity 0}}
+                              :code [0xc3 0xc3])
+                       (dissoc :sha256)
+                       artifact/seal)
+          thrown (try (elf64/package-kernel-object artifact)
+                      (catch clojure.lang.ExceptionInfo e e))]
+      (is (instance? clojure.lang.ExceptionInfo thrown)
+          "packaging must refuse rather than emit a colliding symbol")
+      (is (re-find #"no admitted symbol" (ex-message thrown)))
+      (is (= '[aiueos-not-in-the-table] (:unlisted-exports (ex-data thrown))))))
+  (testing "a source claiming no aiueos name still packages as the probe"
+    (is (= "kotoba_aiueos_probe"
+           (:export (elf64/package-kernel-object
+                     (sealed-kernel :x86_64-aiueos-kernel-v1 512)))))))
