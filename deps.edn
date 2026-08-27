@@ -6,12 +6,13 @@
         io.github.kotoba-lang/kotoba-gmir
         {:git/url "https://github.com/kotoba-lang/kotoba-gmir.git"
          :git/sha "0c74dd6f03c0bd51fc1675b20b11ed3a125704da"}
-        ;; kotoba-mir 767d3c0: call+loop uses the scanner (:call-live).
+        ;; kotoba-mir 5bd8824: call+loop uses the scanner (:call-live), and
+        ;; the conservative fallback colors frame slots from CFG liveness.
         ;; This repository still does not execute compiled programs. A green
         ;; native suite here is encodings only, not that measurement.
         io.github.kotoba-lang/kotoba-mir
         {:git/url "https://github.com/kotoba-lang/kotoba-mir.git"
-         :git/sha "a8c14a94e1ee144f9e3a529a6c55ad3acbf9f9f1"}
+         :git/sha "5bd8824edd161e8d9c1e8fc4605f39770e3125c1"}
         io.github.kotoba-lang/kotoba-codegen
         {:git/url "https://github.com/kotoba-lang/kotoba-codegen.git"
          :git/sha "568650d9d183a1e2642edd6ab8330d435fc07abe"}
