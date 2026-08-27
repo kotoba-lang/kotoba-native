@@ -208,8 +208,10 @@
 (deftest aarch64-kernel-wide-encodes-one-mul-and-eight-madds-after-reassoc
   ;; Production path: compile-kir-module, not the v2 expression helper.
   ;; Round 1 CSEs to one n*C (MUL, eight constant adds). Round 2 is still
-  ;; unique-use serial a0*C+1 (8 MADD). Remainder is SMULH/MSUB and must
-  ;; not be counted as MUL.
+  ;; unique-use serial a0*C+1 (8 MADD). Post-allocation MIR scheduling can
+  ;; reorder pure integer work so native MADD fusion emits one additional
+  ;; standalone MUL while the eight round-2 MADD chains stay intact. Remainder
+  ;; is SMULH/MSUB and must not be counted as MUL.
   (let [body '(let [v_a0 (+ (* n 48271) 1)
                     a0 (- v_a0 (* (quot v_a0 2147483647) 2147483647))
                     v_b0 (+ (* (+ n 1) 48271) 1)
@@ -250,8 +252,8 @@
                      (:code (machine/compile-kir-module :aarch64 kir))))]
     (is (= 8 (count (filter #{:madd} kinds)))
         "round 2 remains unique-use madd")
-    (is (= 1 (count (filter #{:mul} kinds)))
-        "round 1 is one shared n*C")))
+    (is (= 2 (count (filter #{:mul} kinds)))
+        "post-allocation scheduling keeps the shared n*C product plus one extra standalone mul")))
 
 (deftest gmir-keeps-an-independently-live-offset-add
   (let [form '(let [s (+ n 1)] (+ s (* s 48271)))
