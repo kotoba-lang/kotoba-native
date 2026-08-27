@@ -252,8 +252,8 @@
                      (:code (machine/compile-kir-module :aarch64 kir))))]
     (is (= 8 (count (filter #{:madd} kinds)))
         "round 2 remains unique-use madd")
-    (is (= 2 (count (filter #{:mul} kinds)))
-        "post-allocation scheduling keeps the shared n*C product plus one extra standalone mul")))
+    (is (= 1 (count (filter #{:mul} kinds)))
+        "the shared n*C product is the only standalone multiply")))
 
 (deftest gmir-keeps-an-independently-live-offset-add
   (let [form '(let [s (+ n 1)] (+ s (* s 48271)))

@@ -6,15 +6,16 @@
         io.github.kotoba-lang/kotoba-gmir
         {:git/url "https://github.com/kotoba-lang/kotoba-gmir.git"
          :git/sha "0c74dd6f03c0bd51fc1675b20b11ed3a125704da"}
-        ;; kotoba-mir ad739526: call+loop uses the scanner (:call-live), the
+        ;; kotoba-mir 90af8428: call+loop uses the scanner (:call-live), the
         ;; conservative fallback colors frame slots from CFG liveness, and
         ;; pure integer SSA segments are scheduled per basic block after physical
-        ;; allocation behind hard effect barriers.
+        ;; allocation behind hard effect barriers, with RAW/WAR/WAW physical
+        ;; register hazards preserved.
         ;; This repository still does not execute compiled programs. A green
         ;; native suite here is encodings only, not that measurement.
         io.github.kotoba-lang/kotoba-mir
         {:git/url "https://github.com/kotoba-lang/kotoba-mir.git"
-         :git/sha "ad739526d9f80cdda76fd8de3239acb4c07a8f58"}
+         :git/sha "90af842840fd03b7eb0ebc1ff873491c8fa04ab7"}
         io.github.kotoba-lang/kotoba-codegen
         {:git/url "https://github.com/kotoba-lang/kotoba-codegen.git"
          :git/sha "568650d9d183a1e2642edd6ab8330d435fc07abe"}
