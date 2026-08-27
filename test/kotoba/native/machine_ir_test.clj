@@ -1525,6 +1525,39 @@
         (is (seq (:code (machine/compile-kir-module target scalar-call-branch-kir)))
             target)))))
 
+(deftest sequential-call-crossings-share-one-native-frame-save
+  (let [[a call-one ignored b call-two result] (mapv gmir/vreg (range 6))
+        gmir {:gmir/version 3 :gmir/entry 'main
+              :gmir/functions
+              [{:gmir/name 'one :gmir/arity 0
+                :gmir/instructions
+                [{:gmir/op :gmir/constant :gmir/dst (gmir/vreg 20)
+                  :gmir/value 1}
+                 {:gmir/op :gmir/return :gmir/value (gmir/vreg 20)}]}
+               {:gmir/name 'main :gmir/arity 0
+                :gmir/instructions
+                [{:gmir/op :gmir/label :gmir/id :test.label/entry}
+                 {:gmir/op :gmir/constant :gmir/dst a :gmir/value 40}
+                 {:gmir/op :gmir/call :gmir/dst call-one
+                  :gmir/callee 'one :gmir/arguments []}
+                 {:gmir/op :gmir/add :gmir/dst ignored
+                  :gmir/left a :gmir/right call-one}
+                 {:gmir/op :gmir/constant :gmir/dst b :gmir/value 50}
+                 {:gmir/op :gmir/call :gmir/dst call-two
+                  :gmir/callee 'one :gmir/arguments []}
+                 {:gmir/op :gmir/add :gmir/dst result
+                  :gmir/left b :gmir/right call-two}
+                 {:gmir/op :gmir/return :gmir/value result}]}]}]
+    (doseq [target mir/targets]
+      (let [caller (second (:mc/functions (machine/compile-gmir target gmir)))
+            instructions (:mc/instructions caller)]
+        (is (= :call-live (:mc/frame-policy caller)) target)
+        (is (= 1 (count (mir/saved-registers target instructions))) target)
+        (is (not-any? #(contains? #{(keyword (name target) "spill-store")
+                                   (keyword (name target) "spill-load")}
+                                  (:mc/encoding %))
+                      instructions) target)))))
+
 (deftest tail-position-direct-calls-lower-to-terminal-non-linking-transfer
   (let [gmir (machine/lower-kir-module four-argument-call-kir)
         caller (second (:gmir/functions gmir))
