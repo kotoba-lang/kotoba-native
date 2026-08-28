@@ -185,6 +185,10 @@
     (mapv (fn [{:mir/keys [op id test] :as instruction}]
             (case op
               :mir/label (layout/label id)
+              :mir/reentry
+              {:mc/op :mc/reentry :mc/parameters (:mir/parameters instruction)}
+              :mir/recur
+              {:mc/op :mc/recur :mc/arguments (:mir/arguments instruction)}
               :mir/branch-zero
               {:mc/op :mc/branch-zero :mc/test test
                :mc/target (:mir/target instruction)}
@@ -3991,7 +3995,7 @@
 
 (defn- instruction-tokens
   [isa frame-bytes return-suffix tail-suffix callee-labels
-   current-function self-tail-prefix self-tail-body instructions]
+   self-tail-prefix self-tail-body instructions]
   (let [instructions (case isa
                        :aarch64 (-> instructions
                                     a64-cache-leaf-constants
@@ -4020,6 +4024,14 @@
       (if (layout/label-token? instruction)
         [instruction]
         (case op
+          :mc/reentry
+          [(layout/label self-tail-body)]
+
+          :mc/recur
+          (concat (rename-token-labels (str "self-tail." instruction-index)
+                                       self-tail-prefix)
+                  [(layout/relative-branch :aarch64/b-imm26 self-tail-body)])
+
           :mc/instruction
           (if (contains? #{"call" "tail-call"}
                          (name (:mc/encoding instruction)))
@@ -4028,22 +4040,11 @@
               (when-not label
                 (reject! :mc-encode :unknown-call-target instruction))
               (if (= "tail-call" (name (:mc/encoding instruction)))
-                (if (and (= :aarch64 isa) (= callee current-function))
-                  ;; Arguments are already assigned to the ABI registers by
-                  ;; MIR.  Re-charge fuel, then enter after the one-time frame
-                  ;; prologue: rebuilding that frame on every `recur` was both
-                  ;; unnecessary and the dominant cost of loop+call kernels.
-                  (concat (rename-token-labels (str "self-tail." instruction-index)
-                                               self-tail-prefix)
-                          [(layout/relative-branch
-                            (if (= :x86-64 isa)
-                              :x86-64/jmp-rel32 :aarch64/b-imm26)
-                            self-tail-body)])
-                  (concat tail-suffix
-                          [(layout/relative-branch
-                            (if (= :x86-64 isa)
-                              :x86-64/jmp-rel32 :aarch64/b-imm26)
-                            label)]))
+                (concat tail-suffix
+                        [(layout/relative-branch
+                          (if (= :x86-64 isa)
+                            :x86-64/jmp-rel32 :aarch64/b-imm26)
+                          label)])
                 [(layout/relative-branch
                   (if (= :x86-64 isa)
                     :x86-64/call-rel32 :aarch64/bl-imm26)
@@ -4081,20 +4082,26 @@
       {:out [] :cached-a64-multiplier nil}
       (map-indexed vector instructions)))))
 
-(defn- qualify-function-locals [function-index tokens]
-  (let [labels (->> tokens (filter layout/label-token?) (map :mir/id) set)
-        renamed (into {} (map (fn [id]
-                                [id (keyword (str "kotoba.native.local." function-index)
-                                             (str (namespace id) "." (name id)))])
-                              labels))]
-    (mapv (fn [token]
-            (cond
-              (layout/label-token? token) (assoc token :mir/id (get renamed (:mir/id token)))
-              (and (layout/relative-branch-token? token)
-                   (contains? renamed (:mir/target token)))
-              (assoc token :mir/target (get renamed (:mir/target token)))
-              :else token))
-          tokens)))
+(defn- qualify-function-locals
+  ([function-index tokens] (qualify-function-locals function-index tokens #{}))
+  ([function-index tokens protected]
+   (let [labels (->> tokens (filter layout/label-token?) (map :mir/id)
+                     (remove protected) set)
+         renamed (into {} (map (fn [id]
+                                 [id (keyword (str "kotoba.native.local." function-index)
+                                              (str (namespace id) "." (name id)))])
+                               labels))]
+     (mapv (fn [token]
+             (cond
+               (and (layout/label-token? token)
+                    (contains? protected (:mir/id token))) token
+               (layout/label-token? token)
+               (assoc token :mir/id (get renamed (:mir/id token)))
+               (and (layout/relative-branch-token? token)
+                    (contains? renamed (:mir/target token)))
+               (assoc token :mir/target (get renamed (:mir/target token)))
+               :else token))
+           tokens))))
 
 (defn- call-frame-policy? [frame-policy]
   (contains? #{:all-vregs :call-live} frame-policy))
@@ -4181,6 +4188,22 @@
            :return-suffix (vec (concat (a64-adjust-stack 0x910003ff storage-bytes)
                                        restore (u32le 0xd65f03c0)))})))))
 
+(defn- fresh-self-tail-body-label
+  "Choose a deterministic function-local label absent from both admitted MC
+  labels and the closed instrumentation prefix. Source MIR can spell any
+  qualified keyword, so a fixed encoder-private keyword is not collision-safe."
+  [function-index prefix instructions]
+  (let [occupied (->> (concat prefix instructions)
+                      (filter layout/label-token?)
+                      (map :mir/id)
+                      set)]
+    (loop [attempt 0]
+      (let [candidate (keyword "kotoba.native.internal.self-tail"
+                               (str function-index "." attempt))]
+        (if (contains? occupied candidate)
+          (recur (inc attempt))
+          candidate)))))
+
 (defn encode-mc-module
   "Encode an allocated MC v3 module. PREFIXES is an optional function-name to
   target-token map used by production fuel instrumentation; it participates in
@@ -4207,15 +4230,14 @@
            (fn [index {:mc/keys [name frame-slots frame-policy instructions]}]
              (let [{:keys [frame-bytes prologue return-suffix tail-suffix]}
                    (function-frame target frame-slots frame-policy instructions)
-                   self-tail-body :kotoba.mir.label/self-tail-body
                    prefix (get prefixes name [])
+                   self-tail-body (fresh-self-tail-body-label index prefix instructions)
                    local (vec (concat prefix prologue
-                                      [(layout/label self-tail-body)]
                                       (instruction-tokens target frame-bytes return-suffix tail-suffix
-                                                          callee-labels name prefix self-tail-body
+                                                          callee-labels prefix self-tail-body
                                                           instructions)))]
                (into [(layout/label (get callee-labels name))]
-                     (qualify-function-locals index local))))
+                     (qualify-function-locals index local #{self-tail-body}))))
            (range) functions))
          {:keys [labels code code-size]} (resolve-program-layout tokens)
          function-offsets (mapv #(get labels (get callee-labels (:mc/name %))) functions)
@@ -4259,7 +4281,7 @@
     (resolve-layout
      (vec (concat prologue
                   (instruction-tokens target frame-bytes return-suffix tail-suffix {}
-                                      nil [] nil instructions))))))
+                                      [] nil instructions))))))
 
 (def ^:private guest-reentry-ops
   ;; A function that contains one of these can run unbounded guest or host
