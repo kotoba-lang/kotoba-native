@@ -4281,19 +4281,48 @@
              (let [{:keys [frame-bytes prologue return-suffix tail-suffix]}
                    (function-frame target frame-slots frame-policy instructions)
                    instrumentation (get prefixes name [])
-                   prefix (if (map? instrumentation)
-                            (:entry instrumentation [])
-                            instrumentation)
+                   fallback-prefix (when (map? instrumentation)
+                                     (:fallback instrumentation))
+                   fallback-label (when fallback-prefix
+                                    (fresh-self-tail-body-label
+                                     (str index ".fallback-entry")
+                                     fallback-prefix instructions))
+                   prefix-spec (if (map? instrumentation)
+                                 (:entry instrumentation [])
+                                 instrumentation)
+                   prefix (if (fn? prefix-spec)
+                            (prefix-spec fallback-label)
+                            prefix-spec)
                    self-tail-prefix (if (map? instrumentation)
                                       (:recur instrumentation prefix)
                                       prefix)
-                   self-tail-body (fresh-self-tail-body-label index prefix instructions)
-                   local (vec (concat prefix prologue
-                                      (instruction-tokens target frame-bytes return-suffix tail-suffix
-                                                          callee-labels self-tail-prefix self-tail-body
-                                                          instructions)))]
+                   self-tail-body (fresh-self-tail-body-label
+                                   (str index ".bulk") prefix instructions)
+                   primary (qualify-function-locals
+                            (str index ".bulk")
+                            (vec (concat prefix prologue
+                                         (instruction-tokens
+                                          target frame-bytes return-suffix tail-suffix
+                                          callee-labels self-tail-prefix self-tail-body
+                                          instructions)))
+                            (cond-> #{self-tail-body} fallback-label
+                              (conj fallback-label)))
+                   fallback-body (when fallback-prefix
+                                   (fresh-self-tail-body-label
+                                    (str index ".fallback")
+                                    fallback-prefix instructions))
+                   fallback (when fallback-prefix
+                              (qualify-function-locals
+                               (str index ".fallback")
+                               (vec (concat [(layout/label fallback-label)]
+                                            fallback-prefix prologue
+                                            (instruction-tokens
+                                             target frame-bytes return-suffix tail-suffix
+                                             callee-labels fallback-prefix fallback-body
+                                             instructions)))
+                               #{fallback-label fallback-body}))]
                (into [(layout/label (get callee-labels name))]
-                     (qualify-function-locals index local #{self-tail-body}))))
+                     (concat primary fallback))))
            (range) functions))
          {:keys [labels code code-size]} (resolve-program-layout tokens)
          function-offsets (mapv #(get labels (get callee-labels (:mc/name %))) functions)
