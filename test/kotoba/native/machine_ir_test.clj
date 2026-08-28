@@ -14,6 +14,26 @@
 (def v1 (gmir/vreg 1))
 (def v2 (gmir/vreg 2))
 
+(defn- logical-seed-candidates []
+  (for [width [2 4 8 16 32 64]
+        ones (range 1 width)
+        rotation (range width)]
+    (let [chunks
+          (mapv
+           (fn [lane]
+             (reduce
+              (fn [chunk bit]
+                (let [index (+ (* lane 16) bit)]
+                  (if (< (mod (+ (mod index width) rotation) width) ones)
+                    (bit-or chunk (bit-shift-left 1 bit))
+                    chunk)))
+              0 (range 16)))
+           (range 4))]
+      {:chunks chunks
+       :n (if (= width 64) 1 0)
+       :immr rotation
+       :imms (bit-or (bit-and (- (* 2 width)) 0x3f) (dec ones))})))
+
 (deftest aarch64-constants-use-the-shorter-wide-move-seed
   (let [encode #(#'machine/a64-constant :aarch64/x0 %)]
     (is (= [0x00 0x00 0x80 0xd2] (encode 0)) "zero is one MOVZ")
@@ -43,21 +63,17 @@
         encode #(#'machine/a64-constant :aarch64/x0 %)
         reconstruct (fn [target-chunks]
                       (when-let [{:keys [patch-lanes] :as plan}
-                                 (#'machine/a64-logical-seed-plan target-chunks 2)]
+                                 (#'machine/a64-logical-seed-plan target-chunks)]
                         (reduce #(assoc %1 %2 (nth target-chunks %2))
                                 (:chunks plan) patch-lanes)))
-        selected-values [0 -1 Long/MIN_VALUE Long/MAX_VALUE
-                         magic -281470681808896 0x5555aaaa5555aaaa]
-        seeds (distinct
-               (mapcat identity
-                       (vals (deref (var-get #'machine/a64-logical-seed-index)))))
-        patched-seeds
-        (map-indexed
-         (fn [index {:keys [chunks]}]
-           (-> chunks
-               (assoc 0 (bit-and 0xffff (bit-xor (nth chunks 0) (+ 1 index))))
-               (assoc 3 (bit-and 0xffff (bit-xor (nth chunks 3) (+ 257 index))))))
-         seeds)]
+        selected-values [magic]
+        seeds (logical-seed-candidates)
+        admitted-patches
+        (for [[index {:keys [chunks]}] (map-indexed vector seeds)
+              lane (range 4)
+              :when (contains? #{0 0xffff} (nth chunks lane))]
+          (assoc chunks lane
+                 (bit-and 0xffff (bit-xor (nth chunks lane) (+ 1 index)))))]
     (is (= [0xe0 0x0b 0x41 0xb2 0x20 0x00 0xc0 0xf2] (encode magic))
         "the modular-mix reciprocal is one ORR seed plus one MOVK")
     (is (= 8 (count (encode magic))) "one word leaves the hot kernel")
@@ -65,14 +81,31 @@
       (let [chunks (#'machine/a64-constant-chunks value)]
         (is (= chunks (reconstruct chunks))
           (str "logical seed plus lane patches reconstructs " value))))
-    (is (every? #(= (:chunks %) (reconstruct (:chunks %))) seeds)
-        "every architectural logical seed reconstructs exactly")
-    (is (every? #(= % (reconstruct %)) patched-seeds)
-        "every logical seed reconstructs after two adversarial lane patches")
+    (is (every? (fn [{:keys [chunks n immr imms]}]
+                  (= {:n n :immr immr :imms imms}
+                     (#'machine/a64-logical-immediate-fields chunks)))
+                seeds)
+        "all 5,334 architectural seeds agree with the established selector")
+    (is (every? #(= % (reconstruct %)) admitted-patches)
+        "all admitted zero/full seed lanes reconstruct after an adversarial patch")
     (is (nil? (reconstruct [4 3 2 1]))
         "four unrelated lanes have no falsely profitable logical seed")
     (is (= 16 (count (encode 0x0001000200030004)))
-        "a semantic counterexample with four unrelated lanes stays on MOVZ/MOVK")))
+        "a semantic counterexample with four unrelated lanes stays on MOVZ/MOVK")
+    (is (nil? (ns-resolve 'kotoba.native.machine-ir 'a64-logical-seed-index))
+        "cold selection owns no global candidate index")
+    (let [calls (atom 0)
+          recognize (var-get #'machine/a64-logical-immediate-fields)]
+      (with-redefs [machine/a64-logical-immediate-fields
+                    (fn [chunks]
+                      (swap! calls inc)
+                      (recognize chunks))]
+        (is (some? (#'machine/a64-logical-seed-plan
+                    (#'machine/a64-constant-chunks magic))))
+        (is (<= @calls 8) "the qualified constant uses at most eight probes")
+        (reset! calls 0)
+        (is (nil? (#'machine/a64-logical-seed-plan [4 3 2 1])))
+        (is (= 8 @calls) "the worst-case closed miss is exactly eight probes")))))
 
 (deftest aarch64-branchless-leaves-cache-repeated-constants
   (let [leaf (mapv vec (partition 4

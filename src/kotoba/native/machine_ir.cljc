@@ -2460,22 +2460,25 @@
     (some
      (fn [width]
        (when (every? #(= (nth bits %) (nth bits (mod % width))) (range 64))
-         (some
-          (fn [ones]
-            (some
-             (fn [rotation]
-               (when (every? (fn [index]
-                               (= (nth bits index)
-                                  (< (mod (+ (mod index width) rotation) width)
-                                     ones)))
-                             (range 64))
-                 (let [len ({2 1, 4 2, 8 3, 16 4, 32 5, 64 6} width)]
-                   {:n (if (= width 64) 1 0)
-                    :immr rotation
-                    :imms (bit-or (bit-and (- (* 2 width)) 0x3f)
-                                  (dec ones))})))
-             (range width)))
-          (range 1 width))))
+         (let [element (subvec bits 0 width)
+               ones (count (filter true? element))
+               transitions
+               (count (filter true?
+                              (map-indexed
+                               (fn [index bit]
+                                 (not= bit (nth element (mod (inc index) width))))
+                               element)))
+               start (some (fn [index]
+                             (when (and (nth element index)
+                                        (not (nth element (mod (dec index) width))))
+                               index))
+                           (range width))]
+           (when (and (< 0 ones width) (= 2 transitions) (some? start))
+             (let [rotation (mod (- width start) width)]
+               {:n (if (= width 64) 1 0)
+                :immr rotation
+                :imms (bit-or (bit-and (- (* 2 width)) 0x3f)
+                              (dec ones))})))))
      [2 4 8 16 32 64])))
 
 (defn- a64-logical-immediate [rd chunks]
@@ -2487,67 +2490,32 @@
                    (bit-shift-left imms 10)
                    rd))))
 
-(def ^:private a64-logical-seed-index
-  ;; A logical immediate may also be the seed of a wider constant: MOVK then
-  ;; replaces only the 16-bit lanes that differ.  There are only 5,334 valid
-  ;; (width, run length, rotation) descriptions, so derive the closed set once
-  ;; from the same architectural rule as `a64-logical-immediate-fields`.
-  ;; Keeping chunks as four plain u16 values avoids all JVM/JavaScript i64
-  ;; representation differences while selecting the instruction sequence.
-  (delay
-    (reduce
-     (fn [index {:keys [chunks] :as candidate}]
-       (reduce (fn [index [left right]]
-                 (update index [left (nth chunks left) right (nth chunks right)]
-                         (fnil conj []) candidate))
-               index [[0 1] [0 2] [0 3] [1 2] [1 3] [2 3]]))
-     {}
-     (for [width [2 4 8 16 32 64]
-           ones (range 1 width)
-           rotation (range width)]
-       (let [chunks
-             (mapv
-              (fn [lane]
-                (reduce
-                 (fn [chunk bit]
-                   (let [index (+ (* lane 16) bit)]
-                     (if (< (mod (+ (mod index width) rotation) width) ones)
-                       (bit-or chunk (bit-shift-left 1 bit))
-                       chunk)))
-                 0 (range 16)))
-              (range 4))
-             len ({2 1, 4 2, 8 3, 16 4, 32 5, 64 6} width)]
-         {:chunks chunks
-          :n (if (= width 64) 1 0)
-          :immr rotation
-          :imms (bit-or (bit-and (- (* 2 width)) 0x3f) (dec ones))})))))
+(defn- a64-logical-lane-chunks []
+  ;; Admit only a zero/full lane replacement.  It covers the qualified
+  ;; modular-mix reciprocal and bounds cold selection to eight probes.  A
+  ;; broader arbitrary-lane search measured materially slower on both JVM and
+  ;; NBB and is deliberately outside this slice.
+  [0 0xffff])
 
-(defn- a64-logical-seed-plan [chunks max-patches]
-  ;; A seed that can win must agree in at least two lanes, so six indexed
-  ;; lookups replace a 5,334-candidate scan for every literal.  The score is a
-  ;; total deterministic order independent of duplicate index hits.
-  (let [pairs [[0 1] [0 2] [0 3] [1 2] [1 3] [2 3]]
-        candidates (mapcat (fn [[left right]]
-                             (get @a64-logical-seed-index
-                                  [left (nth chunks left)
-                                   right (nth chunks right)]))
-                           pairs)]
-    (reduce
-     (fn [best candidate]
-       (let [patch-lanes (vec (keep-indexed
-                               #(when (not= %2 (nth (:chunks candidate) %1)) %1)
-                               chunks))
-             plan (assoc candidate :patch-lanes patch-lanes)
-             score [(count patch-lanes) (:n plan) (:immr plan) (:imms plan)]]
-         (if (and (<= (count patch-lanes) max-patches)
-                  (or (nil? best) (neg? (compare score (:score best)))))
-           (assoc plan :score score)
-           best)))
-     nil candidates)))
+(defn- a64-logical-seed-plan [chunks]
+  ;; Only one-lane patches are admitted.  This is the actual qualified-kernel
+  ;; shape, gives a complete local proof, and bounds cold selection to four
+  ;; lanes times two seed fills instead of constructing or scanning all 5,334
+  ;; 64-bit logical immediates. Exact logical values were already selected
+  ;; before this function is called.
+  (some
+   (fn [replacement]
+     (some (fn [lane]
+             (when (not= replacement (nth chunks lane))
+               (let [seed-chunks (assoc chunks lane replacement)]
+                 (when-let [fields (a64-logical-immediate-fields seed-chunks)]
+                   (assoc fields :chunks seed-chunks :patch-lanes [lane])))))
+           (range 4)))
+   (a64-logical-lane-chunks)))
 
-(defn- a64-logical-seeded-wide [rd chunks max-patches]
+(defn- a64-logical-seeded-wide [rd chunks]
   (when-let [{:keys [n immr imms patch-lanes]}
-             (a64-logical-seed-plan chunks max-patches)]
+             (a64-logical-seed-plan chunks)]
     (vec
      (concat
       (u32le (bit-or 0xb20003e0
@@ -2593,10 +2561,9 @@
                        (range 4))))
         logical (a64-logical-immediate rd chunks)
         ;; A seed plus patches can only beat a three- or four-word wide move.
-        ;; Avoid constructing the index for the common one/two-word case.
-        logical-seeded (when (> (count wide) 8)
-                         (a64-logical-seeded-wide rd chunks
-                                                  (- (quot (count wide) 4) 2)))
+        ;; Avoid any seed search for the common one/two-word case.
+        logical-seeded (when (and (nil? logical) (> (count wide) 8))
+                         (a64-logical-seeded-wide rd chunks))
         selected (if (and logical-seeded
                           (< (count logical-seeded) (count wide)))
                    logical-seeded wide)]
