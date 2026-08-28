@@ -4124,9 +4124,64 @@
            :return-index (+ reentry-index 2)
            :return return})))))
 
+(defn- a64-identity-callee?
+  "A closed one-argument leaf whose complete allocated body is `x0 -> x0`.
+  The absence of an instrumentation prefix is checked by the caller."
+  [{:mc/keys [arity frame-slots instructions]}]
+  (and (= 1 arity)
+       (zero? frame-slots)
+       (= [{:mc/op :mc/instruction :mc/encoding :aarch64/argument
+            :mir/dst :aarch64/x0 :mir/index 0}
+           {:mc/op :mc/instruction :mc/encoding :aarch64/return
+            :mir/value :aarch64/x0}]
+          instructions)))
+
+(defn- a64-loop-invariant-identity-call-plan
+  "Hoist an exact `x0 := constant; x0 := identity(x0)` materialization from a
+  rotated counted-loop body.  The initial CBZ falls through the hoisted
+  constant, while the back edge targets the following body label and reuses
+  the identity result already left in x0.
+
+  This is deliberately narrower than ordinary LICM: the callee is a closed MC
+  identity leaf, x0 is not a recur parameter, and nothing after the call may
+  redefine x0.  Any different shape keeps the per-iteration materialization."
+  [instructions bottom-test identity-callees]
+  (when bottom-test
+    (let [instructions (vec instructions)
+          body-index (first (keep-indexed
+                             #(when (and (layout/label-token? %2)
+                                         (= (:body bottom-test) (:mir/id %2)))
+                                %1)
+                             instructions))
+          constant-index (some-> body-index inc)
+          call-index (some-> constant-index inc)
+          constant (get instructions constant-index)
+          call (get instructions call-index)
+          recur (get instructions (:recur-index bottom-test))]
+      (when (and body-index
+                 (= :mc/instruction (:mc/op constant))
+                 (= :aarch64/constant (:mc/encoding constant))
+                 (= :aarch64/x0 (:mir/dst constant))
+                 (= :mc/instruction (:mc/op call))
+                 (= :aarch64/call (:mc/encoding call))
+                 (= [:aarch64/x0] (:mir/arguments call))
+                 (= :aarch64/x0 (:mir/dst call))
+                 (contains? identity-callees (:mir/callee call))
+                 (not (some #{:aarch64/x0} (:mc/arguments recur)))
+                 (not-any? #(or (= :aarch64/x0 (:mir/dst %))
+                                (contains? #{:aarch64/call
+                                             :aarch64/runtime-call
+                                             :aarch64/capability-call}
+                                           (:mc/encoding %)))
+                           (subvec instructions (inc call-index)
+                                   (:recur-index bottom-test))))
+        {:body-index body-index
+         :constant-index constant-index
+         :constant constant}))))
+
 (defn- instruction-tokens
   [isa frame-bytes return-suffix tail-suffix callee-labels
-   self-tail-prefix self-tail-body bottom-test-exit instructions]
+   identity-callees self-tail-prefix self-tail-body bottom-test-exit instructions]
   (let [instructions (case isa
                        :aarch64 (-> instructions
                                     a64-cache-leaf-constants
@@ -4143,7 +4198,12 @@
                                  x86-hoist-repeated-reciprocal)
                        instructions)
         bottom-test (when (= :aarch64 isa)
-                      (a64-bottom-test-self-recur-plan instructions))]
+                      (a64-bottom-test-self-recur-plan instructions))
+        identity-hoist (when (and (= :aarch64 isa)
+                                  (not (fn? self-tail-prefix))
+                                  (empty? self-tail-prefix))
+                         (a64-loop-invariant-identity-call-plan
+                          instructions bottom-test identity-callees))]
     (:out
      (reduce
       (fn [{:keys [out cached-a64-multiplier]}
@@ -4155,7 +4215,13 @@
               load-multiplier? (not= multiplier cached-a64-multiplier)
               tokens
       (if (layout/label-token? instruction)
-        [instruction]
+        (if (= instruction-index (:body-index identity-hoist))
+          (concat
+           (encode-selected isa frame-bytes return-suffix
+                            (:constant-index identity-hoist) false
+                            (:constant identity-hoist))
+           [instruction])
+          [instruction])
         (case op
           :mc/reentry
           [(layout/label self-tail-body)]
@@ -4180,7 +4246,8 @@
                       [(layout/relative-branch :aarch64/b-imm26 self-tail-body)])))
 
           :mc/instruction
-          (if (= instruction-index (:return-index bottom-test))
+          (if (or (= instruction-index (:return-index bottom-test))
+                  (= instruction-index (:constant-index identity-hoist)))
             []
             (if (contains? #{"call" "tail-call"}
                          (name (:mc/encoding instruction)))
@@ -4378,6 +4445,15 @@
                               (fn [index {:mc/keys [name]}]
                                 [name (keyword "kotoba.native.function" (str index))])
                               functions))
+         identity-callees
+         (if (= :aarch64 target)
+           (->> functions
+                (filter a64-identity-callee?)
+                (remove (fn [{:mc/keys [name]}]
+                          (seq (get prefixes name))))
+                (map :mc/name)
+                set)
+           #{})
          tokens
          (vec
           (mapcat
@@ -4411,7 +4487,8 @@
                             (vec (concat prefix prologue
                                          (instruction-tokens
                                           target frame-bytes return-suffix tail-suffix
-                                          callee-labels self-tail-prefix self-tail-body
+                                          callee-labels identity-callees
+                                          self-tail-prefix self-tail-body
                                           bottom-test-exit
                                           instructions)))
                             (cond-> #{self-tail-body bottom-test-exit} fallback-label
@@ -4433,7 +4510,8 @@
                                             fallback-prefix prologue
                                             (instruction-tokens
                                              target frame-bytes return-suffix tail-suffix
-                                             callee-labels fallback-prefix fallback-body
+                                             callee-labels identity-callees
+                                             fallback-prefix fallback-body
                                              fallback-exit
                                              instructions)))
                                #{fallback-label fallback-body fallback-exit}))]
@@ -4482,7 +4560,7 @@
     (resolve-layout
      (vec (concat prologue
                   (instruction-tokens target frame-bytes return-suffix tail-suffix {}
-                                      [] nil nil instructions))))))
+                                      #{} [] nil nil instructions))))))
 
 (def ^:private guest-reentry-ops
   ;; A function that contains one of these can run unbounded guest or host
