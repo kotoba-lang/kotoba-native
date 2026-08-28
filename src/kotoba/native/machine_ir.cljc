@@ -4075,8 +4075,11 @@
           [(layout/label self-tail-body)]
 
           :mc/recur
-          (concat (rename-token-labels (str "self-tail." instruction-index)
-                                       self-tail-prefix)
+          (concat (rename-token-labels
+                   (str "self-tail." instruction-index)
+                   (if (fn? self-tail-prefix)
+                     (self-tail-prefix instruction)
+                     self-tail-prefix))
                   [(layout/relative-branch :aarch64/b-imm26 self-tail-body)])
 
           :mc/instruction
@@ -4277,14 +4280,49 @@
            (fn [index {:mc/keys [name frame-slots frame-policy instructions]}]
              (let [{:keys [frame-bytes prologue return-suffix tail-suffix]}
                    (function-frame target frame-slots frame-policy instructions)
-                   prefix (get prefixes name [])
-                   self-tail-body (fresh-self-tail-body-label index prefix instructions)
-                   local (vec (concat prefix prologue
-                                      (instruction-tokens target frame-bytes return-suffix tail-suffix
-                                                          callee-labels prefix self-tail-body
-                                                          instructions)))]
+                   instrumentation (get prefixes name [])
+                   fallback-prefix (when (map? instrumentation)
+                                     (:fallback instrumentation))
+                   fallback-label (when fallback-prefix
+                                    (fresh-self-tail-body-label
+                                     (str index ".fallback-entry")
+                                     fallback-prefix instructions))
+                   prefix-spec (if (map? instrumentation)
+                                 (:entry instrumentation [])
+                                 instrumentation)
+                   prefix (if (fn? prefix-spec)
+                            (prefix-spec fallback-label)
+                            prefix-spec)
+                   self-tail-prefix (if (map? instrumentation)
+                                      (:recur instrumentation prefix)
+                                      prefix)
+                   self-tail-body (fresh-self-tail-body-label
+                                   (str index ".bulk") prefix instructions)
+                   primary (qualify-function-locals
+                            (str index ".bulk")
+                            (vec (concat prefix prologue
+                                         (instruction-tokens
+                                          target frame-bytes return-suffix tail-suffix
+                                          callee-labels self-tail-prefix self-tail-body
+                                          instructions)))
+                            (cond-> #{self-tail-body} fallback-label
+                              (conj fallback-label)))
+                   fallback-body (when fallback-prefix
+                                   (fresh-self-tail-body-label
+                                    (str index ".fallback")
+                                    fallback-prefix instructions))
+                   fallback (when fallback-prefix
+                              (qualify-function-locals
+                               (str index ".fallback")
+                               (vec (concat [(layout/label fallback-label)]
+                                            fallback-prefix prologue
+                                            (instruction-tokens
+                                             target frame-bytes return-suffix tail-suffix
+                                             callee-labels fallback-prefix fallback-body
+                                             instructions)))
+                               #{fallback-label fallback-body}))]
                (into [(layout/label (get callee-labels name))]
-                     (qualify-function-locals index local #{self-tail-body}))))
+                     (concat primary fallback))))
            (range) functions))
          {:keys [labels code code-size]} (resolve-program-layout tokens)
          function-offsets (mapv #(get labels (get callee-labels (:mc/name %))) functions)
@@ -4354,6 +4392,15 @@
                     [name (vec (tokens-for name))]))
                 (:gmir/functions module)))))
 
+(defn counted-self-recur-plans
+  "Prove exact pure counted self recurrence after target selection.  The
+  returned plans are advisory until a backend also implements the runtime
+  non-negative fallback and exact saturating precharge contract."
+  [target kir]
+  (->> (lower-kir-module kir)
+       (mir/select-target target)
+       mir/counted-self-recur-plans))
+
 (defn compile-kir-module
   "End-to-end scalar direct-call slice: checked KIR module through GMIR v3,
   MIR v3 allocation, MC v3 and final function/call layout."
@@ -4362,9 +4409,10 @@
    (aggregate-abi/admit-extracted-call!
     target #{:per-function-frame :spill-live-values-across-call
              :parallel-argument-assignment :single-word-return-register})
-   (->> (lower-kir-module kir)
-        (compile-gmir target)
-        (#(encode-mc-module % prefixes (:exports kir))))))
+   (let [mc (->> (lower-kir-module kir)
+                 (compile-gmir target))
+         prefixes (if (fn? prefixes) (prefixes mc) prefixes)]
+     (encode-mc-module mc prefixes (:exports kir)))))
 
 (defn compile-expression
   "End-to-end closed slice: KIR expression -> GMIR -> MIR -> RA -> MC -> bytes."

@@ -27,7 +27,7 @@
         ;; native suite here is encodings only, not that measurement.
         io.github.kotoba-lang/kotoba-mir
         {:git/url "https://github.com/kotoba-lang/kotoba-mir.git"
-         :git/sha "1677cb0ddb6949ef371c4b7a05735435afd43861"}
+         :git/sha "7f248d578455185a1d801e11183c696f7e9f81ab"}
         io.github.kotoba-lang/kotoba-codegen
         {:git/url "https://github.com/kotoba-lang/kotoba-codegen.git"
          :git/sha "54a3f3b1c335cae69b7ac15744831c0a2c8ddd7c"}
