@@ -6,7 +6,7 @@
         io.github.kotoba-lang/kotoba-gmir
         {:git/url "https://github.com/kotoba-lang/kotoba-gmir.git"
          :git/sha "0c74dd6f03c0bd51fc1675b20b11ed3a125704da"}
-        ;; kotoba-mir be416103: call+loop uses the scanner (:call-live), the
+        ;; kotoba-mir d673ad9: call+loop uses the scanner (:call-live), the
         ;; conservative fallback colors frame slots from CFG liveness, and
         ;; pure integer SSA segments are scheduled per basic block after physical
         ;; allocation behind hard effect barriers, with RAW/WAR/WAW physical
@@ -15,15 +15,17 @@
         ;; the preserved tier and are reused before adding another frame save.
         ;; On AArch64, entry parameters live across a call start in that
         ;; preserved tier, avoiding a store/reload pair on every loop iteration.
-        ;; x86 retains its execution-qualified scratch-first entry plan.
+        ;; Unique-use zero equality followed by branch-zero becomes an explicit
+        ;; AArch64-only branch-nonzero while SSA identities are still available;
+        ;; x86 retains its execution-qualified scratch-first selection.
         ;; This repository still does not execute compiled programs. A green
         ;; native suite here is encodings only, not that measurement.
         io.github.kotoba-lang/kotoba-mir
         {:git/url "https://github.com/kotoba-lang/kotoba-mir.git"
-         :git/sha "be4161038414de3b5337371f3b94fd2c83e79a46"}
+         :git/sha "d673ad9059b553573beff5ce8ec438ba098108f0"}
         io.github.kotoba-lang/kotoba-codegen
         {:git/url "https://github.com/kotoba-lang/kotoba-codegen.git"
-         :git/sha "888e186e854d827c8e7d07014d2ae1e93162984d"}
+         :git/sha "c90dd09aad2c685a7ffb0b745eee4617d1743505"}
         io.github.kotoba-lang/kotoba-object
         {:git/url "https://github.com/kotoba-lang/kotoba-object.git"
          :git/sha "eb460265e15743b85a37f4432277173ad5cedc06"}
