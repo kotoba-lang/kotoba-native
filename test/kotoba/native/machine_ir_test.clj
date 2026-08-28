@@ -1558,6 +1558,37 @@
                                   (:mc/encoding %))
                       instructions) target)))))
 
+(def ^:private loop-call-kir
+  {:format :kotoba.kir/v4 :exports ['kernel]
+   :functions
+   [{:name 'id :params ['x] :result :i64 :body 'x}
+    {:name 'kernel :params ['i 'acc] :result :i64
+     :body '(if (= i 0)
+              acc
+              (kernel (- i 1) (+ acc (id 1))))}]})
+
+(deftest loop-call-parameters-stay-in-registers-through-self-tail-reentry
+  ;; This is the benchmark's exact control-flow shape after frontend `loop`
+  ;; lowering: two parameters cross a real call and then feed a self tail edge.
+  ;; A scratch-first entry plan used to back both parameters with frame slots,
+  ;; adding two stores and two loads to every iteration.
+  (let [gmir (machine/lower-kir-module loop-call-kir)]
+    (doseq [target mir/targets]
+      (let [function (->> (machine/compile-gmir target gmir)
+                          :mc/functions
+                          (filter #(= 'kernel (:mc/name %)))
+                          first)
+            spill-encodings #{(keyword (name target) "spill-store")
+                              (keyword (name target) "spill-load")}]
+        (is (= :call-live (:mc/frame-policy function)) target)
+        (is (zero? (:mc/frame-slots function)) target)
+        (is (not-any? #(contains? spill-encodings (:mc/encoding %))
+                      (:mc/instructions function)) target)
+        (is (= 1 (count (filter #(= (keyword (name target) "tail-call")
+                                    (:mc/encoding %))
+                               (:mc/instructions function))))
+            target)))))
+
 (deftest tail-position-direct-calls-lower-to-terminal-non-linking-transfer
   (let [gmir (machine/lower-kir-module four-argument-call-kir)
         caller (second (:gmir/functions gmir))
