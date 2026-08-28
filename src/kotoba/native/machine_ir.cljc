@@ -2487,6 +2487,78 @@
                    (bit-shift-left imms 10)
                    rd))))
 
+(def ^:private a64-logical-seed-index
+  ;; A logical immediate may also be the seed of a wider constant: MOVK then
+  ;; replaces only the 16-bit lanes that differ.  There are only 5,334 valid
+  ;; (width, run length, rotation) descriptions, so derive the closed set once
+  ;; from the same architectural rule as `a64-logical-immediate-fields`.
+  ;; Keeping chunks as four plain u16 values avoids all JVM/JavaScript i64
+  ;; representation differences while selecting the instruction sequence.
+  (delay
+    (reduce
+     (fn [index {:keys [chunks] :as candidate}]
+       (reduce (fn [index [left right]]
+                 (update index [left (nth chunks left) right (nth chunks right)]
+                         (fnil conj []) candidate))
+               index [[0 1] [0 2] [0 3] [1 2] [1 3] [2 3]]))
+     {}
+     (for [width [2 4 8 16 32 64]
+           ones (range 1 width)
+           rotation (range width)]
+       (let [chunks
+             (mapv
+              (fn [lane]
+                (reduce
+                 (fn [chunk bit]
+                   (let [index (+ (* lane 16) bit)]
+                     (if (< (mod (+ (mod index width) rotation) width) ones)
+                       (bit-or chunk (bit-shift-left 1 bit))
+                       chunk)))
+                 0 (range 16)))
+              (range 4))
+             len ({2 1, 4 2, 8 3, 16 4, 32 5, 64 6} width)]
+         {:chunks chunks
+          :n (if (= width 64) 1 0)
+          :immr rotation
+          :imms (bit-or (bit-and (- (* 2 width)) 0x3f) (dec ones))})))))
+
+(defn- a64-logical-seed-plan [chunks max-patches]
+  ;; A seed that can win must agree in at least two lanes, so six indexed
+  ;; lookups replace a 5,334-candidate scan for every literal.  The score is a
+  ;; total deterministic order independent of duplicate index hits.
+  (let [pairs [[0 1] [0 2] [0 3] [1 2] [1 3] [2 3]]
+        candidates (mapcat (fn [[left right]]
+                             (get @a64-logical-seed-index
+                                  [left (nth chunks left)
+                                   right (nth chunks right)]))
+                           pairs)]
+    (reduce
+     (fn [best candidate]
+       (let [patch-lanes (vec (keep-indexed
+                               #(when (not= %2 (nth (:chunks candidate) %1)) %1)
+                               chunks))
+             plan (assoc candidate :patch-lanes patch-lanes)
+             score [(count patch-lanes) (:n plan) (:immr plan) (:imms plan)]]
+         (if (and (<= (count patch-lanes) max-patches)
+                  (or (nil? best) (neg? (compare score (:score best)))))
+           (assoc plan :score score)
+           best)))
+     nil candidates)))
+
+(defn- a64-logical-seeded-wide [rd chunks max-patches]
+  (when-let [{:keys [n immr imms patch-lanes]}
+             (a64-logical-seed-plan chunks max-patches)]
+    (vec
+     (concat
+      (u32le (bit-or 0xb20003e0
+                     (bit-shift-left n 22)
+                     (bit-shift-left immr 16)
+                     (bit-shift-left imms 10)
+                     rd))
+      (mapcat (fn [lane]
+                (a64-wide-move 0xf2800000 rd (nth chunks lane) lane))
+              patch-lanes)))))
+
 (defn- a64-constant-fixed
   "The legacy four-word form. Keep it only where an enclosing sequence has a
   fixed local branch displacement or layout has reserved exactly 16 bytes."
@@ -2519,10 +2591,18 @@
                                     (not= fill (nth chunks lane)))
                            (a64-wide-move 0xf2800000 rd (nth chunks lane) lane)))
                        (range 4))))
-        logical (a64-logical-immediate rd chunks)]
+        logical (a64-logical-immediate rd chunks)
+        ;; A seed plus patches can only beat a three- or four-word wide move.
+        ;; Avoid constructing the index for the common one/two-word case.
+        logical-seeded (when (> (count wide) 8)
+                         (a64-logical-seeded-wide rd chunks
+                                                  (- (quot (count wide) 4) 2)))
+        selected (if (and logical-seeded
+                          (< (count logical-seeded) (count wide)))
+                   logical-seeded wide)]
     ;; Preserve the established wide-move spelling on ties. Apart from making
     ;; output deterministic, MOVZ/MOVN is the simpler dependency-breaking form.
-    (if (and logical (< (count logical) (count wide))) logical wide)))
+    (if (and logical (< (count logical) (count selected))) logical selected)))
 
 (defn- a64-compare [cset dst left right]
   (vec (concat

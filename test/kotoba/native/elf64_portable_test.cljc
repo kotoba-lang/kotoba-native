@@ -10,7 +10,8 @@
      nbb --classpath \"src:test:<deps>\" run-tests.cljs"
   (:require [clojure.test :refer [deftest is]]
             [kotoba.artifact.core :as artifact]
-            [kotoba.native.elf64 :as elf64]))
+            [kotoba.native.elf64 :as elf64]
+            [kotoba.native.machine-ir :as machine]))
 
 (defn- sealed-kernel [target fuel]
   (artifact/seal
@@ -37,6 +38,17 @@
                        (sealed-kernel :aarch64-aiueos-kernel-v1 4096)))]
     (is (= [0x7f 0x45 0x4c 0x46] (vec (take 4 image))))
     (is (every? #(<= 0 % 255) image))))
+
+(deftest aarch64-logical-seed-selection-is-portable
+  ;; The reciprocal used by the qualified modular-mix kernel is outside the
+  ;; JavaScript safe-integer range.  Exercise the selector on both runtimes so
+  ;; an accidental Number/32-bit coercion cannot silently change its lanes.
+  (let [magic #?(:clj -9223372032559808509
+                 :cljs (js/BigInt "-9223372032559808509"))
+        code (machine/compile-expression :aarch64 [] magic)]
+    (is (= [0xe0 0x0b 0x41 0xb2 0x20 0x00 0xc0 0xf2]
+           (vec (take 8 code))))
+    (is (= 12 (count code)) "two-word constant plus RET")))
 
 (deftest rejects-an-unsealed-fuel-bound
   ;; This is the branch that used to read `Long/MAX_VALUE`.
