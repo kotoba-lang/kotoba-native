@@ -22,12 +22,14 @@
         ;; backed/incomplete sites retain the public-entry tail path. x86 retains
         ;; its execution-qualified scratch-first selection. A unique-use integer
         ;; producer in one closed self-recur suffix may write its exact parameter
-        ;; home directly when the current owner dies at that producer.
+        ;; home directly when the current owner dies at that producer. Counted
+        ;; recurrence proof may admit a real direct call only when the closed
+        ;; module proves its callee is a pure, nontrapping, call-free leaf.
         ;; This repository still does not execute compiled programs. A green
         ;; native suite here is encodings only, not that measurement.
         io.github.kotoba-lang/kotoba-mir
         {:git/url "https://github.com/kotoba-lang/kotoba-mir.git"
-         :git/sha "7f248d578455185a1d801e11183c696f7e9f81ab"}
+         :git/sha "903331f83cc0a3c2613ccdaee1d1be126c06fabd"}
         io.github.kotoba-lang/kotoba-codegen
         {:git/url "https://github.com/kotoba-lang/kotoba-codegen.git"
          :git/sha "54a3f3b1c335cae69b7ac15744831c0a2c8ddd7c"}
