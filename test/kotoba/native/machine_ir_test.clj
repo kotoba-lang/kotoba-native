@@ -1906,6 +1906,39 @@
     (is (= x86-fuel-cmp (subvec x86-code 0 5)))
     (is (= {'down [:fuel]} prefixes))))
 
+(defn- subvector-count [haystack needle]
+  (count (filter #(= needle (vec %))
+                 (partition (count needle) 1 haystack))))
+
+(deftest production-self-tail-call-reuses-one-frame-and-recharges-fuel
+  ;; `loop/recur` lowers to a self tail call. Releasing the frame and branching
+  ;; to the public function label rebuilt the complete call-live frame on every
+  ;; iteration. The optimized edge enters after the one-time prologue, but it
+  ;; carries its own fuel charge; dropping that charge would make this an
+  ;; unbounded native loop.
+  (let [kir {:format :kotoba.kir/v4 :exports ['down]
+             :functions [{:name 'down :params ['n] :result :i64
+                          :body '(if (< n 1) n (down (- n 1)))}]}
+        arm-code (vec (:code (arm/emit-program kir)))
+        arm-words (a64-le-words arm-code)
+        x86-code (vec (:code (x86/emit-program kir)))
+        x86-sub-frame [0x48 0x81 0xec 0x08 0x00 0x00 0x00]
+        x86-add-frame [0x48 0x81 0xc4 0x08 0x00 0x00 0x00]]
+    (testing "AArch64"
+      (is (= 2 (count (filter #{a64-fuel-ldr} arm-words)))
+          "entry and self-tail edge each contain one fuel charge")
+      (is (= 1 (count (filter #{0xa9bf7bfd} arm-words)))
+          "FP/LR prologue is emitted once")
+      (is (= 1 (count (filter #{0xa8c17bfd} arm-words)))
+          "only the returning arm tears the frame down"))
+    (testing "x86-64"
+      (is (= 2 (subvector-count x86-code x86-fuel-cmp))
+          "entry and self-tail edge each contain one fuel charge")
+      (is (= 1 (subvector-count x86-code x86-sub-frame))
+          "call-live frame is allocated once")
+      (is (= 1 (subvector-count x86-code x86-add-frame))
+          "only the returning arm releases the frame"))))
+
 
 (defn- lcg-rounds-form
   "N rounds of `x <- (x*48271 + 1) mod 2147483647`, the shape of

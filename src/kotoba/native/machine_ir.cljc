@@ -3962,8 +3962,29 @@
     :aarch64/shift-right-unsigned :aarch64/spill-load
     :aarch64/spill-store :aarch64/move :aarch64/return})
 
+(defn- rename-token-labels
+  "Give every label defined inside TOKENS a private namespace and retarget its
+  internal branches.  Fuel prefixes contain local success labels; a self-tail
+  re-entry needs a second copy of the prefix, and duplicate labels would make
+  final layout ambiguous."
+  [scope tokens]
+  (let [labels (->> tokens (filter layout/label-token?) (map :mir/id) set)
+        renamed (into {} (map (fn [id]
+                                [id (keyword (str "kotoba.native." scope)
+                                             (str (namespace id) "." (name id)))])
+                              labels))]
+    (mapv (fn [token]
+            (cond
+              (layout/label-token? token) (assoc token :mir/id (get renamed (:mir/id token)))
+              (and (layout/relative-branch-token? token)
+                   (contains? renamed (:mir/target token)))
+              (assoc token :mir/target (get renamed (:mir/target token)))
+              :else token))
+          tokens)))
+
 (defn- instruction-tokens
-  [isa frame-bytes return-suffix tail-suffix callee-labels instructions]
+  [isa frame-bytes return-suffix tail-suffix callee-labels
+   current-function self-tail-prefix self-tail-body instructions]
   (let [instructions (case isa
                        :aarch64 (-> instructions
                                     a64-cache-leaf-constants
@@ -4000,11 +4021,22 @@
               (when-not label
                 (reject! :mc-encode :unknown-call-target instruction))
               (if (= "tail-call" (name (:mc/encoding instruction)))
-                (concat tail-suffix
-                        [(layout/relative-branch
-                          (if (= :x86-64 isa)
-                            :x86-64/jmp-rel32 :aarch64/b-imm26)
-                          label)])
+                (if (= callee current-function)
+                  ;; Arguments are already assigned to the ABI registers by
+                  ;; MIR.  Re-charge fuel, then enter after the one-time frame
+                  ;; prologue: rebuilding that frame on every `recur` was both
+                  ;; unnecessary and the dominant cost of loop+call kernels.
+                  (concat (rename-token-labels (str "self-tail." instruction-index)
+                                               self-tail-prefix)
+                          [(layout/relative-branch
+                            (if (= :x86-64 isa)
+                              :x86-64/jmp-rel32 :aarch64/b-imm26)
+                            self-tail-body)])
+                  (concat tail-suffix
+                          [(layout/relative-branch
+                            (if (= :x86-64 isa)
+                              :x86-64/jmp-rel32 :aarch64/b-imm26)
+                            label)]))
                 [(layout/relative-branch
                   (if (= :x86-64 isa)
                     :x86-64/call-rel32 :aarch64/bl-imm26)
@@ -4162,9 +4194,13 @@
            (fn [index {:mc/keys [name frame-slots frame-policy instructions]}]
              (let [{:keys [frame-bytes prologue return-suffix tail-suffix]}
                    (function-frame target frame-slots frame-policy instructions)
-                   local (vec (concat (get prefixes name []) prologue
+                   self-tail-body :kotoba.mir.label/self-tail-body
+                   prefix (get prefixes name [])
+                   local (vec (concat prefix prologue
+                                      [(layout/label self-tail-body)]
                                       (instruction-tokens target frame-bytes return-suffix tail-suffix
-                                                          callee-labels instructions)))]
+                                                          callee-labels name prefix self-tail-body
+                                                          instructions)))]
                (into [(layout/label (get callee-labels name))]
                      (qualify-function-locals index local))))
            (range) functions))
@@ -4210,7 +4246,7 @@
     (resolve-layout
      (vec (concat prologue
                   (instruction-tokens target frame-bytes return-suffix tail-suffix {}
-                                      instructions))))))
+                                      nil [] nil instructions))))))
 
 (def ^:private guest-reentry-ops
   ;; A function that contains one of these can run unbounded guest or host
