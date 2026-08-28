@@ -1581,9 +1581,18 @@
             spill-encodings #{(keyword (name target) "spill-store")
                               (keyword (name target) "spill-load")}]
         (is (= :call-live (:mc/frame-policy function)) target)
-        (is (zero? (:mc/frame-slots function)) target)
-        (is (not-any? #(contains? spill-encodings (:mc/encoding %))
-                      (:mc/instructions function)) target)
+        (if (= :aarch64 target)
+          (do
+            (is (zero? (:mc/frame-slots function)) target)
+            (is (not-any? #(contains? spill-encodings (:mc/encoding %))
+                          (:mc/instructions function)) target))
+          (do
+            ;; The broader preserved-entry placement exposed an x86 host-call
+            ;; execution regression downstream. Its prior, qualified plan
+            ;; backs only the accumulator and remains explicit here.
+            (is (= 1 (:mc/frame-slots function)) target)
+            (is (= 2 (count (filter #(contains? spill-encodings (:mc/encoding %))
+                                    (:mc/instructions function)))) target)))
         (is (= 1 (count (filter #(= (keyword (name target) "tail-call")
                                     (:mc/encoding %))
                                (:mc/instructions function))))
