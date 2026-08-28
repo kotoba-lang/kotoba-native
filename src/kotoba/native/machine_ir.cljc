@@ -4082,20 +4082,26 @@
       {:out [] :cached-a64-multiplier nil}
       (map-indexed vector instructions)))))
 
-(defn- qualify-function-locals [function-index tokens]
-  (let [labels (->> tokens (filter layout/label-token?) (map :mir/id) set)
-        renamed (into {} (map (fn [id]
-                                [id (keyword (str "kotoba.native.local." function-index)
-                                             (str (namespace id) "." (name id)))])
-                              labels))]
-    (mapv (fn [token]
-            (cond
-              (layout/label-token? token) (assoc token :mir/id (get renamed (:mir/id token)))
-              (and (layout/relative-branch-token? token)
-                   (contains? renamed (:mir/target token)))
-              (assoc token :mir/target (get renamed (:mir/target token)))
-              :else token))
-          tokens)))
+(defn- qualify-function-locals
+  ([function-index tokens] (qualify-function-locals function-index tokens #{}))
+  ([function-index tokens protected]
+   (let [labels (->> tokens (filter layout/label-token?) (map :mir/id)
+                     (remove protected) set)
+         renamed (into {} (map (fn [id]
+                                 [id (keyword (str "kotoba.native.local." function-index)
+                                              (str (namespace id) "." (name id)))])
+                               labels))]
+     (mapv (fn [token]
+             (cond
+               (and (layout/label-token? token)
+                    (contains? protected (:mir/id token))) token
+               (layout/label-token? token)
+               (assoc token :mir/id (get renamed (:mir/id token)))
+               (and (layout/relative-branch-token? token)
+                    (contains? renamed (:mir/target token)))
+               (assoc token :mir/target (get renamed (:mir/target token)))
+               :else token))
+           tokens))))
 
 (defn- call-frame-policy? [frame-policy]
   (contains? #{:all-vregs :call-live} frame-policy))
@@ -4182,6 +4188,22 @@
            :return-suffix (vec (concat (a64-adjust-stack 0x910003ff storage-bytes)
                                        restore (u32le 0xd65f03c0)))})))))
 
+(defn- fresh-self-tail-body-label
+  "Choose a deterministic function-local label absent from both admitted MC
+  labels and the closed instrumentation prefix. Source MIR can spell any
+  qualified keyword, so a fixed encoder-private keyword is not collision-safe."
+  [function-index prefix instructions]
+  (let [occupied (->> (concat prefix instructions)
+                      (filter layout/label-token?)
+                      (map :mir/id)
+                      set)]
+    (loop [attempt 0]
+      (let [candidate (keyword "kotoba.native.internal.self-tail"
+                               (str function-index "." attempt))]
+        (if (contains? occupied candidate)
+          (recur (inc attempt))
+          candidate)))))
+
 (defn encode-mc-module
   "Encode an allocated MC v3 module. PREFIXES is an optional function-name to
   target-token map used by production fuel instrumentation; it participates in
@@ -4208,14 +4230,14 @@
            (fn [index {:mc/keys [name frame-slots frame-policy instructions]}]
              (let [{:keys [frame-bytes prologue return-suffix tail-suffix]}
                    (function-frame target frame-slots frame-policy instructions)
-                   self-tail-body :kotoba.mir.label/self-tail-body
                    prefix (get prefixes name [])
+                   self-tail-body (fresh-self-tail-body-label index prefix instructions)
                    local (vec (concat prefix prologue
                                       (instruction-tokens target frame-bytes return-suffix tail-suffix
                                                           callee-labels prefix self-tail-body
                                                           instructions)))]
                (into [(layout/label (get callee-labels name))]
-                     (qualify-function-locals index local))))
+                     (qualify-function-locals index local #{self-tail-body}))))
            (range) functions))
          {:keys [labels code code-size]} (resolve-program-layout tokens)
          function-offsets (mapv #(get labels (get callee-labels (:mc/name %))) functions)

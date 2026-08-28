@@ -1636,6 +1636,28 @@
            (:mc/arguments (nth instructions recur-index))))
     (is (not-any? #(= :aarch64/tail-call (:mc/encoding %)) instructions))))
 
+(deftest encoder-direct-reentry-label-is-fresh-against-admitted-labels
+  (let [colliding (keyword "kotoba.native.internal.self-tail" "0.0")
+        qualification-collision :kotoba.native.internal/self-tail.0.0
+        module (fn [ordinary-label]
+                 {:mc/version 3 :mc/target :aarch64 :mc/entry 'loop
+                  :mc/functions
+                  [{:mc/name 'loop :mc/arity 1 :mc/frame-slots 0
+                    :mc/frame-policy :call-live
+                    :mc/instructions
+                    [{:mc/op :mc/instruction :mc/encoding :aarch64/argument
+                      :mir/dst :aarch64/x0 :mir/index 0}
+                     {:mc/op :mc/reentry :mc/parameters [:aarch64/x0]}
+                     {:mc/op :mc/recur :mc/arguments [:aarch64/x0]}
+                     (layout/label ordinary-label)
+                     {:mc/op :mc/instruction :mc/encoding :aarch64/return
+                      :mir/value :aarch64/x0}]}]})]
+    (doseq [ordinary-label [colliding qualification-collision]]
+      (let [encoded (machine/encode-mc-module (module ordinary-label))]
+        (is (seq (:code encoded)) ordinary-label)
+        (is (= {:offset 0 :length (count (:code encoded)) :arity 1}
+               (get-in encoded [:exports 'loop])) ordinary-label)))))
+
 (deftest tail-position-direct-calls-lower-to-terminal-non-linking-transfer
   (let [gmir (machine/lower-kir-module four-argument-call-kir)
         caller (second (:gmir/functions gmir))
