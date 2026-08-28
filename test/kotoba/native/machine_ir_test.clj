@@ -14,6 +14,26 @@
 (def v1 (gmir/vreg 1))
 (def v2 (gmir/vreg 2))
 
+(defn- logical-seed-candidates []
+  (for [width [2 4 8 16 32 64]
+        ones (range 1 width)
+        rotation (range width)]
+    (let [chunks
+          (mapv
+           (fn [lane]
+             (reduce
+              (fn [chunk bit]
+                (let [index (+ (* lane 16) bit)]
+                  (if (< (mod (+ (mod index width) rotation) width) ones)
+                    (bit-or chunk (bit-shift-left 1 bit))
+                    chunk)))
+              0 (range 16)))
+           (range 4))]
+      {:chunks chunks
+       :n (if (= width 64) 1 0)
+       :immr rotation
+       :imms (bit-or (bit-and (- (* 2 width)) 0x3f) (dec ones))})))
+
 (deftest aarch64-constants-use-the-shorter-wide-move-seed
   (let [encode #(#'machine/a64-constant :aarch64/x0 %)]
     (is (= [0x00 0x00 0x80 0xd2] (encode 0)) "zero is one MOVZ")
@@ -37,6 +57,55 @@
         "the forbidden all-ones logical immediate stays one MOVN")
     (is (= 16 (count (encode 0x0001000200030004)))
         "non-bitmask constants retain their exact wide-move sequence")))
+
+(deftest aarch64-logical-immediates-can-seed-one-lane-patches
+  (let [magic -9223372032559808509
+        encode #(#'machine/a64-constant :aarch64/x0 %)
+        reconstruct (fn [target-chunks]
+                      (when-let [{:keys [patch-lanes] :as plan}
+                                 (#'machine/a64-logical-seed-plan target-chunks)]
+                        (reduce #(assoc %1 %2 (nth target-chunks %2))
+                                (:chunks plan) patch-lanes)))
+        selected-values [magic]
+        seeds (logical-seed-candidates)
+        admitted-patches
+        (for [[index {:keys [chunks]}] (map-indexed vector seeds)
+              lane (range 4)
+              :when (contains? #{0 0xffff} (nth chunks lane))]
+          (assoc chunks lane
+                 (bit-and 0xffff (bit-xor (nth chunks lane) (+ 1 index)))))]
+    (is (= [0xe0 0x0b 0x41 0xb2 0x20 0x00 0xc0 0xf2] (encode magic))
+        "the modular-mix reciprocal is one ORR seed plus one MOVK")
+    (is (= 8 (count (encode magic))) "one word leaves the hot kernel")
+    (doseq [value selected-values]
+      (let [chunks (#'machine/a64-constant-chunks value)]
+        (is (= chunks (reconstruct chunks))
+          (str "logical seed plus lane patches reconstructs " value))))
+    (is (every? (fn [{:keys [chunks n immr imms]}]
+                  (= {:n n :immr immr :imms imms}
+                     (#'machine/a64-logical-immediate-fields chunks)))
+                seeds)
+        "all 5,334 architectural seeds agree with the established selector")
+    (is (every? #(= % (reconstruct %)) admitted-patches)
+        "all admitted zero/full seed lanes reconstruct after an adversarial patch")
+    (is (nil? (reconstruct [4 3 2 1]))
+        "four unrelated lanes have no falsely profitable logical seed")
+    (is (= 16 (count (encode 0x0001000200030004)))
+        "a semantic counterexample with four unrelated lanes stays on MOVZ/MOVK")
+    (is (nil? (ns-resolve 'kotoba.native.machine-ir 'a64-logical-seed-index))
+        "cold selection owns no global candidate index")
+    (let [calls (atom 0)
+          recognize (var-get #'machine/a64-logical-immediate-fields)]
+      (with-redefs [machine/a64-logical-immediate-fields
+                    (fn [chunks]
+                      (swap! calls inc)
+                      (recognize chunks))]
+        (is (some? (#'machine/a64-logical-seed-plan
+                    (#'machine/a64-constant-chunks magic))))
+        (is (<= @calls 8) "the qualified constant uses at most eight probes")
+        (reset! calls 0)
+        (is (nil? (#'machine/a64-logical-seed-plan [4 3 2 1])))
+        (is (= 8 @calls) "the worst-case closed miss is exactly eight probes")))))
 
 (deftest aarch64-branchless-leaves-cache-repeated-constants
   (let [leaf (mapv vec (partition 4
@@ -1025,8 +1094,8 @@
         words (mapv vec (partition 4 bytes))]
     (is (= [0x22 0xfe 0x51 0x8b] (peek words))
         "ADD X2,X17,X17,LSR#63")
-    (is (= 7 (count words))
-        "three-word magic plus SMULH, numerator ADD, ASR, shifted ADD")
+    (is (= 6 (count words))
+        "two-word logical seed plus SMULH, numerator ADD, ASR, shifted ADD")
     (is (not-any? #{[0x30 0xfe 0x7f 0xd3]} words)
         "the standalone LSR correction is gone")))
 
