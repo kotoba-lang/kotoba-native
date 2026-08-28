@@ -113,7 +113,7 @@
               (cond (vector? value) value
                     (keyword? value) [value]
                     :else [])))
-          [:mir/test :mir/value :mir/src :mir/input :mir/left :mir/right
+          [:mc/test :mir/test :mir/value :mir/src :mir/input :mir/left :mir/right
            :mir/addend :mir/base :mir/length :mir/index :mir/stored
            :mir/offset :mir/size :mir/arguments]))
 
@@ -3505,6 +3505,10 @@
     (u32le (bit-or 0xb4000000
                    (bit-shift-left (bit-and (quot displacement 4) 0x7ffff) 5)
                    (first operands)))
+    :aarch64/cbnz-imm19
+    (u32le (bit-or 0xb5000000
+                   (bit-shift-left (bit-and (quot displacement 4) 0x7ffff) 5)
+                   (first operands)))
     :aarch64/b-hi-imm19
     (u32le (bit-or 0x54000008
                    (bit-shift-left (bit-and (quot displacement 4) 0x7ffff) 5)))
@@ -3982,6 +3986,49 @@
               :else token))
           tokens)))
 
+(defn- a64-fuse-zero-equal-branches
+  "Replace an adjacent `equal(x, 0); branch-zero(equal-result)` with CBNZ x.
+
+  The zero materialization is deliberately retained. At allocated-MC level a
+  physical register may hold different virtual values on exclusive CFG paths,
+  so deleting its apparent definition requires a reaching-definition proof.
+  The equality result is removed only when the adjacent branch is its sole
+  source occurrence in the complete suffix; stopping at a physical-register
+  redefinition would be unsound across a branch target."
+  [instructions]
+  (let [instructions (vec instructions)]
+    (loop [index 0, out []]
+      (if (>= index (count instructions))
+        (vec out)
+        (let [constant (get instructions index)
+              equal (get instructions (inc index))
+              branch (get instructions (+ index 2))
+              zero-register (:mir/dst constant)
+              result-register (:mir/dst equal)
+              left (:mir/left equal)
+              right (:mir/right equal)
+              operand (cond (= zero-register left) right
+                            (= zero-register right) left)
+              later-result-use? (when (<= (+ index 3) (count instructions))
+                                  (some #(some #{result-register}
+                                               (a64-source-registers-mir %))
+                                        (subvec instructions (+ index 3))))
+              fuse? (and (= :aarch64/constant (:mc/encoding constant))
+                         (zero? (:mir/value constant))
+                         (= :aarch64/equal (:mc/encoding equal))
+                         (= :mc/branch-zero (:mc/op branch))
+                         (= result-register (:mc/test branch))
+                         operand
+                         (= 3 (count (set [zero-register result-register operand])))
+                         (not later-result-use?))]
+          (if fuse?
+            (recur (+ index 3)
+                   (conj out constant
+                         {:mc/op :mc/branch-nonzero
+                          :mc/test operand
+                          :mc/target (:mc/target branch)}))
+            (recur (inc index) (conj out constant))))))))
+
 (defn- instruction-tokens
   [isa frame-bytes return-suffix tail-suffix callee-labels
    current-function self-tail-prefix self-tail-body instructions]
@@ -3993,7 +4040,8 @@
                                     ;; `(n+k)*C`) stays MUL; fusing it would drop
                                     ;; the multiply while later adds still read it.
                                     a64-fuse-multiplies
-                                    a64-fold-adjacent-add-sub-immediates)
+                                    a64-fold-adjacent-add-sub-immediates
+                                    a64-fuse-zero-equal-branches)
                        :x86-64 (-> instructions
                                  x86-fold-adjacent-immediates
                                  x86-propagate-copies
@@ -4051,6 +4099,12 @@
             [(layout/relative-branch :aarch64/cbz-imm19
                                      (:mc/target instruction)
                                      [(a64-register test)])])
+          :mc/branch-nonzero
+          (if (= :aarch64 isa)
+            [(layout/relative-branch :aarch64/cbnz-imm19
+                                     (:mc/target instruction)
+                                     [(a64-register (:mc/test instruction))])]
+            (reject! :mc-encode :unknown-operation instruction))
           :mc/jump
           [(layout/relative-branch
             (if (= :x86-64 isa) :x86-64/jmp-rel32 :aarch64/b-imm26)
