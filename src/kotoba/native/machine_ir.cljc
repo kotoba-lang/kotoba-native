@@ -3687,6 +3687,41 @@
                :native/a64-mersenne-factor factor)
         instruction))))
 
+(declare a64-source-registers)
+
+(defn- a64-profitable-cached-mersenne-values
+  "Return cached constants whose every use is an MSUB factor and whose shifted
+  two-instruction expansion is smaller than keeping one materialization.
+
+  This is deliberately a whole-leaf cost decision.  In particular,
+  2147483647 is one AArch64 logical-immediate word: N remainders cost `1 + N`
+  words as `constant; MSUB...`, but `2 * N` words as shifted SUB+ADD.  The old
+  local rewrite chose the latter merely because the factor was Mersenne, making
+  the qualified eight- and sixteen-lane modular kernels seven and fifteen words
+  larger respectively.  A cached register with any non-MSUB reader is also
+  retained, because its materialization cannot be removed."
+  [instructions cache]
+  (set
+   (keep
+    (fn [[value register]]
+      (when-let [shift (positive-mersenne-shift value)]
+        (let [readers (filterv #(some #{register} (a64-source-registers %))
+                               instructions)
+              msub-readers
+              (filterv #(and (= :aarch64/multiply-subtract (:mc/encoding %))
+                             (contains? #{(:mir/left %) (:mir/right %)} register))
+                       readers)
+              uses (count msub-readers)
+              materialization-words
+              (quot (count (a64-constant :aarch64/x13 value)) 4)]
+          (when (and (pos? uses)
+                     (= (count readers) uses)
+                     ;; shifted reduction: two words/use; retained MSUB:
+                     ;; one materialization plus one word/use.
+                     (< (* 2 uses) (+ materialization-words uses)))
+            value))))
+    cache)))
+
 (def ^:private a64-source-keys
   [:mir/test :mir/value :mir/src :mir/input :mir/left :mir/right :mir/addend
    :mir/base :mir/length :mir/index :mir/stored :mir/offset :mir/size
@@ -3981,7 +4016,7 @@
           cache (into {} (map (fn [{:keys [value]} register]
                                 [value register])
                               selected a64-leaf-constant-registers))
-          rewritten
+          aliased
           (:out
            (reduce
             (fn [{:keys [aliases loaded out]} {:mc/keys [encoding] :as instruction}]
@@ -3995,15 +4030,17 @@
                   {:aliases (assoc aliases (:mir/dst instruction) register)
                    :loaded (conj loaded value)
                    :out emitted})
-                (let [rewritten (-> instruction
-                                    (a64-cache-register-sources aliases)
-                                    (a64-strength-reduce-cached-mersenne cache))
+                (let [rewritten (a64-cache-register-sources instruction aliases)
                       dst (:mir/dst instruction)]
                   {:aliases (if dst (dissoc aliases dst) aliases)
                    :loaded loaded
                    :out (conj out rewritten)})))
             {:aliases {} :loaded #{} :out []}
             instructions))
+          reducible (a64-profitable-cached-mersenne-values aliased cache)
+          reduction-cache (select-keys cache reducible)
+          rewritten (mapv #(a64-strength-reduce-cached-mersenne % reduction-cache)
+                          aliased)
           used (a64-used-source-registers rewritten)
           cache-registers (set (vals cache))]
       (vec (remove #(and (= :aarch64/constant (:mc/encoding %))

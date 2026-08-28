@@ -165,7 +165,7 @@
            (mapv vec (partition 4 bytes)))
         "SUB X17,X2,X2,LSL#31; ADD X0,X3,X17")))
 
-(deftest aarch64-strength-reduces-only-repeated-positive-mersenne-factors
+(deftest aarch64-repeated-mersenne-remainders-retain-profitable-msub
   (let [lower (fn [value]
                 (#'machine/a64-cache-leaf-constants
                  [{:mc/op :mc/instruction :mc/encoding :aarch64/constant
@@ -180,16 +180,82 @@
                    :mir/right :aarch64/x1 :mir/addend :aarch64/x3}
                   {:mc/op :mc/instruction :mc/encoding :aarch64/return
                    :mir/value :aarch64/x0}]))
-        reduced (lower 2147483647)
+        repeated (lower 2147483647)
         small (lower 15)
-        ordinary (lower 14)]
-    (is (= [31 31] (mapv :native/a64-mersenne-shift (take 2 reduced))))
-    (is (= [4 4] (mapv :native/a64-mersenne-shift (take 2 small))))
-    (is (not-any? #(= :aarch64/constant (:mc/encoding %)) reduced)
-        "the now-unused divisor materialization is removed")
+        ordinary (lower 14)
+        mixed (#'machine/a64-cache-leaf-constants
+               [{:mc/op :mc/instruction :mc/encoding :aarch64/constant
+                 :mir/dst :aarch64/x1 :mir/value 2147483647}
+                {:mc/op :mc/instruction :mc/encoding :aarch64/multiply-subtract
+                 :mir/dst :aarch64/x0 :mir/left :aarch64/x2
+                 :mir/right :aarch64/x1 :mir/addend :aarch64/x3}
+                {:mc/op :mc/instruction :mc/encoding :aarch64/constant
+                 :mir/dst :aarch64/x1 :mir/value 2147483647}
+                {:mc/op :mc/instruction :mc/encoding :aarch64/add
+                 :mir/dst :aarch64/x4 :mir/left :aarch64/x1
+                 :mir/right :aarch64/x2}
+                {:mc/op :mc/instruction :mc/encoding :aarch64/return
+                 :mir/value :aarch64/x4}])]
+    (is (= 1 (count (filter #(= :aarch64/constant (:mc/encoding %)) repeated)))
+        "one logical-immediate divisor feeds both remainders")
+    (is (= 2 (count (filter #(= :aarch64/multiply-subtract (:mc/encoding %))
+                            repeated))))
+    (is (not-any? :native/a64-mersenne-shift repeated)
+        "one load plus two MSUBs is smaller than two shifted pairs")
+    (is (not-any? :native/a64-mersenne-shift small)
+        "the same cost rule applies to another one-word logical immediate")
     (is (= 1 (count (filter #(= :aarch64/constant (:mc/encoding %)) ordinary))))
     (is (not-any? :native/a64-mersenne-shift ordinary)
-        "a non-Mersenne factor retains MSUB")))
+        "a non-Mersenne factor retains MSUB")
+    (is (= 1 (count (filter #(= :aarch64/constant (:mc/encoding %)) mixed))))
+    (is (not-any? :native/a64-mersenne-shift mixed)
+        "a mixed MSUB/add reader retains the materialization and exact inputs")))
+
+(declare a64-le-words a64-mul-kind lcg-rounds-form)
+
+(deftest aarch64-repeated-remainder-msub-cost-and-safety
+  (let [words-for (fn [body]
+                    (a64-le-words
+                     (machine/compile-expression :aarch64 ['n 'd] body)))
+        kinds-for #(keep a64-mul-kind (words-for %))
+        one (lcg-rounds-form 1)
+        eight (lcg-rounds-form 8)
+        narrow-code (:code
+                     (machine/compile-kir-module
+                      :aarch64
+                      {:format :kotoba.kir/v3 :entry 'kernel :exports ['kernel]
+                       :functions [{:name 'kernel :params ['n] :body eight}]}))
+        variable '(- n (* (quot n d) d))
+        shared '(let [q (quot n 7) p (* q 7)] (+ (- n p) p))]
+    (is (= 1 (count (filter #{:msub} (kinds-for one)))))
+    (is (= 8 (count (filter #{:msub} (kinds-for eight))))
+        "each repeated remainder is one hardware MSUB")
+    (is (= 22 (count (words-for one))))
+    (is (= 148 (count (words-for eight)))
+        "the whole eight-round expression is eight words shorter than baseline")
+    (is (= 54 (count (a64-le-words narrow-code)))
+        "the production narrow kernel is seven words shorter than its 61-word baseline")
+    (is (= 8 (count (filter #{:msub}
+                            (keep a64-mul-kind (a64-le-words narrow-code))))))
+    (is (= 1 (count (filter #{:msub} (kinds-for variable))))
+        "a dynamic divisor keeps guarded SDIV and fuses only q*d subtraction")
+    (is (zero? (count (filter #{:msub} (kinds-for shared))))
+        "a multiply with another live reader is never consumed by fusion")
+    (doseq [body [variable
+                  '(- n (* (quot n 0) 0))
+                  '(- n (* (quot n -1) -1))]]
+      (let [encodings (mapv :mc/encoding
+                            (:mc/instructions
+                             (machine/compile-gmir
+                              :aarch64
+                              (machine/lower-kir-expression ['n 'd] body))))]
+        (is (= 1 (count (filter #{:aarch64/quotient} encodings))) body)
+        (is (= 1 (count (filter #{:aarch64/multiply-subtract} encodings))) body)))
+    (let [guarded-words (words-for variable)]
+      (is (= 1 (count (filter #{0xd4200000} guarded-words)))
+          "zero and MIN/-1 share the original BRK guard")
+      (is (some #(= 0x9ac00c00 (bit-and % 0xffe0fc00)) guarded-words)
+          "the signed SDIV remains ahead of the fused remainder"))))
 
 (deftest aarch64-fuses-safe-multiply-add-and-subtract-after-allocation
   (let [expression '(let [v (+ (* n 7) 1)] (- v (* n 3)))
@@ -317,13 +383,17 @@
                 (+ (+ (+ a1 b1) (+ c1 d1)) (+ (+ e1 f1) (+ g1 h1))))
         kir {:format :kotoba.kir/v3 :entry 'kernel :exports ['kernel]
              :functions [{:name 'kernel :params ['n] :body body}]}
-        kinds (keep a64-mul-kind
-                    (a64-le-words
-                     (:code (machine/compile-kir-module :aarch64 kir))))]
+        code (:code (machine/compile-kir-module :aarch64 kir))
+        words (a64-le-words code)
+        kinds (keep a64-mul-kind words)]
     (is (= 8 (count (filter #{:madd} kinds)))
         "round 2 remains unique-use madd")
     (is (= 1 (count (filter #{:mul} kinds)))
-        "the shared n*C product is the only standalone multiply")))
+        "the shared n*C product is the only standalone multiply")
+    (is (= 16 (count (filter #{:msub} kinds)))
+        "all sixteen repeated remainders stay single-word MSUB")
+    (is (= 123 (count words))
+        "the production wide kernel is fifteen words shorter than its 138-word baseline")))
 
 (deftest gmir-keeps-an-independently-live-offset-add
   (let [form '(let [s (+ n 1)] (+ s (* s 48271)))
