@@ -1962,13 +1962,17 @@
           "FP/LR prologue is emitted once")
       (is (= 1 (count (filter #{0xa8c17bfd} arm-words)))
           "only the returning arm tears the frame down"))
-    (testing "x86-64"
-      (is (= 2 (subvector-count x86-code x86-fuel-cmp))
-          "entry and self-tail edge each contain one fuel charge")
+    (testing "x86-64 remains on its independently qualified teardown path"
+      ;; Reusing the MIR frame is not yet safe for x86 helpers containing host
+      ;; callbacks. Keep its prior tail teardown until that ABI interaction has
+      ;; an execution proof; the AArch64 benchmark optimization must not widen
+      ;; its claim across an unqualified ISA.
+      (is (= 1 (subvector-count x86-code x86-fuel-cmp))
+          "the public entry prefix is reached again after tail teardown")
       (is (= 1 (subvector-count x86-code x86-sub-frame))
-          "call-live frame is allocated once")
-      (is (= 1 (subvector-count x86-code x86-add-frame))
-          "only the returning arm releases the frame"))))
+          "one static call-live prologue remains")
+      (is (= 2 (subvector-count x86-code x86-add-frame))
+          "return and self-tail edges each release the frame"))))
 
 
 (defn- lcg-rounds-form
