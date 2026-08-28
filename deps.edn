@@ -20,12 +20,14 @@
         ;; AArch64 self-tail edges now receive the allocator's explicit
         ;; parameter-home vector and use its cycle-safe parallel-copy schedule;
         ;; backed/incomplete sites retain the public-entry tail path. x86 retains
-        ;; its execution-qualified scratch-first selection.
+        ;; its execution-qualified scratch-first selection. A unique-use integer
+        ;; producer in one closed self-recur suffix may write its exact parameter
+        ;; home directly when the current owner dies at that producer.
         ;; This repository still does not execute compiled programs. A green
         ;; native suite here is encodings only, not that measurement.
         io.github.kotoba-lang/kotoba-mir
         {:git/url "https://github.com/kotoba-lang/kotoba-mir.git"
-         :git/sha "be01f15d91700a6140972d8d33a1879c8c54f3d3"}
+         :git/sha "1677cb0ddb6949ef371c4b7a05735435afd43861"}
         io.github.kotoba-lang/kotoba-codegen
         {:git/url "https://github.com/kotoba-lang/kotoba-codegen.git"
          :git/sha "54a3f3b1c335cae69b7ac15744831c0a2c8ddd7c"}

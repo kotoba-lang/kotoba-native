@@ -1611,9 +1611,8 @@
 (deftest string-index-self-recur-updates-all-three-explicit-parameter-homes
   ;; Regression for the minimized stale-third-parameter failure: the new
   ;; position was already in ABI x2, so an encoder pattern looking only for
-  ;; staging MOVs saw two moves and skipped the rewrite. The allocator now
-  ;; explicitly copies x2 into x21 and emits the only operation allowed to
-  ;; target the post-materialization boundary.
+  ;; staging MOVs saw two moves and skipped the rewrite. The allocator's
+  ;; explicit boundary now lets the unique-use ADD produce x21 directly.
   (let [kir {:format :kotoba.kir/v4 :exports ['main]
              :functions
              (string-index/augment-functions
@@ -1629,8 +1628,9 @@
                                          instructions))]
     (is (= [:aarch64/x19 :aarch64/x20 :aarch64/x21]
            (:mc/parameters boundary)))
-    (is (= {:mc/op :mc/instruction :mc/encoding :aarch64/move
-            :mir/dst :aarch64/x21 :mir/src :aarch64/x2}
+    (is (= {:mc/op :mc/instruction :mc/encoding :aarch64/add
+            :mir/dst :aarch64/x21 :mir/left :aarch64/x21
+            :mir/right :aarch64/x1}
            (nth instructions (dec recur-index))))
     (is (= (:mc/parameters boundary)
            (:mc/arguments (nth instructions recur-index))))
@@ -2080,8 +2080,8 @@
         "x86 retains its canonical TEST/JZ branch path")
     ;; Virtual SSA ownership proves both definitions dead, removing MOV zero as
     ;; well as CMP+CSET. This pins a 4-to-1 production reduction.
-    (is (= 28 (count words))
-        "explicit direct-home reentry is two words shorter on the hot edge; its static module is 28 words")))
+    (is (= 27 (count words))
+        "one safe direct-home producer removes one more hot-edge word; the static module is 27 words")))
 
 
 (defn- lcg-rounds-form
