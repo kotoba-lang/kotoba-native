@@ -2075,13 +2075,47 @@
     (is (not-any? #{0xeb01001f 0x9a9f17e2} words)
         "the former CMP x0,x1 and CSET x2,eq pair is absent")
     (is (= 2 (count (filter #{a64-fuel-ldr} words)))
-        "entry and self-tail re-entry still each charge fuel")
+        "a loop containing a call retains entry and self-tail fuel charges")
     (is (pos? (subvector-count x86-code [0x0f 0x84]))
         "x86 retains its canonical TEST/JZ branch path")
     ;; Virtual SSA ownership proves both definitions dead, removing MOV zero as
     ;; well as CMP+CSET. This pins a 4-to-1 production reduction.
     (is (= 27 (count words))
         "one safe direct-home producer removes one more hot-edge word; the static module is 27 words")))
+
+(def ^:private pure-counted-kir
+  {:format :kotoba.kir/v4 :exports ['kernel]
+   :functions
+   [{:name 'kernel :params ['i 'acc] :result :i64
+     :body '(if (= i 0)
+              acc
+              (kernel (- i 1) (+ acc 1)))}]})
+
+(deftest counted-bulk-fuel-is-aarch64-only-and-fails-closed
+  (let [pure pure-counted-kir
+        with-call (-> pure
+                      (assoc-in [:functions 0 :body]
+                                '(if (= i 0) acc
+                                   (kernel (- i 1) (helper acc))))
+                      (update :functions conj
+                              {:name 'helper :params ['x] :result :i64 :body 'x}))
+        dependent-exit (assoc-in pure [:functions 0 :body]
+                                 '(if (= i 0) acc
+                                    (if (= acc 7) acc
+                                      (kernel (- i 1) (+ acc 1)))))
+        unsafe-division (assoc-in pure [:functions 0 :body]
+                                  '(if (= i 0) acc
+                                     (kernel (- i 1) (quot acc -1))))]
+    (is (contains? (machine/counted-self-recur-plans :aarch64 pure) 'kernel))
+    (doseq [[why kir] [["call" with-call]
+                       ["data-dependent exit" dependent-exit]
+                       ["trapping division" unsafe-division]]]
+      (is (empty? (machine/counted-self-recur-plans :aarch64 kir)) why))
+    (is (= 2 (count (filter #{a64-fuel-ldr}
+                            (a64-le-words (:code (arm/emit-program dependent-exit))))))
+        "fallback retains entry and recur charges")
+    (is (= 1 (subvector-count (vec (:code (x86/emit-program pure))) x86-fuel-cmp))
+        "x86 remains unchanged and re-enters its ordinary public prefix")))
 
 
 (defn- lcg-rounds-form

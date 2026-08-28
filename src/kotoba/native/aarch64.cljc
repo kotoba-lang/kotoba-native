@@ -113,6 +113,76 @@
           [(layout/label :kotoba.mir.label/fuel-present)]
           (insn 0xd1000610) (insn 0xf90004f0)))
 
+(def ^:private argument-registers [0 1 2 3 4])
+(def ^:private physical-register-numbers
+  (into {} (map (fn [number]
+                  [(keyword "aarch64" (str "x" number)) number])
+                (range 31))))
+
+(defn- counted-bulk-entry-charge-tokens
+  "Charge COUNTER+1 before a proven pure countdown executes.  Signed-negative
+  counters retain the ordinary one-unit entry charge and per-recur charging.
+  An insufficient non-negative charge stores zero before BRK, matching the
+  ordinary charge's saturating exhaustion contract without partial effects."
+  [counter]
+  (let [fallback :kotoba.native.bulk-fuel/entry-fallback
+        enough :kotoba.native.bulk-fuel/entry-enough
+        done :kotoba.native.bulk-fuel/entry-done]
+    (vec
+     (concat
+      ;; cmp xCOUNTER, xzr; b.lt fallback
+      (insn (bit-or 0xeb1f001f (bit-shift-left counter 5)))
+      [(layout/relative-branch :aarch64/b-lt-imm19 fallback)]
+      ;; x16 = counter + 1; x17 = fuel; cmp x17,x16; b.hs enough
+      (insn (bit-or 0x91000410 (bit-shift-left counter 5)))
+      (insn 0xf94004f1)
+      (insn 0xeb10023f)
+      [(layout/relative-branch :aarch64/b-hs-imm19 enough)]
+      ;; Insufficient: saturate the public remaining word, then trap.
+      (insn 0xf90004ff)
+      (insn 0xd4200000)
+      [(layout/label enough)]
+      ;; Sufficient: fuel -= counter+1, once.
+      (insn 0xcb100231)
+      (insn 0xf90004f1)
+      [(layout/relative-branch :aarch64/b-imm26 done)
+       (layout/label fallback)]
+      fuel-charge-tokens
+      [(layout/label done)]))))
+
+(defn- counted-bulk-recur-charge-tokens
+  "Skip the recur charge only on the precharged non-negative path.  Negative
+  counters remain negative for every reachable, fuel-bounded edge, so they
+  keep the historical per-edge charge rather than wrapping into a bulk cost."
+  [counter]
+  (let [charge :kotoba.native.bulk-fuel/recur-charge
+        done :kotoba.native.bulk-fuel/recur-done]
+    (vec
+     (concat
+      (insn (bit-or 0xeb1f001f (bit-shift-left counter 5)))
+      [(layout/relative-branch :aarch64/b-lt-imm19 charge)
+       (layout/relative-branch :aarch64/b-imm26 done)
+       (layout/label charge)]
+      fuel-charge-tokens
+      [(layout/label done)]))))
+
+(defn- fuel-instrumentation [kir]
+  (let [ordinary (machine-ir/entry-fuel-prefixes kir (fn [_] fuel-charge-tokens))
+        plans (machine-ir/counted-self-recur-plans :aarch64 kir)]
+    (reduce-kv
+     (fn [out name {:keys [counter-parameter]}]
+       (if-let [counter (get argument-registers counter-parameter)]
+         (assoc out name
+                {:entry (counted-bulk-entry-charge-tokens counter)
+                 :recur (fn [{:mc/keys [arguments]}]
+                          (let [home (nth arguments counter-parameter nil)
+                                register (get physical-register-numbers home)]
+                            (if (some? register)
+                              (counted-bulk-recur-charge-tokens register)
+                              fuel-charge-tokens)))})
+         out))
+     ordinary plans)))
+
 (defn- token-size [token]
   (cond (some? (layout/token-size token)) (layout/token-size token)
         (and (map? token) (:call token)) 4
@@ -1384,4 +1454,4 @@
                       (assoc % :exports (mapv :name (:functions %))))))]
     (machine-ir/compile-kir-module
      :aarch64 kir
-     (machine-ir/entry-fuel-prefixes kir (fn [_] fuel-charge-tokens)))))
+     (fuel-instrumentation kir))))

@@ -4028,8 +4028,11 @@
           [(layout/label self-tail-body)]
 
           :mc/recur
-          (concat (rename-token-labels (str "self-tail." instruction-index)
-                                       self-tail-prefix)
+          (concat (rename-token-labels
+                   (str "self-tail." instruction-index)
+                   (if (fn? self-tail-prefix)
+                     (self-tail-prefix instruction)
+                     self-tail-prefix))
                   [(layout/relative-branch :aarch64/b-imm26 self-tail-body)])
 
           :mc/instruction
@@ -4230,11 +4233,17 @@
            (fn [index {:mc/keys [name frame-slots frame-policy instructions]}]
              (let [{:keys [frame-bytes prologue return-suffix tail-suffix]}
                    (function-frame target frame-slots frame-policy instructions)
-                   prefix (get prefixes name [])
+                   instrumentation (get prefixes name [])
+                   prefix (if (map? instrumentation)
+                            (:entry instrumentation [])
+                            instrumentation)
+                   self-tail-prefix (if (map? instrumentation)
+                                      (:recur instrumentation prefix)
+                                      prefix)
                    self-tail-body (fresh-self-tail-body-label index prefix instructions)
                    local (vec (concat prefix prologue
                                       (instruction-tokens target frame-bytes return-suffix tail-suffix
-                                                          callee-labels prefix self-tail-body
+                                                          callee-labels self-tail-prefix self-tail-body
                                                           instructions)))]
                (into [(layout/label (get callee-labels name))]
                      (qualify-function-locals index local #{self-tail-body}))))
@@ -4306,6 +4315,15 @@
                   (when (function-reenters-guest? instructions)
                     [name (vec (tokens-for name))]))
                 (:gmir/functions module)))))
+
+(defn counted-self-recur-plans
+  "Prove exact pure counted self recurrence after target selection.  The
+  returned plans are advisory until a backend also implements the runtime
+  non-negative fallback and exact saturating precharge contract."
+  [target kir]
+  (->> (lower-kir-module kir)
+       (mir/select-target target)
+       mir/counted-self-recur-plans))
 
 (defn compile-kir-module
   "End-to-end scalar direct-call slice: checked KIR module through GMIR v3,
