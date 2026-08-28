@@ -2198,14 +2198,21 @@
         x86-code (vec (:code (x86/emit-program loop-call-kir)))
         cbnz-x0? #(= 0xb5000000
                       (bit-and % 0xff00001f))
+        cbz-x0? #(= 0xb4000000
+                     (bit-and % 0xff00001f))
+        b-imm26? #(= 0x14000000 (bit-and % 0xfc000000))
         encoded (#'kotoba.native.machine-ir/encode-layout-branch
                  (layout/relative-branch :aarch64/cbnz-imm19
                                          :test.label/continue [19])
                  8)]
     (is (= [0x53 0x00 0x00 0xb5] encoded)
         "CBNZ x19,+8 is 0xb5000053 in little-endian bytes")
+    (is (= 2 (count (filter cbz-x0? words)))
+        "bulk primary and cold negative entry each emit a forward CBZ i")
     (is (= 2 (count (filter cbnz-x0? words)))
-        "bulk fuel keeps one separately encoded cold negative body")
+        "bulk primary and cold negative hot edges each emit a backward CBNZ i")
+    (is (zero? (count (filter b-imm26? words)))
+        "the hot self-tail edge no longer branches back through the entry test")
     (is (= 1 (count (filter #(= :mc/branch-nonzero (:mc/op %))
                             loop-instructions))))
     (is (not-any? #(and (= :aarch64/constant (:mc/encoding %))
@@ -2232,10 +2239,42 @@
         "the optimization retains the real helper call in MIR/MC")
     (is (pos? (subvector-count x86-code [0x0f 0x84]))
         "x86 retains its canonical TEST/JZ branch path")
-    ;; Virtual SSA ownership proves both definitions dead, removing MOV zero as
-    ;; well as CMP+CSET. This pins a 4-to-1 production reduction.
     (is (= 53 (count words))
-        "the 27-word ordinary module becomes a primary path plus a cold negative copy")))
+        "rotation moves each shared exit without growing the bulk/fallback copies")))
+
+(deftest aarch64-bottom-test-rotation-fails-closed-outside-the-exact-form
+  (let [plan @#'kotoba.native.machine-ir/a64-bottom-test-self-recur-plan
+        instructions (->> (machine/compile-gmir
+                           :aarch64 (machine/lower-kir-module loop-call-kir))
+                          :mc/functions
+                          (filter #(= 'kernel (:mc/name %)))
+                          first :mc/instructions)
+        recur-index (dec (count instructions))
+        reentry-index (first (keep-indexed
+                              #(when (= :mc/reentry (:mc/op %2)) %1)
+                              instructions))]
+    (is (= {:recur-index recur-index
+            :branch-index (inc reentry-index)
+            :test :aarch64/x0
+            :body :kotoba.gmir.label/if-else-0
+            :return-index (+ reentry-index 2)
+            :return (nth instructions (+ reentry-index 2))}
+           (plan instructions)))
+    (doseq [[why changed]
+            [["recur is not terminal"
+              (conj instructions
+                    {:mc/op :mc/instruction :mc/encoding :aarch64/return
+                     :mir/value :aarch64/x19})]
+             ["recur arguments do not equal the reentry parameter homes"
+              (assoc-in instructions [recur-index :mc/arguments]
+                        [:aarch64/x0 :aarch64/x20])]
+             ["the bottom test is not carried by the recur"
+              (assoc-in instructions [(inc reentry-index) :mc/test]
+                        :aarch64/x18)]
+             ["the zero return is not a carried value"
+              (assoc-in instructions [(+ reentry-index 2) :mir/value]
+                        :aarch64/x18)]]]
+      (is (nil? (plan changed)) why))))
 
 (def ^:private pure-counted-kir
   {:format :kotoba.kir/v4 :exports ['kernel]

@@ -4077,9 +4077,56 @@
               :else token))
           tokens)))
 
+(defn- a64-bottom-test-self-recur-plan
+  "Recognize the closed direct-reentry form whose entry test can also guard
+  the self-tail edge.
+
+  Canonical lowering spells a countdown as
+
+      reentry; CBNZ test, body; RETURN value; body: ...; recur arguments
+
+  Re-entering executes the recur fuel prefix, an unconditional branch, then
+  the CBNZ.  On AArch64 the recur edge can instead execute the same prefix,
+  CBNZ directly to BODY, and a duplicate of the already-admitted return.  The
+  proof is deliberately structural: one terminal recur, one reentry, exact
+  parameter homes, and an immediate branch/return/body-label triple.  Anything
+  less exact keeps the established reentry path."
+  [instructions]
+  (let [instructions (vec instructions)
+        reentries (keep-indexed #(when (= :mc/reentry (:mc/op %2)) %1)
+                                instructions)
+        recurs (keep-indexed #(when (= :mc/recur (:mc/op %2)) %1)
+                             instructions)]
+    (when (and (= 1 (count reentries))
+               (= 1 (count recurs)))
+      (let [reentry-index (first reentries)
+            recur-index (first recurs)
+            reentry (get instructions reentry-index)
+            branch (get instructions (inc reentry-index))
+            return (get instructions (+ reentry-index 2))
+            body-label (get instructions (+ reentry-index 3))
+            recur (get instructions recur-index)
+            parameters (:mc/parameters reentry)
+            arguments (:mc/arguments recur)]
+        (when (and (= recur-index (dec (count instructions)))
+                   (= :mc/branch-nonzero (:mc/op branch))
+                   (= :mc/instruction (:mc/op return))
+                   (= :aarch64/return (:mc/encoding return))
+                   (layout/label-token? body-label)
+                   (= (:mc/target branch) (:mir/id body-label))
+                   (= parameters arguments)
+                   (some #{(:mc/test branch)} arguments)
+                   (some #{(:mir/value return)} arguments))
+          {:recur-index recur-index
+           :branch-index (inc reentry-index)
+           :test (:mc/test branch)
+           :body (:mc/target branch)
+           :return-index (+ reentry-index 2)
+           :return return})))))
+
 (defn- instruction-tokens
   [isa frame-bytes return-suffix tail-suffix callee-labels
-   self-tail-prefix self-tail-body instructions]
+   self-tail-prefix self-tail-body bottom-test-exit instructions]
   (let [instructions (case isa
                        :aarch64 (-> instructions
                                     a64-cache-leaf-constants
@@ -4094,7 +4141,9 @@
                                  x86-propagate-copies
                                  x86-quotient-result-in-place
                                  x86-hoist-repeated-reciprocal)
-                       instructions)]
+                       instructions)
+        bottom-test (when (= :aarch64 isa)
+                      (a64-bottom-test-self-recur-plan instructions))]
     (:out
      (reduce
       (fn [{:keys [out cached-a64-multiplier]}
@@ -4112,32 +4161,45 @@
           [(layout/label self-tail-body)]
 
           :mc/recur
-          (concat (rename-token-labels
-                   (str "self-tail." instruction-index)
-                   (if (fn? self-tail-prefix)
-                     (self-tail-prefix instruction)
-                     self-tail-prefix))
-                  [(layout/relative-branch :aarch64/b-imm26 self-tail-body)])
+          (let [prefix (rename-token-labels
+                        (str "self-tail." instruction-index)
+                        (if (fn? self-tail-prefix)
+                          (self-tail-prefix instruction)
+                          self-tail-prefix))]
+            (if (= instruction-index (:recur-index bottom-test))
+              (concat
+               prefix
+               [(layout/relative-branch :aarch64/cbnz-imm19
+                                        (:body bottom-test)
+                                        [(a64-register (:test bottom-test))])]
+               [(layout/label bottom-test-exit)]
+               (encode-selected isa frame-bytes return-suffix
+                                (:return-index bottom-test) false
+                                (:return bottom-test)))
+              (concat prefix
+                      [(layout/relative-branch :aarch64/b-imm26 self-tail-body)])))
 
           :mc/instruction
-          (if (contains? #{"call" "tail-call"}
+          (if (= instruction-index (:return-index bottom-test))
+            []
+            (if (contains? #{"call" "tail-call"}
                          (name (:mc/encoding instruction)))
-            (let [callee (:mir/callee instruction)
-                  label (get callee-labels callee)]
-              (when-not label
-                (reject! :mc-encode :unknown-call-target instruction))
-              (if (= "tail-call" (name (:mc/encoding instruction)))
-                (concat tail-suffix
-                        [(layout/relative-branch
-                          (if (= :x86-64 isa)
-                            :x86-64/jmp-rel32 :aarch64/b-imm26)
-                          label)])
-                [(layout/relative-branch
-                  (if (= :x86-64 isa)
-                    :x86-64/call-rel32 :aarch64/bl-imm26)
-                  label)]))
-            (encode-selected isa frame-bytes return-suffix instruction-index
-                             load-multiplier? instruction))
+              (let [callee (:mir/callee instruction)
+                    label (get callee-labels callee)]
+                (when-not label
+                  (reject! :mc-encode :unknown-call-target instruction))
+                (if (= "tail-call" (name (:mc/encoding instruction)))
+                  (concat tail-suffix
+                          [(layout/relative-branch
+                            (if (= :x86-64 isa)
+                              :x86-64/jmp-rel32 :aarch64/b-imm26)
+                            label)])
+                  [(layout/relative-branch
+                    (if (= :x86-64 isa)
+                      :x86-64/call-rel32 :aarch64/bl-imm26)
+                    label)]))
+              (encode-selected isa frame-bytes return-suffix instruction-index
+                               load-multiplier? instruction)))
           :mc/branch-zero
           (if (= :x86-64 isa)
             (concat (x86-rr 0x85 test test)
@@ -4148,9 +4210,14 @@
                                      [(a64-register test)])])
           :mc/branch-nonzero
           (if (= :aarch64 isa)
-            [(layout/relative-branch :aarch64/cbnz-imm19
-                                     (:mc/target instruction)
-                                     [(a64-register (:mc/test instruction))])]
+            [(layout/relative-branch
+              (if (= instruction-index (:branch-index bottom-test))
+                :aarch64/cbz-imm19
+                :aarch64/cbnz-imm19)
+              (if (= instruction-index (:branch-index bottom-test))
+                bottom-test-exit
+                (:mc/target instruction))
+              [(a64-register (:mc/test instruction))])]
             (reject! :mc-encode :unknown-operation instruction))
           :mc/jump
           [(layout/relative-branch
@@ -4335,19 +4402,30 @@
                                       prefix)
                    self-tail-body (fresh-self-tail-body-label
                                    (str index ".bulk") prefix instructions)
+                   bottom-test-exit (fresh-self-tail-body-label
+                                     (str index ".bulk-exit")
+                                     (conj (vec prefix) (layout/label self-tail-body))
+                                     instructions)
                    primary (qualify-function-locals
                             (str index ".bulk")
                             (vec (concat prefix prologue
                                          (instruction-tokens
                                           target frame-bytes return-suffix tail-suffix
                                           callee-labels self-tail-prefix self-tail-body
+                                          bottom-test-exit
                                           instructions)))
-                            (cond-> #{self-tail-body} fallback-label
+                            (cond-> #{self-tail-body bottom-test-exit} fallback-label
                               (conj fallback-label)))
                    fallback-body (when fallback-prefix
                                    (fresh-self-tail-body-label
                                     (str index ".fallback")
                                     fallback-prefix instructions))
+                   fallback-exit (when fallback-prefix
+                                   (fresh-self-tail-body-label
+                                    (str index ".fallback-exit")
+                                    (conj (vec fallback-prefix)
+                                          (layout/label fallback-body))
+                                    instructions))
                    fallback (when fallback-prefix
                               (qualify-function-locals
                                (str index ".fallback")
@@ -4356,8 +4434,9 @@
                                             (instruction-tokens
                                              target frame-bytes return-suffix tail-suffix
                                              callee-labels fallback-prefix fallback-body
+                                             fallback-exit
                                              instructions)))
-                               #{fallback-label fallback-body}))]
+                               #{fallback-label fallback-body fallback-exit}))]
                (into [(layout/label (get callee-labels name))]
                      (concat primary fallback))))
            (range) functions))
@@ -4403,7 +4482,7 @@
     (resolve-layout
      (vec (concat prologue
                   (instruction-tokens target frame-bytes return-suffix tail-suffix {}
-                                      [] nil instructions))))))
+                                      [] nil nil instructions))))))
 
 (def ^:private guest-reentry-ops
   ;; A function that contains one of these can run unbounded guest or host
