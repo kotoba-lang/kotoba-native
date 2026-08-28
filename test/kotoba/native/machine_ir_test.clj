@@ -2174,8 +2174,18 @@
                                       (kernel (- i 1) (+ acc 1)))))
         unsafe-division (assoc-in pure [:functions 0 :body]
                                   '(if (= i 0) acc
-                                     (kernel (- i 1) (quot acc -1))))]
+                                     (kernel (- i 1) (quot acc -1))))
+        pure-mc (machine/compile-gmir :aarch64
+                                      (machine/lower-kir-module pure))]
     (is (contains? (machine/counted-self-recur-plans :aarch64 pure) 'kernel))
+    (let [instrumentation (get (#'kotoba.native.aarch64/fuel-instrumentation
+                                pure pure-mc)
+                               'kernel)]
+      (is (fn? (:entry instrumentation)))
+      (is (empty? (:recur instrumentation))
+          "the precharged non-negative hot edge has no fuel instructions")
+      (is (seq (:fallback instrumentation))
+          "the separately encoded negative body retains ordinary charging"))
     (doseq [[why kir] [["call" with-call]
                        ["data-dependent exit" dependent-exit]
                        ["trapping division" unsafe-division]]]
@@ -2185,6 +2195,70 @@
         "fallback retains entry and recur charges")
     (is (= 1 (subvector-count (vec (:code (x86/emit-program pure))) x86-fuel-cmp))
         "x86 remains unchanged and re-enters its ordinary public prefix")))
+
+(deftest bulk-fuel-requires-the-allocated-direct-recur-edge
+  (let [mc (machine/compile-gmir :aarch64
+                                 (machine/lower-kir-module pure-counted-kir))
+        public-tail-mc
+        (update-in mc [:mc/functions 0 :mc/instructions]
+                   (fn [instructions]
+                     (mapv #(if (= :mc/recur (:mc/op %))
+                              {:mc/op :mc/instruction
+                               :mc/encoding :aarch64/tail-call
+                               :mir/callee 'kernel :mir/arguments (:mc/arguments %)}
+                              %)
+                           instructions)))
+        direct (get (#'kotoba.native.aarch64/fuel-instrumentation
+                     pure-counted-kir mc) 'kernel)
+        fallback (get (#'kotoba.native.aarch64/fuel-instrumentation
+                       pure-counted-kir public-tail-mc) 'kernel)]
+    (is (map? direct))
+    (is (vector? fallback)
+        "a MIR proof alone cannot bulk-charge an allocated public tail-call")
+    (is (= a64-fuel-ldr (first (a64-le-words (take 4 fallback))))
+        "the allocation fallback receives the ordinary one-unit prefix")))
+
+(deftest high-pressure-countdown-falls-back-after-allocation
+  (let [values (mapv #(symbol (str "v" %)) (range 30))
+        bindings (vec (mapcat (fn [symbol index]
+                                [symbol (list '+ 'acc index)])
+                              values (range 30)))
+        sum (reduce (fn [accumulator symbol]
+                      (list '+ accumulator symbol))
+                    'acc values)
+        body (list 'if (list '= 'i 0) 'acc
+                   (list 'let bindings
+                         (list 'kernel (list '- 'i 1) 'b 'c 'd sum)))
+        kir {:format :kotoba.kir/v4 :exports ['kernel]
+             :functions [{:name 'kernel :params ['i 'b 'c 'd 'acc]
+                          :result :i64 :body body}]}
+        mc (machine/compile-gmir :aarch64 (machine/lower-kir-module kir))
+        function (first (:mc/functions mc))
+        instructions (:mc/instructions function)
+        instrumentation (get (#'kotoba.native.aarch64/fuel-instrumentation kir mc)
+                             'kernel)]
+    (is (contains? (machine/counted-self-recur-plans :aarch64 kir) 'kernel)
+        "the source recurrence alone is eligible")
+    (is (= 24 (:mc/frame-slots function)))
+    (is (= :aarch64/tail-call (:mc/encoding (last instructions))))
+    (is (some #(= :aarch64/spill-load (:mc/encoding %)) instructions))
+    (is (not-any? #(= :mc/recur (:mc/op %)) instructions))
+    (is (vector? instrumentation)
+        "a public-tail allocation must retain ordinary entry charging")))
+
+(deftest fifth-argument-counter-precharges-from-x4
+  (let [kir {:format :kotoba.kir/v4 :exports ['down]
+             :functions
+             [{:name 'down :params ['a 'b 'c 'd 'counter] :result :i64
+               :body '(if (= counter 0) a
+                        (down (+ a 1) b c d (- counter 1)))}]}
+        mc (machine/compile-gmir :aarch64 (machine/lower-kir-module kir))
+        instrumentation (get (#'kotoba.native.aarch64/fuel-instrumentation kir mc)
+                             'down)
+        entry ((:entry instrumentation) :test/fallback)]
+    (is (map? instrumentation))
+    (is (= 0xeb1f009f (first (a64-le-words (take 4 entry))))
+        "entry compares the proven fifth parameter in x4 before precharge")))
 
 
 (defn- lcg-rounds-form

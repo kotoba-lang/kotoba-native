@@ -140,12 +140,22 @@
       (insn 0xcb100231)
       (insn 0xf90004f1)))))
 
-(defn- fuel-instrumentation [kir]
+(defn- direct-self-recur-mc? [name {:mc/keys [instructions]}]
+  (and (= 1 (count (filter #(= :mc/recur (:mc/op %)) instructions)))
+       (= 1 (count (filter #(= :mc/reentry (:mc/op %)) instructions)))
+       (not-any? #(and (= :mc/instruction (:mc/op %))
+                       (= name (:mir/callee %))
+                       (= "tail-call" (some-> (:mc/encoding %) clojure.core/name)))
+                 instructions)))
+
+(defn- fuel-instrumentation [kir mc]
   (let [ordinary (machine-ir/entry-fuel-prefixes kir (fn [_] fuel-charge-tokens))
-        plans (machine-ir/counted-self-recur-plans :aarch64 kir)]
+        plans (machine-ir/counted-self-recur-plans :aarch64 kir)
+        mc-functions (into {} (map (juxt :mc/name identity) (:mc/functions mc)))]
     (reduce-kv
      (fn [out name {:keys [counter-parameter]}]
-       (if-let [counter (get argument-registers counter-parameter)]
+       (if-let [counter (and (direct-self-recur-mc? name (get mc-functions name))
+                             (get argument-registers counter-parameter))]
          (assoc out name
                 {:entry (fn [fallback]
                           (counted-bulk-entry-charge-tokens counter fallback))
@@ -1428,4 +1438,4 @@
                       (assoc % :exports (mapv :name (:functions %))))))]
     (machine-ir/compile-kir-module
      :aarch64 kir
-     (fuel-instrumentation kir))))
+     (fn [mc] (fuel-instrumentation kir mc)))))

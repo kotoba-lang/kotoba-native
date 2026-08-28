@@ -4409,9 +4409,10 @@
    (aggregate-abi/admit-extracted-call!
     target #{:per-function-frame :spill-live-values-across-call
              :parallel-argument-assignment :single-word-return-register})
-   (->> (lower-kir-module kir)
-        (compile-gmir target)
-        (#(encode-mc-module % prefixes (:exports kir))))))
+   (let [mc (->> (lower-kir-module kir)
+                 (compile-gmir target))
+         prefixes (if (fn? prefixes) (prefixes mc) prefixes)]
+     (encode-mc-module mc prefixes (:exports kir)))))
 
 (defn compile-expression
   "End-to-end closed slice: KIR expression -> GMIR -> MIR -> RA -> MC -> bytes."
