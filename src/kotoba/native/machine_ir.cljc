@@ -4021,7 +4021,7 @@
               (when-not label
                 (reject! :mc-encode :unknown-call-target instruction))
               (if (= "tail-call" (name (:mc/encoding instruction)))
-                (if (= callee current-function)
+                (if (and (= :aarch64 isa) (= callee current-function))
                   ;; Arguments are already assigned to the ABI registers by
                   ;; MIR.  Re-charge fuel, then enter after the one-time frame
                   ;; prologue: rebuilding that frame on every `recur` was both
