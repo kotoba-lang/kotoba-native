@@ -25,10 +25,10 @@
         ;; native suite here is encodings only, not that measurement.
         io.github.kotoba-lang/kotoba-mir
         {:git/url "https://github.com/kotoba-lang/kotoba-mir.git"
-         :git/sha "4bf67c02ecfe58108ce23d6aa693ce4abe5f557f"}
+         :git/sha "be01f15d91700a6140972d8d33a1879c8c54f3d3"}
         io.github.kotoba-lang/kotoba-codegen
         {:git/url "https://github.com/kotoba-lang/kotoba-codegen.git"
-         :git/sha "2d1651c72ad7b20b6ba4824904f51eb583e422ea"}
+         :git/sha "54a3f3b1c335cae69b7ac15744831c0a2c8ddd7c"}
         io.github.kotoba-lang/kotoba-object
         {:git/url "https://github.com/kotoba-lang/kotoba-object.git"
          :git/sha "eb460265e15743b85a37f4432277173ad5cedc06"}
