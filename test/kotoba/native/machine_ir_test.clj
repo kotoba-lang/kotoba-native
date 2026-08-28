@@ -2190,6 +2190,11 @@
                                first :mc/instructions)
         arm-code (:code (arm/emit-program loop-call-kir))
         words (a64-le-words arm-code)
+        instrumentation (get (#'kotoba.native.aarch64/fuel-instrumentation
+                              loop-call-kir module)
+                             'kernel)
+        ordinary-prefixes (machine/entry-fuel-prefixes
+                           loop-call-kir (constantly [:fuel]))
         x86-code (vec (:code (x86/emit-program loop-call-kir)))
         cbnz-x0? #(= 0xb5000000
                       (bit-and % 0xff00001f))
@@ -2199,8 +2204,8 @@
                  8)]
     (is (= [0x53 0x00 0x00 0xb5] encoded)
         "CBNZ x19,+8 is 0xb5000053 in little-endian bytes")
-    (is (= 1 (count (filter cbnz-x0? words)))
-        "equal(i,0) followed by branch-zero emits one CBNZ i")
+    (is (= 2 (count (filter cbnz-x0? words)))
+        "bulk fuel keeps one separately encoded cold negative body")
     (is (= 1 (count (filter #(= :mc/branch-nonzero (:mc/op %))
                             loop-instructions))))
     (is (not-any? #(and (= :aarch64/constant (:mc/encoding %))
@@ -2213,14 +2218,24 @@
         "equality materialization and its inverted branch are absent from MC")
     (is (not-any? #{0xeb01001f 0x9a9f17e2} words)
         "the former CMP x0,x1 and CSET x2,eq pair is absent")
+    (is (map? instrumentation))
+    (is (= #{'kernel} (set (keys ordinary-prefixes)))
+        "the proven helper is an uncharged leaf; only kernel entries cost fuel")
+    (is (empty? (:recur instrumentation))
+        "the non-negative hot edge removes the four executed fuel operations")
     (is (= 2 (count (filter #{a64-fuel-ldr} words)))
-        "a loop containing a call retains entry and self-tail fuel charges")
+        "ordinary entry/recur charging survives only in the negative copy")
+    (is (= 1 (count (filter #{0xf94004f1} words)))
+        "the primary entry contains one exact bulk load from [x7,#8]")
+    (is (= 1 (count (filter #(= :aarch64/call (:mc/encoding %))
+                            loop-instructions)))
+        "the optimization retains the real helper call in MIR/MC")
     (is (pos? (subvector-count x86-code [0x0f 0x84]))
         "x86 retains its canonical TEST/JZ branch path")
     ;; Virtual SSA ownership proves both definitions dead, removing MOV zero as
     ;; well as CMP+CSET. This pins a 4-to-1 production reduction.
-    (is (= 27 (count words))
-        "one safe direct-home producer removes one more hot-edge word; the static module is 27 words")))
+    (is (= 53 (count words))
+        "the 27-word ordinary module becomes a primary path plus a cold negative copy")))
 
 (def ^:private pure-counted-kir
   {:format :kotoba.kir/v4 :exports ['kernel]
@@ -2238,6 +2253,10 @@
                                    (kernel (- i 1) (helper acc))))
                       (update :functions conj
                               {:name 'helper :params ['x] :result :i64 :body 'x}))
+        with-trapping-call (assoc-in with-call [:functions 1 :body]
+                                     '(quot x -1))
+        with-branching-call (assoc-in with-call [:functions 1 :body]
+                                      '(if (= x 0) 0 x))
         dependent-exit (assoc-in pure [:functions 0 :body]
                                  '(if (= i 0) acc
                                     (if (= acc 7) acc
@@ -2248,6 +2267,8 @@
         pure-mc (machine/compile-gmir :aarch64
                                       (machine/lower-kir-module pure))]
     (is (contains? (machine/counted-self-recur-plans :aarch64 pure) 'kernel))
+    (is (contains? (machine/counted-self-recur-plans :aarch64 with-call) 'kernel)
+        "a statically proven pure nontrapping leaf call is admitted")
     (let [instrumentation (get (#'kotoba.native.aarch64/fuel-instrumentation
                                 pure pure-mc)
                                'kernel)]
@@ -2256,7 +2277,8 @@
           "the precharged non-negative hot edge has no fuel instructions")
       (is (seq (:fallback instrumentation))
           "the separately encoded negative body retains ordinary charging"))
-    (doseq [[why kir] [["call" with-call]
+    (doseq [[why kir] [["trapping leaf call" with-trapping-call]
+                       ["branching leaf call" with-branching-call]
                        ["data-dependent exit" dependent-exit]
                        ["trapping division" unsafe-division]]]
       (is (empty? (machine/counted-self-recur-plans :aarch64 kir)) why))
