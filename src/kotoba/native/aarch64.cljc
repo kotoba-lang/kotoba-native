@@ -100,18 +100,22 @@
 (def ^:private fuel-charge
   ;; Compatibility byte vector for the direct executor qualification helper.
   (vec (concat (insn 0xf94004f0)
-               (insn 0xb5000050) ; cbnz x16, +8
+               (insn 0xf1000610) ; subs x16, x16, #1
+               (insn 0x54000042) ; b.hs +8: no unsigned borrow
                (insn 0xd4200000)
-               (insn 0xd1000610) (insn 0xf90004f0))))
+               (insn 0xf90004f0))))
 
 (def ^:private fuel-charge-tokens
-  ;; context v2: fuel is qword [x7,#8].
+  ;; context v2: fuel is qword [x7,#8]. SUBS sets C exactly when decrementing
+  ;; does not borrow. Fuel 0 therefore traps before the wrapped value can be
+  ;; stored; fuel 1 stores 0; and UINT64_MAX stores UINT64_MAX-1.
   (concat (insn 0xf94004f0)
-          [(layout/relative-branch :aarch64/cbnz-x16-imm19
+          (insn 0xf1000610)
+          [(layout/relative-branch :aarch64/b-hs-imm19
                                    :kotoba.mir.label/fuel-present)]
           (insn 0xd4200000)
           [(layout/label :kotoba.mir.label/fuel-present)]
-          (insn 0xd1000610) (insn 0xf90004f0)))
+          (insn 0xf90004f0)))
 
 (defn- token-size [token]
   (cond (some? (layout/token-size token)) (layout/token-size token)

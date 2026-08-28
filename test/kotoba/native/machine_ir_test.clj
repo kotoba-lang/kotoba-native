@@ -1965,7 +1965,51 @@
           "and the epilogue restores exactly those, in reverse, before returning"))))
 
 (def ^:private a64-fuel-ldr 0xf94004f0)
+(def ^:private a64-fuel-subs-one 0xf1000610)
+(def ^:private a64-fuel-b-hs-eight 0x54000042)
+(def ^:private a64-fuel-brk 0xd4200000)
+(def ^:private a64-fuel-str 0xf90004f0)
+(def ^:private a64-fuel-prefix
+  [a64-fuel-ldr a64-fuel-subs-one a64-fuel-b-hs-eight
+   a64-fuel-brk a64-fuel-str])
 (def ^:private x86-fuel-cmp [0x49 0x83 0x79 0x08 0x00])
+
+(deftest aarch64-fuel-decrement-uses-unsigned-borrow-without-storing-on-trap
+  (let [modulus 18446744073709551616N
+        maximum (dec modulus)
+        transition (fn [fuel]
+                     (let [difference (- fuel 1)
+                           carry? (not (neg? difference))
+                           wrapped (mod difference modulus)]
+                       {:branch-hs? carry?
+                        :trap? (not carry?)
+                        :register wrapped
+                        :stored (if carry? wrapped fuel)}))
+        encoded (#'kotoba.native.machine-ir/encode-layout-branch
+                 (layout/relative-branch :aarch64/b-hs-imm19
+                                         :test.label/fuel-present)
+                 8)]
+    (is (= [0x42 0x00 0x00 0x54] encoded)
+        "B.HS +8 is the unsigned no-borrow branch over BRK")
+    (is (= a64-fuel-prefix
+           (a64-le-words @#'kotoba.native.aarch64/fuel-charge))
+        "the compatibility byte vector uses the same five exact instructions")
+    (is (= {:branch-hs? false :trap? true
+            :register maximum :stored 0N}
+           (transition 0N))
+        "fuel zero traps before the wrapped UINT64_MAX register is stored")
+    (is (= {:branch-hs? true :trap? false
+            :register 0N :stored 0N}
+           (transition 1N))
+        "fuel one succeeds and stores zero")
+    (is (= {:branch-hs? true :trap? false
+            :register 1N :stored 1N}
+           (transition 2N))
+        "fuel two succeeds and stores one")
+    (is (= {:branch-hs? true :trap? false
+            :register (dec maximum) :stored (dec maximum)}
+           (transition maximum))
+        "UINT64_MAX succeeds and stores UINT64_MAX-1")))
 
 (deftest production-acyclic-leaf-omits-entry-fuel
   ;; emit-program used to prefix every function. The 100k C harness then paid
@@ -2017,6 +2061,10 @@
     (testing "AArch64"
       (is (= 2 (count (filter #{a64-fuel-ldr} arm-words)))
           "entry and self-tail edge each contain one fuel charge")
+      (is (= 2 (subvector-count arm-words a64-fuel-prefix))
+          "entry and renamed self-tail copies use the exact SUBS/B.HS prefix")
+      (is (not-any? #{0xb5000050 0xd1000610} arm-words)
+          "the old CBNZ x16 and non-flag-setting SUB x16 fuel path is absent")
       (is (= 1 (count (filter #{0xa9bf7bfd} arm-words)))
           "FP/LR prologue is emitted once")
       (is (= 1 (count (filter #{0xa8c17bfd} arm-words)))
