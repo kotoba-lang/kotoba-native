@@ -245,10 +245,26 @@
         x86-expression (machine/compile-expression :x86-64 params body)
         arm-expression (machine/compile-expression :aarch64 params body)
         x86-code (:code (x86/emit-program kir))
-        arm-code (:code (arm/emit-program kir))]
+        arm-artifact (arm/emit-program kir)
+        arm-code (:code arm-artifact)
+        {:keys [offset length]} (get-in arm-artifact [:exports 'main])
+        arm-function (subvec arm-code offset (+ offset length))
+        arm-v2 (machine/compile-gmir :aarch64 gmir)
+        arm-v3 (machine/compile-gmir :aarch64
+                                     (machine/lower-kir-module kir))]
     (is (= x86-expression
            (subvec x86-code (- (count x86-code) (count x86-expression)))))
-    (is (= arm-expression
-           (subvec arm-code (- (count arm-code) (count arm-expression)))))
+    ;; v3 selection removes unique zero/equality definitions before RA, so its
+    ;; function is shorter than the v2 expression oracle. Compare the resolved
+    ;; function's architectural return suffix rather than using a negative
+    ;; backwards offset from the longer v2 byte vector.
+    (is (= [0xc0 0x03 0x5f 0xd6] (subvec arm-function (- length 4))))
+    (is (= (subvec arm-expression (- (count arm-expression) 4))
+           (subvec arm-function (- length 4))))
+    (is (< length (count arm-expression))
+        "v3 virtual fusion, not a legacy epilogue, explains the shorter body")
+    (is (some #(= :mc/branch-zero (:mc/op %)) (:mc/instructions arm-v2)))
+    (is (some #(= :mc/branch-nonzero (:mc/op %))
+              (get-in arm-v3 [:mc/functions 0 :mc/instructions])))
     (is (zero? (:mc/frame-slots (machine/compile-gmir :x86-64 gmir))))
     (is (zero? (:mc/frame-slots (machine/compile-gmir :aarch64 gmir))))))

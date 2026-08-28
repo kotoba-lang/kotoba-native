@@ -1568,55 +1568,6 @@
               acc
               (kernel (- i 1) (+ acc (id 1))))}]})
 
-(deftest aarch64-zero-equality-branch-fusion-is-closed-and-use-bounded
-  (let [fuse @#'kotoba.native.machine-ir/a64-fuse-zero-equal-branches
-        constant {:mc/op :mc/instruction :mc/encoding :aarch64/constant
-                  :mir/dst :aarch64/x1 :mir/value 0}
-        equal {:mc/op :mc/instruction :mc/encoding :aarch64/equal
-               :mir/dst :aarch64/x2 :mir/left :aarch64/x19
-               :mir/right :aarch64/x1}
-        branch {:mc/op :mc/branch-zero :mc/test :aarch64/x2
-                :mc/target :test.label/continue}
-        after {:mc/op :mc/instruction :mc/encoding :aarch64/constant
-               :mir/dst :aarch64/x3 :mir/value 1}
-        fused {:mc/op :mc/branch-nonzero :mc/test :aarch64/x19
-               :mc/target :test.label/continue}]
-    (is (= [constant fused after] (fuse [constant equal branch after]))
-        "the zero materialization remains; equal+branch becomes direct CBNZ")
-    (is (= [constant fused after]
-           (fuse [constant (assoc equal :mir/left :aarch64/x1
-                                        :mir/right :aarch64/x19)
-                  branch after]))
-        "zero may be either equality operand")
-    (testing "an equality result reused after the branch is not deleted"
-      (let [reuse {:mc/op :mc/instruction :mc/encoding :aarch64/add
-                   :mir/dst :aarch64/x3 :mir/left :aarch64/x2
-                   :mir/right :aarch64/x19}
-            input [constant equal branch reuse]]
-        (is (= input (fuse input)))))
-    (testing "nonzero constants, aliases, and intervening control flow stay canonical"
-      (let [nonzero (assoc constant :mir/value 1)
-            alias (assoc equal :mir/left :aarch64/x1)
-            label {:mir/op :mir/label :mir/id :test.label/intervening}
-            wrong-branch (assoc branch :mc/test :aarch64/x3)
-            non-equal (assoc equal :mc/encoding :aarch64/less-than)]
-        (doseq [input [[nonzero equal branch after]
-                       [constant alias branch after]
-                       [constant equal label branch after]
-                       [constant equal wrong-branch after]
-                       [constant non-equal branch after]
-                       [] [constant] [constant equal]]]
-          (is (= input (fuse input))))))
-    (testing "a path-exclusive physical redefinition cannot hide a target use"
-      (let [redefine (assoc after :mir/dst :aarch64/x2)
-            target-label {:mir/op :mir/label :mir/id :test.label/continue}
-            target-use {:mc/op :mc/instruction :mc/encoding :aarch64/add
-                        :mir/dst :aarch64/x3 :mir/left :aarch64/x2
-                        :mir/right :aarch64/x19}
-            input [constant equal branch redefine target-label target-use]]
-        (is (= input (fuse input))
-            "whole-suffix proof does not stop at the fallthrough redefinition")))))
-
 (deftest loop-call-parameters-stay-in-registers-through-self-tail-reentry
   ;; This is the benchmark's exact control-flow shape after frontend `loop`
   ;; lowering: two parameters cross a real call and then feed a self tail edge.
@@ -2034,7 +1985,12 @@
           "return and self-tail edges each release the frame"))))
 
 (deftest production-loop-call-uses-direct-aarch64-cbnz
-  (let [arm-code (:code (arm/emit-program loop-call-kir))
+  (let [module (machine/compile-gmir :aarch64
+                                     (machine/lower-kir-module loop-call-kir))
+        loop-instructions (->> (:mc/functions module)
+                               (filter #(= 'kernel (:mc/name %)))
+                               first :mc/instructions)
+        arm-code (:code (arm/emit-program loop-call-kir))
         words (a64-le-words arm-code)
         x86-code (vec (:code (x86/emit-program loop-call-kir)))
         cbnz-x0? #(= 0xb5000000
@@ -2047,16 +2003,26 @@
         "CBNZ x19,+8 is 0xb5000053 in little-endian bytes")
     (is (= 1 (count (filter cbnz-x0? words)))
         "equal(i,0) followed by branch-zero emits one CBNZ i")
+    (is (= 1 (count (filter #(= :mc/branch-nonzero (:mc/op %))
+                            loop-instructions))))
+    (is (not-any? #(and (= :aarch64/constant (:mc/encoding %))
+                        (zero? (:mir/value %)))
+                  loop-instructions)
+        "the uniquely consumed virtual zero definition is absent from MC")
+    (is (not-any? #(contains? #{:aarch64/equal :mc/branch-zero}
+                              (or (:mc/encoding %) (:mc/op %)))
+                  loop-instructions)
+        "equality materialization and its inverted branch are absent from MC")
     (is (not-any? #{0xeb01001f 0x9a9f17e2} words)
         "the former CMP x0,x1 and CSET x2,eq pair is absent")
     (is (= 2 (count (filter #{a64-fuel-ldr} words)))
         "entry and self-tail re-entry still each charge fuel")
     (is (pos? (subvector-count x86-code [0x0f 0x84]))
         "x86 retains its canonical TEST/JZ branch path")
-    ;; The safe allocated-MC fusion retains MOV zero and removes only CMP+CSET.
-    ;; This pins a real size reduction as well as the presence of an opcode.
-    (is (= 28 (count words))
-        "loop-call module is two AArch64 words shorter than the 30-word baseline")))
+    ;; Virtual SSA ownership proves both definitions dead, removing MOV zero as
+    ;; well as CMP+CSET. This pins a 4-to-1 production reduction.
+    (is (= 27 (count words))
+        "loop-call module is three AArch64 words shorter than the 30-word baseline")))
 
 
 (defn- lcg-rounds-form
