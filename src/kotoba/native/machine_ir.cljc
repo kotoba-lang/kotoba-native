@@ -185,6 +185,10 @@
     (mapv (fn [{:mir/keys [op id test] :as instruction}]
             (case op
               :mir/label (layout/label id)
+              :mir/reentry
+              {:mc/op :mc/reentry :mc/parameters (:mir/parameters instruction)}
+              :mir/recur
+              {:mc/op :mc/recur :mc/arguments (:mir/arguments instruction)}
               :mir/branch-zero
               {:mc/op :mc/branch-zero :mc/test test
                :mc/target (:mir/target instruction)}
@@ -3991,7 +3995,7 @@
 
 (defn- instruction-tokens
   [isa frame-bytes return-suffix tail-suffix callee-labels
-   current-function self-tail-prefix self-tail-body instructions]
+   self-tail-prefix self-tail-body instructions]
   (let [instructions (case isa
                        :aarch64 (-> instructions
                                     a64-cache-leaf-constants
@@ -4020,6 +4024,14 @@
       (if (layout/label-token? instruction)
         [instruction]
         (case op
+          :mc/reentry
+          [(layout/label self-tail-body)]
+
+          :mc/recur
+          (concat (rename-token-labels (str "self-tail." instruction-index)
+                                       self-tail-prefix)
+                  [(layout/relative-branch :aarch64/b-imm26 self-tail-body)])
+
           :mc/instruction
           (if (contains? #{"call" "tail-call"}
                          (name (:mc/encoding instruction)))
@@ -4028,22 +4040,11 @@
               (when-not label
                 (reject! :mc-encode :unknown-call-target instruction))
               (if (= "tail-call" (name (:mc/encoding instruction)))
-                (if (and (= :aarch64 isa) (= callee current-function))
-                  ;; Arguments are already assigned to the ABI registers by
-                  ;; MIR.  Re-charge fuel, then enter after the one-time frame
-                  ;; prologue: rebuilding that frame on every `recur` was both
-                  ;; unnecessary and the dominant cost of loop+call kernels.
-                  (concat (rename-token-labels (str "self-tail." instruction-index)
-                                               self-tail-prefix)
-                          [(layout/relative-branch
-                            (if (= :x86-64 isa)
-                              :x86-64/jmp-rel32 :aarch64/b-imm26)
-                            self-tail-body)])
-                  (concat tail-suffix
-                          [(layout/relative-branch
-                            (if (= :x86-64 isa)
-                              :x86-64/jmp-rel32 :aarch64/b-imm26)
-                            label)]))
+                (concat tail-suffix
+                        [(layout/relative-branch
+                          (if (= :x86-64 isa)
+                            :x86-64/jmp-rel32 :aarch64/b-imm26)
+                          label)])
                 [(layout/relative-branch
                   (if (= :x86-64 isa)
                     :x86-64/call-rel32 :aarch64/bl-imm26)
@@ -4210,9 +4211,8 @@
                    self-tail-body :kotoba.mir.label/self-tail-body
                    prefix (get prefixes name [])
                    local (vec (concat prefix prologue
-                                      [(layout/label self-tail-body)]
                                       (instruction-tokens target frame-bytes return-suffix tail-suffix
-                                                          callee-labels name prefix self-tail-body
+                                                          callee-labels prefix self-tail-body
                                                           instructions)))]
                (into [(layout/label (get callee-labels name))]
                      (qualify-function-locals index local))))
@@ -4259,7 +4259,7 @@
     (resolve-layout
      (vec (concat prologue
                   (instruction-tokens target frame-bytes return-suffix tail-suffix {}
-                                      nil [] nil instructions))))))
+                                      [] nil instructions))))))
 
 (def ^:private guest-reentry-ops
   ;; A function that contains one of these can run unbounded guest or host

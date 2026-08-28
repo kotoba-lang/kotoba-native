@@ -1594,10 +1594,47 @@
             (is (= 1 (:mc/frame-slots function)) target)
             (is (= 2 (count (filter #(contains? spill-encodings (:mc/encoding %))
                                     (:mc/instructions function)))) target)))
-        (is (= 1 (count (filter #(= (keyword (name target) "tail-call")
-                                    (:mc/encoding %))
-                               (:mc/instructions function))))
-            target)))))
+        (if (= :aarch64 target)
+          (do
+            (is (= 1 (count (filter #(= :mc/reentry (:mc/op %))
+                                    (:mc/instructions function)))) target)
+            (is (= 1 (count (filter #(= :mc/recur (:mc/op %))
+                                    (:mc/instructions function)))) target)
+            (is (not-any? #(= :aarch64/tail-call (:mc/encoding %))
+                          (:mc/instructions function)) target))
+          (do
+            (is (= 1 (count (filter #(= :x86-64/tail-call (:mc/encoding %))
+                                    (:mc/instructions function)))) target)
+            (is (not-any? #(contains? #{:mc/reentry :mc/recur} (:mc/op %))
+                          (:mc/instructions function)) target)))))))
+
+(deftest string-index-self-recur-updates-all-three-explicit-parameter-homes
+  ;; Regression for the minimized stale-third-parameter failure: the new
+  ;; position was already in ABI x2, so an encoder pattern looking only for
+  ;; staging MOVs saw two moves and skipped the rewrite. The allocator now
+  ;; explicitly copies x2 into x21 and emits the only operation allowed to
+  ;; target the post-materialization boundary.
+  (let [kir {:format :kotoba.kir/v4 :exports ['main]
+             :functions
+             (string-index/augment-functions
+              [{:name 'main :params [] :param-types [] :result :i64
+                :body '(string-index-count (string-index-new))}])}
+        helper (->> (machine/compile-gmir :aarch64
+                                          (machine/lower-kir-module kir))
+                    :mc/functions
+                    (filter #(= string-index/find-name (:mc/name %))) first)
+        instructions (:mc/instructions helper)
+        boundary (first (filter #(= :mc/reentry (:mc/op %)) instructions))
+        recur-index (first (keep-indexed #(when (= :mc/recur (:mc/op %2)) %1)
+                                         instructions))]
+    (is (= [:aarch64/x19 :aarch64/x20 :aarch64/x21]
+           (:mc/parameters boundary)))
+    (is (= {:mc/op :mc/instruction :mc/encoding :aarch64/move
+            :mir/dst :aarch64/x21 :mir/src :aarch64/x2}
+           (nth instructions (dec recur-index))))
+    (is (= (:mc/parameters boundary)
+           (:mc/arguments (nth instructions recur-index))))
+    (is (not-any? #(= :aarch64/tail-call (:mc/encoding %)) instructions))))
 
 (deftest tail-position-direct-calls-lower-to-terminal-non-linking-transfer
   (let [gmir (machine/lower-kir-module four-argument-call-kir)
@@ -2021,8 +2058,8 @@
         "x86 retains its canonical TEST/JZ branch path")
     ;; Virtual SSA ownership proves both definitions dead, removing MOV zero as
     ;; well as CMP+CSET. This pins a 4-to-1 production reduction.
-    (is (= 27 (count words))
-        "loop-call module is three AArch64 words shorter than the 30-word baseline")))
+    (is (= 28 (count words))
+        "explicit direct-home reentry is two words shorter on the hot edge; its static module is 28 words")))
 
 
 (defn- lcg-rounds-form
