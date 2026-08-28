@@ -2276,6 +2276,83 @@
                         :aarch64/x18)]]]
       (is (nil? (plan changed)) why))))
 
+(deftest aarch64-hoists-an-exact-loop-invariant-identity-argument
+  (let [bottom-plan @#'kotoba.native.machine-ir/a64-bottom-test-self-recur-plan
+        hoist-plan @#'kotoba.native.machine-ir/a64-loop-invariant-identity-call-plan
+        body :test.identity/body
+        instructions
+        [#:mc{:op :mc/reentry :parameters [:aarch64/x19 :aarch64/x20]}
+         #:mc{:op :mc/branch-nonzero :test :aarch64/x19 :target body}
+         {:mc/op :mc/instruction :mc/encoding :aarch64/return
+          :mir/value :aarch64/x20}
+         #:mir{:op :mir/label :id body}
+         {:mc/op :mc/instruction :mc/encoding :aarch64/constant
+          :mir/dst :aarch64/x0 :mir/value 1}
+         {:mc/op :mc/instruction :mc/encoding :aarch64/call
+          :mir/arguments [:aarch64/x0] :mir/dst :aarch64/x0 :mir/callee 'id}
+         {:mc/op :mc/instruction :mc/encoding :aarch64/subtract
+          :mir/dst :aarch64/x19 :mir/left :aarch64/x19
+          :native/a64-immediate-op :subtract :native/a64-immediate 1
+          :native/a64-immediate-shift 0}
+         {:mc/op :mc/instruction :mc/encoding :aarch64/add
+          :mir/dst :aarch64/x20 :mir/left :aarch64/x20 :mir/right :aarch64/x0}
+         #:mc{:op :mc/recur :arguments [:aarch64/x19 :aarch64/x20]}]
+        bottom (bottom-plan instructions)]
+    (is (= {:body-index 3 :constant-index 4 :constant (nth instructions 4)}
+           (hoist-plan instructions bottom #{'id})))
+    (is (nil? (hoist-plan instructions bottom #{}))
+        "an unproven callee is not hoisted")
+    (is (nil? (hoist-plan (assoc-in instructions [8 :mc/arguments]
+                                     [:aarch64/x19 :aarch64/x0])
+                          bottom #{'id}))
+        "x0 as recurrence state requires rematerialization")
+    (is (nil? (hoist-plan (assoc-in instructions [7 :mir/dst] :aarch64/x0)
+                          bottom #{'id}))
+        "a post-call x0 redefinition fails closed")))
+
+(deftest aarch64-loop-invariant-identity-hoist-requires-an-empty-recur-prefix
+  (let [tokens-for @#'kotoba.native.machine-ir/instruction-tokens
+        body :test.identity-prefix/body
+        instructions
+        [#:mc{:op :mc/reentry :parameters [:aarch64/x19 :aarch64/x20]}
+         #:mc{:op :mc/branch-nonzero :test :aarch64/x19 :target body}
+         {:mc/op :mc/instruction :mc/encoding :aarch64/return
+          :mir/value :aarch64/x20}
+         #:mir{:op :mir/label :id body}
+         {:mc/op :mc/instruction :mc/encoding :aarch64/constant
+          :mir/dst :aarch64/x0 :mir/value 1}
+         {:mc/op :mc/instruction :mc/encoding :aarch64/call
+          :mir/arguments [:aarch64/x0] :mir/dst :aarch64/x0 :mir/callee 'id}
+         {:mc/op :mc/instruction :mc/encoding :aarch64/subtract
+          :mir/dst :aarch64/x19 :mir/left :aarch64/x19
+          :native/a64-immediate-op :subtract :native/a64-immediate 1
+          :native/a64-immediate-shift 0}
+         {:mc/op :mc/instruction :mc/encoding :aarch64/add
+          :mir/dst :aarch64/x20 :mir/left :aarch64/x20 :mir/right :aarch64/x0}
+         #:mc{:op :mc/recur :arguments [:aarch64/x19 :aarch64/x20]}]
+        positions
+        (fn [prefix]
+          (let [tokens (vec (tokens-for
+                             :aarch64 0 [] []
+                             {'id :test.identity-prefix/id} #{'id}
+                             prefix :test.identity-prefix/reentry
+                             :test.identity-prefix/exit instructions))]
+            {:label (first (keep-indexed
+                            #(when (and (layout/label-token? %2)
+                                        (= body (:mir/id %2))) %1)
+                           tokens))
+             :constant (first (filter
+                               #(and (<= (+ % 4) (count tokens))
+                                     (= [0x20 0x00 0x80 0xd2]
+                                        (subvec tokens % (+ % 4))))
+                               (range (count tokens))))}))
+        hot (positions [])
+        guarded (positions [:opaque-prefix])]
+    (is (< (:constant hot) (:label hot))
+        "the hot empty-prefix loop materializes the invariant before its body")
+    (is (< (:label guarded) (:constant guarded))
+        "an opaque recurrence prefix fails closed and keeps the constant in-body")))
+
 (def ^:private pure-counted-kir
   {:format :kotoba.kir/v4 :exports ['kernel]
    :functions
