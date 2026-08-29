@@ -211,6 +211,50 @@
     (is (not-any? :native/a64-mersenne-shift mixed)
         "a mixed MSUB/add reader retains the materialization and exact inputs")))
 
+(deftest aarch64-serial-remainder-chain-takes-shifted-form
+  (let [chained (#'machine/a64-cache-leaf-constants
+                 [{:mc/op :mc/instruction :mc/encoding :aarch64/constant
+                   :mir/dst :aarch64/x1 :mir/value 2147483647}
+                  {:mc/op :mc/instruction :mc/encoding :aarch64/multiply-subtract
+                   :mir/dst :aarch64/x0 :mir/left :aarch64/x2
+                   :mir/right :aarch64/x1 :mir/addend :aarch64/x3}
+                  {:mc/op :mc/instruction :mc/encoding :aarch64/constant
+                   :mir/dst :aarch64/x1 :mir/value 2147483647}
+                  ;; the second remainder reads the first: one serial chain
+                  {:mc/op :mc/instruction :mc/encoding :aarch64/multiply-subtract
+                   :mir/dst :aarch64/x4 :mir/left :aarch64/x0
+                   :mir/right :aarch64/x1 :mir/addend :aarch64/x5}
+                  {:mc/op :mc/instruction :mc/encoding :aarch64/return
+                   :mir/value :aarch64/x4}])
+        parallel (#'machine/a64-cache-leaf-constants
+                  [{:mc/op :mc/instruction :mc/encoding :aarch64/constant
+                    :mir/dst :aarch64/x1 :mir/value 2147483647}
+                   {:mc/op :mc/instruction :mc/encoding :aarch64/multiply-subtract
+                    :mir/dst :aarch64/x0 :mir/left :aarch64/x2
+                    :mir/right :aarch64/x1 :mir/addend :aarch64/x3}
+                   {:mc/op :mc/instruction :mc/encoding :aarch64/constant
+                    :mir/dst :aarch64/x1 :mir/value 2147483647}
+                   ;; the second remainder shares nothing with the first:
+                   ;; two independent lanes joined only by the final add
+                   {:mc/op :mc/instruction :mc/encoding :aarch64/multiply-subtract
+                    :mir/dst :aarch64/x4 :mir/left :aarch64/x6
+                    :mir/right :aarch64/x1 :mir/addend :aarch64/x5}
+                   {:mc/op :mc/instruction :mc/encoding :aarch64/add
+                    :mir/dst :aarch64/x0 :mir/left :aarch64/x0
+                    :mir/right :aarch64/x4}
+                   {:mc/op :mc/instruction :mc/encoding :aarch64/return
+                    :mir/value :aarch64/x0}])]
+    (is (= 2 (count (filter :native/a64-mersenne-shift chained)))
+        "a serial remainder chain is annotated although two shifted pairs
+        outweigh one materialization in words")
+    (is (zero? (count (filter #(= :aarch64/constant (:mc/encoding %)) chained)))
+        "the serial chain's divisor materialization is dead and removed")
+    (is (not-any? :native/a64-mersenne-shift parallel)
+        "independent lanes keep MSUB: the chain test, not the Mersenne
+        factor, decides (measured -5.1% when lanes take the shifted form)")
+    (is (= 1 (count (filter #(= :aarch64/constant (:mc/encoding %)) parallel)))
+        "independent lanes keep one cached divisor materialization")))
+
 (declare a64-le-words a64-mul-kind lcg-rounds-form)
 
 (deftest aarch64-repeated-remainder-msub-cost-and-safety
@@ -233,10 +277,13 @@
     (is (= 22 (count (words-for one))))
     (is (= 148 (count (words-for eight)))
         "the whole eight-round expression is eight words shorter than baseline")
-    (is (= 54 (count (a64-le-words narrow-code)))
-        "the production narrow kernel is seven words shorter than its 61-word baseline")
-    (is (= 8 (count (filter #{:msub}
-                            (keep a64-mul-kind (a64-le-words narrow-code))))))
+    (is (= 61 (count (a64-le-words narrow-code)))
+        "one serial chain takes the shifted form although it is larger: 8
+        MSUBs become 16 words and the dead divisor materialization is removed
+        (measured +2.6% on the chain, amu docs/codegen-coscientist.md iter 17)")
+    (is (zero? (count (filter #{:msub}
+                              (keep a64-mul-kind (a64-le-words narrow-code)))))
+        "every serial-chain remainder leaves the multiply pipes")
     (is (= 1 (count (filter #{:msub} (kinds-for variable))))
         "a dynamic divisor keeps guarded SDIV and fuses only q*d subtraction")
     (is (zero? (count (filter #{:msub} (kinds-for shared))))

@@ -3689,17 +3689,93 @@
 
 (declare a64-source-registers)
 
+(defn- a64-serial-msub-chain?
+  "Do these MSUBs form one serial dependence chain?
+
+  Measured 2026-08-29 (amu docs/codegen-coscientist.md, iteration 17): the
+  shifted SUB+ADD form is 2.6% faster than MSUB when every remainder feeds
+  the next multiply serially -- the second multiply sits on the critical
+  resource -- and 5.1% slower when eight independent lanes are live, where
+  the extra word per use is pure cost.  Order-independent structure, not
+  program order, decides which case a leaf is: instruction scheduling is
+  free to interleave a serial chain or to group independent lanes.
+
+  Each MSUB's destination value is tagged and propagated forward through
+  every later instruction's def-use (any encoding transmits a value; a
+  redefinition without an intervening read kills it).  The MSUBs are serial
+  exactly when reachability totally orders them: for every earlier tag, the
+  next MSUB reads a value carrying it.  Eight independent lanes have no
+  cross-lane reachability and fail; a dead intermediate destination
+  propagates nowhere and fails; the degenerate single MSUB is trivially
+  ordered.  Anything unprovable stays MSUB -- the shape that holds today's
+  qualified wide-lane wins."
+  [instructions factor-register]
+  (let [indexed (vec (map-indexed vector instructions))
+        ;; Positions, not instruction maps: with two rotating destination
+        ;; registers the same MSUB map recurs verbatim every other round, so
+        ;; a map cannot name an occurrence.
+        msub-positions
+        (into {}
+              (comp (keep (fn [[i instruction]]
+                            (when (and (= :aarch64/multiply-subtract
+                                          (:mc/encoding instruction))
+                                       (contains? #{(:mir/left instruction)
+                                                    (:mir/right instruction)}
+                                                  factor-register))
+                              i)))
+                    (map-indexed (fn [ordinal i] [i ordinal])))
+              indexed)
+        msub-count (count msub-positions)]
+    (or (<= msub-count 1)
+        (let [;; forward value-tag propagation: register -> set of msub
+              ;; ordinals whose destination value (possibly through later
+              ;; defs) it currently holds.
+              reaches
+              (:reaches
+               (reduce
+                (fn [{:keys [tags reaches]} [i instruction]]
+                  (let [source-tags (reduce
+                                     (fn [acc register]
+                                       (into acc (get tags register #{})))
+                                     #{}
+                                     (a64-source-registers instruction))
+                        ordinal (get msub-positions i)
+                        reaches (if ordinal
+                                  (assoc reaches ordinal source-tags)
+                                  reaches)
+                        dst (:mir/dst instruction)
+                        tags (if dst
+                               (let [carried (if ordinal
+                                               (conj source-tags ordinal)
+                                               source-tags)]
+                                 (if (seq carried)
+                                   (assoc tags dst carried)
+                                   (dissoc tags dst)))
+                               tags)]
+                    {:tags tags :reaches reaches}))
+                {:tags {} :reaches {}}
+                indexed))]
+          (every? (fn [ordinal]
+                    (contains? (get reaches ordinal #{}) (dec ordinal)))
+                  (range 1 msub-count))))))
+
 (defn- a64-profitable-cached-mersenne-values
   "Return cached constants whose every use is an MSUB factor and whose shifted
-  two-instruction expansion is smaller than keeping one materialization.
+  two-instruction expansion is either smaller than keeping one
+  materialization, or sits on one serial remainder chain.
 
-  This is deliberately a whole-leaf cost decision.  In particular,
-  2147483647 is one AArch64 logical-immediate word: N remainders cost `1 + N`
-  words as `constant; MSUB...`, but `2 * N` words as shifted SUB+ADD.  The old
-  local rewrite chose the latter merely because the factor was Mersenne, making
-  the qualified eight- and sixteen-lane modular kernels seven and fifteen words
-  larger respectively.  A cached register with any non-MSUB reader is also
-  retained, because its materialization cannot be removed."
+  The size arm is a whole-leaf cost decision.  In particular, 2147483647 is
+  one AArch64 logical-immediate word: N remainders cost `1 + N` words as
+  `constant; MSUB...`, but `2 * N` words as shifted SUB+ADD.  The old local
+  rewrite chose the latter merely because the factor was Mersenne, making
+  the qualified eight- and sixteen-lane modular kernels seven and fifteen
+  words larger respectively.  A cached register with any non-MSUB reader is
+  also retained, because its materialization cannot be removed.
+
+  The serial arm is a latency decision with the opposite sign, and it is
+  measured, not argued (see a64-serial-msub-chain?): on one serial chain the
+  shifted form wins although it is larger, so size alone may not keep MSUB
+  there.  Independent lanes fail the chain test and keep today's bytes."
   [instructions cache]
   (set
    (keep
@@ -3718,7 +3794,8 @@
                      (= (count readers) uses)
                      ;; shifted reduction: two words/use; retained MSUB:
                      ;; one materialization plus one word/use.
-                     (< (* 2 uses) (+ materialization-words uses)))
+                     (or (< (* 2 uses) (+ materialization-words uses))
+                         (a64-serial-msub-chain? instructions register)))
             value))))
     cache)))
 
