@@ -8,6 +8,7 @@
             [kotoba.native.peephole :as peephole]
             [kotoba.native.string-index :as string-index]
             [kotoba.native.string-search :as string-search]
+            [kotoba.native.vector-region :as vector-region]
             #?@(:cljs [[kotoba.kir.cljs-i64 :as i64]])))
 
 ;; `le32` only ever encodes small, non-negative, interpreter-internal
@@ -1998,6 +1999,7 @@
 
 (defn emit-program [kir]
   (let [kir (-> kir
+                vector-region/rewrite-program
                 (update :functions #(-> % string-search/augment-functions
                                            string-index/augment-functions))
                 (#(if (:exports %) %
