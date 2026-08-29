@@ -2163,7 +2163,11 @@
                  [0x48 0x99 0x48 0xf7 0xf9]
                  restore))))
 
-(defn- x86-quotient-constant [dst left divisor reciprocal-live? result-in-r11?]
+(defn- x86-quotient-constant
+  ([dst left divisor reciprocal-live? result-in-r11?]
+   (x86-quotient-constant dst left divisor reciprocal-live? result-in-r11?
+                          true true))
+  ([dst left divisor reciprocal-live? result-in-r11? save-rax? save-rdx?]
   (if-let [{:keys [multiplier shift add-numerator? subtract-numerator?]}
            (signed-division-magic divisor)]
     ;; RAX and RDX are saved because `imul r10` writes both and MIR declares
@@ -2187,8 +2191,8 @@
                  (if (= target source) [] (x86-rr 0x89 target source)))]
       (vec
        (concat
-        (x86-push :x86-64/rax)
-        (x86-push :x86-64/rdx)
+        (when save-rax? (x86-push :x86-64/rax))
+        (when save-rdx? (x86-push :x86-64/rdx))
         (when numerator? (move :x86-64/r11 left))
         (move :x86-64/rax left)
         (when-not reciprocal-live? (x86-mov-imm :x86-64/r10 multiplier))
@@ -2214,15 +2218,15 @@
         (when (pos? shift) [0x49 0xc1 0xfb shift]) ; sar r11,shift
         [0x48 0xc1 0xea 0x3f] ; shr rdx,63
         (x86-rr 0x01 :x86-64/r11 :x86-64/rdx)
-        (x86-pop :x86-64/rdx)
-        (x86-pop :x86-64/rax)
+        (when save-rdx? (x86-pop :x86-64/rdx))
+        (when save-rax? (x86-pop :x86-64/rax))
         (when-not (or result-in-r11? (= dst :x86-64/r11))
           (x86-rr 0x89 dst :x86-64/r11)))))
     ;; Zero and +/-1 retain the established hardware guards. They are uncommon
     ;; in real optimized code and keeping one path prevents special-case trap
     ;; semantics from drifting between the two ISAs.
     (vec (concat (x86-mov-imm :x86-64/r11 divisor)
-                 (x86-quotient dst left :x86-64/r11)))))
+                 (x86-quotient dst left :x86-64/r11))))))
 
 (defn- x86-shift [subop dst left right]
   ;; Variable-count shifts require CL. r11 is outside MIR's allocator profile,
@@ -3343,7 +3347,9 @@
     (x86-quotient-constant (:mir/dst instruction) (:mir/left instruction)
                            (:mir/divisor instruction)
                            (:native/x86-reciprocal-live instruction)
-                           (:native/x86-result-in-r11 instruction))
+                           (:native/x86-result-in-r11 instruction)
+                           (:native/x86-save-rax instruction true)
+                           (:native/x86-save-rdx instruction true))
     :x86-64/bit-and
     (let [dst (:mir/dst instruction) left (:mir/left instruction) right (:mir/right instruction)]
       (vec (concat (when-not (= dst left) (x86-rr 0x89 dst left))
@@ -4059,6 +4065,69 @@
             (recur (next remaining) (conj out copy))))
         (vec out)))))
 
+(def ^:private x86-straight-line-encodings
+  "Encodings a dead-save scan can walk: straight-line register data flow with
+  no label, branch or call. Every instruction's reads are its MIR source keys
+  (plus the quotient's implicit RAX/RDX writes) -- anything outside this set
+  refuses the scan, and refusal keeps the saves."
+  #{:x86-64/argument :x86-64/constant :x86-64/move :x86-64/add :x86-64/subtract
+    :x86-64/multiply :x86-64/quotient-constant :x86-64/bit-and :x86-64/bit-or
+    :x86-64/bit-xor :x86-64/shift-left :x86-64/shift-right-signed
+    :x86-64/shift-right-unsigned :x86-64/spill-load :x86-64/spill-store
+    :x86-64/equal :x86-64/less-than :x86-64/greater-than :x86-64/less-or-equal
+    :x86-64/greater-or-equal :x86-64/return})
+
+(defn- x86-register-live-after?
+  "Is REGISTER read after position I before being written? Conservative: an
+  instruction outside the straight-line set answers live (keep the save)."
+  [instructions i register]
+  (loop [remaining (drop (inc i) instructions)]
+    (if-let [{:mc/keys [encoding] :as instruction} (first remaining)]
+      (cond
+        (not (contains? x86-straight-line-encodings encoding)) true
+        (some #{register}
+              (mapcat (fn [key]
+                        (let [value (get instruction key)]
+                          (cond (vector? value) value
+                                (keyword? value) [value]
+                                :else [])))
+                      [:mir/left :mir/right :mir/src :mir/value :mir/test
+                       :mir/addend :mir/arguments]))
+        true
+        (or (= register (:mir/dst instruction))
+            ;; a later quotient rewrites RAX and RDX before reading them
+            ;; (its only register read is :mir/left, already checked above)
+            (and (= :x86-64/quotient-constant encoding)
+                 (contains? #{:x86-64/rax :x86-64/rdx} register)))
+        false
+        :else (recur (next remaining)))
+      false)))
+
+(defn- x86-elide-dead-quotient-saves
+  "Drop a quotient's RAX/RDX push-pop pairs when the register provably holds
+  nothing that is read again.
+
+  `imul r10` writes RDX:RAX, and MIR declares only the destination, so the
+  emitter has always saved both around every constant division -- four stack
+  operations per quotient, thirty-two per narrow-kernel call, measured as the
+  largest named x86 mechanism behind the gcc deficit (amu
+  docs/codegen-coscientist.md, iterations 40-41). Each register's save is
+  decided independently by a forward read-before-write scan; any instruction
+  outside the closed straight-line set -- a label, branch or call -- answers
+  live, and the saves stay."
+  [instructions]
+  (vec
+   (map-indexed
+    (fn [i {:mc/keys [encoding] :as instruction}]
+      (if (not= :x86-64/quotient-constant encoding)
+        instruction
+        (assoc instruction
+               :native/x86-save-rax
+               (x86-register-live-after? instructions i :x86-64/rax)
+               :native/x86-save-rdx
+               (x86-register-live-after? instructions i :x86-64/rdx))))
+    instructions)))
+
 (defn- x86-fold-adjacent-immediates [instructions]
   (letfn [(uses-before-redefinition [instructions register]
             (loop [remaining instructions, uses 0]
@@ -4306,7 +4375,8 @@
                                  x86-fold-adjacent-immediates
                                  x86-propagate-copies
                                  x86-quotient-result-in-place
-                                 x86-hoist-repeated-reciprocal)
+                                 x86-hoist-repeated-reciprocal
+                                 x86-elide-dead-quotient-saves)
                        instructions)
         bottom-test (when (= :aarch64 isa)
                       (a64-bottom-test-self-recur-plan instructions))
