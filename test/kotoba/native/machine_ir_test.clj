@@ -2019,8 +2019,63 @@
           (is (= 1 (count (filter #(= spill-load (:mc/encoding %))
                                   (:mc/instructions function))))
               [target (:mc/name function)]))
-        (is (= (if (= :x86-64 target) 114 68)
+        ;; The AArch64 leaf's one spill slot parks in a SIMD register, so
+        ;; its SP adjustment disappears (68 -> 60); the call-live caller
+        ;; keeps its stack slot.
+        (is (= (if (= :x86-64 target) 114 60)
                (count (:code compiled))) target)))))
+
+(deftest aarch64-leaf-spill-slots-park-in-simd-registers
+  (let [store {:mc/op :mc/instruction :mc/encoding :aarch64/spill-store
+               :mir/src :aarch64/x2 :mir/slot 0}
+        load {:mc/op :mc/instruction :mc/encoding :aarch64/spill-load
+              :mir/dst :aarch64/x3 :mir/slot 0}
+        ret {:mc/op :mc/instruction :mc/encoding :aarch64/return
+             :mir/value :aarch64/x3}
+        leaf {:mc/name 'leaf :mc/arity 0 :mc/frame-slots 1
+              :mc/frame-policy :allocator
+              :mc/instructions [store load ret]}
+        parked (#'machine/a64-simd-park-spills leaf)]
+    (is (zero? (:mc/frame-slots parked))
+        "the parked frame needs no stack storage")
+    (is (= [:aarch64/simd-park-store :aarch64/simd-park-load :aarch64/return]
+           (mapv :mc/encoding (:mc/instructions parked))))
+    (is (= [[0x50 0x00 0x67 0x9e]]
+           (mapv vec (partition 4 (#'machine/encode-selected
+                                   :aarch64 0 [0xc0 0x03 0x5f 0xd6] 0 true
+                                   (first (:mc/instructions parked))))))
+        "FMOV D16,X2")
+    (is (= [[0x03 0x02 0x66 0x9e]]
+           (mapv vec (partition 4 (#'machine/encode-selected
+                                   :aarch64 0 [0xc0 0x03 0x5f 0xd6] 0 true
+                                   (second (:mc/instructions parked))))))
+        "FMOV X3,D16")
+    (is (= (assoc leaf :mc/frame-policy :call-live)
+           (#'machine/a64-simd-park-spills
+            (assoc leaf :mc/frame-policy :call-live)))
+        "a call-frame function keeps its stack slots: SIMD registers are
+        caller-saved and a call could clobber a parked lane")
+    (is (= (assoc leaf :mc/instructions
+                  [(assoc store :mir/slot 16) load ret]
+                  :mc/frame-slots 17)
+           (#'machine/a64-simd-park-spills
+            (assoc leaf :mc/instructions
+                   [(assoc store :mir/slot 16) load ret]
+                   :mc/frame-slots 17)))
+        "a frame past sixteen slots keeps the stack shape")
+    (is (= (assoc leaf :mc/instructions
+                  [store
+                   {:mc/op :mc/instruction :mc/encoding :aarch64/call
+                    :mir/arguments [] :mir/dst :aarch64/x0 :mir/callee 'f}
+                   load ret])
+           (#'machine/a64-simd-park-spills
+            (assoc leaf :mc/instructions
+                   [store
+                    {:mc/op :mc/instruction :mc/encoding :aarch64/call
+                     :mir/arguments [] :mir/dst :aarch64/x0 :mir/callee 'f}
+                    load ret])))
+        "any call-shaped instruction refuses parking even under a leaf
+        frame policy")))
 
 (deftest word-call-module-boundary-supports-multiple-exports-and-fails-closed
   (let [multi-export (assoc scalar-call-kir :exports ['main 'add-one])]
