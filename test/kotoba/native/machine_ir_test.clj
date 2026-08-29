@@ -1205,6 +1205,26 @@
   (is (nil? (machine/signed-division-magic 1)))
   (is (nil? (machine/signed-division-magic -1))))
 
+(deftest x86-reciprocal-reads-the-sign-from-the-unshifted-value
+  (let [bytes (#'machine/x86-quotient-constant
+               :x86-64/rcx :x86-64/rdi 2147483647 false false)
+        words (vec bytes)
+        ;; the tail must read: mov rdx,r11 ; sar r11,shift ; shr rdx,63 --
+        ;; the copy of the UNSHIFTED value goes first so SAR and SHR run in
+        ;; parallel (iterations 18/40; the serialized order cost one
+        ;; critical-path stage per quotient)
+        tail-mov-sar-shr [0x4c 0x89 0xda          ; mov rdx,r11
+                          0x49 0xc1 0xfb 0x1e     ; sar r11,30
+                          0x48 0xc1 0xea 0x3f]]   ; shr rdx,63
+    (is (some (fn [i] (= tail-mov-sar-shr (subvec words i (+ i (count tail-mov-sar-shr)))))
+              (range (inc (- (count words) (count tail-mov-sar-shr)))))
+        "MOV RDX,R11 precedes SAR R11: the correction reads the unshifted value")
+    (let [serialized [0x49 0xc1 0xfb 0x1e         ; sar r11,30
+                      0x4c 0x89 0xda]]            ; mov rdx,r11 (old order)
+      (is (not-any? (fn [i] (= serialized (subvec words i (+ i (count serialized)))))
+                    (range (inc (- (count words) (count serialized)))))
+          "the serialized copy-after-shift order is gone"))))
+
 (deftest aarch64-reciprocal-combines-the-sign-correction
   (let [bytes (#'machine/a64-quotient-constant
                :aarch64/x2 :aarch64/x0 2147483647 true)

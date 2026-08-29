@@ -2205,11 +2205,17 @@
           subtract-numerator? (concat (x86-rr 0x29 :x86-64/rdx :x86-64/r11)
                                       (x86-rr 0x89 :x86-64/r11 :x86-64/rdx))
           :else (x86-rr 0x89 :x86-64/r11 :x86-64/rdx))
-        (when (pos? shift) [0x49 0xc1 0xfb shift]) ; sar r11,shift
-        ;; RDX rather than R10: it is dead here in every branch above and the
-        ;; pop restores it regardless, which leaves R10 free to keep carrying
+        ;; The sign bit is identical before and after the arithmetic shift,
+        ;; so copy the unshifted value into RDX first and let SAR and SHR run
+        ;; in parallel -- the serialized copy-after-shift form cost one
+        ;; critical-path stage per quotient (the x86 port of the AArch64
+        ;; change measured at +4.2% on the narrow chain; amu
+        ;; docs/codegen-coscientist.md, iterations 18 and 40). RDX rather
+        ;; than R10: it is dead here in every branch above and the pop
+        ;; restores it regardless, which leaves R10 free to keep carrying
         ;; the reciprocal into the next division.
         (x86-rr 0x89 :x86-64/rdx :x86-64/r11)
+        (when (pos? shift) [0x49 0xc1 0xfb shift]) ; sar r11,shift
         [0x48 0xc1 0xea 0x3f] ; shr rdx,63
         (x86-rr 0x01 :x86-64/r11 :x86-64/rdx)
         (when save-rdx? (x86-pop :x86-64/rdx))
