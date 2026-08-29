@@ -1692,13 +1692,13 @@
             caller (second (:mc/functions mc))]
         (is (= 3 (:mc/version mc)) target)
         (is (= :call-live (:mc/frame-policy caller)) target)
-        (is (= 1 (:mc/frame-slots caller)) target)
-        (is (= 1 (count (filter #(= (keyword (name target) "spill-store")
-                                     (:mc/encoding %))
-                                (:mc/instructions caller)))) target)
-        (is (= 1 (count (filter #(= (keyword (name target) "spill-load")
-                                     (:mc/encoding %))
-                                (:mc/instructions caller)))) target)
+        (is (zero? (:mc/frame-slots caller)) target)
+        (is (not-any? #(contains? #{(keyword (name target) "spill-store")
+                                    (keyword (name target) "spill-load")}
+                                  (:mc/encoding %))
+                      (:mc/instructions caller))
+            [target "the call-crossing value is preserved, not spilled
+                     (kotoba-mir 8a2bc4d)"])
         (is (= 1 (count (filter #(= (keyword (name target) "call")
                                      (:mc/encoding %))
                                 (:mc/instructions caller)))) target)))))
