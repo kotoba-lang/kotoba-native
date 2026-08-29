@@ -31,9 +31,11 @@
         ;; call-crossing values live in preserved registers instead of stable
         ;; slots (+6.66% measured on the qualified call fixture); the
         ;; superseded allocate-call-live is deleted.
+        ;; 4a75623 steers quotient-leaf values away from RAX/RDX, arming
+        ;; the dead-quotient-save elision below it.
         io.github.kotoba-lang/kotoba-mir
         {:git/url "https://github.com/kotoba-lang/kotoba-mir.git"
-         :git/sha "8a2bc4d19d67be325b228f66fbdfda43fcd47088"}
+         :git/sha "4a756239e8eea3833fb45bdc6ae28f669a0a929b"}
         io.github.kotoba-lang/kotoba-codegen
         {:git/url "https://github.com/kotoba-lang/kotoba-codegen.git"
          :git/sha "54a3f3b1c335cae69b7ac15744831c0a2c8ddd7c"}
