@@ -3540,6 +3540,19 @@
     (a64-stack-memory 0xf9400000 (:mir/dst instruction) (:mir/slot instruction))
     :aarch64/spill-store
     (a64-stack-memory 0xf9000000 (:mir/src instruction) (:mir/slot instruction))
+    ;; A leaf's spill slot parked in a caller-saved SIMD register: FMOV is a
+    ;; one-instruction register-file crossing, where the stack round trip the
+    ;; slot form takes is a store-load through memory (measured +3.21% on the
+    ;; qualified deep-spill fixture -- amu docs/codegen-coscientist.md,
+    ;; iterations 23-24; rustc parks its overflow lanes the same way).
+    :aarch64/simd-park-store
+    (u32le (bit-or 0x9e670000
+                   (bit-shift-left (a64-register (:mir/src instruction)) 5)
+                   (+ 16 (:mir/slot instruction))))
+    :aarch64/simd-park-load
+    (u32le (bit-or 0x9e660000
+                   (bit-shift-left (+ 16 (:mir/slot instruction)) 5)
+                   (a64-register (:mir/dst instruction))))
     :aarch64/move
     (if (= (:mir/dst instruction) (:mir/src instruction))
       []
@@ -3651,7 +3664,8 @@
     :aarch64/f64-greater-or-equal :aarch64/f64-unordered
     :aarch64/equal :aarch64/less-than :aarch64/greater-than
     :aarch64/less-or-equal :aarch64/greater-or-equal
-    :aarch64/spill-load :aarch64/spill-store :aarch64/move :aarch64/return})
+    :aarch64/spill-load :aarch64/spill-store :aarch64/move :aarch64/return
+    :aarch64/simd-park-store :aarch64/simd-park-load})
 
 (defn- a64-cache-register-sources [instruction aliases]
   (reduce
@@ -4145,7 +4159,8 @@
     :aarch64/bit-and :aarch64/bit-or :aarch64/bit-xor
     :aarch64/shift-left :aarch64/shift-right-signed
     :aarch64/shift-right-unsigned :aarch64/spill-load
-    :aarch64/spill-store :aarch64/move :aarch64/return})
+    :aarch64/spill-store :aarch64/move :aarch64/return
+    :aarch64/simd-park-store :aarch64/simd-park-load})
 
 (defn- rename-token-labels
   "Give every label defined inside TOKENS a private namespace and retarget its
@@ -4499,6 +4514,48 @@
            :return-suffix (vec (concat (a64-adjust-stack 0x910003ff storage-bytes)
                                        restore (u32le 0xd65f03c0)))})))))
 
+(def ^:private a64-call-like-encodings
+  #{:aarch64/call :aarch64/tail-call :aarch64/runtime-call
+    :aarch64/capability-call})
+
+(defn- a64-simd-park-spills
+  "Park an AArch64 leaf's spill slots in caller-saved SIMD registers.
+
+  A slot round trip is a store and a load through memory; an FMOV crossing to
+  d16+slot is one register-file move each way. rustc's emission of the
+  qualified deep-spill fixture banks its overflow lanes exactly this way, and
+  hand-substituting amu's remaining fourteen spill instructions measured
+  +3.21% separated (amu docs/codegen-coscientist.md, iterations 23-24).
+
+  Admission is fail-closed: AArch64 only, a frame of one through sixteen
+  slots, no call-shaped instruction anywhere in the body (SIMD registers are
+  caller-saved, so a call could clobber a parked lane), and every spill slot
+  in range. Anything else keeps today's stack shape, and the parked form
+  zeroes the frame so the SP adjustment disappears with the slots."
+  [{:mc/keys [frame-slots frame-policy instructions] :as function}]
+  (if-not (and (pos? frame-slots) (<= frame-slots 16)
+               (not (call-frame-policy? frame-policy))
+               (not-any? #(contains? a64-call-like-encodings (:mc/encoding %))
+                         instructions)
+               (every? (fn [{:mc/keys [encoding] :as instruction}]
+                         (or (not (contains? #{:aarch64/spill-store
+                                               :aarch64/spill-load} encoding))
+                             (and (integer? (:mir/slot instruction))
+                                  (<= 0 (:mir/slot instruction) 15))))
+                       instructions))
+    function
+    (assoc function
+           :mc/frame-slots 0
+           :mc/instructions
+           (mapv (fn [{:mc/keys [encoding] :as instruction}]
+                   (case encoding
+                     :aarch64/spill-store
+                     (assoc instruction :mc/encoding :aarch64/simd-park-store)
+                     :aarch64/spill-load
+                     (assoc instruction :mc/encoding :aarch64/simd-park-load)
+                     instruction))
+                 instructions))))
+
 (defn- fresh-self-tail-body-label
   "Choose a deterministic function-local label absent from both admitted MC
   labels and the closed instrumentation prefix. Source MIR can spell any
@@ -4547,8 +4604,12 @@
          tokens
          (vec
           (mapcat
-           (fn [index {:mc/keys [name frame-slots frame-policy instructions]}]
-             (let [{:keys [frame-bytes prologue return-suffix tail-suffix]}
+           (fn [index function]
+             (let [{:mc/keys [name frame-slots frame-policy instructions]}
+                   (if (= :aarch64 target)
+                     (a64-simd-park-spills function)
+                     function)
+                   {:keys [frame-bytes prologue return-suffix tail-suffix]}
                    (function-frame target frame-slots frame-policy instructions)
                    instrumentation (get prefixes name [])
                    fallback-prefix (when (map? instrumentation)
