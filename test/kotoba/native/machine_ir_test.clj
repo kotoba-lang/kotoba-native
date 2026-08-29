@@ -1210,6 +1210,59 @@
   (is (nil? (machine/signed-division-magic 1)))
   (is (nil? (machine/signed-division-magic -1))))
 
+(deftest x86-reciprocal-tracks-one-divisor-at-a-time
+  ;; R10 holds one reciprocal. The set-based fold marked `quot by 7, 9, 7`
+  ;; third division live and it divided by 9's magic -- measured end to end
+  ;; as 61 instead of 78 for n=200 before this test existed.
+  (let [q (fn [dst left divisor] {:mc/op :mc/instruction
+                                  :mc/encoding :x86-64/quotient-constant
+                                  :mir/dst dst :mir/left left
+                                  :mir/divisor divisor})
+        interleaved (#'machine/x86-hoist-repeated-reciprocal
+                     [(q :x86-64/rcx :x86-64/rdi 7)
+                      (q :x86-64/r8 :x86-64/rsi 9)
+                      (q :x86-64/r9 :x86-64/rbx 7)])]
+    (is (not (:native/x86-reciprocal-live (nth interleaved 0))))
+    (is (not (:native/x86-reciprocal-live (nth interleaved 1)))
+        "a different divisor reloads")
+    (is (not (:native/x86-reciprocal-live (nth interleaved 2)))
+        "R10 now holds 9's reciprocal: 7 must reload, not reuse")
+    (let [repeated (#'machine/x86-hoist-repeated-reciprocal
+                    [(q :x86-64/rcx :x86-64/rdi 7)
+                     (q :x86-64/r8 :x86-64/rsi 7)])]
+      (is (true? (:native/x86-reciprocal-live (nth repeated 1)))
+          "the same divisor back to back still rides")))
+  ;; a spilled function keeps the hoist: spill traffic is a fixed-RSP move
+  ;; with no scratch register, so R10 survives it (kernel_deep reloaded the
+  ;; same reciprocal twenty-four times under the old whole-function guard)
+  (let [q (fn [dst left] {:mc/op :mc/instruction
+                          :mc/encoding :x86-64/quotient-constant
+                          :mir/dst dst :mir/left left :mir/divisor 2147483647})
+        spilled (#'machine/x86-hoist-repeated-reciprocal
+                 [(q :x86-64/rcx :x86-64/rdi)
+                  {:mc/op :mc/instruction :mc/encoding :x86-64/spill-store
+                   :mir/src :x86-64/rcx :mir/slot 0}
+                  {:mc/op :mc/instruction :mc/encoding :x86-64/spill-load
+                   :mir/dst :x86-64/rsi :mir/slot 1}
+                  (q :x86-64/r8 :x86-64/rsi)])]
+    (is (true? (:native/x86-reciprocal-live (nth spilled 3)))
+        "the reciprocal rides across spill traffic"))
+  ;; an instruction outside the safe set resets the tracked divisor instead
+  ;; of disqualifying the whole function
+  (let [q (fn [dst left] {:mc/op :mc/instruction
+                          :mc/encoding :x86-64/quotient-constant
+                          :mir/dst dst :mir/left left :mir/divisor 2147483647})
+        island (#'machine/x86-hoist-repeated-reciprocal
+                [(q :x86-64/rcx :x86-64/rdi)
+                 {:mc/op :mc/instruction :mc/encoding :x86-64/call
+                  :mir/callee 'helper :mir/dst :x86-64/rax :mir/arguments []}
+                 (q :x86-64/r8 :x86-64/rsi)
+                 (q :x86-64/r9 :x86-64/rbx)])]
+    (is (not (:native/x86-reciprocal-live (nth island 2)))
+        "after the unsafe island the reciprocal reloads once")
+    (is (true? (:native/x86-reciprocal-live (nth island 3)))
+        "and rides again within the new safe run")))
+
 (deftest x86-saved-quotients-are-rax-transparent
   ;; kernel_wide's shape on x86-64: a lane value parked in RAX by the
   ;; allocator, read again only after several intermediate quotients.

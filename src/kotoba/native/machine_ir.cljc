@@ -4010,7 +4010,12 @@
     :x86-64/quotient-constant :x86-64/return
     :x86-64/bit-and :x86-64/bit-or :x86-64/bit-xor
     :x86-64/equal :x86-64/less-than :x86-64/less-or-equal
-    :x86-64/greater-than :x86-64/greater-or-equal})
+    :x86-64/greater-than :x86-64/greater-or-equal
+    ;; mov to and from a fixed RSP displacement; no scratch register at all
+    ;; (x86-stack-memory), so R10 rides across a spilled function's traffic --
+    ;; kernel_deep reloaded the same reciprocal twenty-four times because two
+    ;; spill instructions disqualified the whole function.
+    :x86-64/spill-load :x86-64/spill-store})
 
 ;; Every constant division by the same divisor loads the same ten-byte
 ;; reciprocal into R10. Loading it once is worth seven of those ten-byte loads
@@ -4023,20 +4028,33 @@
 ;; after the first with that exact divisor. A branch would let control reach the
 ;; second division without passing the first.
 (defn- x86-hoist-repeated-reciprocal [instructions]
-  (if-not (every? #(contains? x86-reciprocal-cache-safe-encodings (:mc/encoding %))
-                  instructions)
-    instructions
-    (first
-     (reduce (fn [[out loaded] instruction]
-               (if (= :x86-64/quotient-constant (:mc/encoding instruction))
-                 (let [divisor (:mir/divisor instruction)]
-                   (if (contains? loaded divisor)
-                     [(conj out (assoc instruction :native/x86-reciprocal-live true))
-                      loaded]
-                     [(conj out instruction) (conj loaded divisor)]))
-                 [(conj out instruction) loaded]))
-             [[] #{}]
-             instructions))))
+  ;; R10 holds exactly ONE reciprocal at a time, so the tracked state is the
+  ;; last divisor loaded -- not a set. The set version marked `D1 D2 D1` third
+  ;; division live and it divided by D2's magic (measured end to end: quot by
+  ;; 7, 9, 7 returned 61 instead of 78 for n=200). And the old whole-function
+  ;; `every?` guard threw the hoist away wherever one instruction outside the
+  ;; safe set appeared anywhere in the function; resetting the tracked divisor
+  ;; at that instruction keeps both the safety argument (within one safe run
+  ;; the first division dominates the later ones) and the hoist everywhere
+  ;; else. A divisor without magic (0, +/-1) loads nothing into R10 and its
+  ;; hardware-guard path may clobber it, so it resets the state too.
+  (first
+   (reduce (fn [[out current] {:mc/keys [encoding] :as instruction}]
+             (cond
+               (not (contains? x86-reciprocal-cache-safe-encodings encoding))
+               [(conj out instruction) nil]
+               (= :x86-64/quotient-constant encoding)
+               (let [divisor (:mir/divisor instruction)]
+                 (cond
+                   (nil? (signed-division-magic divisor))
+                   [(conj out instruction) nil]
+                   (= current divisor)
+                   [(conj out (assoc instruction :native/x86-reciprocal-live true))
+                    current]
+                   :else [(conj out instruction) divisor]))
+               :else [(conj out instruction) current]))
+           [[] nil]
+           instructions)))
 
 (defn- x86-propagate-copies [instructions]
   (letfn [(uses-before-redefinition [instructions register]
