@@ -2893,18 +2893,31 @@
         (u32le (bit-or 0xcb000000
                        (bit-shift-left (a64-register left) 16)
                        (bit-shift-left 17 5) 17)))
-      ;; asr x17,x17,#shift (SBFM), omitted when the reciprocal needs no shift.
-      (when (pos? shift)
-        (u32le (bit-or 0x9340fc00
-                       (bit-shift-left shift 16)
-                       (bit-shift-left 17 5) 17)))
-      ;; ADD dst,x17,x17,LSR#63 combines extraction of the sign correction and
-      ;; truncation toward zero. x16 therefore keeps the cached multiplier.
-      (u32le (bit-or 0x8b400000
-                     (bit-shift-left 17 16)
-                     (bit-shift-left 63 10)
-                     (bit-shift-left 17 5)
-                     (a64-register dst)))))
+      ;; The sign bit is identical before and after the arithmetic shift, so
+      ;; the truncation correction may read the unshifted x17 and run in
+      ;; parallel with the shift: ASR dst,x17,#shift; ADD dst,dst,x17,LSR#63.
+      ;; The serialized ASR x17->x17 form cost one critical-path stage per
+      ;; quotient -- measured 2026-08-29 as the whole remaining narrow-chain
+      ;; gap against Clang's emission (amu docs/codegen-coscientist.md,
+      ;; iteration 18: +4.2% separated, landing at parity). When the
+      ;; reciprocal needs no shift the single ADD already reads the unshifted
+      ;; value. x16 keeps the cached multiplier in every form.
+      (if (pos? shift)
+        (concat
+         (u32le (bit-or 0x9340fc00
+                        (bit-shift-left shift 16)
+                        (bit-shift-left 17 5)
+                        (a64-register dst)))
+         (u32le (bit-or 0x8b400000
+                        (bit-shift-left 17 16)
+                        (bit-shift-left 63 10)
+                        (bit-shift-left (a64-register dst) 5)
+                        (a64-register dst))))
+        (u32le (bit-or 0x8b400000
+                       (bit-shift-left 17 16)
+                       (bit-shift-left 63 10)
+                       (bit-shift-left 17 5)
+                       (a64-register dst))))))
     (vec (concat (a64-constant :aarch64/x17 divisor)
                  (a64-quotient dst left :aarch64/x17)))))
 

@@ -1209,12 +1209,19 @@
   (let [bytes (#'machine/a64-quotient-constant
                :aarch64/x2 :aarch64/x0 2147483647 true)
         words (mapv vec (partition 4 bytes))]
-    (is (= [0x22 0xfe 0x51 0x8b] (peek words))
-        "ADD X2,X17,X17,LSR#63")
+    (is (= [0x22 0xfe 0x5e 0x93] (nth words (- (count words) 2)))
+        "ASR X2,X17,#30 writes the destination, keeping the unshifted x17")
+    (is (= [0x42 0xfc 0x51 0x8b] (peek words))
+        "ADD X2,X2,X17,LSR#63: the sign correction reads the unshifted x17
+        and runs in parallel with the shift -- the serialized x17->x17 ASR
+        cost one critical-path stage per quotient (measured +4.2%, amu
+        docs/codegen-coscientist.md iteration 18)")
     (is (= 6 (count words))
         "two-word logical seed plus SMULH, numerator ADD, ASR, shifted ADD")
     (is (not-any? #{[0x30 0xfe 0x7f 0xd3]} words)
-        "the standalone LSR correction is gone")))
+        "the standalone LSR correction is gone")
+    (is (not-any? #{[0x22 0xfe 0x51 0x8b]} words)
+        "the serialized ADD X2,X17,X17 form is gone")))
 
 (deftest aarch64-folds-single-use-add-sub-immediates
   (let [words (fn [form]
