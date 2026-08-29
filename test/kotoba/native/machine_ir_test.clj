@@ -1151,16 +1151,21 @@
 (deftest x86-signed-division-preserves-all-implicit-registers
   (let [bytes (machine/compile-expression
                :x86-64 [] '(+ (* 3 4) (quot 10 2)))
+        ;; The quotient-steered pool (kotoba-mir 4a75623) keeps allocated
+        ;; values out of RAX/RDX, so the operands arrive in RCX/RSI and the
+        ;; quotient leaves in R8; the implicit-register discipline this test
+        ;; exists for is unchanged -- RAX, RDX and RCX are pushed, IDIV runs,
+        ;; and all three pop back in reverse.
         division-window [0x50             ; push rax
-                         0x52             ; push rdx (live product)
+                         0x52             ; push rdx
                          0x51             ; push rcx
-                         0x48 0x8b 0x8c 0x24 0x10 0x00 0x00 0x00 ; divisor
-                         0x4c 0x89 0xc0   ; mov rax,r8 (dividend)
+                         0x48 0x8b 0x8c 0x24 0x00 0x00 0x00 0x00 ; divisor from saved rcx slot
+                         0x48 0x89 0xf0   ; mov rax,rsi (dividend)
                          0x48 0x99         ; cqo
                          0x48 0xf7 0xf9   ; idiv rcx
-                         0x48 0x89 0xc1   ; quotient -> allocated rcx
-                         0x48 0x81 0xc4 0x08 0x00 0x00 0x00 ; discard old rcx
-                         0x5a             ; restore live rdx
+                         0x49 0x89 0xc0   ; quotient -> r8
+                         0x59             ; restore rcx
+                         0x5a             ; restore rdx
                          0x58]]           ; restore rax
     (is (= 1 (count (filter #(= division-window %)
                             (partition (count division-window) 1 bytes)))))))
