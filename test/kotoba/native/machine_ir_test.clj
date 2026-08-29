@@ -1205,6 +1205,56 @@
   (is (nil? (machine/signed-division-magic 1)))
   (is (nil? (machine/signed-division-magic -1))))
 
+(deftest x86-dead-quotient-saves-are-elided
+  (let [q (fn [dst left] {:mc/op :mc/instruction
+                          :mc/encoding :x86-64/quotient-constant
+                          :mir/dst dst :mir/left left :mir/divisor 2147483647})
+        push-rax [0x50] push-rdx [0x52]
+        chain (#'machine/x86-elide-dead-quotient-saves
+               [{:mc/op :mc/instruction :mc/encoding :x86-64/constant
+                 :mir/dst :x86-64/rcx :mir/value 7}
+                (q :x86-64/r8 :x86-64/rcx)
+                {:mc/op :mc/instruction :mc/encoding :x86-64/add
+                 :mir/dst :x86-64/rcx :mir/left :x86-64/r8 :mir/right :x86-64/rcx}
+                {:mc/op :mc/instruction :mc/encoding :x86-64/return
+                 :mir/value :x86-64/rcx}])
+        parked (nth chain 1)]
+    ;; rax holds nothing read later; rcx is the live chain -- rax save drops,
+    ;; and rdx (also unread) drops too
+    (is (false? (:native/x86-save-rax parked))
+        "RAX provably dead after the quotient: no save")
+    (is (false? (:native/x86-save-rdx parked))
+        "RDX provably dead after the quotient: no save")
+    (let [rax-live (#'machine/x86-elide-dead-quotient-saves
+                    [(q :x86-64/r8 :x86-64/rcx)
+                     {:mc/op :mc/instruction :mc/encoding :x86-64/add
+                      :mir/dst :x86-64/rcx :mir/left :x86-64/rax
+                      :mir/right :x86-64/r8}
+                     {:mc/op :mc/instruction :mc/encoding :x86-64/return
+                      :mir/value :x86-64/rcx}])]
+      (is (true? (:native/x86-save-rax (first rax-live)))
+          "a later read of RAX keeps its save")
+      (is (false? (:native/x86-save-rdx (first rax-live)))
+          "RDX stays independently elidable"))
+    (let [branchy (#'machine/x86-elide-dead-quotient-saves
+                   [(q :x86-64/r8 :x86-64/rcx)
+                    {:mc/op :mc/instruction :mc/encoding :x86-64/jmp-rel
+                     :mir/id :somewhere}
+                    {:mc/op :mc/instruction :mc/encoding :x86-64/return
+                     :mir/value :x86-64/r8}])]
+      (is (true? (:native/x86-save-rax (first branchy)))
+          "an instruction outside the straight-line set refuses the scan")
+      (is (true? (:native/x86-save-rdx (first branchy)))))
+    ;; byte level: flags off emit no PUSH RAX/PUSH RDX
+    (let [with-saves (#'machine/x86-quotient-constant
+                      :x86-64/rcx :x86-64/rcx 2147483647 false false)
+          without (#'machine/x86-quotient-constant
+                   :x86-64/rcx :x86-64/rcx 2147483647 false false false false)]
+      (is (= (+ (count without) 4) (count with-saves))
+          "dropping both saves removes exactly two pushes and two pops")
+      (is (= (vec (concat push-rax push-rdx)) (vec (take 2 with-saves)))
+          "the saved form still opens with PUSH RAX; PUSH RDX"))))
+
 (deftest x86-reciprocal-reads-the-sign-from-the-unshifted-value
   (let [bytes (#'machine/x86-quotient-constant
                :x86-64/rcx :x86-64/rdi 2147483647 false false)
