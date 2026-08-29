@@ -1210,6 +1210,48 @@
   (is (nil? (machine/signed-division-magic 1)))
   (is (nil? (machine/signed-division-magic -1))))
 
+(deftest x86-saved-quotients-are-rax-transparent
+  ;; kernel_wide's shape on x86-64: a lane value parked in RAX by the
+  ;; allocator, read again only after several intermediate quotients.
+  ;; Each saved quotient pushes RAX before its internal clobber and pops
+  ;; it after, so the value flows through -- treating every later
+  ;; quotient as a kill elided the first save and destroyed the lane
+  ;; (n=200 returned -4457590639641959876 instead of 5224842816, while
+  ;; aarch64 executed the same MIR correctly).
+  (let [q (fn [dst left] {:mc/op :mc/instruction
+                          :mc/encoding :x86-64/quotient-constant
+                          :mir/dst dst :mir/left left :mir/divisor 2147483647})
+        carried (#'machine/x86-elide-dead-quotient-saves
+                 [{:mc/op :mc/instruction :mc/encoding :x86-64/subtract
+                   :mir/dst :x86-64/rax :mir/left :x86-64/r8
+                   :mir/right :x86-64/rcx}
+                  (q :x86-64/r9 :x86-64/rcx)
+                  (q :x86-64/r10 :x86-64/rsi)
+                  {:mc/op :mc/instruction :mc/encoding :x86-64/multiply
+                   :mir/dst :x86-64/rcx :mir/left :x86-64/rax
+                   :mir/right :x86-64/rsi}
+                  {:mc/op :mc/instruction :mc/encoding :x86-64/return
+                   :mir/value :x86-64/rcx}])]
+    (is (true? (:native/x86-save-rax (nth carried 2)))
+        "the quotient just before the RAX read keeps its save")
+    (is (true? (:native/x86-save-rax (nth carried 1)))
+        "an earlier quotient sees the saved one as transparent, not a kill"))
+  ;; the win stays: when nothing reads RAX later, a chain of quotients
+  ;; still elides every save (the later quotient, having elided its own,
+  ;; really does destroy RAX -- and that is fine, nothing wanted it)
+  (let [q (fn [dst left] {:mc/op :mc/instruction
+                          :mc/encoding :x86-64/quotient-constant
+                          :mir/dst dst :mir/left left :mir/divisor 2147483647})
+        chain (#'machine/x86-elide-dead-quotient-saves
+               [(q :x86-64/r9 :x86-64/rcx)
+                (q :x86-64/r10 :x86-64/r9)
+                {:mc/op :mc/instruction :mc/encoding :x86-64/return
+                 :mir/value :x86-64/r10}])]
+    (is (false? (:native/x86-save-rax (nth chain 0))))
+    (is (false? (:native/x86-save-rdx (nth chain 0))))
+    (is (false? (:native/x86-save-rax (nth chain 1))))
+    (is (false? (:native/x86-save-rdx (nth chain 1))))))
+
 (deftest x86-dead-quotient-saves-are-elided
   (let [q (fn [dst left] {:mc/op :mc/instruction
                           :mc/encoding :x86-64/quotient-constant
