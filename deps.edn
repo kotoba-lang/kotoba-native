@@ -27,9 +27,13 @@
         ;; module proves its callee is a pure, nontrapping, call-free leaf.
         ;; This repository still does not execute compiled programs. A green
         ;; native suite here is encodings only, not that measurement.
+        ;; 8a2bc4d sends straight-line call functions through the scanner:
+        ;; call-crossing values live in preserved registers instead of stable
+        ;; slots (+6.66% measured on the qualified call fixture); the
+        ;; superseded allocate-call-live is deleted.
         io.github.kotoba-lang/kotoba-mir
         {:git/url "https://github.com/kotoba-lang/kotoba-mir.git"
-         :git/sha "903331f83cc0a3c2613ccdaee1d1be126c06fabd"}
+         :git/sha "8a2bc4d19d67be325b228f66fbdfda43fcd47088"}
         io.github.kotoba-lang/kotoba-codegen
         {:git/url "https://github.com/kotoba-lang/kotoba-codegen.git"
          :git/sha "54a3f3b1c335cae69b7ac15744831c0a2c8ddd7c"}
