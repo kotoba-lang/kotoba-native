@@ -25,6 +25,7 @@ checkable from outside.
   packager rejects disagreement between `:limits` and `:fuel-abi`.
 - `kotoba.native.peephole`
 - `kotoba.native.string-search`
+- `kotoba.native.vector-region`
 
 ## Native is not an effect provider
 
@@ -60,6 +61,16 @@ functions it needs are appended to the program by `emit-program`, only when a
 body actually reaches one, and never exported. See ADR 0002.
 
 ## Optimization
+
+Bounded native vector literals now pass through a conservative escape proof
+before instruction selection. A literal of at most 32 items becomes scalar
+locals only when every lexical use is `vector-count`, `vector-at`, or
+`vector-get`; construction order and single evaluation are preserved. Passing
+the value to a function, returning it, storing it, observing identity, or using
+an unsupported operation keeps the existing checked host-vector ABI. The same
+rewrite feeds x86-64 and AArch64, including lexical shadowing and dynamic-index
+bounds behavior. This is scalar replacement for proven non-escaping literals,
+not a general arena allocator; see ADR 0037.
 
 `kotoba.codegen.layout` is the explicit MC/layout boundary. Its closed
 reference EDN projection uses qualified keys and qualified label IDs:
