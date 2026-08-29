@@ -450,11 +450,30 @@
 
 (defn word-result-type?
   "True for result descriptors represented by one native word. Escaping
-  records and variants retain their explicit aggregate ABI boundary."
+  records and variants retain their explicit aggregate ABI boundary.
+
+  The i64 vector handle is spelled `:vector-i64`. It was written `:vector`
+  here, and NOTHING produces that spelling -- `kotoba.kir`, `kotoba.verifier`
+  and the frontend all emit `:vector-i64`, and `:vector-i64` appeared nowhere
+  else in this repository. The effect was not a rejected type but a rejected
+  MODULE: `scalar-boundary-type?` is applied to every parameter AND result at
+  `lower-kir-module`, so a single function returning or taking a `:vector-i64`
+  failed `unsupported-function-module` and took the whole compile with it.
+
+  The asymmetry is what hid it. `:vector-f64` is spelled correctly, so the f64
+  family crossed function boundaries while the i64 family could not, which
+  reads from outside like `:vector-i64` lacking a constructor rather than
+  lacking a spelling. Both families are the SAME host table (see
+  `vector-op-aliases` in both backends: `vector-f64-at` lowers to `vector-at`),
+  so admitting `:vector-i64` here adds no representation, no ABI change and no
+  new lowering -- it makes the lowering that already existed reachable.
+
+  `kir-vector-boundary-types-are-spelled-the-same-way` pins the agreement
+  against `kotoba.kir` so this cannot drift back silently."
   [type]
   (or (contains? #{nil :i64 :bool :f32 :f64 :string :keyword :document
                    :option-i64 :result-i64
-                   :vector :vector-f64 :string-index} type)
+                   :vector-i64 :vector-f64 :string-index} type)
       (and (vector? type)
            (contains? #{:option :result :list :set :map :ref}
                       (first type)))))
