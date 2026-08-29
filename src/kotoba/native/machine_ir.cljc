@@ -4079,10 +4079,20 @@
 
 (defn- x86-register-live-after?
   "Is REGISTER read after position I before being written? Conservative: an
-  instruction outside the straight-line set answers live (keep the save)."
-  [instructions i register]
-  (loop [remaining (drop (inc i) instructions)]
-    (if-let [{:mc/keys [encoding] :as instruction} (first remaining)]
+  instruction outside the straight-line set answers live (keep the save).
+
+  DECISIONS maps a later quotient's index to its already-decided save flags
+  (the caller walks quotients back to front). A later quotient that keeps
+  its save of REGISTER pushes it before its internal clobber and pops it
+  after, so the register flows through unchanged and the scan continues
+  behind it; only a quotient that elided that save actually destroys the
+  register. Treating every later quotient as a kill lost a live value the
+  saved quotients were carrying (kernel_wide on x86-64 returned
+  -4457590639641959876 instead of 5224842816 for n=200; the aarch64 backend
+  executed the same MIR correctly)."
+  [instructions i register decisions]
+  (loop [j (inc i)]
+    (if-let [{:mc/keys [encoding] :as instruction} (nth instructions j nil)]
       (cond
         (not (contains? x86-straight-line-encodings encoding)) true
         (some #{register}
@@ -4094,13 +4104,15 @@
                       [:mir/left :mir/right :mir/src :mir/value :mir/test
                        :mir/addend :mir/arguments]))
         true
-        (or (= register (:mir/dst instruction))
-            ;; a later quotient rewrites RAX and RDX before reading them
-            ;; (its only register read is :mir/left, already checked above)
-            (and (= :x86-64/quotient-constant encoding)
-                 (contains? #{:x86-64/rax :x86-64/rdx} register)))
+        (= register (:mir/dst instruction))
         false
-        :else (recur (next remaining)))
+        (and (= :x86-64/quotient-constant encoding)
+             (contains? #{:x86-64/rax :x86-64/rdx} register))
+        (if (get-in decisions [j (if (= register :x86-64/rax)
+                                   :save-rax :save-rdx)])
+          (recur (inc j))
+          false)
+        :else (recur (inc j)))
       false)))
 
 (defn- x86-elide-dead-quotient-saves
@@ -4114,19 +4126,36 @@
   docs/codegen-coscientist.md, iterations 40-41). Each register's save is
   decided independently by a forward read-before-write scan; any instruction
   outside the closed straight-line set -- a label, branch or call -- answers
-  live, and the saves stay."
+  live, and the saves stay.
+
+  Quotients are decided back to front: whether a later quotient kills or
+  preserves RAX/RDX depends on whether that quotient keeps its own save,
+  so the scan needs the later decisions before it can make the earlier
+  ones (iteration 44 of the tournament; the forward-order version shipped
+  a miscompile that eight-lane straight-line kernels exposed)."
   [instructions]
-  (vec
-   (map-indexed
-    (fn [i {:mc/keys [encoding] :as instruction}]
-      (if (not= :x86-64/quotient-constant encoding)
-        instruction
-        (assoc instruction
-               :native/x86-save-rax
-               (x86-register-live-after? instructions i :x86-64/rax)
-               :native/x86-save-rdx
-               (x86-register-live-after? instructions i :x86-64/rdx))))
-    instructions)))
+  (let [quotient-indexes (keep-indexed
+                          (fn [i {:mc/keys [encoding]}]
+                            (when (= :x86-64/quotient-constant encoding) i))
+                          instructions)
+        decisions (reduce
+                   (fn [decisions i]
+                     (assoc decisions i
+                            {:save-rax (x86-register-live-after?
+                                        instructions i :x86-64/rax decisions)
+                             :save-rdx (x86-register-live-after?
+                                        instructions i :x86-64/rdx decisions)}))
+                   {}
+                   (reverse quotient-indexes))]
+    (vec
+     (map-indexed
+      (fn [i instruction]
+        (if-let [decision (get decisions i)]
+          (assoc instruction
+                 :native/x86-save-rax (:save-rax decision)
+                 :native/x86-save-rdx (:save-rdx decision))
+          instruction))
+      instructions))))
 
 (defn- x86-fold-adjacent-immediates [instructions]
   (letfn [(uses-before-redefinition [instructions register]
