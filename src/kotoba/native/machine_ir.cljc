@@ -4490,7 +4490,10 @@
                                 (:return-index bottom-test) false
                                 (:return bottom-test)))
               (concat prefix
-                      [(layout/relative-branch :aarch64/b-imm26 self-tail-body)])))
+                      [(layout/relative-branch
+                        (if (= :x86-64 isa)
+                          :x86-64/jmp-rel32 :aarch64/b-imm26)
+                        self-tail-body)])))
 
           :mc/instruction
           (if (or (= instruction-index (:return-index bottom-test))
