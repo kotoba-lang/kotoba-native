@@ -1375,6 +1375,52 @@
                     (range (inc (- (count words) (count serialized)))))
           "the serialized copy-after-shift order is gone"))))
 
+(deftest x86-surviving-numerator-fuses-into-lea
+  ;; `imul r10` clobbers only RAX and RDX, so a numerator in any other
+  ;; register is still there after the multiply: the add-numerator
+  ;; correction is one `lea r11,[rdx+left]` -- the fusion gcc spells as
+  ;; `lea (%rdx,%rcx),%r9` -- with no staging move before the multiply,
+  ;; and the subtract-numerator correction reads `left` directly.
+  ;; Divisors picked by branch, measured off `signed-division-magic`:
+  ;; 2147483647 is add-numerator (the Lehmer modulus kernel_deep divides
+  ;; by), -9 is subtract-numerator, 7 is neither.
+  (letfn [(runs [words run]
+            (count (filter (fn [i] (= run (subvec words i (+ i (count run)))))
+                           (range (inc (- (count words) (count run)))))))
+          (run? [words run] (pos? (runs words run)))]
+    (let [fused (vec (#'machine/x86-quotient-constant
+                      :x86-64/rcx :x86-64/rcx 2147483647 true false))]
+      (is (run? fused [0x4c 0x8d 0x1c 0x0a])
+          "lea r11,[rdx+rcx] folds numerator + high half into one instruction")
+      (is (run? fused [0x4c 0x89 0xda])
+          "the add branch still refreshes RDX: R11 diverged from it")
+      (is (not (run? fused [0x49 0x89 0xcb]))
+          "no mov r11,rcx staging move before the multiply")
+      (is (= 1 (runs fused [0x49 0x01 0xd3]))
+          "one add r11,rdx left: the sign correction -- the numerator add is gone"))
+    (let [staged (vec (#'machine/x86-quotient-constant
+                       :x86-64/rcx :x86-64/rax 2147483647 true false))]
+      (is (run? staged [0x49 0x89 0xc3])
+          "a numerator in RAX is about to be clobbered, so it still stages into R11")
+      (is (= 2 (runs staged [0x49 0x01 0xd3]))
+          "numerator add AND sign-correction add: the staged path keeps both")
+      (is (not (run? staged [0x4c 0x8d 0x1c 0x02]))
+          "no lea over a clobbered numerator: rax is stale after the multiply"))
+    (let [subtracted (vec (#'machine/x86-quotient-constant
+                           :x86-64/rcx :x86-64/rcx -9 true false))]
+      (is (run? subtracted [0x48 0x29 0xca])
+          "sub rdx,rcx reads the surviving numerator directly")
+      (is (not (run? subtracted [0x49 0x89 0xcb]))
+          "no staging move on the subtract-numerator path")
+      (is (not (run? subtracted [0x4c 0x89 0xda]))
+          "no RDX refresh either: SUB computed in RDX, so they already agree"))
+    (let [plain (vec (#'machine/x86-quotient-constant
+                      :x86-64/rcx :x86-64/rcx 7 true false))]
+      (is (run? plain [0x49 0x89 0xd3])
+          "the plain branch still copies the high half into R11")
+      (is (not (run? plain [0x4c 0x89 0xda]))
+          "but the RDX round trip of the same value is gone"))))
+
 (deftest aarch64-reciprocal-combines-the-sign-correction
   (let [bytes (#'machine/a64-quotient-constant
                :aarch64/x2 :aarch64/x0 2147483647 true)
