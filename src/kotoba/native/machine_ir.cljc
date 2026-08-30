@@ -2127,6 +2127,22 @@
      0x0f opcode
      (bit-or 0xc0 (bit-shift-left (bit-and d 7) 3) (bit-and s 7))]))
 
+(defn- x86-lea-sum [dst base index]
+  ;; lea dst, [base + index] -- REX.W 8D /r, SIB with scale 1, no displacement.
+  ;; In this mod=00 SIB form RBP and R13 cannot be the base and RSP cannot be
+  ;; the index; the caller keeps RDX as the base, which is neither.
+  (let [d (get x86-register-code dst)
+        b (get x86-register-code base)
+        x (get x86-register-code index)]
+    (when (or (nil? d) (nil? b) (nil? x)
+              (contains? #{:x86-64/rbp :x86-64/r13} base)
+              (= :x86-64/rsp index))
+      (reject! :mc-encode :unsupported-lea {:dst dst :base base :index index}))
+    [(bit-or 0x48 (if (>= d 8) 4 0) (if (>= x 8) 2 0) (if (>= b 8) 1 0))
+     0x8d
+     (bit-or 0x04 (bit-shift-left (bit-and d 7) 3))
+     (bit-or (bit-shift-left (bit-and x 7) 3) (bit-and b 7))]))
+
 (defn- x86-push [register]
   (let [code (get x86-register-code register)]
     (when-not (some? code)
@@ -2198,42 +2214,58 @@
     ;;   the register it pushes. When `left` is RAX the value is already in
     ;;   place and the instruction is nothing at all; otherwise a register move
     ;;   reaches it, since nothing has been clobbered yet.
-    ;; - the read AFTER the multiply does not either, if the numerator is put
-    ;;   in R11 first. R11 is outside MIR's allocator profile and is where the
-    ;;   result accumulates anyway, so `add r11,rdx` finishes the add-numerator
-    ;;   case with no separate move and no reload.
+    ;; - the read AFTER the multiply does not either: a numerator outside
+    ;;   RAX/RDX is still sitting in its own register when `imul r10` is done
+    ;;   (the multiply clobbers only those two), so the add-numerator case
+    ;;   folds it into the high half with a single `lea r11,[rdx+left]` -- the
+    ;;   same fusion gcc's idiom spells as `lea (%rdx,%rcx),%r9` -- and the
+    ;;   subtract case subtracts it directly. Only a numerator that lives in
+    ;;   RAX or RDX is staged in R11 first, because the multiply is about to
+    ;;   overwrite it (R11 is outside MIR's allocator profile and is where the
+    ;;   result accumulates anyway).
     ;;
-    ;; Together that removes two eight-byte stack reads per division and, in
-    ;; the add-numerator case, the `mov r11,rdx` as well.
+    ;; Together that removes two eight-byte stack reads per division and, for
+    ;; every steered lane, the staging move as well.
     (let [numerator? (or add-numerator? subtract-numerator?)
+          left-survives-multiply? (not (contains? #{:x86-64/rax :x86-64/rdx} left))
+          stage-numerator? (and numerator? (not left-survives-multiply?))
           move (fn [target source]
                  (if (= target source) [] (x86-rr 0x89 target source)))]
       (vec
        (concat
         (when save-rax? (x86-push :x86-64/rax))
         (when save-rdx? (x86-push :x86-64/rdx))
-        (when numerator? (move :x86-64/r11 left))
+        (when stage-numerator? (move :x86-64/r11 left))
         (move :x86-64/rax left)
         (when-not reciprocal-live? (x86-mov-imm :x86-64/r10 multiplier))
         ;; imul r10: signed RDX:RAX = RAX * R10
         [0x49 0xf7 0xea]
-        (cond
-          ;; r11 already holds the numerator; RDX holds the high half.
-          add-numerator? (x86-rr 0x01 :x86-64/r11 :x86-64/rdx)
-          ;; high - numerator, computed in RDX because it is already clobbered.
-          subtract-numerator? (concat (x86-rr 0x29 :x86-64/rdx :x86-64/r11)
-                                      (x86-rr 0x89 :x86-64/r11 :x86-64/rdx))
-          :else (x86-rr 0x89 :x86-64/r11 :x86-64/rdx))
-        ;; The sign bit is identical before and after the arithmetic shift,
-        ;; so copy the unshifted value into RDX first and let SAR and SHR run
-        ;; in parallel -- the serialized copy-after-shift form cost one
+        ;; The sign correction reads the UNSHIFTED value out of RDX so SAR and
+        ;; SHR run in parallel -- the serialized copy-after-shift form cost one
         ;; critical-path stage per quotient (the x86 port of the AArch64
         ;; change measured at +4.2% on the narrow chain; amu
         ;; docs/codegen-coscientist.md, iterations 18 and 40). RDX rather
-        ;; than R10: it is dead here in every branch above and the pop
-        ;; restores it regardless, which leaves R10 free to keep carrying
-        ;; the reciprocal into the next division.
-        (x86-rr 0x89 :x86-64/rdx :x86-64/r11)
+        ;; than R10: it is dead here in every branch and the pop restores it
+        ;; regardless, which leaves R10 free to keep carrying the reciprocal
+        ;; into the next division. Only the add-numerator branch has to copy
+        ;; R11 back into RDX: the subtract branch computes IN RDX and the
+        ;; plain branch copies FROM RDX, so both leave the two registers
+        ;; already agreeing and the copy there was a round trip of the same
+        ;; value.
+        (cond
+          ;; RDX holds the high half; the numerator is still in `left` unless
+          ;; the multiply forced it through the R11 staging slot.
+          add-numerator? (concat (if stage-numerator?
+                                   (x86-rr 0x01 :x86-64/r11 :x86-64/rdx)
+                                   (x86-lea-sum :x86-64/r11 :x86-64/rdx left))
+                                 (x86-rr 0x89 :x86-64/rdx :x86-64/r11))
+          ;; high - numerator, computed in RDX because it is already clobbered.
+          subtract-numerator? (concat (x86-rr 0x29 :x86-64/rdx
+                                              (if stage-numerator?
+                                                :x86-64/r11
+                                                left))
+                                      (x86-rr 0x89 :x86-64/r11 :x86-64/rdx))
+          :else (x86-rr 0x89 :x86-64/r11 :x86-64/rdx))
         (when (pos? shift) [0x49 0xc1 0xfb shift]) ; sar r11,shift
         [0x48 0xc1 0xea 0x3f] ; shr rdx,63
         (x86-rr 0x01 :x86-64/r11 :x86-64/rdx)
