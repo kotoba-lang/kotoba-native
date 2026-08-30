@@ -1951,25 +1951,19 @@
             (is (not-any? #(contains? spill-encodings (:mc/encoding %))
                           (:mc/instructions function)) target))
           (do
-            ;; The broader preserved-entry placement exposed an x86 host-call
-            ;; execution regression downstream. Its prior, qualified plan
-            ;; backs only the accumulator and remains explicit here.
-            (is (= 1 (:mc/frame-slots function)) target)
-            (is (= 2 (count (filter #(contains? spill-encodings (:mc/encoding %))
-                                    (:mc/instructions function)))) target)))
-        (if (= :aarch64 target)
-          (do
-            (is (= 1 (count (filter #(= :mc/reentry (:mc/op %))
-                                    (:mc/instructions function)))) target)
-            (is (= 1 (count (filter #(= :mc/recur (:mc/op %))
-                                    (:mc/instructions function)))) target)
-            (is (not-any? #(= :aarch64/tail-call (:mc/encoding %))
-                          (:mc/instructions function)) target))
-          (do
-            (is (= 1 (count (filter #(= :x86-64/tail-call (:mc/encoding %))
-                                    (:mc/instructions function)))) target)
-            (is (not-any? #(contains? #{:mc/reentry :mc/recur} (:mc/op %))
-                          (:mc/instructions function)) target)))))))
+            ;; x86 admits preserved entry homes only for this closed
+            ;; self-tail + guest-call shape. Runtime/capability callbacks keep
+            ;; their established scratch-and-slot path in kotoba-mir.
+            (is (zero? (:mc/frame-slots function)) target)
+            (is (not-any? #(contains? spill-encodings (:mc/encoding %))
+                          (:mc/instructions function)) target)))
+        (is (= 1 (count (filter #(= :mc/reentry (:mc/op %))
+                                (:mc/instructions function)))) target)
+        (is (= 1 (count (filter #(= :mc/recur (:mc/op %))
+                                (:mc/instructions function)))) target)
+        (is (not-any? #(= (keyword (name target) "tail-call")
+                          (:mc/encoding %))
+                      (:mc/instructions function)) target)))))
 
 (deftest string-index-self-recur-updates-all-three-explicit-parameter-homes
   ;; Regression for the minimized stale-third-parameter failure: the new
@@ -2449,17 +2443,16 @@
           "FP/LR prologue is emitted once")
       (is (= 1 (count (filter #{0xa8c17bfd} arm-words)))
           "only the returning arm tears the frame down"))
-    (testing "x86-64 remains on its independently qualified teardown path"
-      ;; Reusing the MIR frame is not yet safe for x86 helpers containing host
-      ;; callbacks. Keep its prior tail teardown until that ABI interaction has
-      ;; an execution proof; the AArch64 benchmark optimization must not widen
-      ;; its claim across an unqualified ISA.
-      (is (= 1 (subvector-count x86-code x86-fuel-cmp))
-          "the public entry prefix is reached again after tail teardown")
-      (is (= 1 (subvector-count x86-code x86-sub-frame))
-          "one static call-live prologue remains")
+    (testing "x86-64 reuses the same closed self-tail frame"
+      ;; The recur edge has its own charge and jumps after the one-time frame
+      ;; prologue. Runtime/capability callbacks remain outside the x86
+      ;; preserved-entry admission in kotoba-mir.
+      (is (= 2 (subvector-count x86-code x86-fuel-cmp))
+          "entry and self-tail edge each contain one fuel charge")
+      (is (= 2 (subvector-count x86-code x86-sub-frame))
+          "callee-save alignment and the call-context slot are each allocated once")
       (is (= 2 (subvector-count x86-code x86-add-frame))
-          "return and self-tail edges each release the frame"))))
+          "only the returning arm releases those two one-time allocations"))))
 
 (deftest production-loop-call-uses-direct-aarch64-cbnz
   (let [module (machine/compile-gmir :aarch64
@@ -2680,8 +2673,8 @@
     (is (= 2 (count (filter #{a64-fuel-ldr}
                             (a64-le-words (:code (arm/emit-program dependent-exit))))))
         "fallback retains entry and recur charges")
-    (is (= 1 (subvector-count (vec (:code (x86/emit-program pure))) x86-fuel-cmp))
-        "x86 remains unchanged and re-enters its ordinary public prefix")))
+    (is (= 2 (subvector-count (vec (:code (x86/emit-program pure))) x86-fuel-cmp))
+        "x86 keeps ordinary per-iteration charging on its direct recur edge")))
 
 (deftest bulk-fuel-requires-the-allocated-direct-recur-edge
   (let [mc (machine/compile-gmir :aarch64
