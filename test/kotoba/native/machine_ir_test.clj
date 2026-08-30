@@ -2908,3 +2908,46 @@
     (testing "the comparand is the operation's"
       (is (contains-subvector? acquire (word 0xf100023f)) "acquire compares against 0")
       (is (contains-subvector? release (word 0xf100063f)) "release compares against 1"))))
+(deftest x86-compare-setcc-agrees-with-the-movzx-byte
+  ;; amu #706 (measured 2026-08-30): for a comparison whose destination is
+  ;; rsi or rdi, the old encoding emitted the REX for the movzx but dropped
+  ;; it for the setcc, so the two halves of the pair addressed DIFFERENT
+  ;; bytes. Register codes 4-7 name SPL/BPL/SIL/DIL under a REX prefix and
+  ;; AH/CH/DH/BH without one, so `setcc` wrote the stale high-byte slot,
+  ;; the `movzx` zero-extended a byte that was never written, and the
+  ;; branch consumed arbitrary leftover register bits. In real programs
+  ;; this surfaced as SIGFPE (the (quot 1 0) out-of-bounds marker reaching
+  ;; a real idiv) or a silently wrong constant (`(vector-at [10 20 30] 1)`
+  ;; answered 10), while the same KIR ran correctly on AArch64, which has
+  ;; no such byte-register aliasing.
+  ;;
+  ;; Pinned at the private emitters, byte-exactly: the movzx always reads
+  ;; the LOW byte of the destination (its REX.W=1 is the 64-bit width), so
+  ;; the setcc must carry a REX exactly when the destination's byte name
+  ;; needs one (codes 4-7, the aliased high-byte slots, plus all extended
+  ;; registers), and its REX.B must agree with the movzx's.
+  (doseq [[register code] [[:x86-64/rax 0] [:x86-64/rcx 1] [:x86-64/rdx 2]
+                           [:x86-64/rbx 3] [:x86-64/rsi 6] [:x86-64/rdi 7]
+                           [:x86-64/r8 8] [:x86-64/r9 9] [:x86-64/r10 10]
+                           [:x86-64/r11 11] [:x86-64/r12 12] [:x86-64/r13 13]
+                           [:x86-64/r14 14] [:x86-64/r15 15]]
+          :let [setcc (#'machine/x86-setcc 0x94 register)
+                movzx (#'machine/x86-movzx-byte register)
+                movzx-rex (first movzx)
+                setcc-rex (let [b (first setcc)]
+                            (when (= 0x40 (bit-and b 0xf0)) b))]]
+    (testing (name register)
+      ;; movzx: REX.W always set (zero-extend to 64), REX.B per register
+      (is (= 0x48 (bit-and movzx-rex 0xf8)))
+      (is (= (>= code 8) (pos? (bit-and movzx-rex 1))))
+      ;; setcc: REX present exactly for the aliased/extended byte slots
+      (is (= (>= code 4) (some? setcc-rex)))
+      (when (some? setcc-rex)
+        (is (= (pos? (bit-and movzx-rex 1)) (pos? (bit-and setcc-rex 1)))
+            "both halves must select the byte with the same REX.B state"))))
+  ;; The exact bytes that shipped broken: `sete sil` used to come out with
+  ;; no REX, which the no-REX ModRM aliasing turns into `sete dh`.
+  (is (= [0x40 0x0f 0x94 0xc6] (#'machine/x86-setcc 0x94 :x86-64/rsi))
+      "sete into SIL carries the 0x40 REX that names the low byte")
+  (is (= [0x41 0x0f 0x94 0xc0] (#'machine/x86-setcc 0x94 :x86-64/r8))
+      "sete into R8B carries REX.B"))

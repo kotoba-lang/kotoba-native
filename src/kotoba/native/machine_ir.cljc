@@ -2473,11 +2473,25 @@
                   (le64 value)))))
 
 (defn- x86-compare [condition dst left right]
+  ;; The setcc/movzx pair must agree on WHICH byte of dst they mean.
+  ;; Register codes 4-7 are SPL/BPL/SIL/DIL only under a REX prefix; without
+  ;; one the same ModRM bytes address AH/CH/DH/BH. The old encoding emitted
+  ;; the REX for the movzx but dropped it for the setcc whenever dst was
+  ;; rsi/rdi, so `setcc` wrote the stale high-byte slot while `movzx` read
+  ;; the (never-written) low-byte slot -- the comparison's own answer was
+  ;; discarded, the branch consumed arbitrary leftover bits, and
+  ;; vector-region lowering's (quot 1 0) trap marker turned that into a
+  ;; real SIGFPE or a silently wrong constant (measured 2026-08-30: amu
+  ;; #706, native/vector_at returned 10 or died with SIGFPE on x86-64
+  ;; while AArch64 answered 20). Emitting the REX for BOTH instructions is
+  ;; required even when dst's code is 0-3: correctness only needs the two
+  ;; byte names to match, and the redundant 0x40 on low registers is one
+  ;; benign byte versus a fourth distinct encoding of the same pair.
   (let [d (get x86-register-code dst)]
     (when-not (some? d)
       (reject! :mc-encode :unsupported-register {:dst dst}))
     (vec (concat (x86-rr 0x39 left right)
-                 (when (>= d 8) [0x41])
+                 (when (>= d 4) [(bit-or 0x40 (if (>= d 8) 1 0))])
                  [0x0f condition (bit-or 0xc0 (bit-and d 7))
                   (bit-or 0x48 (if (>= d 8) 5 0)) 0x0f 0xb6
                   (bit-or 0xc0
