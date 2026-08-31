@@ -67,6 +67,16 @@
    'aiueos-task-exit-route {:arity 5 :symbol "kotoba_aiueos_task_exit_route"}
    'aiueos-service-task-transition {:arity 5 :symbol "kotoba_aiueos_service_task_transition"}
    'aiueos-rsa2048-sha256-verify {:arity 5 :symbol "kotoba_aiueos_rsa2048_sha256_verify"}
+   'aiueos-ecdsa-p256-public {:arity 3 :symbol "kotoba_aiueos_ecdsa_p256_public"}
+   'aiueos-ecdsa-p256-sign {:arity 5 :symbol "kotoba_aiueos_ecdsa_p256_sign"}
+   'aiueos-value-runtime-capability-grant {:arity 5 :symbol "kotoba_aiueos_value_runtime_capability_grant"}
+   'aiueos-value-runtime-capability-mutate {:arity 5 :symbol "kotoba_aiueos_value_runtime_capability_mutate"}
+   'aiueos-value-runtime-dispatch {:arity 5 :symbol "kotoba_aiueos_value_runtime_dispatch"}
+   'aiueos-value-runtime-entry {:arity 5 :symbol "kotoba_aiueos_value_runtime_entry"}
+   'aiueos-value-runtime-provider-claim {:arity 0 :symbol "kotoba_aiueos_value_runtime_provider_claim"}
+   'aiueos-value-runtime-provider-complete {:arity 5 :symbol "kotoba_aiueos_value_runtime_provider_complete"}
+   'aiueos-value-runtime-provider-status {:arity 2 :symbol "kotoba_aiueos_value_runtime_provider_status"}
+   'aiueos-value-runtime-publish-domain {:arity 1 :symbol "kotoba_aiueos_value_runtime_publish_domain"}
    ;; Network frame admission. The virtio-net driver owns the mechanism (queue
    ;; setup, DMA, doorbells); whether the bytes that came back are the reply it
    ;; asked for is a decision, and decisions are Kotoba objects here.
@@ -652,7 +662,10 @@
           ;; its 512 and hits the prologue `ud2` -- measured, not predicted:
           ;; that is exactly how it failed, as AIUEOS_EXCEPTION_FAIL
           ;; unexpected-vector (vector 6 is `ud2`).
-          rsa-fuel? (contains? '#{aiueos-rsa2048-sha256-verify aiueos-x25519}
+          rsa-fuel? (contains? '#{aiueos-rsa2048-sha256-verify aiueos-x25519
+                                  aiueos-ecdsa-p256-sha256-verify
+                                  aiueos-ecdsa-p256-sign
+                                  aiueos-ecdsa-p256-public}
                                object-entry)
           ;; Two Jacobian scalar muls plus inverses. The RSA/X25519
           ;; 250,000,000 tier is unmeasured for this object. Affine exhausted

@@ -109,6 +109,11 @@
    'aiueos-task-exit-route {:arity 5 :symbol "kotoba_aiueos_task_exit_route"}
    'aiueos-service-task-transition {:arity 5 :symbol "kotoba_aiueos_service_task_transition"}
    'aiueos-rsa2048-sha256-verify {:arity 5 :symbol "kotoba_aiueos_rsa2048_sha256_verify"}
+   'aiueos-dhcp-option-u32 {:arity 3 :symbol "kotoba_aiueos_dhcp_option_u32"}
+   'aiueos-dhcp-reply-valid {:arity 5 :symbol "kotoba_aiueos_dhcp_reply_valid"}
+   'aiueos-ecdsa-p256-public {:arity 3 :symbol "kotoba_aiueos_ecdsa_p256_public"}
+   'aiueos-ecdsa-p256-sha256-verify {:arity 5 :symbol "kotoba_aiueos_ecdsa_p256_sha256_verify"}
+   'aiueos-ecdsa-p256-sign {:arity 5 :symbol "kotoba_aiueos_ecdsa_p256_sign"}
    ;; Network frame admission. The virtio-net driver owns the mechanism (queue
    ;; setup, DMA, doorbells); whether the bytes that came back are the reply it
    ;; asked for is a decision, and decisions are Kotoba objects here.
@@ -763,7 +768,10 @@
           ;; its 512 and hits the prologue `ud2` -- measured, not predicted:
           ;; that is exactly how it failed, as AIUEOS_EXCEPTION_FAIL
           ;; unexpected-vector (vector 6 is `ud2`).
-          rsa-fuel? (contains? '#{aiueos-rsa2048-sha256-verify aiueos-x25519}
+          rsa-fuel? (contains? '#{aiueos-rsa2048-sha256-verify aiueos-x25519
+                                  aiueos-ecdsa-p256-sha256-verify
+                                  aiueos-ecdsa-p256-sign
+                                  aiueos-ecdsa-p256-public}
                                object-entry)
           context-fuel? (contains? '#{aiueos-user-context-build
                                      aiueos-kernel-context-build}
