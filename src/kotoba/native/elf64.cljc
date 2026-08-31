@@ -225,6 +225,15 @@
    {:arity 5 :symbol "kotoba_aiueos_value_runtime_syscall_plan"}
    'aiueos-value-runtime-cas-verify
    {:arity 5 :symbol "kotoba_aiueos_value_runtime_cas_verify"}
+   ;; `cas-verify` above compares a block against a 32-byte digest the caller
+   ;; supplies, and its contract declares `:identity {:cid-version 1 :codec
+   ;; :dag-cbor :multihash :sha2-256}` beside it -- a declaration, not a check.
+   ;; This row transcribes the symbol from
+   ;; `contracts/cid-v1-admit-v1.edn`, whose object reads those four prefix
+   ;; bytes out of the CID itself, so the machine decides which CID it holds
+   ;; rather than trusting that some digest it was handed is the right one.
+   'aiueos-cid-v1-admit
+   {:arity 5 :symbol "kotoba_aiueos_cid_v1_admit"}
    ;; IDT gate construction. Splitting a 64-bit handler address across an
    ;; interrupt descriptor's three offset fields is bit-packing, and getting it
    ;; wrong points a vector at the wrong address -- which is a silent, exploitable

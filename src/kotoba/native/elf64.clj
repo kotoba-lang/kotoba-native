@@ -71,6 +71,13 @@
    'aiueos-value-runtime-provider-claim {:arity 0 :symbol "kotoba_aiueos_value_runtime_provider_claim"}
    'aiueos-value-runtime-provider-complete {:arity 5 :symbol "kotoba_aiueos_value_runtime_provider_complete"}
    'aiueos-value-runtime-cas-verify {:arity 5 :symbol "kotoba_aiueos_value_runtime_cas_verify"}
+   ;; The CID envelope beside the digest. `cas-verify` above compares a block
+   ;; against 32 bytes the caller supplies, and its contract declares
+   ;; `:identity {:cid-version 1 :codec :dag-cbor :multihash :sha2-256}` next
+   ;; to it -- a declaration, not a check. This object reads those four prefix
+   ;; bytes out of the CID. Symbol transcribed from aiueos
+   ;; `contracts/cid-v1-admit-v1.edn`.
+   'aiueos-cid-v1-admit {:arity 5 :symbol "kotoba_aiueos_cid_v1_admit"}
    'aiueos-capability-mutation-plan {:arity 5 :symbol "kotoba_aiueos_capability_mutation_plan"}
    'aiueos-service-lifecycle {:arity 4 :symbol "kotoba_aiueos_service_lifecycle"}
    'aiueos-service-registry-build {:arity 5 :symbol "kotoba_aiueos_service_registry_build"}
@@ -554,7 +561,7 @@
           context (into (vec (repeat 8 0))
                         (concat (le (artifact-fuel artifact) 8)
                                 (repeat (- kernel-image-context-size 16) 0)))
-          names (mapv int (.getBytes " .text .data .shstrtab " "UTF-8"))
+          names (mapv int (.getBytes "\u0000.text\u0000.data\u0000.shstrtab\u0000" "UTF-8"))
           names-offset (+ data-offset kernel-image-context-size)
           section-offset (+ names-offset (count names)
                             (mod (- 8 (mod (+ names-offset (count names)) 8)) 8))
