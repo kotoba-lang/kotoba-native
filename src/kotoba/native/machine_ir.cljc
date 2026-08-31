@@ -4289,14 +4289,29 @@
                   (not (contains? #{"call" "tail-call"} (name encoding)))))
            instructions)
     instructions
-    (let [occurrences
+    (let [;; Keyed by `const-key`, not by the i64 itself. This map is the one
+          ;; collection here that grows with the leaf: `cache` and `loaded`
+          ;; hold at most one entry per cache register, so they stay array
+          ;; maps and compare with `=`, but a leaf with more than eight
+          ;; distinct constants turns this one into a hash map, and hashing a
+          ;; ClojureScript i64 throws on a BigInt primitive. That is why
+          ;; `kernel_deep.kotoba` -- this repository's own 24-lane benchmark
+          ;; fixture -- answered `internal compiler error` on the NBB front
+          ;; while the JVM front compiled it, and why a small leaf did not.
+          ;; Same failure `const-key` was introduced for on x86-64; the
+          ;; AArch64 path had not adopted it.
+          occurrences
           (reduce (fn [out [index {:mc/keys [encoding] :as instruction}]]
                     (if (= :aarch64/constant encoding)
-                      (update out (:mir/value instruction) (fnil conj []) index)
+                      (let [value (:mir/value instruction)]
+                        (update out (const-key value)
+                                (fn [entry]
+                                  (-> (or entry {:value value :indexes []})
+                                      (update :indexes conj index)))))
                       out))
                   {} (map-indexed vector instructions))
           selected (->> occurrences
-                        (keep (fn [[value indexes]]
+                        (keep (fn [[_ {:keys [value indexes]}]]
                                 (when (> (count indexes) 1)
                                   {:value value :first (first indexes)
                                    :saving (* (dec (count indexes))
