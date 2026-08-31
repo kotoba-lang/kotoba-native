@@ -234,6 +234,13 @@
    ;; rather than trusting that some digest it was handed is the right one.
    'aiueos-cid-v1-admit
    {:arity 5 :symbol "kotoba_aiueos_cid_v1_admit"}
+   ;; The UnixFS file root beside the leaf. `cid-v1-admit` above verifies ONE
+   ;; block, and SHA-256 there caps a block at 12,288 bytes; the artifacts
+   ;; aiueos fetches are gigabytes. A UnixFS root names its children by CID, so
+   ;; an unbounded file is verified block by block against one name. Symbol
+   ;; transcribed from aiueos `contracts/unixfs-file-admit-v1.edn`.
+   'aiueos-unixfs-file-admit
+   {:arity 4 :symbol "kotoba_aiueos_unixfs_file_admit"}
    ;; IDT gate construction. Splitting a 64-bit handler address across an
    ;; interrupt descriptor's three offset fields is bit-packing, and getting it
    ;; wrong points a vector at the wrong address -- which is a silent, exploitable

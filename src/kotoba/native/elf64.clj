@@ -78,6 +78,12 @@
    ;; bytes out of the CID. Symbol transcribed from aiueos
    ;; `contracts/cid-v1-admit-v1.edn`.
    'aiueos-cid-v1-admit {:arity 5 :symbol "kotoba_aiueos_cid_v1_admit"}
+   ;; The UnixFS file root beside the leaf. `cid-v1-admit` above verifies ONE
+   ;; block, and SHA-256 there caps a block at 12,288 bytes; the artifacts
+   ;; aiueos fetches are gigabytes. A UnixFS root names its children by CID, so
+   ;; an unbounded file is verified block by block against one name. Symbol
+   ;; transcribed from aiueos `contracts/unixfs-file-admit-v1.edn`.
+   'aiueos-unixfs-file-admit {:arity 4 :symbol "kotoba_aiueos_unixfs_file_admit"}
    'aiueos-capability-mutation-plan {:arity 5 :symbol "kotoba_aiueos_capability_mutation_plan"}
    'aiueos-service-lifecycle {:arity 4 :symbol "kotoba_aiueos_service_lifecycle"}
    'aiueos-service-registry-build {:arity 5 :symbol "kotoba_aiueos_service_registry_build"}
