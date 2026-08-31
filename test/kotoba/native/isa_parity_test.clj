@@ -901,3 +901,53 @@
            clojure.lang.ExceptionInfo #"(undeclared field|invalid-projection)"
            (emit (handle-program (list 'let ['h '(mk)]
                                        (list 'record-get pair-rec 'h :nope)))))))))
+
+
+;; ---------------------------------------------------------------------------
+;; The FALLBACK u32 emitters must not be weaker than the machine-IR path
+;; ---------------------------------------------------------------------------
+
+(defn- bytes-only [tokens] (vec (filter integer? tokens)))
+
+(defn- index-of [needle hay]
+  (first (keep-indexed #(when (= needle (vec %2)) %1)
+                       (partition (count needle) 1 hay))))
+
+(deftest fallback-u32-emitters-check-the-index-before-adding-four
+  ;; `emit-program` routes word-typed expressions through machine-IR, whose u32
+  ;; lowering proves `index < length` and then `length - index >= 4` -- pinned
+  ;; by `u32-accesses-reserve-four-bytes-not-one` above. The direct emitters
+  ;; here are the fallback for everything else, and they used a different form:
+  ;; `index + 4 > length`, computed with a 64-bit add that wraps. An index in
+  ;; [2^64-4, 2^64-1] wrapped to 0..3, compared below any length, and addressed
+  ;; the four bytes BEFORE the window.
+  ;;
+  ;; Measured 2026-08-31 by instrumenting both x86-64 vars: nothing reached
+  ;; them, including a recursive walker that leaves the pilot path. Being
+  ;; unreached today is not being unreachable, so the guard is added and pinned
+  ;; rather than the emitters deleted.
+  (let [emit-load (ns-resolve 'kotoba.native.x86-64 'emit-kernel-load-u32)
+        emit-store (ns-resolve 'kotoba.native.x86-64 'emit-kernel-store-u32)
+        ctx {:tail? false :temp-depth 0 :mir-label-counter (atom -1)}]
+    (testing "x86-64 load compares index against length before the wrapping lea"
+      (let [code (bytes-only (emit-load [4096 512 0] 512 {} ctx))
+            cmp-at (index-of [0x48 0x39 0xc8] code)      ; cmp rax,rcx
+            lea-at (index-of [0x48 0x8d 0x70 0x04] code)] ; lea rsi,[rax+4]
+        (is (some? cmp-at) "cmp rax,rcx (index vs length) must be emitted")
+        (is (some? lea-at) "lea rsi,[rax+4] must still be emitted")
+        (is (< cmp-at lea-at) "the index check must precede the wrapping add")))
+    (testing "x86-64 store compares index against length before the wrapping lea"
+      (let [code (bytes-only (emit-store [4096 512 0 7] 512 {} ctx))
+            cmp-at (index-of [0x48 0x39 0xcf] code)      ; cmp rdi,rcx
+            lea-at (index-of [0x48 0x8d 0x77 0x04] code)]
+        (is (some? cmp-at) "cmp rdi,rcx (index vs length) must be emitted")
+        (is (some? lea-at))
+        (is (< cmp-at lea-at))))
+    (testing "AArch64's shared bounds check does the same"
+      (let [check (ns-resolve 'kotoba.native.aarch64 'bounds-check-u32)
+            code (bytes-only (check 512 "trap"))
+            cmp-at (index-of [0x7f 0x00 0x02 0xeb] code)  ; cmp x3,x2
+            add-at (index-of [0x65 0x10 0x00 0x91] code)] ; add x5,x3,#4
+        (is (some? cmp-at) "cmp x3,x2 (index vs length) must be emitted")
+        (is (some? add-at) "add x5,x3,#4 must still be emitted")
+        (is (< cmp-at add-at) "the index check must precede the wrapping add")))))

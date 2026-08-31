@@ -453,6 +453,13 @@
           (insn 0xeb04005f)          ; cmp x2, x4  (length vs maximum)
           [(layout/relative-branch :aarch64/b-hi-imm19 trap-label)]
           [(layout/relative-branch :aarch64/cbz-x1-imm19 trap-label)]
+          ;; `index < length` FIRST. `add x5, x3, #4` below wraps modulo 2^64
+          ;; like every other 64-bit add, so without this an index in
+          ;; [2^64-4, 2^64-1] wrapped to 0..3, compared below any length, and
+          ;; addressed the four bytes BEFORE the window. With `length` already
+          ;; bounded by the profile maximum, `index + 4` cannot reach 2^64.
+          (insn 0xeb02007f)          ; cmp x3, x2       (index vs length)
+          [(layout/relative-branch :aarch64/b-hs-imm19 trap-label)]
           (insn 0x91001065)          ; add x5, x3, #4   (index + 4)
           (insn 0xeb0200bf)          ; cmp x5, x2       (index+4 vs length)
           [(layout/relative-branch :aarch64/b-hi-imm19 trap-label)]))

@@ -686,12 +686,28 @@
 ;; "unknown call target".
 ;;
 ;; The checks mirror `emit-kernel-load-u8` exactly -- profile maximum, non-null
-;; base, in-range index -- with ONE deliberate difference matching AArch64's
-;; own `bounds-check-u32`: a four-byte access needs `index + 4 <= length`, not
+;; base, in-range index -- plus one more matching AArch64's own
+;; `bounds-check-u32`: a four-byte access needs `index + 4 <= length`, not
 ;; `index < length`, so the last three bytes of a buffer cannot be read or
-;; written past. `lea` computes `index + 4` without disturbing the index, and
-;; the comparison is unsigned (`ja`), so an index near 2^64 wraps into the trap
-;; rather than out of it.
+;; written past.
+;;
+;; `index < length` is checked FIRST, and that ordering is the whole
+;; correctness of the `lea` below. This comment used to claim that an index
+;; near 2^64 "wraps into the trap rather than out of it", which is true of
+;; every index except four: `lea` computes `index + 4` modulo 2^64, so
+;; [2^64-4, 2^64-1] wrapped to 0..3, compared below any length, and addressed
+;; the four bytes BEFORE the window. The `jae` now above it refuses every
+;; index at or past `length`, and since `length` is already bounded by the
+;; profile maximum, `index + 4` cannot reach 2^64 at all.
+;;
+;; These two emitters are a FALLBACK. `emit-program` routes word-typed
+;; expressions through `kotoba.native.machine-ir`, whose u32 lowering proves
+;; `index < length` and then `length - index >= 4` -- a form that cannot wrap
+;; by construction, pinned by `u32-accesses-reserve-four-bytes-not-one`.
+;; Measured 2026-08-31 by instrumenting both vars: no shape tried reached
+;; them, including a recursive walker that leaves the pilot path. A fallback
+;; nothing currently reaches is still a fallback, and it must not be the
+;; weaker of the two.
 ;;
 ;; Every `rel32` below is the distance from the end of its own jump to the UD2,
 ;; recomputed for this body's instruction lengths rather than copied from the
@@ -711,6 +727,8 @@
         [(layout/relative-branch :x86-64/ja-rel32 trap-label)]
         [0x48 0x85 0xd2]
         [(layout/relative-branch :x86-64/jz-rel32 trap-label)]
+        [0x48 0x39 0xc8]                         ; cmp rax,rcx  (index vs length)
+        [(layout/relative-branch :x86-64/jae-rel32 trap-label)]
         [0x48 0x8d 0x70 0x04 0x48 0x39 0xce]
         [(layout/relative-branch :x86-64/ja-rel32 trap-label)]
         [0x8b 0x04 0x02]
@@ -735,6 +753,8 @@
         [(layout/relative-branch :x86-64/ja-rel32 trap-label)]
         [0x48 0x85 0xd2]
         [(layout/relative-branch :x86-64/jz-rel32 trap-label)]
+        [0x48 0x39 0xcf]                         ; cmp rdi,rcx  (index vs length)
+        [(layout/relative-branch :x86-64/jae-rel32 trap-label)]
         [0x48 0x8d 0x77 0x04 0x48 0x39 0xce]
         [(layout/relative-branch :x86-64/ja-rel32 trap-label)]
         [0x89 0x04 0x3a]
