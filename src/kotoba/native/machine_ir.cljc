@@ -338,7 +338,27 @@
    'vector-f64-count :vector-count
    'vector-f64-at :vector-at
    'vector-f64-assoc :vector-assoc
-   'vector-f64-drop :vector-drop})
+   'vector-f64-drop :vector-drop
+   ;; ABI v4 (superproject ADR-2609010200). Two host slots the six above
+   ;; cannot express, and the two KIR heads that reach them.
+   ;;
+   ;; `vector-alloc` is n zeros in one call. `vector-new` is variadic, so a
+   ;; struct of arrays with a million slots would need a million arguments in
+   ;; source -- the literal limit refuses that long before the item limit
+   ;; does.
+   ;;
+   ;; `vector-assoc!` is the same operation as `vector-assoc` in KIR, on
+   ;; purpose: the bang says the caller has proved the handle is dead
+   ;; afterwards, which lets a BACKEND lower the update to a store instead of
+   ;; a copy. That is a lowering, not a semantics -- so the reference
+   ;; interpreter must not distinguish them, and this table is the one place
+   ;; where the distinction is allowed to exist.
+   ;;
+   ;; Neither gains an f64 twin, because KIR declares neither
+   ;; `vector-f64-alloc` nor `vector-f64-assoc!`. The `vector-op-aliases`
+   ;; tables in both legacy backends are correspondingly unchanged.
+   'vector-alloc :vector-alloc
+   'vector-assoc! :vector-assoc-in-place})
 
 (def ^:private native-clock-request-type
   [:variant :kotoba.clock/request [[:wall :bool] [:monotonic :bool]]])
