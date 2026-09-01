@@ -59,6 +59,60 @@
                         (x86-context-call 152)))))
 
 ;; ---------------------------------------------------------------------------
+;; ABI v4: the two operations the copying table could not express
+;; ---------------------------------------------------------------------------
+
+;; `ldr x16, [x7, #offset]` -- how AArch64 loads a context slot before
+;; `blr x16`. The offset is scaled by 8 and sits in imm12, so this is the
+;; AArch64 twin of `x86-context-call` above.
+(defn- arm-context-load [offset]
+  (let [word (bit-or 0xf9400000 (bit-shift-left (quot offset 8) 10)
+                     (bit-shift-left 7 5) 16)]
+    [(bit-and word 0xff) (bit-and (bit-shift-right word 8) 0xff)
+     (bit-and (bit-shift-right word 16) 0xff) (bit-and (bit-shift-right word 24) 0xff)]))
+
+;; The whole reason `vector-assoc!` exists is that it calls a DIFFERENT slot
+;; from `vector-assoc`. If it called 184 the program would still compute the
+;; right answer -- a copy and an in-place write are indistinguishable on a
+;; handle the caller has proved dead, which is exactly why the KIR interpreter
+;; refuses to tell them apart -- and the only thing lost would be the cost
+;; model the operation exists for. So a test that only checked the ANSWER
+;; could not see this regression at all; nothing but the emitted slot can.
+(deftest abi-v4-operations-call-their-own-context-slot
+  (doseq [[body offset] [['(vector-alloc n) 200]
+                         ['(vector-assoc! v i x) 208]]]
+    (testing (str body)
+      (is (= 1 (occurrences (code x86/emit-program '[v i x n] body)
+                            (x86-context-call offset)))
+          "x86-64: exactly one call, to this operation's own slot")
+      (is (= 1 (occurrences (code arm/emit-program '[v i x n] body)
+                            (arm-context-load offset)))
+          "AArch64: exactly one context load, of this operation's own slot"))))
+
+(deftest the-bang-is-the-only-difference-between-the-store-and-the-copy
+  (let [copy (code x86/emit-program '[v i x] '(vector-assoc v i x))
+        store (code x86/emit-program '[v i x] '(vector-assoc! v i x))]
+    (is (= 1 (occurrences copy (x86-context-call 184))))
+    (is (= 0 (occurrences copy (x86-context-call 208))))
+    (is (= 1 (occurrences store (x86-context-call 208))))
+    (is (= 0 (occurrences store (x86-context-call 184)))
+        "the store must not reach the allocating slot")
+    (is (= (count copy) (count store))
+        "same shape, same size -- only the slot number differs")))
+
+;; KIR declares no `vector-f64-alloc` and no `vector-f64-assoc!`, so unlike
+;; every operation in `vector-op-aliases` these two have no f64 twin to stay
+;; in step with. Pinned so that adding one later is a deliberate act rather
+;; than something that quietly starts working.
+(deftest the-abi-v4-operations-have-no-f64-twin
+  (doseq [body ['(vector-f64-alloc n) '(vector-f64-assoc! v i x)]]
+    (testing (str body)
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (code x86/emit-program '[v i x n] body)))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (code arm/emit-program '[v i x n] body))))))
+
+;; ---------------------------------------------------------------------------
 ;; Construction is linear
 ;; ---------------------------------------------------------------------------
 

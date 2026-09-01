@@ -577,7 +577,13 @@
    ;; stay inside LDR's unsigned-offset imm12 range (8 * 4095), the same
    ;; range `ldr-context` already encodes for every offset above.
    'vector-new-empty 152 'vector-conj 160 'vector-count 168
-   'vector-at 176 'vector-assoc 184 'vector-drop 192})
+   'vector-at 176 'vector-assoc 184 'vector-drop 192
+   ;; ABI v4 (superproject ADR-2609010200). `vector-alloc` allocates n zeros
+   ;; in one call; `vector-assoc!` is the same update as `vector-assoc`
+   ;; lowered to a STORE, returning the same handle rather than a new one.
+   ;; Both stay inside LDR's unsigned-offset imm12 range (8 * 4095), like
+   ;; every offset above.
+   'vector-alloc 200 'vector-assoc! 208})
 
 ;; `vector-f64-*` is the SAME host table. A native f64 is already an i64 word
 ;; carrying an IEEE-754 bit pattern (ADR-2608030300: "no new value
@@ -1182,7 +1188,8 @@
                       string-byte-length string=? string-concat
                       string-substring string-code-point-at
                       vector-new-empty vector-conj vector-count
-                      vector-at vector-assoc vector-drop} op)
+                      vector-at vector-assoc vector-drop
+                      vector-alloc vector-assoc!} op)
         (emit-heap-call op args env depth)
         ;; Pure representation changes: the bits are already in x0.
         (contains? '#{f64-from-bits f64-to-bits} op)
