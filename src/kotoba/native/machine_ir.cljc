@@ -12,6 +12,7 @@
             [kotoba.codegen.mc :as mc]
             [kotoba.codegen.layout :as layout]
             [kotoba.native.aggregate-abi :as aggregate-abi]
+            [kotoba.native.image-scratch :as image-scratch]
             [kotoba.native.interrupt-abi :as interrupt-abi]
             [kotoba.native.string-index :as string-index]
             [kotoba.native.string-search :as string-search]
@@ -521,7 +522,13 @@
    ;; need. It rides this channel because it takes one ordinary operand and
    ;; names no memory window; the answer is a load from the image's kernel
    ;; context, not an address this encoder knows.
-   'kernel-isr-entry-address :isr-entry-address})
+   'kernel-isr-entry-address :isr-entry-address
+   ;; boot-scratch: the base of the writable area the image packager reserves
+   ;; (kotoba-gmir ADR-0013). It rides this channel because it takes no
+   ;; operand and names no memory window, exactly as `:boot-info` does -- and
+   ;; unlike `:boot-info` its answer is an ADDRESS this encoder computes
+   ;; rather than a word read out of the context.
+   'kernel-scratch-region :scratch-region})
 
 ;; boot-lit: the literal heads. NOT in the table above, because a privileged
 ;; action's operands are registers and these take a piece of the source text.
@@ -537,6 +544,12 @@
 ;; the address is derived from -- deriving it anywhere else would be a second
 ;; place that has to agree about what a literal is.
 (def ^:private kir-rodata-length-op 'bytes-literal-length)
+
+;; boot-scratch: the address of a function in the same module. NOT in the
+;; privileged table either, and for the literal heads' reason: the operand is
+;; a NAME, and a privileged action's operands are virtual registers by the
+;; time this lowering is done with them.
+(def ^:private kir-function-address-op 'kernel-function-address)
 
 (def ^:private kir-runtime-ops
   {'pair :pair
@@ -1848,6 +1861,21 @@
                      :gmir/value (count (gmir/rodata-bytes :hex-bytes content))}]
                    dst])
 
+                ;; boot-scratch: the address of a named function. The name is
+                ;; carried on the instruction rather than lowered to an
+                ;; operand -- kotoba-gmir resolves it against the module's own
+                ;; function list, and the backend's label table is what the
+                ;; layout pass fills in.
+                (and (seq? form) (= kir-function-address-op (first form)))
+                (let [name (second form)
+                      dst (fresh-reg)]
+                  (when-not (and (= 2 (count form)) (simple-symbol? name))
+                    (reject! :kir-to-gmir :function-address-name
+                             {:form form}))
+                  [[{:gmir/op :gmir/function-address :gmir/dst dst
+                     :gmir/function name}]
+                   dst])
+
                 (and (seq? form)
                      (contains? kir-x86-privileged-ops (first form)))
                 (let [action (get kir-x86-privileged-ops (first form))
@@ -2226,6 +2254,17 @@
                          (= kir-rodata-length-op (first form)))
                      (= 2 (count form))
                      (string? (second form)))
+                :scalar
+
+                ;; boot-scratch: an address is one word. The argument's shape
+                ;; is deliberately not consulted for the reason above -- it is
+                ;; a function NAME, whose shape here would be read as a local
+                ;; reference, and the lowering refuses anything but a simple
+                ;; symbol.
+                (and (seq? form)
+                     (= kir-function-address-op (first form))
+                     (= 2 (count form))
+                     (simple-symbol? (second form)))
                 :scalar
 
                 (and (seq? form) (contains? kir-runtime-ops (first form))
@@ -5905,6 +5944,22 @@
       ;; at the identical cost.
       :system-table
       (finish [0x4d 0x8b 0x51 0x58] :x86-64/r10)
+      ;; boot-scratch: `lea r10,[r9+0x60]` -- REX.W+R+B (0x4d), 0x8d, a mod-01
+      ;; ModRM with reg=010 (R10) and rm=001 (R9), and the displacement as a
+      ;; disp8. FOUR bytes, one more than a `mov` would need to be, and it is
+      ;; an `lea` rather than a `mov` precisely because nothing is read: the
+      ;; answer is the ADDRESS of the reservation, not a word stored in it.
+      ;;
+      ;; `:boot-info` one line up is `mov r10,[r9+0x50]` -- the same ModRM
+      ;; byte shape with the load opcode. That is the whole difference between
+      ;; "the word the firmware handed us" and "somewhere we may write".
+      ;;
+      ;; The offset is `kotoba.native.image-scratch`'s, not this file's: the
+      ;; packager that reserves the bytes reads the same var, and that
+      ;; namespace fails closed if the offset ever exceeds the disp8 this
+      ;; encoding assumes.
+      :scratch-region
+      (finish [0x4d 0x8d 0x51 image-scratch/offset] :x86-64/r10)
       ;; `:load-ptr` is `mov r10,[r10+r11]` -- one unchecked 64-bit read at
       ;; the address the firmware handed over. R10/R11 are the encoder's
       ;; scratch pair and are never in the allocator's pool, so copying into
@@ -6384,6 +6439,17 @@
                         (unsigned-bit-shift-right displacement 16)
                         (unsigned-bit-shift-right displacement 24)])))
 
+(defn- x86-lea-rip-code
+  "The seven bytes, given the destination's register CODE. Split out from
+  `x86-lea-rip` because the layout table's operands are codes, not register
+  keywords -- kotoba-codegen ADR-0011 -- and the two callers must not grow
+  two encodings of one instruction."
+  [code displacement]
+  (vec (concat [(bit-or 0x48 (if (>= code 8) 4 0))
+                0x8d
+                (bit-or 0x05 (bit-shift-left (bit-and code 7) 3))]
+               (u32le (bit-and displacement 0xffffffff)))))
+
 (defn- encode-layout-branch [{:mir/keys [encoding operands]} displacement]
   (case encoding
     :x86-64/jz-rel32 (into [0x0f 0x84] (subvec (relative32 0 displacement) 1))
@@ -6393,6 +6459,10 @@
     :x86-64/jmp-rel32 (relative32 0xe9 displacement)
     :x86-64/call-rel32 (relative32 0xe8 displacement)
     :x86-64/jne-rel8 [0x75 (byte-value displacement)]
+    ;; boot-scratch: `lea dst,[rip+disp32]`, resolved against a function's
+    ;; label rather than a literal pool offset. Same seven bytes and the same
+    ;; ModRM as the pool's `lea`, which is why they share `x86-lea-rip-code`.
+    :x86-64/lea-rip-label (x86-lea-rip-code (first operands) displacement)
     :aarch64/cbz-imm19
     (u32le (bit-or 0xb4000000
                    (bit-shift-left (bit-and (quot displacement 4) 0x7ffff) 5)
@@ -6443,10 +6513,7 @@
   (let [code (get x86-register-code dst)]
     (when-not (some? code)
       (reject! :mc-encode :unsupported-register {:register dst}))
-    (vec (concat [(bit-or 0x48 (if (>= code 8) 4 0))
-                  0x8d
-                  (bit-or 0x05 (bit-shift-left (bit-and code 7) 3))]
-                 (u32le (bit-and displacement 0xffffffff))))))
+    (x86-lea-rip-code code displacement)))
 
 (defn- align-to [value alignment]
   (* alignment (quot (+ value (dec alignment)) alignment)))
@@ -7388,6 +7455,27 @@
           (if (or (= instruction-index (:return-index bottom-test))
                   (= instruction-index (:constant-index identity-hoist)))
             []
+            (if (= "function-address" (name (:mc/encoding instruction)))
+              ;; boot-scratch: the address of a function, resolved against the
+              ;; SAME label table a call resolves against. It is here rather
+              ;; than in `encode-selected` for exactly that reason -- that
+              ;; function is handed one instruction and no module, and a
+              ;; function's label is a property of the module.
+              ;;
+              ;; `:mc-encode :unknown-function-address-target` rather than the
+              ;; call's `:unknown-call-target`: a program that takes the
+              ;; address of a name it did not define contains no call to that
+              ;; name, so the call's message would describe something the
+              ;; source does not have. kotoba-gmir refuses the same program;
+              ;; this is the floor under it.
+              (let [callee (:mir/function instruction)
+                    label (get callee-labels callee)
+                    code (get x86-register-code (:mir/dst instruction))]
+                (when-not label
+                  (reject! :mc-encode :unknown-function-address-target instruction))
+                (when-not (some? code)
+                  (reject! :mc-encode :unsupported-register instruction))
+                [(layout/relative-branch :x86-64/lea-rip-label label [code])])
             (if (contains? #{"call" "tail-call"}
                          (name (:mc/encoding instruction)))
               (let [callee (:mir/callee instruction)
@@ -7405,7 +7493,7 @@
                       :x86-64/call-rel32 :aarch64/bl-imm26)
                     label)]))
               (encode-selected isa frame-bytes return-suffix instruction-index
-                               load-multiplier? instruction)))
+                               load-multiplier? instruction))))
           :mc/branch-zero
           (if (= :x86-64 isa)
             (concat (x86-rr 0x85 test test)
