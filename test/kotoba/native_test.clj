@@ -171,6 +171,76 @@
     (is (= [0xf2 0x0f 0x51 0xc0 0x66 0x48 0x0f 0x7e 0xc0]
            (vec (take-last 9 (emit86 (list 'f64-sqrt (list 'f64-from-bits 1)))))))))
 
+;; ── f64 min/max: MINSD/MAXSD are not the operation ───────────────────────
+;;
+;; The definition is the KIR interpreter (`Math/min`/`Math/max`; `js/Math.min`
+;; on cljs), which propagates NaN and orders -0.0 below +0.0. A bare
+;; `minsd xmm0,xmm1` computes `(a<b) ? a : b` and therefore returns the second
+;; operand in exactly those cases. Measured through the Rosetta loader on
+;; 2026-09-02, that was six wrong answers out of twelve NaN/zero rows, with
+;; AArch64 right on all twelve. These goldens pin the corrected sequence; every
+;; byte was assembled with `llvm-mc -arch=x86-64 -show-encoding`.
+
+(def ^:private x86-f64-min-bytes
+  [0x66 0x0f 0x28 0xd0        ; movapd xmm2, xmm0
+   0x66 0x0f 0x28 0xd8        ; movapd xmm3, xmm0
+   0xf2 0x0f 0xc2 0xd1 0x00   ; cmpeqsd xmm2, xmm1
+   0x66 0x0f 0x56 0xd9        ; orpd xmm3, xmm1
+   0x66 0x0f 0x54 0xda        ; andpd xmm3, xmm2
+   0x66 0x0f 0x28 0xe0        ; movapd xmm4, xmm0
+   0xf2 0x0f 0x5d 0xc1        ; minsd xmm0, xmm1
+   0x66 0x0f 0x55 0xd0        ; andnpd xmm2, xmm0
+   0x66 0x0f 0x56 0xda        ; orpd xmm3, xmm2
+   0x66 0x0f 0x28 0xc4        ; movapd xmm0, xmm4
+   0xf2 0x0f 0xc2 0xc0 0x03   ; cmpunordsd xmm0, xmm0
+   0x66 0x0f 0x54 0xe0        ; andpd xmm4, xmm0
+   0x66 0x0f 0x55 0xc3        ; andnpd xmm0, xmm3
+   0x66 0x0f 0x56 0xc4])      ; orpd xmm0, xmm4
+
+(def ^:private x86-f64-max-bytes
+  ;; The same sequence with ANDPD for the equal-inputs fixup (so +0.0 wins
+  ;; instead of -0.0) and MAXSD for the ordered select. Written out rather than
+  ;; derived from the min bytes by index: an off-by-one in the derivation would
+  ;; make this golden agree with whatever the emitter produced.
+  [0x66 0x0f 0x28 0xd0        ; movapd xmm2, xmm0
+   0x66 0x0f 0x28 0xd8        ; movapd xmm3, xmm0
+   0xf2 0x0f 0xc2 0xd1 0x00   ; cmpeqsd xmm2, xmm1
+   0x66 0x0f 0x54 0xd9        ; andpd xmm3, xmm1
+   0x66 0x0f 0x54 0xda        ; andpd xmm3, xmm2
+   0x66 0x0f 0x28 0xe0        ; movapd xmm4, xmm0
+   0xf2 0x0f 0x5f 0xc1        ; maxsd xmm0, xmm1
+   0x66 0x0f 0x55 0xd0        ; andnpd xmm2, xmm0
+   0x66 0x0f 0x56 0xda        ; orpd xmm3, xmm2
+   0x66 0x0f 0x28 0xc4        ; movapd xmm0, xmm4
+   0xf2 0x0f 0xc2 0xc0 0x03   ; cmpunordsd xmm0, xmm0
+   0x66 0x0f 0x54 0xe0        ; andpd xmm4, xmm0
+   0x66 0x0f 0x55 0xc3        ; andnpd xmm0, xmm3
+   0x66 0x0f 0x56 0xc4])      ; orpd xmm0, xmm4
+
+(deftest x86-f64-min-max-do-not-trust-minsd
+  (testing "the emitted tail is the corrected sequence, not one MINSD"
+    (let [code (emit86 (list 'f64-min (list 'f64-from-bits 1) (list 'f64-from-bits 2)))]
+      (is (= (into x86-f64-min-bytes [0x66 0x48 0x0f 0x7e 0xc0])
+             (vec (take-last (+ 5 (count x86-f64-min-bytes)) code)))))
+    (let [code (emit86 (list 'f64-max (list 'f64-from-bits 1) (list 'f64-from-bits 2)))]
+      (is (= (into x86-f64-max-bytes [0x66 0x48 0x0f 0x7e 0xc0])
+             (vec (take-last (+ 5 (count x86-f64-max-bytes)) code))))))
+  (testing "a bare MINSD/MAXSD is no longer the whole operation"
+    (is (not= [0xf2 0x0f 0x5d 0xc1] (vec (take 4 x86-f64-min-bytes))))
+    (is (not= [0xf2 0x0f 0x5f 0xc1] (vec (take 4 x86-f64-max-bytes))))))
+
+(deftest both-x86-emitters-agree-on-f64-min-max
+  (testing "the machine-IR production encoder and the stack emitter emit the
+            same corrected bytes -- two emitters for one ISA is how a repair
+            lands on the path nobody runs"
+    (doseq [[op bytes] {'f64-min x86-f64-min-bytes 'f64-max x86-f64-max-bytes}]
+      (let [production (machine/compile-expression
+                        :x86-64 [] (list op (list 'f64-from-bits 1)
+                                         (list 'f64-from-bits 2)))
+            stack (emit86 (list op (list 'f64-from-bits 1) (list 'f64-from-bits 2)))]
+        (is (contains-bytes? production bytes) (str op " production"))
+        (is (contains-bytes? stack bytes) (str op " stack"))))))
+
 (deftest both-backends-cover-the-same-f64-ops
   (testing "a parity gap that closes on one architecture only is still a gap"
     (let [a (set (keys @#'kotoba.native.aarch64/f64-binary-ops))
