@@ -312,7 +312,12 @@
    'kernel-cpuid-eax :cpuid-eax
    'kernel-cpuid-ebx :cpuid-ebx
    'kernel-cpuid-ecx :cpuid-ecx
-   'kernel-cpuid-edx :cpuid-edx})
+   'kernel-cpuid-edx :cpuid-edx
+   ;; boot: the UEFI firmware boundary (kotoba-gmir ADR-0008).
+   'kernel-system-table :system-table
+   'kernel-load-ptr :load-ptr
+   'kernel-uefi-call2 :uefi-call2
+   'kernel-jump-to :jump-to})
 
 (def ^:private kir-runtime-ops
   {'pair :pair
@@ -3246,6 +3251,63 @@
    0x48 0x83 0xc4 0x10 0x49 0xc7 0xc2 0x01 0x00 0x00 0x00 0xeb 0x02
    0x0f 0x0b])
 
+;; boot: one Microsoft x64 call out of a Kotoba guest, and back.
+;;
+;; Three things have to be true at the `call` and none of them is true on
+;; arrival. RSP must be 16-byte aligned; the callee owns 32 bytes of shadow
+;; space above it; and every volatile register must be a value the guest can
+;; afford to lose. The guest's own frame is `sub rsp, frame-bytes` from an
+;; alignment this encoder cannot know statically, so the alignment is done at
+;; run time rather than assumed.
+;;
+;; The register discipline is the part worth reading twice. MS x64 preserves
+;; RBX, RBP, RDI, RSI and R12-R15, which is the whole of `kotoba.mir`'s leaf
+;; and preserved tiers -- those survive by contract. What does NOT survive is
+;; the four-register scratch tier (RAX, RCX, RDX, R8) and R9, which carries
+;; the guest's hidden context. All five are saved here rather than at the MIR
+;; layer, because `:mir/x86-privileged` is not a `call-operation?`: the
+;; scanner does not treat it as a barrier and may hold a live value in the
+;; scratch tier across it.
+;;
+;; The argument order (R10 <- a, RDX <- b, RCX <- R10) is not cosmetic. `a`
+;; and `b` arrive in allocator registers that may BE RCX or RDX, so writing
+;; RCX first would destroy `b` whenever `b` lives there. Staging `a` through
+;; R10 -- outside the pool -- makes every assignment safe.
+(defn- x86-uefi-call2 [dst arguments]
+  (let [[base offset a b] arguments
+        copy-to (fn [register value]
+                  (if (= register value) [] (x86-rr 0x89 register value)))
+        ;; slots are 8 bytes: 4 = +0x20, 5 = +0x28, ... 9 = +0x48.
+        save (fn [slot register] (x86-stack-memory 0x89 register slot))
+        load (fn [slot register] (x86-stack-memory 0x8b register slot))]
+    (vec (concat
+          (copy-to :x86-64/r10 base)
+          (copy-to :x86-64/r11 offset)
+          [0x4f 0x8b 0x1c 0x1a]                 ; mov r11,[r10+r11] -> target
+          ;; RSP is deliberately absent from `x86-register-code` -- no
+          ;; allocator tier contains it -- so these two write it by hand.
+          [0x49 0x89 0xe2]                      ; mov r10,rsp (original)
+          [0x48 0x83 0xe4 0xf0]                 ; and rsp,-16
+          ;; 0x50 = 32 bytes of shadow space the callee owns, plus six saved
+          ;; words at +0x20..+0x48. 0x50 is itself a multiple of 16, so RSP is
+          ;; still 16-aligned at the `call`, which is the whole point of the
+          ;; two instructions above.
+          [0x48 0x83 0xec 0x50]                 ; sub rsp,0x50
+          (save 4 :x86-64/r10)                  ; [rsp+0x20] = original rsp
+          (save 5 :x86-64/rax) (save 6 :x86-64/rcx)
+          (save 7 :x86-64/rdx) (save 8 :x86-64/r8)
+          (save 9 :x86-64/r9)
+          (copy-to :x86-64/r10 a)               ; stage `a` outside the pool
+          (copy-to :x86-64/rdx b)
+          (x86-rr 0x89 :x86-64/rcx :x86-64/r10)
+          [0x41 0xff 0xd3]                      ; call r11
+          (x86-rr 0x89 :x86-64/r10 :x86-64/rax) ; keep the status
+          (load 9 :x86-64/r9) (load 8 :x86-64/r8)
+          (load 7 :x86-64/rdx) (load 6 :x86-64/rcx)
+          (load 5 :x86-64/rax)
+          [0x48 0x8b 0xa4 0x24 0x20 0x00 0x00 0x00] ; mov rsp,[rsp+0x20]
+          (if (= dst :x86-64/r10) [] (x86-rr 0x89 dst :x86-64/r10))))))
+
 (defn- x86-privileged
   [{:mir/keys [dst action arguments] :as instruction}]
   (let [copy-to (fn [register value]
@@ -3368,6 +3430,34 @@
                (x86-pop :x86-64/rdx) (x86-pop :x86-64/rcx)
                (x86-pop :x86-64/rax))
        :x86-64/r11)
+      ;; boot: the UEFI firmware boundary.
+      ;;
+      ;; `:system-table` is `:boot-info`'s twin one slot along. The entry shim
+      ;; amu emits for the two-arity EFI contract parks RCX (ImageHandle) at
+      ;; context+0x50 and RDX (SystemTable) at +0x58, so `:boot-info` reads
+      ;; the first and this reads the second, with the identical instruction
+      ;; at the identical cost.
+      :system-table
+      (finish [0x4d 0x8b 0x51 0x58] :x86-64/r10)
+      ;; `:load-ptr` is `mov r10,[r10+r11]` -- one unchecked 64-bit read at
+      ;; the address the firmware handed over. R10/R11 are the encoder's
+      ;; scratch pair and are never in the allocator's pool, so copying into
+      ;; them cannot clobber the other operand.
+      :load-ptr
+      (finish (concat (copy-to :x86-64/r10 a)
+                      (copy-to :x86-64/r11 b)
+                      [0x4f 0x8b 0x14 0x1a])
+              :x86-64/r10)
+      ;; `:jump-to` is the only action here that does not come back. RDI is
+      ;; the SysV first argument, which is the handoff every aiueos kernel
+      ;; entry expects; `jmp r10` leaves no return address, so the kernel's
+      ;; own stack discipline starts clean.
+      :jump-to
+      (vec (concat (copy-to :x86-64/r10 a)
+                   (copy-to :x86-64/r11 b)
+                   (x86-rr 0x89 :x86-64/rdi :x86-64/r11)
+                   [0x41 0xff 0xe2]))
+      :uefi-call2 (x86-uefi-call2 dst arguments)
       (:cpuid-eax :cpuid-ebx :cpuid-ecx :cpuid-edx)
       (finish
        (concat (copy-to :x86-64/r10 a)
