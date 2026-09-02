@@ -141,3 +141,32 @@
     (is (= "kotoba_aiueos_probe"
            (:export (elf64/package-kernel-object
                      (sealed-kernel :x86_64-aiueos-kernel-v1 512)))))))
+
+;; The Qwen3.5 forward-pass tranche. Two things are asserted, and the second is
+;; the one that has gone wrong before (ADR-0036): the export symbol, and the
+;; FUEL WORD the packager writes into the object's context. A tier that falls
+;; through to the 1,024 default is not a compile error -- it is a prologue
+;; `ud2` on an input the object was built to handle, which surfaces as an
+;; unexpected vector 6 and reads as an arithmetic bug rather than a fuel bug.
+;;
+;; File offset 75 is where the immediate of `mov qword [r9+8], imm32` lands:
+;; 64 bytes of ELF header, then `lea r9,[rip+.data]` (7) and four opcode bytes.
+(deftest qwen35-forward-pass-objects-carry-their-measured-fuel-tiers
+  (doseq [[entry arity symbol-name fuel]
+          [['aiueos-qwen35-dot-f32     5 "kotoba_aiueos_qwen35_dot_f32"     4194304]
+           ['aiueos-qwen35-dequant-row 5 "kotoba_aiueos_qwen35_dequant_row" 16777216]
+           ['aiueos-qwen35-matvec      4 "kotoba_aiueos_qwen35_matvec"      250000000]]]
+    (let [artifact (-> (sealed-kernel :x86_64-aiueos-kernel-v1 512)
+                       (assoc :exports {entry {:offset 0 :arity arity}
+                                        'main {:offset 1 :arity 0}}
+                              :code [0xc3 0xc3])
+                       (dissoc :sha256)
+                       artifact/seal)
+          packaged (elf64/package-kernel-object artifact)
+          image (:bytes packaged)
+          immediate (reduce (fn [v i] (+ v (bit-shift-left (long (nth image (+ 75 i)))
+                                                           (* 8 i))))
+                            0 (range 4))]
+      (is (= symbol-name (:export packaged)) (str entry))
+      (is (= fuel immediate)
+          (str entry " must carry its own tier, not the 1024 default")))))

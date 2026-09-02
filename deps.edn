@@ -33,9 +33,15 @@
         ;; superseded allocate-call-live is deleted.
         ;; 4a75623 steers quotient-leaf values away from RAX/RDX, arming
         ;; the dead-quotient-save elision below it.
+        ;; e266a86: the parallel copy's cycle-breaking temporary is carried
+        ;; into the body only when something reserved it. Carried unreserved it
+        ;; named the slot the body's first spill was then handed, and the next
+        ;; cycle break stored over a live value -- measured on aiueos
+        ;; hkdf-sha256.kotoba, whose `hmac-mode` passed the literal 92 as its
+        ;; own context pointer (kotoba-mir ADR-0017).
         io.github.kotoba-lang/kotoba-mir
         {:git/url "https://github.com/kotoba-lang/kotoba-mir.git"
-         :git/sha "660cabff5e0164a7da3a0e31154562c9e9e97a94"}
+         :git/sha "e266a862a4b3c83013e3bd3995080ac3230503fd"}
         io.github.kotoba-lang/kotoba-codegen
         {:git/url "https://github.com/kotoba-lang/kotoba-codegen.git"
          :git/sha "68d409fbc229a56add1d524c909c480373afdff8"}
