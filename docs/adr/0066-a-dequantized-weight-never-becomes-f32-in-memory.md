@@ -1,4 +1,4 @@
-# ADR 0052: a dequantized weight never becomes f32 in memory
+# ADR 0066: a dequantized weight never becomes f32 in memory
 
 Status: accepted. Date: 2026-09-02.
 
@@ -157,7 +157,7 @@ right number of times and adds nothing — a working instruction that answers
   (LLVM 22.1.7), not derived from the manual.
 - Full suite at this commit: 337 tests / 4671 assertions / 0 failures.
 - **Executed in QEMU**, both arms, same artifact:
-  `os/aiueos/scripts/smoke-qemu-dequant-dot.cljs` (aiueos, ADR 0143). `-cpu
+  `os/aiueos/scripts/smoke-qemu-dequant-dot.cljs` (aiueos, ADR 0165). `-cpu
   max` reports `arm=avx2` and `-cpu qemu64` reports `arm=scalar`, and both
   print `4C800012` — which is what `kotoba.kir` answers for the same bytes,
   and is neither what a left-to-right sum answers (`4C800010`) nor what this
