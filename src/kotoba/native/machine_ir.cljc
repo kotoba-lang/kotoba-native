@@ -536,7 +536,14 @@
    ;; operand and names no memory window, exactly as `:boot-info` does -- and
    ;; unlike `:boot-info` its answer is an ADDRESS this encoder computes
    ;; rather than a word read out of the context.
-   'kernel-scratch-region :scratch-region})
+   'kernel-scratch-region :scratch-region
+   ;; fwstore: the allocation that answers with an address (kotoba-gmir
+   ;; ADR-0030). It rides this channel because its six operands are ordinary
+   ;; values and it names no memory window -- there is no base, length or index
+   ;; here to bound. What it produces is the base a later window is declared
+   ;; over, and that window is bounded by kotoba-sema against the page count
+   ;; this call passes.
+   'kernel-uefi-alloc-region :uefi-alloc-region})
 
 ;; boot-lit: the literal heads. NOT in the table above, because a privileged
 ;; action's operands are registers and these take a piece of the source text.
@@ -5713,6 +5720,81 @@
           [0x48 0x8b 0xa4 0x24 0x30 0x00 0x00 0x00] ; mov rsp,[rsp+0x30]
           (if (= dst :x86-64/r10) [] (x86-rr 0x89 dst :x86-64/r10))))))
 
+
+;; fwstore: `AllocatePages`, with the out-pointer inside this frame.
+;;
+;; The whole reason this is an encoder and not a call site is the out-word.
+;; `AllocatePages(AllocateType, MemoryType, Pages, OUT Memory)` writes the base
+;; through its fourth argument, and if the program supplied that pointer the
+;; program could supply a pointer to a word it wrote itself -- so "the address
+;; the firmware returned" would be an address the program chose, and the
+;; region-provenance root kotoba-sema grants would be worth nothing. Here the
+;; word is at `[rsp+0x20]` in a frame nothing else can name.
+;;
+;; It is `x86-uefi-call-wide`'s frame with one slot repurposed:
+;;
+;;   +0x00..0x18  shadow space / staging for arguments 1-4
+;;   +0x20        THE OUT WORD, and the address passed as argument 4
+;;   +0x28        original RSP
+;;   +0x30..0x50  RAX, RCX, RDX, R8, R9
+;;
+;; 0x60 is a multiple of 16, so RSP is still 16-aligned at the `call` after
+;; `and rsp,-16`. `+0x20` is the fifth-argument slot of the Microsoft x64
+;; frame: a four-parameter callee owns `[rsp..rsp+0x18]` and never writes
+;; above it, so the word survives the call it is an argument to.
+;;
+;; The out word is PRE-LOADED with `address-hint` before the call, which is
+;; what makes `AllocateMaxAddress` and `AllocateAddress` expressible -- for
+;; those two the parameter is IN OUT. `AllocateAnyPages` ignores what is there.
+;;
+;; And the answer is zeroed on failure, branchlessly:
+;;
+;;   mov r10,[rsp+0x20]   the word the firmware wrote
+;;   xor r11,r11          (this sets flags, so it comes BEFORE the test)
+;;   test rax,rax         EFI_STATUS, still in RAX from the call
+;;   cmovne r10,r11       status != 0 -> 0
+;;
+;; Zero rather than a status because Kotoba has no multi-value return on a
+;; firmware target, and because a null base is the one answer every bounded
+;; memory operation already refuses -- so a caller that forgets to test it
+;; traps at its first access rather than writing wherever the out-word
+;; happened to point. Every byte here was checked against `llvm-mc -triple
+;; x86_64 -show-encoding`.
+(defn- x86-uefi-alloc-region [dst arguments]
+  (let [[base offset allocate-type memory-type pages hint] arguments
+        copy-to (fn [register value]
+                  (if (= register value) [] (x86-rr 0x89 register value)))
+        save (fn [slot register] (x86-stack-memory 0x89 register slot))
+        load (fn [slot register] (x86-stack-memory 0x8b register slot))]
+    (vec (concat
+          (copy-to :x86-64/r10 base)
+          (copy-to :x86-64/r11 offset)
+          [0x4f 0x8b 0x1c 0x1a]                 ; mov r11,[r10+r11] -> target
+          [0x49 0x89 0xe2]                      ; mov r10,rsp (original)
+          [0x48 0x83 0xe4 0xf0]                 ; and rsp,-16
+          [0x48 0x83 0xec 0x60]                 ; sub rsp,0x60
+          (save 5 :x86-64/r10)                  ; [rsp+0x28] = original rsp
+          (save 6 :x86-64/rax) (save 7 :x86-64/rcx)
+          (save 8 :x86-64/rdx) (save 9 :x86-64/r8)
+          (save 10 :x86-64/r9)
+          ;; Read every operand out of its allocated register first. The
+          ;; scratch tier has been SAVED above but not yet overwritten, so a
+          ;; source that lives there is still the caller's value.
+          (save 0 allocate-type) (save 1 memory-type) (save 2 pages)
+          (save 4 hint)                         ; the out word, pre-loaded
+          (load 0 :x86-64/rcx) (load 1 :x86-64/rdx) (load 2 :x86-64/r8)
+          [0x4c 0x8d 0x4c 0x24 0x20]            ; lea r9,[rsp+0x20] -> &Memory
+          [0x41 0xff 0xd3]                      ; call r11
+          [0x4c 0x8b 0x54 0x24 0x20]            ; mov r10,[rsp+0x20]
+          [0x4d 0x31 0xdb]                      ; xor r11,r11 (sets flags)
+          [0x48 0x85 0xc0]                      ; test rax,rax (EFI_STATUS)
+          [0x4d 0x0f 0x45 0xd3]                 ; cmovne r10,r11
+          (load 10 :x86-64/r9) (load 9 :x86-64/r8)
+          (load 8 :x86-64/rdx) (load 7 :x86-64/rcx)
+          (load 6 :x86-64/rax)
+          [0x48 0x8b 0xa4 0x24 0x28 0x00 0x00 0x00] ; mov rsp,[rsp+0x28]
+          (if (= dst :x86-64/r10) [] (x86-rr 0x89 dst :x86-64/r10))))))
+
 (defn- x86-privileged
   [{:mir/keys [dst action arguments] :as instruction}]
   (let [copy-to (fn [register value]
@@ -6002,6 +6084,8 @@
                    (x86-rr 0x89 :x86-64/rdi :x86-64/r11)
                    [0x41 0xff 0xe2]))
       :uefi-call2 (x86-uefi-call2 dst arguments)
+      ;; fwstore: `AllocatePages`, with the out-pointer in this frame.
+      :uefi-alloc-region (x86-uefi-alloc-region dst arguments)
       ;; boot-lit: four and six UEFI arguments, one encoder. `:uefi-call2`
       ;; keeps its own because its bytes are the ones that booted, and because
       ;; its frame is 0x50 where this one's is 0x60.
