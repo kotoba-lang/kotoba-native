@@ -290,6 +290,60 @@
    ;; narrowing checked -- the caller has already been told where it starts.
    'aiueos-qwen35-tensor-table-bind
    {:arity 5 :symbol "kotoba_aiueos_qwen35_tensor_table_bind"}
+   ;; The Qwen3.5 forward pass, first tranche: the arithmetic under
+   ;; `matvec_range` in aiueos `kernel/qwen35_infer.c`. Three rows because a
+   ;; kernel object exports ONE symbol and cannot call another, and the C has
+   ;; three seams a caller can want separately -- dequantise a row, take a dot
+   ;; product, or do both over a range of rows. `aiueos-qwen35-matvec` INLINES
+   ;; the other two rather than calling them, so the three are three copies of
+   ;; one piece of arithmetic and their contracts pin them to the same vectors.
+   ;; A divergence between them is a test failure, not a discovery.
+   ;;
+   ;; F32, Q8_0, Q4_K and Q6_K only. The four IQ types that dominate the
+   ;; shipping model (IQ3_XXS, IQ3_S, IQ4_XS, IQ2_S -- 306 of 866 tensors)
+   ;; decode through codebook grids that `qwen35_quant_tables.inc` holds as
+   ;; static const data, and this dialect has no rodata and no bytes literal to
+   ;; put one in. Those types stay in the C.
+   ;;
+   ;; THE ONE OBJECT HERE WHOSE ANSWER IS A WORD rather than a verdict. It
+   ;; returns the binary32 bit pattern of the dot product, sign-extended from
+   ;; bit 31 the way this backend represents an f32, so a reason code cannot be
+   ;; a small negative number -- every one of those is a legal float. Its
+   ;; refusals are below -2^32, which no f32 pattern can reach.
+   ;;
+   ;; `[a a-length b b-length count]`, with both lengths required to equal
+   ;; `count * 4`, so the object cannot be handed two vectors of different
+   ;; extents and silently read past the shorter one.
+   ;;
+   ;; It is `dot_scalar` (`qwen35_infer.c:234`) and not `dot_avx2`: four
+   ;; accumulators, `(s0+s1)+(s2+s3)`, then a scalar tail. THE TWO DISAGREE IN
+   ;; THE C -- `dot_avx2` reduces its four lanes left to right -- so naming
+   ;; which one is reproduced is part of the contract rather than a detail.
+   ;;
+   ;; `kernel-dot-f32` (kotoba-gmir ADR 0010, landed in this repo at `db33743`)
+   ;; is the SIMD swap-in and is deliberately NOT used yet: `kotoba.verifier`
+   ;; has no row for it, so an artifact that uses it is refused by
+   ;; `verify-native-artifact!` with "runtime KIR operation rejected" (measured
+   ;; 2026-09-02 against amu 25907a65). Its accumulation tree is the same one
+   ;; and it agrees with `dot_scalar` exactly when the element count is a
+   ;; multiple of eight, which every Qwen3.5 dimension is.
+   'aiueos-qwen35-dot-f32 {:arity 5 :symbol "kotoba_aiueos_qwen35_dot_f32"}
+   ;; `[qtype src src-length dst dst-length]`. Zero is the success value. The
+   ;; element count is DERIVED from `dst-length / 4` rather than passed,
+   ;; because a count and a destination length that disagree is the one shape a
+   ;; bounds check cannot catch: both are inside their regions and the row is
+   ;; silently truncated.
+   'aiueos-qwen35-dequant-row
+   {:arity 5 :symbol "kotoba_aiueos_qwen35_dequant_row"}
+   ;; `[arena arena-length plan plan-length]` -- four arguments for four
+   ;; regions, because `kernel-subregion` requires a BASE to be a parameter and
+   ;; the ABI admits five. The caller puts weights, input, output and row
+   ;; scratch in one arena and describes them in a 96-byte plan; an OFFSET may
+   ;; be computed, and the offsets are 64-bit because the model mapping is
+   ;; 10,934,860,704 bytes and a u32 slot would truncate every tensor past
+   ;; 4 GiB. The plan also carries a ROW RANGE, which is what makes the fuel
+   ;; bound finite and an SMP split expressible without a second object.
+   'aiueos-qwen35-matvec {:arity 4 :symbol "kotoba_aiueos_qwen35_matvec"}
    ;; The TLS 1.3 record layer (RFC 8446 5.2), which is `aiueos-aes128-gcm`
    ;; plus the framing that decides what the AEAD is applied TO. It replaces
    ;; `protect` and `unprotect` in aiueos `kernel/tls13.c`. The framing is
@@ -933,6 +987,37 @@
           ;; starts. A separate arm, so that measuring either one cannot
           ;; silently move the other.
           qwen-tensor-fuel? (= 'aiueos-qwen35-tensor-table-bind object-entry)
+          ;; The three forward-pass objects. MEASURED, in the `kotoba.kir`
+          ;; interpreter rather than on a CPU, by bisecting the fuel each
+          ;; needs to return for a given input size and fitting the line. The
+          ;; interpreter charges one unit per Kotoba call, which is the same
+          ;; accounting the emitted prologue does, so the fits transfer -- but
+          ;; a fit is not an execution, and none of these has run on hardware
+          ;; at the time this arm was written. Say so rather than round up
+          ;; silently: `aiueos-hkdf-sha256` passed the same interpreter and
+          ;; then failed to return on the machine.
+          ;;
+          ;;   dot        3n + 6         n = element count, ceiling 65,536
+          ;;                             -> 196,614 worst case
+          ;;   dequant    19n + 5        Q4_K, the dearest of the four types
+          ;;                             (F32 n+5, Q6_K 13n+5, Q8_0 10n+5)
+          ;;                             -> 1,245,189 at the same ceiling
+          ;;   matvec     22 per element of work + 18 per row + 39
+          ;;                             -> ~65,011,751 at the object's own
+          ;;                             2,097,152-element work ceiling and
+          ;;                             1,048,576-row ceiling
+          ;;
+          ;; THE MATVEC CEILING IS WHY ITS BOUND IS FINITE. A single K16
+          ;; matvec is 17,408 rows of 5,120 -- 89 million multiply-accumulates
+          ;; -- and no fuel tier bounds that. The object refuses more than
+          ;; 2,097,152 elements of work per call and the caller chunks, which
+          ;; is also how the C's SMP split is expressed.
+          ;;
+          ;; Three arms rather than one, so that re-measuring any one of them
+          ;; cannot silently move the other two.
+          qwen-dot-fuel? (= 'aiueos-qwen35-dot-f32 object-entry)
+          qwen-dequant-fuel? (= 'aiueos-qwen35-dequant-row object-entry)
+          qwen-matvec-fuel? (= 'aiueos-qwen35-matvec object-entry)
           context-fuel? (contains? '#{aiueos-user-context-build
                                      aiueos-kernel-context-build}
                                    object-entry)
@@ -1033,6 +1118,9 @@
                       hkdf-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
                       qwen-metadata-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000
                       qwen-tensor-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
+                      qwen-dot-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x40 0x00] ; 4,194,304 (21x)
+                      qwen-dequant-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x00 0x01] ; 16,777,216 (13x)
+                      qwen-matvec-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000 (3.8x)
                       rsa-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000
                       sha-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
                       context-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x01 0x00] ; 65,536
