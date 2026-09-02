@@ -454,7 +454,56 @@
    'aiueos-device-worker-body
    {:arity 5 :symbol "kotoba_aiueos_device_worker_body"}
    'aiueos-device-worker-parse
-   {:arity 5 :symbol "kotoba_aiueos_device_worker_parse"}})
+   {:arity 5 :symbol "kotoba_aiueos_device_worker_parse"}
+   ;; nic: the RTL8125 2.5GbE driver. `kernel/rtl8125.c` is 306 lines of C that
+   ;; reaches its device through a six-function-pointer `struct
+   ;; aiueos_rtl8125_io`, and the six names below are the Kotoba objects that
+   ;; replace it.
+   ;;
+   ;; SIX RATHER THAN ONE, and only part of that is the rule the qwen35 and
+   ;; device-worker rows already give (one symbol per object, no object may
+   ;; call another, no export above five arguments). The part that is specific
+   ;; to a DRIVER is region provenance: `kernel-load-*` and `kernel-store-*`
+   ;; take a literal, `kernel-boot-info` or an ARGUMENT as their base and
+   ;; nothing else. A port that kept device state in one struct and read the
+   ;; BAR address back out of it could not be written at all -- the load would
+   ;; be based on a computed value. So the BAR window, each descriptor and each
+   ;; frame address arrive as their own argument, and the shape of the driver
+   ;; follows from that rather than from the shape of the C.
+   ;;
+   ;; MMIO uses the `-4k` window tier: `aiueos_map_pci_mmio(bar,4096)` maps one
+   ;; page per BAR and the highest register the driver touches is RXDESC_HI at
+   ;; 0xe8. The plain 512 tier would fit every offset and then refuse the
+   ;; caller's own declared length. Descriptors use the plain tier with a
+   ;; literal 32, which is what a descriptor is.
+   ;;
+   ;; RETURN CONVENTIONS, and they are deliberately not all the same:
+   ;;
+   ;;   identify, program, ring-build, tx-submit
+   ;;       ZERO IS SUCCESS. Non-zero is the `enum aiueos_rtl8125_result` the C
+   ;;       returned at that point, unchanged, so a caller transcribed from the
+   ;;       C keeps its meaning.
+   ;;   link-up
+   ;;       a boolean, 0 or 1, like the `int` the C returned.
+   ;;   rx-poll
+   ;;       NON-NEGATIVE is a frame length with the four FCS bytes already
+   ;;       subtracted, and zero means the descriptor is still owned by the
+   ;;       device -- which is the C's `*frame_length = 0` with `OK`. NEGATIVE
+   ;;       is a reason code. A length and a reason cannot share a non-negative
+   ;;       value space, which is why this one object breaks the family's
+   ;;       convention instead of taking an out-parameter it has no room for.
+   'aiueos-rtl8125-identify
+   {:arity 4 :symbol "kotoba_aiueos_rtl8125_identify"}
+   'aiueos-rtl8125-link-up
+   {:arity 2 :symbol "kotoba_aiueos_rtl8125_link_up"}
+   'aiueos-rtl8125-ring-build
+   {:arity 5 :symbol "kotoba_aiueos_rtl8125_ring_build"}
+   'aiueos-rtl8125-program
+   {:arity 5 :symbol "kotoba_aiueos_rtl8125_program"}
+   'aiueos-rtl8125-tx-submit
+   {:arity 5 :symbol "kotoba_aiueos_rtl8125_tx_submit"}
+   'aiueos-rtl8125-rx-poll
+   {:arity 2 :symbol "kotoba_aiueos_rtl8125_rx_poll"}})
 
 (def ^:private admitted-entry-prefix
   "The prefix every `kernel-object-entries` key carries, checked against the
@@ -1190,6 +1239,34 @@
                                             aiueos-device-worker-body}
                                          object-entry)
           device-parse-fuel? (= 'aiueos-device-worker-parse object-entry)
+          ;; nic: the RTL8125 transmit-FIFO drain, and it is the one object in
+          ;; that driver whose cost is not a handful of calls. COMPUTED.
+          ;;
+          ;; `rings_restart` in `kernel/rtl8125.c` sets the STOP bit and then
+          ;; spins up to 300,000 times reading MCUCMD until both FIFO-empty bits
+          ;; report empty. The Kotoba port keeps that literal budget, so the two
+          ;; agree on when they give up; each spin is one recursive call at one
+          ;; fuel apiece and the register programming either side of it is
+          ;; another twenty or so, for 300,020 at the worst shape.
+          ;;
+          ;; 10,000,000 is a 33x margin on that. 65,536 would clear a device
+          ;; whose FIFO is already empty -- which is every boot where the
+          ;; firmware left the engine idle, and every run of the software model
+          ;; -- and `ud2` partway through the one case the budget exists for.
+          ;; That is the size-dependent trap this file's other comments name,
+          ;; with the added hazard that the shape which triggers it is exactly
+          ;; the shape nobody tests.
+          ;;
+          ;; The port also carries a `kernel-rdtsc` deadline the C does not
+          ;; have, which does not change this number: the deadline can only make
+          ;; the loop end EARLIER than the 300,000th spin.
+          ;;
+          ;; The other five objects in the family take the 1024 default. Each is
+          ;; a single function whose body is comparisons and bounded
+          ;; loads/stores, and the primitives are inlined rather than charged;
+          ;; the largest, `ring-build`, zeroes a 32-byte descriptor with four
+          ;; u64 stores and writes three fields.
+          rtl8125-program-fuel? (= 'aiueos-rtl8125-program object-entry)
           ;; Qwen3.8 GGUF metadata scan. COMPUTED, like the two arms above,
           ;; and said so -- nothing has executed this object yet.
           ;;
@@ -1385,6 +1462,7 @@
                       hkdf-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
                       device-client-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x01 0x00] ; 65,536
                       device-parse-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
+                      rtl8125-program-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
                       qwen-metadata-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000
                       qwen-tensor-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
                       qwen-dot-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x40 0x00] ; 4,194,304 (21x)
