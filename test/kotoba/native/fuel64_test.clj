@@ -170,3 +170,96 @@
                                                            (* 8 i))))
                             0 (range 8)))
             (str target " " fuel))))))
+
+;; ── the budget the machine runs on is the budget somebody wrote ────────────
+;;
+;; A ceiling that can be raised and a budget that is silently discarded are the
+;; same defect at two layers, and the second one shipped for longer. Until
+;; 2026-09-03 `package-user` wrote the CONSTANT 512 into its context, so a
+;; ring-3 image ran on 512 whatever `--fuel` said -- the flag is parsed,
+;; validated, sealed into `:limits :fuel` and `:fuel-abi :initial`, and then
+;; the one place that decides what the machine gets ignored all of it. The same
+;; line was in amu's PE32+ packager, where the LOADER stream found it from the
+;; other end: `sha256-region` costs 1,772 fuel per 64-byte block, so ONE block
+;; could not fit in 512 and the loader's `integrity` module had never returned.
+;;
+;; The test is DIFFERENTIAL rather than positional. Reading the word at a fixed
+;; offset would need a different offset per route and would go stale the moment
+;; a context grows; two budgets that must not produce the same bytes needs no
+;; offset at all, and is exactly the observation that found the defect --
+;; `--fuel 512` and `--fuel 1048576` produced identical images.
+;;
+;; THE OBJECT ROUTE IS LISTED AS INSENSITIVE ON PURPOSE, not omitted. Its
+;; `.data` really does hold 512 and really is independent of the sealed budget,
+;; because the wrapper replenishes on every call and overwrites it before the
+;; entry runs. Leaving it out would make this test read as "every packager is
+;; fuel-sensitive", which is false; listing it with its reason means a future
+;; edit that makes the object route sensitive has to come here and say why.
+(deftest every-image-route-carries-the-declared-budget
+  (let [budgets [512 1048576 2147483648 elf64/max-object-fuel]
+        image (fn [package target fuel]
+                (:bytes (package
+                         (artifact/seal
+                          {:target target
+                           :target-profile {:runtime :none :ambient-syscalls false}
+                           :program {:entry 'main}
+                           :exports {'main {:offset 0 :arity 0}}
+                           :limits {:fuel fuel}
+                           :fuel-abi {:initial fuel}
+                           :code [0xc3]}))))
+        scanned (atom 0)]
+    (doseq [[label package target]
+            [["x86-64 kernel image" elf64/package-kernel :x86_64-aiueos-kernel-v1]
+             ["aarch64 kernel image" elf64/package-kernel-aarch64 :aarch64-aiueos-kernel-v1]
+             ["x86-64 user image" elf64/package-user :x86_64-aiueos-user-v1]]]
+      (let [digests (mapv #(sha256-hex (image package target %)) budgets)]
+        (swap! scanned inc)
+        (is (= (count budgets) (count (set digests)))
+            (str label " must produce a different image for every budget; got "
+                 (count (set digests)) " distinct for " (count budgets)
+                 " budgets -- a packager that writes a constant answers the same"
+                 " bytes for all of them"))))
+    (println "SCANNED" @scanned)
+    (is (= 3 @scanned) "n=0 is not a pass")))
+
+(deftest the-object-route-is-insensitive-and-that-is-correct
+  (let [object (fn [fuel]
+                 (:bytes (elf64/package-kernel-object
+                          (artifact/seal
+                           {:target :x86_64-aiueos-kernel-v1
+                            :target-profile {:runtime :none :ambient-syscalls false}
+                            :program {:entry 'main}
+                            :exports {'aiueos-sha256-region {:offset 0 :arity 4}
+                                      'main {:offset 1 :arity 0}}
+                            :limits {:fuel fuel}
+                            :fuel-abi {:initial fuel}
+                            :code [0xc3 0xc3]}))))]
+    (is (= (sha256-hex (object 512)) (sha256-hex (object 1048576)))
+        "an object's `.data` 512 is overwritten by the wrapper's replenish
+         before the entry runs, so the sealed budget is unobservable there --
+         the per-call TIER is what bounds an object, and it comes from the
+         table, not from --fuel")))
+
+(deftest an-image-with-a-contradictory-fuel-seal-is-refused
+  ;; `:limits :fuel` and `:fuel-abi :initial` are two statements of one number
+  ;; and the verifier re-derives one from the other. A packager that read only
+  ;; one of them could ship an image whose running budget contradicts its own
+  ;; receipt, which is why `artifact-fuel` checks the agreement rather than
+  ;; just the range.
+  (doseq [[label package target]
+          [["x86-64 kernel image" elf64/package-kernel :x86_64-aiueos-kernel-v1]
+           ["x86-64 user image" elf64/package-user :x86_64-aiueos-user-v1]]]
+    (let [thrown (try (package
+                       (artifact/seal
+                        {:target target
+                         :target-profile {:runtime :none :ambient-syscalls false}
+                         :program {:entry 'main}
+                         :exports {'main {:offset 0 :arity 0}}
+                         :limits {:fuel 4096}
+                         :fuel-abi {:initial 8192}
+                         :code [0xc3]}))
+                      nil
+                      (catch clojure.lang.ExceptionInfo e e))]
+      (is (some? thrown) (str label " must refuse a fuel seal that disagrees with itself"))
+      (is (= 4096 (:fuel (ex-data thrown))) label)
+      (is (= 8192 (:fuel-abi-initial (ex-data thrown))) label))))

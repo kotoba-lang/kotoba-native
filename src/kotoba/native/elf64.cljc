@@ -958,7 +958,24 @@
           bitmap (capability-bitmap (:effects artifact))
           callback (if (some #(= :cap/call (first %)) (:effects artifact))
                      (+ entry-address 32) 0)
-          context (vec (concat (repeat 8 0) (le 512 8) bitmap
+          ;; fuel64: the DECLARED budget, not the constant 512 this used to
+          ;; write. Same defect the UEFI packager had (amu ADR 0332), found by
+          ;; measuring every image route at three budgets rather than by
+          ;; reading the one that was reported: `x86_64-aiueos-user-v1`
+          ;; produced BYTE-IDENTICAL images at 512, 1,048,576 and 4,300,000,000
+          ;; (sha256 d958af7247542d5e...), while both kernel-image routes
+          ;; answered with three distinct digests.
+          ;;
+          ;; Nobody had reported it because nothing has shipped a ring-3 image
+          ;; that needs more than 512 -- which is the shape of the class, not
+          ;; an excuse: a budget the caller sets and the packager discards is
+          ;; wrong whether or not a program has yet outgrown the default.
+          ;;
+          ;; The OBJECT route's `(le 512 8)` below is NOT this defect and must
+          ;; stay: an object's wrapper replenishes unconditionally on every
+          ;; call, so the word in `.data` is overwritten before the entry is
+          ;; reached and its value is unobservable.
+          context (vec (concat (repeat 8 0) (le (artifact-fuel artifact) 8) bitmap
                                (le callback 8) (repeat 24 0)
                                (repeat 8 0)))
           names (mapv int (utf8-bytes "\u0000.text\u0000.data\u0000.shstrtab\u0000"))
