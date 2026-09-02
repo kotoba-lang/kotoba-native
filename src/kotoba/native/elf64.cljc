@@ -339,7 +339,19 @@
    ;; inside a 10.9 GiB mapping and `kernel-subregion` is what makes the
    ;; narrowing checked -- the caller has already been told where it starts.
    'aiueos-qwen35-tensor-table-bind
-   {:arity 5 :symbol "kotoba_aiueos_qwen35_tensor_table_bind"}})
+   {:arity 5 :symbol "kotoba_aiueos_qwen35_tensor_table_bind"}
+   ;; The TLS 1.3 record layer (RFC 8446 5.2), which is `aiueos-aes128-gcm`
+   ;; plus the framing that decides what the AEAD is applied TO. It replaces
+   ;; `protect` and `unprotect` in aiueos `kernel/tls13.c`. The framing is
+   ;; where a record layer gets exploited: the 5-byte header is the additional
+   ;; authenticated data, so a length taken from the wrong place is a forgery
+   ;; the AEAD accepts; the sequence number is XORed into the nonce, so a
+   ;; reused sequence is a reused keystream; and the inner content type is the
+   ;; last non-zero plaintext byte, so a padding strip that stops early hands
+   ;; the caller the wrong record type.
+   ;;
+   ;; NOT A BOOLEAN, same convention as the two TLS rows above: zero is done.
+   'aiueos-tls13-record {:arity 5 :symbol "kotoba_aiueos_tls13_record"}})
 
 (defn- le [n width]
   (object-elf/little-endian n width))
@@ -759,7 +771,13 @@
           ;; magnitudes agree is a fact about the work (X25519's ladder was
           ;; measured at 4,815,405 bounded-memory operations), not a shared
           ;; derivation.
-          aead-fuel? (= 'aiueos-aes128-gcm object-entry)
+          ;; `aiueos-tls13-record` shares this arm, and it is the one case
+          ;; here where sharing a constant is a SHARED DERIVATION rather than a
+          ;; coincidence of magnitude: that object's AEAD is this object's
+          ;; source, copied, and its framing adds a few hundred calls to four
+          ;; million. Re-measuring one genuinely re-measures the other.
+          aead-fuel? (contains? '#{aiueos-aes128-gcm aiueos-tls13-record}
+                                object-entry)
           ;; HMAC-SHA256 / HKDF-Expand-Label. COMPUTED, like the arm above and
           ;; like `dhcp-fuel?`, and said so.
           ;;
