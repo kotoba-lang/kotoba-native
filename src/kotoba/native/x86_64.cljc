@@ -271,10 +271,41 @@
 (def ^:private movq-rcx-xmm1 [0x66 0x48 0x0f 0x6e 0xc9])
 (def ^:private movq-xmm0-rax [0x66 0x48 0x0f 0x7e 0xc0])
 
+;; MINSD/MAXSD alone do not compute `f64-min`/`f64-max`. They compute
+;; `(a < b) ? a : b`, so they return the SECOND operand whenever the comparison
+;; is false -- and the two cases where the first operand should win are exactly
+;; the ones where it is: either input NaN, and (-0.0, +0.0). The oracle
+;; (`kotoba.kir`'s `Math/min`/`Math/max`, and `js/Math.min`/`js/Math.max` on
+;; cljs) and AArch64's FMIN/FMAX return the NaN and the negative zero.
+;;
+;; `min-max-sequence` is the corrected form, kept byte-identical to
+;; `kotoba.native.machine-ir/x86-f64-min-max` -- see that function for the
+;; measurement and the derivation. Two emitters for one ISA is a standing
+;; hazard, so the bytes are written once per file and asserted equal in
+;; `kotoba.native-test/both-x86-emitters-agree-on-f64-min-max`.
+(defn- min-max-sequence
+  "`fixup` 0x56 (ORPD, min) / 0x54 (ANDPD, max); `select` 0x5d / 0x5f."
+  [fixup select]
+  [0x66 0x0f 0x28 0xd0        ; movapd xmm2, xmm0
+   0x66 0x0f 0x28 0xd8        ; movapd xmm3, xmm0
+   0xf2 0x0f 0xc2 0xd1 0x00   ; cmpeqsd xmm2, xmm1    (mask: a == b)
+   0x66 0x0f fixup 0xd9       ; orpd/andpd xmm3, xmm1
+   0x66 0x0f 0x54 0xda        ; andpd xmm3, xmm2
+   0x66 0x0f 0x28 0xe0        ; movapd xmm4, xmm0     (keep a)
+   0xf2 0x0f select 0xc1      ; minsd/maxsd xmm0, xmm1
+   0x66 0x0f 0x55 0xd0        ; andnpd xmm2, xmm0
+   0x66 0x0f 0x56 0xda        ; orpd xmm3, xmm2       (ordered answer)
+   0x66 0x0f 0x28 0xc4        ; movapd xmm0, xmm4
+   0xf2 0x0f 0xc2 0xc0 0x03   ; cmpunordsd xmm0, xmm0 (mask: a is NaN)
+   0x66 0x0f 0x54 0xe0        ; andpd xmm4, xmm0
+   0x66 0x0f 0x55 0xc3        ; andnpd xmm0, xmm3
+   0x66 0x0f 0x56 0xc4])      ; orpd xmm0, xmm4
+
 (def ^:private f64-binary-ops
   {'f64-add [0xf2 0x0f 0x58 0xc1] 'f64-sub [0xf2 0x0f 0x5c 0xc1]
    'f64-mul [0xf2 0x0f 0x59 0xc1] 'f64-div [0xf2 0x0f 0x5e 0xc1]
-   'f64-max [0xf2 0x0f 0x5f 0xc1] 'f64-min [0xf2 0x0f 0x5d 0xc1]})
+   'f64-max (min-max-sequence 0x54 0x5f)
+   'f64-min (min-max-sequence 0x56 0x5d)})
 
 ;; UCOMISD sets ZF=PF=CF=1 when either operand is NaN, so a NaN-safe ordered
 ;; test must be one that reads CF=0 or ZF=0: `seta` (CF=0 and ZF=0) and `setae`

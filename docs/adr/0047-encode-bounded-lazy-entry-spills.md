@@ -1,4 +1,4 @@
-# ADR 0020: Encode bounded lazy function-entry spills
+# ADR 0047: Encode bounded lazy function-entry spills
 
 ## Status
 

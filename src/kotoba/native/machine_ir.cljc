@@ -291,13 +291,15 @@
 ;; here: it is `signed-i32-value`, which also canonicalises the zero-extended
 ;; u32 that `kernel-load-u32` returns.
 ;;
-;; `f32-min`/`f32-max` are absent, and the absence is the decision rather than
-;; an omission. x86's MINSS/MAXSS return the SECOND operand when either input
-;; is NaN; AArch64's FMIN/FMAX and the oracle's Math/min return the NaN. The
-;; f64 table above admits both, so x86 already disagrees with the other ISA and
-;; with the oracle on shipped code -- a pre-existing defect recorded in the ADR,
-;; not repaired here because repairing it moves f64 goldens. This width does not
-;; inherit it. `kotoba.kir` refuses them at admission for both backends.
+;; `f32-min`/`f32-max` are absent, and the reason is no longer the one this
+;; comment used to give. It said x86's MINSS/MAXSS disagree with the oracle on
+;; NaN and signed zeros -- true, and its f64 twin shipped with that defect until
+;; `x86-f64-min-max` above repaired it. The same corrected shape transfers to
+;; binary32 unchanged (CMPEQSS/ORPS/ANDPS/ANDNPS/MINSS/CMPUNORDSS). What is
+;; missing is not an encoding but an admission: `f32-min`/`f32-max` would have
+;; to travel kir -> sema -> gmir -> mir -> codegen -> verifier -> native, seven
+;; repositories, and that is a slice of its own rather than a hygiene fix.
+;; `kotoba.kir` still refuses them at admission for both backends.
 (def ^:private kir-f32-binary-ops
   {'f32-add :gmir/f32-add 'f32-sub :gmir/f32-subtract
    'f32-mul :gmir/f32-multiply 'f32-div :gmir/f32-divide
@@ -3066,13 +3068,68 @@
 
 (def ^:private x86-f64-binary-opcode
   {:x86-64/f64-add 0x58 :x86-64/f64-subtract 0x5c
-   :x86-64/f64-multiply 0x59 :x86-64/f64-divide 0x5e
-   :x86-64/f64-min 0x5d :x86-64/f64-max 0x5f})
+   :x86-64/f64-multiply 0x59 :x86-64/f64-divide 0x5e})
 
 (defn- x86-f64-binary [encoding dst left right]
   (vec (concat (x86-gpr-to-xmm 0 left)
                (x86-gpr-to-xmm 1 right)
                [0xf2 0x0f (get x86-f64-binary-opcode encoding) 0xc1]
+               (x86-xmm-to-gpr dst 0))))
+
+;; ── f64 min/max: MINSD/MAXSD alone do NOT compute this operation ─────────
+;;
+;; The definition is the KIR interpreter, which is `Math/min`/`Math/max` on the
+;; JVM and `js/Math.min`/`js/Math.max` on cljs. Measured 2026-09-02, both arms
+;; agree on every row, and AArch64's FMIN/FMAX agree with them under execution:
+;;
+;;   min(NaN,x)=NaN  min(x,NaN)=NaN  min(-0.0,+0.0)=-0.0  min(+0.0,-0.0)=-0.0
+;;   max(NaN,x)=NaN  max(x,NaN)=NaN  max(-0.0,+0.0)=+0.0  max(+0.0,-0.0)=+0.0
+;;
+;; A bare `minsd xmm0, xmm1` computes `(a < b) ? a : b`, so it returns the
+;; SECOND operand whenever the comparison is false -- which is exactly the two
+;; cases above where the first operand should win. Executed through the Rosetta
+;; loader on 2026-09-02 this cost SIX of the twelve NaN/zero rows (`min(NaN,x)`,
+;; `min(-0,+0)`, `max(NaN,x)`, `max(+0,-0)` and their -2.0 twins), while
+;; AArch64 got all twelve right. Not a hypothetical: the previous encoding was
+;; a silent wrong answer on shipped code.
+;;
+;; The repair is straight-line and branchless. `minsd a,b` is already correct
+;; except in two situations, and each has a mask that names it:
+;;
+;;   a == b (ordered)  -- the only inputs that are equal yet differ in bits are
+;;                        +0.0 and -0.0, so `a|b` is the min (sign bit wins) and
+;;                        `a&b` is the max. For equal non-zero inputs the bits
+;;                        are identical and both are the identity.
+;;   a is NaN          -- the answer is `a` itself. When only *b* is NaN the
+;;                        bare MINSD/MAXSD already returns b, because the
+;;                        comparison against a NaN is false.
+;;
+;; So: result = a-is-NaN ? a : (a==b ? a|b : minsd(a,b)). Every byte below was
+;; assembled with `llvm-mc -arch=x86-64 -show-encoding`, not derived by hand.
+;; The sequence borrows xmm2/xmm3/xmm4, which is safe for the same reason
+;; xmm0/xmm1 are: no f64 value is live in the SSE bank across an operation --
+;; every one of them bounces in from a general register and back out again.
+(defn- x86-f64-min-max
+  "MINSD/MAXSD corrected to the oracle's NaN and signed-zero answers.
+  `fixup` is 0x56 (ORPD, min) or 0x54 (ANDPD, max); `select` is 0x5d (MINSD)
+  or 0x5f (MAXSD). Leaves the result in xmm0 like every other f64 encoder."
+  [fixup select dst left right]
+  (vec (concat (x86-gpr-to-xmm 0 left)
+               (x86-gpr-to-xmm 1 right)
+               [0x66 0x0f 0x28 0xd0        ; movapd xmm2, xmm0
+                0x66 0x0f 0x28 0xd8        ; movapd xmm3, xmm0
+                0xf2 0x0f 0xc2 0xd1 0x00   ; cmpeqsd xmm2, xmm1   (mask: a == b)
+                0x66 0x0f fixup 0xd9       ; orpd/andpd xmm3, xmm1
+                0x66 0x0f 0x54 0xda        ; andpd xmm3, xmm2
+                0x66 0x0f 0x28 0xe0        ; movapd xmm4, xmm0    (keep a)
+                0xf2 0x0f select 0xc1      ; minsd/maxsd xmm0, xmm1
+                0x66 0x0f 0x55 0xd0        ; andnpd xmm2, xmm0
+                0x66 0x0f 0x56 0xda        ; orpd xmm3, xmm2      (ordered answer)
+                0x66 0x0f 0x28 0xc4        ; movapd xmm0, xmm4
+                0xf2 0x0f 0xc2 0xc0 0x03   ; cmpunordsd xmm0, xmm0 (mask: a is NaN)
+                0x66 0x0f 0x54 0xe0        ; andpd xmm4, xmm0
+                0x66 0x0f 0x55 0xc3        ; andnpd xmm0, xmm3
+                0x66 0x0f 0x56 0xc4]       ; orpd xmm0, xmm4
                (x86-xmm-to-gpr dst 0))))
 
 ;; ── f32 encoders ─────────────────────────────────────────────────────────
@@ -5183,9 +5240,15 @@
     (x86-shift 5 (:mir/dst instruction) (:mir/left instruction)
                (:mir/right instruction))
     (:x86-64/f64-add :x86-64/f64-subtract :x86-64/f64-multiply
-     :x86-64/f64-divide :x86-64/f64-min :x86-64/f64-max)
+     :x86-64/f64-divide)
     (x86-f64-binary encoding (:mir/dst instruction) (:mir/left instruction)
                     (:mir/right instruction))
+    :x86-64/f64-min
+    (x86-f64-min-max 0x56 0x5d (:mir/dst instruction) (:mir/left instruction)
+                     (:mir/right instruction))
+    :x86-64/f64-max
+    (x86-f64-min-max 0x54 0x5f (:mir/dst instruction) (:mir/left instruction)
+                     (:mir/right instruction))
     :x86-64/f64-sqrt
     (vec (concat (x86-gpr-to-xmm 0 (:mir/input instruction))
                  [0xf2 0x0f 0x51 0xc0]

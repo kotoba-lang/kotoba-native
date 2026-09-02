@@ -1,4 +1,4 @@
-{:adr/id 20
+{:adr/id 47
  :adr/status :accepted
  :decision :encode-bounded-lazy-entry-spills
  :supersedes {:adr/id 19 :scope :five-live-argument-behavior}
