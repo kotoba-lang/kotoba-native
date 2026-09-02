@@ -1,4 +1,4 @@
-# ADR-0038: Encodings for the UEFI firmware boundary
+# ADR-0039: Encodings for the UEFI firmware boundary
 
 - Status: accepted
 - Date: 2026-09-02
