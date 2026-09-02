@@ -1,4 +1,4 @@
-# ADR 0038: The x86-64 system primitives a NIC driver needs, and one AArch64 baseline
+# ADR 0040: The x86-64 system primitives a NIC driver needs, and one AArch64 baseline
 
 ## Status
 

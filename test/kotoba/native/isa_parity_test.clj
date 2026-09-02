@@ -192,7 +192,18 @@
    [[] '(kernel-fence-full)]
    [[] '(kernel-rdtsc)]
    [[] '(kernel-rdtscp)]
-   [[] '(kernel-swapgs)]])
+   [[] '(kernel-swapgs)]
+   ;; boot: the UEFI firmware boundary. x86-only for a reason that is not
+   ;; about the instruction set at all -- there IS AArch64 UEFI, and its
+   ;; calling convention for an EFI image entry is AAPCS64 with the arguments
+   ;; in x0/x1 rather than RCX/RDX. So an AArch64 counterpart would be a
+   ;; different operator set with a different ABI, decided by whoever needs
+   ;; one, and NOT a translation of these four. Pinned here so a partial
+   ;; translation shows up as a failure rather than as silence.
+   [[] '(kernel-system-table)]
+   [['b 'o] '(kernel-load-ptr b o)]
+   [['b 'o 'x 'y] '(kernel-uefi-call2 b o x y)]
+   [['a 'i] '(kernel-jump-to a i)]])
 
 (deftest privileged-x86-operators-are-x86-only-by-design
   (doseq [[params body] x86-only]

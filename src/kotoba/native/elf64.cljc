@@ -272,7 +272,74 @@
    'aiueos-cpu-feature-syscall {:arity 0 :symbol "kotoba_aiueos_cpu_feature_syscall"}
    ;; NOT a feature test: leaf 1 EBX 31:24 is the initial APIC ID, which pci.c
    ;; uses as the MSI-X message destination.
-   'aiueos-cpu-apic-id {:arity 0 :symbol "kotoba_aiueos_cpu_apic_id"}})
+   'aiueos-cpu-apic-id {:arity 0 :symbol "kotoba_aiueos_cpu_apic_id"}
+   ;; AES-128-GCM (FIPS 197 + SP 800-38D), the AEAD under every TLS 1.3 record
+   ;; this OS sends or accepts. It replaces `kernel/tls_aes_gcm.c` -- 275 lines
+   ;; of C holding the S-box, the key schedule, the cipher, GHASH, CTR and the
+   ;; tag comparison. aiueos ADR-0015 draws the C boundary at MECHANISM, and
+   ;; "are these the bytes the peer sent, under the key we agreed" is not
+   ;; mechanism; it is the confidentiality and integrity decision itself.
+   ;;
+   ;; NOT A BOOLEAN. Like the two DHCP rows above, this returns a REASON CODE
+   ;; and ZERO IS SUCCESS (1 ctx too small, 2 data too long, 3 aad too long,
+   ;; 4 bad mode, 5 tag mismatch). The C it replaces returned 1 for success, so
+   ;; the call sites have to change -- deliberately, because a caller writing
+   ;; `if (aes128_gcm(...))` would accept exactly the records this refuses.
+   ;;
+   ;; One region and a mode, because the ABI admits five parameters: key,
+   ;; nonce, AAD, tag and every scratch buffer live in `ctx`, and `data` is
+   ;; transformed in place. The object's own header states the layout.
+   'aiueos-aes128-gcm {:arity 5 :symbol "kotoba_aiueos_aes128_gcm"}
+   ;; HMAC-SHA256 and HKDF-Expand-Label (RFC 5869 + RFC 8446 7.1) -- the key
+   ;; schedule that turns the X25519 shared secret into the traffic keys the
+   ;; row above encrypts with. It replaces four static functions in
+   ;; `kernel/tls13.c` (`hmac_sha256`, `hkdf_extract`, `hkdf_expand_label` and
+   ;; the HMAC half of `finish_check`). Which bytes become the traffic key is
+   ;; not mechanism.
+   ;;
+   ;; NOT A BOOLEAN, same convention as the row above: zero is done, 1..6 name
+   ;; the clause that refused.
+   ;;
+   ;; RFC 5869's Extract is not a mode. It is `HMAC(salt, ikm)` with the salt
+   ;; in the key slot, and the C's "an empty salt means 32 zero bytes" rule is
+   ;; not a rule either -- HMAC pads its key to the block, so the two produce
+   ;; the same padded block. The object's contract asserts that with a vector.
+   ;;
+   ;; SHA-256 is inlined rather than required from `aiueos.sha256`: a namespace
+   ;; that declares `(:require ...)` is a multi-module project and
+   ;; `amu compile` will not package one for this target at all (measured
+   ;; 2026-09-02 against amu b1fdaad2), which is why `cid-v1-admit.kotoba` has
+   ;; no committed `.o` beside it.
+   'aiueos-hkdf-sha256 {:arity 3 :symbol "kotoba_aiueos_hkdf_sha256"}
+   ;; Qwen3.8-27B GGUF v3 admission, three objects covering what
+   ;; `kernel/qwen35_runtime.c` does before a single weight is read:
+   ;; container header, metadata key/value scan, tensor table. The graph they
+   ;; admit is aiueos `contracts/qwen38-qwen35-runtime-v1.edn` -- 866 tensors,
+   ;; 65 layers, 15 quantisation types, one artifact of 10,934,860,704 bytes.
+   ;;
+   ;; Three rather than one because a kernel object exports ONE symbol and
+   ;; cannot call another, and because the three answer different questions:
+   ;; "is this the file", "what does it say it is", "where is every tensor".
+   ;;
+   ;; NONE OF THE THREE IS A BOOLEAN. Each returns a REASON CODE with **zero as
+   ;; the success value**, the `aiueos-dhcp-reply-valid` convention -- a caller
+   ;; that writes `if (parse(...))` inverts the decision and admits exactly the
+   ;; files these objects rejected. The codes are negative so that the two that
+   ;; would otherwise return a useful non-negative number (a file offset) cannot
+   ;; be confused with one.
+   'aiueos-qwen35-gguf-header-valid
+   {:arity 3 :symbol "kotoba_aiueos_qwen35_gguf_header_valid"}
+   ;; The metadata scan writes its findings into a caller-owned workspace
+   ;; region rather than returning them: 27 scalars and six tokenizer-array
+   ;; coordinates do not fit in one word, and the ABI admits five parameters.
+   'aiueos-qwen35-gguf-kv-scan
+   {:arity 4 :symbol "kotoba_aiueos_qwen35_gguf_kv_scan"}
+   ;; Same workspace shape, 866 fixed-size binding slots. Takes the table's own
+   ;; region rather than the model's, because the tensor table is 51,242 bytes
+   ;; inside a 10.9 GiB mapping and `kernel-subregion` is what makes the
+   ;; narrowing checked -- the caller has already been told where it starts.
+   'aiueos-qwen35-tensor-table-bind
+   {:arity 5 :symbol "kotoba_aiueos_qwen35_tensor_table_bind"}})
 
 (defn- le [n width]
   (object-elf/little-endian n width))
@@ -671,6 +738,77 @@
           ;; 250,000,000 tier is unmeasured for this object. Affine exhausted
           ;; this imm32 ceiling; Solinas Jacobian completed inside it.
           ecdsa-fuel? (= 'aiueos-ecdsa-p256-sha256-verify object-entry)
+          ;; AES-128-GCM over a full 12,288-byte record. Not measured on the
+          ;; machine -- COMPUTED, and said so, because every loop bound in the
+          ;; object is a literal or a length and the cost is therefore closed
+          ;; form rather than data-dependent.
+          ;;
+          ;; One GHASH multiply is 4,565 calls (16 bytes x 8 bits x a 17-call
+          ;; XOR plus a 16-call shift, and the XOR is counted at its worst,
+          ;; every bit set). A 12,288-byte record with a 5-byte AAD takes 770
+          ;; of them -- one for the AAD block, 768 for the data, one for the
+          ;; length block -- which is 3.52M. CTR adds 768 AES blocks at 646
+          ;; calls apiece, 0.50M. The derived S-box and the key schedule are
+          ;; ~2.3K and do not move with the record. Total 4.03M calls, or 9.4M
+          ;; if the counter charges bounded-memory operations rather than
+          ;; calls; the tier covers the larger of the two 26x over.
+          ;;
+          ;; It shares X25519's constant and is a SEPARATE ARM on purpose, the
+          ;; same reason `dhcp-fuel?` is separate from `context-fuel?`:
+          ;; measuring one must not silently move the other. That the two
+          ;; magnitudes agree is a fact about the work (X25519's ladder was
+          ;; measured at 4,815,405 bounded-memory operations), not a shared
+          ;; derivation.
+          aead-fuel? (= 'aiueos-aes128-gcm object-entry)
+          ;; HMAC-SHA256 / HKDF-Expand-Label. COMPUTED, like the arm above and
+          ;; like `dhcp-fuel?`, and said so.
+          ;;
+          ;; Unlike `aiueos-sha256`, whose message may be 12,288 bytes, this
+          ;; object's message is bounded IN THE OBJECT at 192: HMAC only ever
+          ;; hashes a 64-byte padded key block plus an info string that RFC 8446
+          ;; 7.1 caps at 91 bytes here. That is at most four block
+          ;; compressions per hash and two hashes per call, and one compression
+          ;; is ~800 calls (a 17-call prepare, a 49-call extend, 64 rounds each
+          ;; carrying a 9-call register rotation, an 8-call add). Call it 7,000
+          ;; with the pad-block writes and the info construction.
+          ;;
+          ;; It takes SHA-256's own tier rather than something tighter. 65,536
+          ;; would be a 9x margin on an estimate, not a measurement, and the
+          ;; failure a tight bound produces is a prologue `ud2` -- an unexpected
+          ;; vector 6 that reads as a protocol bug rather than a fuel bug. The
+          ;; arm is separate from `sha-fuel?` so that measuring either one
+          ;; cannot silently move the other.
+          hkdf-fuel? (= 'aiueos-hkdf-sha256 object-entry)
+          ;; Qwen3.8 GGUF metadata scan. COMPUTED, like the two arms above,
+          ;; and said so -- nothing has executed this object yet.
+          ;;
+          ;; The bound is NOT the admitted artifact's own shape. That file's
+          ;; two tokenizer arrays hold 248,320 and 247,587 strings, and a
+          ;; length-prefixed string array can only be traversed element by
+          ;; element, so accepting it costs ~496,000 calls. But the object also
+          ;; has to REFUSE files, and the widest refusable shape is the one
+          ;; `qwen35_runtime.c`'s own `skip_value` admits: an element count of
+          ;; up to 1,000,000, in each of the 50 metadata entries, when the
+          ;; element type is itself a string. That is 50,000,000 traversal
+          ;; steps spent before the object can say no -- a hundred times the
+          ;; cost of the file it exists to accept.
+          ;;
+          ;; 250,000,000 is a 5x margin on that worst case. The 10,000,000 tier
+          ;; below would clear the admitted artifact by 20x and `ud2` partway
+          ;; through refusing a hostile one, which is the size-dependent trap
+          ;; this file's other comments keep naming.
+          qwen-metadata-fuel? (= 'aiueos-qwen35-gguf-kv-scan object-entry)
+          ;; Qwen3.8 tensor table. COMPUTED. 866 tensor records, each matched
+          ;; against 27 role literals of at most 30 bytes -- 810 comparison
+          ;; calls if every candidate is exhausted -- plus the dimension, type
+          ;; and extent arithmetic and the workspace writes. ~1,000,000.
+          ;;
+          ;; It does NOT inherit the arm above: a tensor NAME is skipped by
+          ;; arithmetic rather than traversed, so a hostile length buys no
+          ;; steps here, and the record count is fixed at 866 before the walk
+          ;; starts. A separate arm, so that measuring either one cannot
+          ;; silently move the other.
+          qwen-tensor-fuel? (= 'aiueos-qwen35-tensor-table-bind object-entry)
           context-fuel? (contains? '#{aiueos-user-context-build
                                      aiueos-kernel-context-build}
                                    object-entry)
@@ -761,6 +899,10 @@
           ;; the fourth `ud2`s partway through leaving the sector half written.
           replenish (cond
                       ecdsa-fuel? [0x49 0xc7 0x41 0x08 0xff 0xff 0xff 0x7f] ; 2,147,483,647
+                      aead-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000
+                      hkdf-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
+                      qwen-metadata-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000
+                      qwen-tensor-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
                       rsa-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000
                       sha-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
                       context-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x01 0x00] ; 65,536

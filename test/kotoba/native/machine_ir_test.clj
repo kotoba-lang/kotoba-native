@@ -3104,3 +3104,229 @@
     (testing (str body)
       (is (thrown? clojure.lang.ExceptionInfo (sysops-x86 params body)) body)
       (is (thrown? clojure.lang.ExceptionInfo (sysops-arm params body)) body))))
+
+;; ── simdprep: VEX prefix and AVX/AVX2 encoding goldens ──────────────────────
+;;
+;; Every expected byte vector below was cross-checked against an INDEPENDENT
+;; assembler: the emitted bytes were disassembled with
+;;
+;;   llvm-mc --triple=x86_64-unknown-linux-gnu --disassemble \
+;;           --output-asm-variant=1
+;;
+;; (Homebrew LLVM 22.1.7) and the resulting Intel-syntax text compared to the
+;; label on each row. All 61 round-tripped.
+;;
+;; The check is done in the DISASSEMBLY direction rather than by assembling the
+;; labels, and that is not a stylistic choice: LLVM's assembler COMMUTES the
+;; operands of commutative VEX instructions when doing so lets it use the
+;; shorter two-byte prefix. `vaddps ymm8, ymm0, ymm15` assembles to
+;; `c5 04 58 c0` -- which is `vaddps ymm8, ymm15, ymm0`, the same instruction
+;; with its sources swapped. The encoder here does not commute, so it emits
+;; `c4 41 7c 58 c7`; both decode to the operation the label names, and only the
+;; disassembly direction can say so. Assembling the labels and diffing would
+;; have reported a bug that is not there.
+;;
+;; This namespace does not execute anything. These are ENCODINGS: this machine
+;; is an Apple M4 and Rosetta exposes no AVX, so no test here can observe a
+;; single one of these instructions run. See docs/adr/0028.
+
+(def ^:private vex-register-goldens
+  "[form operands expected-bytes] for the ModRM register-register forms.
+  Register numbers >= 8 appear on every mnemonic, because the R and B bits
+  they set are inverted in the VEX prefix and a sign error there is invisible
+  in the low-register case."
+  [[:vmulps         {:reg 0 :vvvv 1 :rm 2}   [0xc5 0xf4 0x59 0xc2]]
+   [:vmulps         {:reg 9 :vvvv 10 :rm 11} [0xc4 0x41 0x2c 0x59 0xcb]]
+   [:vaddps         {:reg 0 :vvvv 1 :rm 2}   [0xc5 0xf4 0x58 0xc2]]
+   ;; The commuted case described above: llvm-mc's ASSEMBLER answers
+   ;; `c5 04 58 c0` here, and its DISASSEMBLER agrees these bytes are the same
+   ;; instruction.
+   [:vaddps         {:reg 8 :vvvv 0 :rm 15}  [0xc4 0x41 0x7c 0x58 0xc7]]
+   [:vsubps         {:reg 0 :vvvv 1 :rm 2}   [0xc5 0xf4 0x5c 0xc2]]
+   [:vsubps         {:reg 15 :vvvv 14 :rm 13} [0xc4 0x41 0x0c 0x5c 0xfd]]
+   [:vfmadd231ps    {:reg 5 :vvvv 6 :rm 7}   [0xc4 0xe2 0x4d 0xb8 0xef]]
+   [:vfmadd231ps    {:reg 0 :vvvv 1 :rm 2}   [0xc4 0xe2 0x75 0xb8 0xc2]]
+   [:vfmadd231ps    {:reg 8 :vvvv 9 :rm 10}  [0xc4 0x42 0x35 0xb8 0xc2]]
+   [:vpmaddubsw     {:reg 0 :vvvv 1 :rm 2}   [0xc4 0xe2 0x75 0x04 0xc2]]
+   [:vpmaddubsw     {:reg 8 :vvvv 9 :rm 10}  [0xc4 0x42 0x35 0x04 0xc2]]
+   [:vpmaddwd       {:reg 0 :vvvv 1 :rm 2}   [0xc5 0xf5 0xf5 0xc2]]
+   [:vpmaddwd       {:reg 8 :vvvv 9 :rm 10}  [0xc4 0x41 0x35 0xf5 0xc2]]
+   ;; Two operands, so vvvv is absent and encodes as 1111.
+   [:vcvtdq2ps      {:reg 0 :rm 1}           [0xc5 0xfc 0x5b 0xc1]]
+   [:vcvtdq2ps      {:reg 9 :rm 12}          [0xc4 0x41 0x7c 0x5b 0xcc]]
+   ;; `/2`: the ModRM reg field is the opcode extension the form supplies, and
+   ;; the DESTINATION travels in vvvv.
+   [:vpsrlw-imm8    {:vvvv 0 :rm 1 :imm8 4}  [0xc5 0xfd 0x71 0xd1 0x04]]
+   [:vpsrlw-imm8    {:vvvv 9 :rm 10 :imm8 8} [0xc4 0xc1 0x35 0x71 0xd2 0x08]]
+   [:vpand          {:reg 0 :vvvv 1 :rm 2}   [0xc5 0xf5 0xdb 0xc2]]
+   [:vpand          {:reg 8 :vvvv 9 :rm 10}  [0xc4 0x41 0x35 0xdb 0xc2]]
+   [:vpxor          {:reg 0 :vvvv 1 :rm 2}   [0xc5 0xf5 0xef 0xc2]]
+   [:vpxor          {:reg 8 :vvvv 9 :rm 10}  [0xc4 0x41 0x35 0xef 0xc2]]
+   ;; Reversed: the 256-bit SOURCE is in reg and the 128-bit DESTINATION in rm.
+   [:vextractf128   {:reg 1 :rm 0 :imm8 1}   [0xc4 0xe3 0x7d 0x19 0xc8 0x01]]
+   [:vextractf128   {:reg 10 :rm 9 :imm8 0}  [0xc4 0x43 0x7d 0x19 0xd1 0x00]]
+   [:vhaddps-256    {:reg 0 :vvvv 1 :rm 2}   [0xc5 0xf7 0x7c 0xc2]]
+   [:vhaddps-128    {:reg 0 :vvvv 1 :rm 2}   [0xc5 0xf3 0x7c 0xc2]]
+   [:vhaddps-128    {:reg 8 :vvvv 9 :rm 10}  [0xc4 0x41 0x33 0x7c 0xc2]]
+   ;; The one place a GENERAL register occupies a VEX operand slot, named by
+   ;; the same keywords `x86-register-code` owns rather than by a number.
+   [:vmovd-to-gpr   {:reg 0 :rm :x86-64/rax} [0xc5 0xf9 0x7e 0xc0]]
+   [:vmovd-to-gpr   {:reg 9 :rm :x86-64/r11} [0xc4 0x41 0x79 0x7e 0xcb]]
+   [:vmovd-from-gpr {:reg 0 :rm :x86-64/rax} [0xc5 0xf9 0x6e 0xc0]]
+   [:vmovd-from-gpr {:reg 9 :rm :x86-64/r11} [0xc4 0x41 0x79 0x6e 0xcb]]
+   [:vxorps-256     {:reg 0 :vvvv 0 :rm 0}   [0xc5 0xfc 0x57 0xc0]]
+   [:vxorps-256     {:reg 9 :vvvv 9 :rm 9}   [0xc4 0x41 0x34 0x57 0xc9]]
+   [:vxorps-128     {:reg 0 :vvvv 0 :rm 0}   [0xc5 0xf8 0x57 0xc0]]])
+
+(def ^:private vex-memory-goldens
+  "[form operands expected-bytes] for the ModRM memory forms. The `vmovups`
+  rows are the ModRM/SIB corner cases in full, because a load emitter gets
+  them wrong once and then everywhere."
+  [[:vmovups-load  {:reg 0 :operand {:base :x86-64/r10}}
+    [0xc4 0xc1 0x7c 0x10 0x02]]
+   [:vmovups-load  {:reg 3 :operand {:base :x86-64/r11 :disp 32}}
+    [0xc4 0xc1 0x7c 0x10 0x5b 0x20]]
+   [:vmovups-load  {:reg 9 :operand {:base :x86-64/rax :index :x86-64/r11
+                                     :scale 4 :disp 64}}
+    [0xc4 0x21 0x7c 0x10 0x4c 0x98 0x40]]
+   [:vmovups-load  {:reg 0 :operand {:rip 0}}
+    [0xc5 0xfc 0x10 0x05 0x00 0x00 0x00 0x00]]
+   ;; RSP's low three bits are the SIB escape, so a bare [rsp] still emits a
+   ;; SIB byte naming "no index".
+   [:vmovups-load  {:reg 0 :operand {:base :x86-64/rsp}}
+    [0xc5 0xfc 0x10 0x04 0x24]]
+   ;; RBP's low three bits are the RIP-relative escape, so a bare [rbp] must
+   ;; carry an explicit zero displacement or it would address a different
+   ;; location entirely.
+   [:vmovups-load  {:reg 0 :operand {:base :x86-64/rbp}}
+    [0xc5 0xfc 0x10 0x45 0x00]]
+   ;; R12 and R13 share those low three bits and inherit both rules, with the
+   ;; B bit set on top.
+   [:vmovups-load  {:reg 0 :operand {:base :x86-64/r12}}
+    [0xc4 0xc1 0x7c 0x10 0x04 0x24]]
+   [:vmovups-load  {:reg 0 :operand {:base :x86-64/r13}}
+    [0xc4 0xc1 0x7c 0x10 0x45 0x00]]
+   [:vmovups-load  {:reg 0 :operand {:base :x86-64/rax}}
+    [0xc5 0xfc 0x10 0x00]]
+   ;; The displacement-size boundary, both signs.
+   [:vmovups-load  {:reg 0 :operand {:base :x86-64/rax :disp 127}}
+    [0xc5 0xfc 0x10 0x40 0x7f]]
+   [:vmovups-load  {:reg 0 :operand {:base :x86-64/rax :disp 128}}
+    [0xc5 0xfc 0x10 0x80 0x80 0x00 0x00 0x00]]
+   [:vmovups-load  {:reg 0 :operand {:base :x86-64/rax :disp -128}}
+    [0xc5 0xfc 0x10 0x40 0x80]]
+   [:vmovups-load  {:reg 0 :operand {:base :x86-64/rax :disp -129}}
+    [0xc5 0xfc 0x10 0x80 0x7f 0xff 0xff 0xff]]
+   [:vmovups-load  {:reg 0 :operand {:base :x86-64/rsp :index :x86-64/rax
+                                     :scale 8 :disp 16}}
+    [0xc5 0xfc 0x10 0x44 0xc4 0x10]]
+   ;; Both the X and the B bit set, and the RBP displacement rule on top.
+   [:vmovups-load  {:reg 0 :operand {:base :x86-64/r13 :index :x86-64/r10
+                                     :scale 2}}
+    [0xc4 0x81 0x7c 0x10 0x44 0x55 0x00]]
+   [:vmovups-store {:reg 0 :operand {:base :x86-64/r10}}
+    [0xc4 0xc1 0x7c 0x11 0x02]]
+   [:vmovups-store {:reg 12 :operand {:base :x86-64/r11 :disp 4096}}
+    [0xc4 0x41 0x7c 0x11 0xa3 0x00 0x10 0x00 0x00]]
+   [:vbroadcastss  {:reg 1 :operand {:base :x86-64/r10}}
+    [0xc4 0xc2 0x7d 0x18 0x0a]]
+   [:vbroadcastss  {:reg 11 :operand {:base :x86-64/r11 :disp 8}}
+    [0xc4 0x42 0x7d 0x18 0x5b 0x08]]
+   [:vbroadcastss  {:reg 15 :operand {:rip 0}}
+    [0xc4 0x62 0x7d 0x18 0x3d 0x00 0x00 0x00 0x00]]
+   [:vpmovzxbw     {:reg 0 :operand {:base :x86-64/r10}}
+    [0xc4 0xc2 0x7d 0x30 0x02]]
+   [:vpmovzxbw     {:reg 12 :operand {:base :x86-64/r11 :disp 16}}
+    [0xc4 0x42 0x7d 0x30 0x63 0x10]]
+   [:vmovss-load   {:reg 0 :operand {:base :x86-64/r10}}
+    [0xc4 0xc1 0x7a 0x10 0x02]]
+   [:vmovss-load   {:reg 9 :operand {:base :x86-64/r11 :disp 4}}
+    [0xc4 0x41 0x7a 0x10 0x4b 0x04]]
+   [:vmovss-store  {:reg 3 :operand {:base :x86-64/r10 :disp 8}}
+    [0xc4 0xc1 0x7a 0x11 0x5a 0x08]]])
+
+(deftest vex-forms-encode-the-published-bytes
+  (doseq [[form operands expected] vex-register-goldens]
+    (is (= expected
+           (#'machine/x86-vex-rr (#'machine/x86-avx-form form) operands))
+        (str form " " operands)))
+  (doseq [[form operands expected] vex-memory-goldens]
+    (is (= expected
+           (#'machine/x86-vex-rm (#'machine/x86-avx-form form) operands))
+        (str form " " operands)))
+  ;; `vzeroupper` has no ModRM at all: a two-byte VEX and one opcode byte.
+  (is (= [0xc5 0xf8 0x77] @#'machine/x86-vzeroupper))
+  ;; Legacy SSE, no VEX prefix, because the horizontal tail of a dot product
+  ;; has to run on the machine whose AVX check failed.
+  (is (= [0x0f 0x58 0xc1] (#'machine/x86-sse-rr 0x58 0 1)))
+  (is (= [0x45 0x0f 0x58 0xca] (#'machine/x86-sse-rr 0x58 9 10)))
+  ;; An empty table is not a green suite. 61 is the number of rows this
+  ;; namespace was cross-checked against llvm-mc with.
+  (is (= 61 (+ (count vex-register-goldens) (count vex-memory-goldens) 3))
+      "SCANNED goldens"))
+
+(deftest vex-prefix-picks-the-shorter-legal-form
+  ;; Two bytes exactly when X, B and W are clear and the map is 0F. These four
+  ;; specs differ in one field each from a spec that qualifies.
+  (is (= [0xc5 0xf4] (#'machine/vex {:map :0f :l 256 :vvvv 1}))
+      "qualifies: no X, no B, no W, 0F map")
+  (is (= 3 (count (#'machine/vex {:map :0f :l 256 :vvvv 1 :b 1})))
+      "B forces three bytes")
+  (is (= 3 (count (#'machine/vex {:map :0f :l 256 :vvvv 1 :x 1})))
+      "X forces three bytes")
+  (is (= 3 (count (#'machine/vex {:map :0f :l 256 :vvvv 1 :w 1})))
+      "W forces three bytes")
+  (is (= 3 (count (#'machine/vex {:map :0f38 :l 256 :vvvv 1})))
+      "a map other than 0F forces three bytes")
+  ;; Both forms of the same prefix must describe the same instruction, which
+  ;; is the only reason picking the shorter one is safe. `vmulps ymm0, ymm1,
+  ;; ymm2` written both ways: llvm-mc disassembles c4 e1 74 59 c2 and
+  ;; c5 f4 59 c2 to the same text.
+  (is (= [0xc5 0xf4] (#'machine/vex2 {:map :0f :l 256 :vvvv 1})))
+  (is (= [0xc4 0xe1 0x74] (#'machine/vex3 {:map :0f :l 256 :vvvv 1}))))
+
+(defn- vex-rejection [f]
+  (try (f) nil
+       (catch clojure.lang.ExceptionInfo e (:problem (ex-data e)))))
+
+(deftest vex-encoders-refuse-what-they-cannot-encode
+  ;; Each row pins the REASON, not merely that something threw. A rename
+  ;; upstream should fail here rather than pass for a different cause.
+  (is (= :unknown-avx-form
+         (vex-rejection #(#'machine/x86-avx-form :vfmadd231pd))))
+  (is (= :unsupported-vex-register
+         (vex-rejection #(#'machine/x86-vex-rr
+                          (#'machine/x86-avx-form :vmulps)
+                          {:reg 16 :vvvv 1 :rm 2})))
+      "there are sixteen vector registers, not seventeen")
+  (is (= :unsupported-vex-register
+         (vex-rejection #(#'machine/x86-vex-rr
+                          (#'machine/x86-avx-form :vmulps)
+                          {:reg 0 :vvvv 1 :rm :x86-64/rsp})))
+      "RSP is not an allocatable register and is not a VEX operand")
+  ;; SIB index 100 with X clear MEANS "no index", so an RSP index would be
+  ;; silently dropped rather than encoded. It is refused instead.
+  (is (= :vex-index-cannot-be-rsp
+         (vex-rejection #(#'machine/x86-vex-rm
+                          (#'machine/x86-avx-form :vmovups-load)
+                          {:reg 0 :operand {:base :x86-64/rax
+                                            :index :x86-64/rsp :scale 1}}))))
+  (is (= :vex-scale-unsupported
+         (vex-rejection #(#'machine/x86-vex-rm
+                          (#'machine/x86-avx-form :vmovups-load)
+                          {:reg 0 :operand {:base :x86-64/rax
+                                            :index :x86-64/rcx :scale 3}})))
+      "the SIB scale field holds 1, 2, 4 or 8 and nothing else")
+  (is (= :unsupported-address-register
+         (vex-rejection #(#'machine/x86-vex-rm
+                          (#'machine/x86-avx-form :vmovups-load)
+                          {:reg 0 :operand {:base :x86-64/rip}}))))
+  (is (= :vex-imm8-out-of-range
+         (vex-rejection #(#'machine/x86-vex-rr
+                          (#'machine/x86-avx-form :vpsrlw-imm8)
+                          {:vvvv 0 :rm 1 :imm8 256}))))
+  (is (= :vex-length-unsupported (vex-rejection #(#'machine/vex2 {:l 512}))))
+  (is (= :vex-prefix-unsupported (vex-rejection #(#'machine/vex2 {:pp :f0}))))
+  (is (= :vex-opcode-map-unsupported
+         (vex-rejection #(#'machine/vex3 {:map :0f0f :b 1}))))
+  (is (= :vex-vvvv-out-of-range (vex-rejection #(#'machine/vex2 {:vvvv 16})))))
