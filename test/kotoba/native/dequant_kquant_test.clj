@@ -1,0 +1,448 @@
+(ns kotoba.native.dequant-kquant-test
+  "dequant-iq: the two K-quant formats, as geometry and as bytes.
+
+  DEQUANT-FUSION landed Q8_0 and REFUSED Q4_K and Q6_K by name, for a stated
+  reason: a Q4_K block's (scale, min) pair and its nibble half change every
+  thirty-two elements and a Q6_K block's scale index every sixteen, so their
+  thirty-two eight-element groups are not a loop. That is still true, and the
+  arms below are unrolled thirty-two times because of it. What changed is only
+  that the unrolling exists.
+
+  WHAT THESE TESTS SAY.
+
+  1. THE GEOMETRY IS RIGHT. The emitter reads a block through a table of
+     thirty-two constant displacements, and the table is compared here with an
+     INDEPENDENT transcription of `dequantize_row_q4_K` / `dequantize_row_q6_K`
+     from `os/aiueos/kernel/qwen35_quant.c` -- written with the C's own
+     `y++`/`q += 32` walk rather than with the table's arithmetic, so an
+     off-by-one in one is not an off-by-one in the other. The comparison is
+     ELEMENT BY ELEMENT over a synthesised block whose every byte differs, and
+     it is shown to be non-vacuous: two deliberate perturbations of the table
+     (the nibble half swapped, the scale index shifted) are asserted to
+     DISAGREE with the same port.
+
+  2. THE BYTES ARE THE SEQUENCE INTENDED. Whole group bodies are pinned, not
+     counts of the instructions in them -- DEQUANT-FUSION measured that a
+     golden which counted `addss` per accumulator passes for `lane = e div 2`,
+     which writes each accumulator twice as well and puts the right products
+     in the wrong chains. The ordered ModRM byte of every `addss` is asserted
+     as a SEQUENCE below, which is that same claim in the form a reader can
+     check.
+
+  WHAT THEY DO NOT SAY. Nothing here executes anything. That the two arms
+  compute the same number, and that the number is the one `kotoba.kir`
+  answers, is a claim about a machine and is measured in
+  `os/aiueos/scripts/smoke-qemu-dequant-kquant.cljs` under `-cpu max` and
+  `-cpu qemu64`.
+
+  Every byte run below was assembled and read back with
+  `llvm-mc --disassemble --triple=x86_64-unknown-linux-gnu` (Homebrew LLVM
+  22.1.7) on 2026-09-03, not derived from the manual and trusted."
+  (:require [clojure.test :refer [deftest is testing]]
+            [kotoba.native.machine-ir :as mir]
+            [kotoba.native.x86-64 :as x86]))
+
+(defn- code [head]
+  (vec (:code (x86/emit-program
+               {:format :kotoba.kir/v4 :exports ['main]
+                :functions [{:name 'main :params '[w wl x xl n]
+                             :body (list head 'w 'wl 'x 'xl 'n)}]}))))
+
+(defn- byte-run? [haystack needle]
+  (boolean (some #(= needle (subvec haystack % (+ % (count needle))))
+                 (range (inc (- (count haystack) (count needle)))))))
+
+(defn- byte-run-count [haystack needle]
+  (count (filter #(= needle (subvec haystack % (+ % (count needle))))
+                 (range (inc (- (count haystack) (count needle)))))))
+
+(defn- byte-run-indexes [haystack needle]
+  (vec (filter #(= needle (subvec haystack % (+ % (count needle))))
+               (range (inc (- (count haystack) (count needle)))))))
+
+(def ^:private q4-groups @#'mir/x86-dequant-q4-k-groups)
+(def ^:private q6-groups @#'mir/x86-dequant-q6-k-groups)
+
+;; ---------------------------------------------------------------------------
+;; the C, transcribed -- `dequantize_row_*` as a RECIPE per output element
+;;
+;; Each entry says where element i's code comes from, as byte offsets INTO THE
+;; BLOCK, so it can be compared with the emitter's table without either side
+;; knowing how the other computed it. The loops below are the C's:
+;; `qwen35_quant.c` walks `q` and `y` with pointer increments, and so do they.
+;; ---------------------------------------------------------------------------
+
+(defn- q4-k-recipe
+  "128 nibble pairs, four 64-element halves, two (scale, min) pairs each."
+  []
+  (let [out (volatile! [])]
+    (dotimes [half 4]
+      (let [q (+ 16 (* 32 half))]
+        ;; `for (l = 0; l < 32; ++l) *y++ = d1 * (q[l] & 0xF) - m1;`
+        (dotimes [l 32]
+          (vswap! out conj {:byte (+ q l) :high? false :pair (* 2 half)}))
+        ;; `for (l = 0; l < 32; ++l) *y++ = d2 * (q[l] >> 4) - m2;`
+        (dotimes [l 32]
+          (vswap! out conj {:byte (+ q l) :high? true :pair (inc (* 2 half))}))))
+    @out))
+
+(defn- q6-k-recipe
+  "Two halves of 128. `ql` walks 64 at a time, `qh` 32, `sc` 8; within a half
+  the four strips take the low nibble of `ql[l]`, the low nibble of
+  `ql[l+32]`, then the high nibbles of the same two, against `qh`'s two-bit
+  fields at shift 0, 2, 4 and 6."
+  []
+  (let [out (volatile! (vec (repeat 256 nil)))]
+    (dotimes [n 2]
+      (let [ql (* 64 n) qh (+ 128 (* 32 n)) sc (+ 192 (* 8 n))]
+        (dotimes [l 32]
+          (let [is (quot l 16)]
+            (vswap! out assoc (+ (* 128 n) l 0)
+                    {:ql (+ ql l) :qh (+ qh l) :shift 0 :high? false
+                     :scale (+ sc is 0)})
+            (vswap! out assoc (+ (* 128 n) l 32)
+                    {:ql (+ ql l 32) :qh (+ qh l) :shift 2 :high? false
+                     :scale (+ sc is 2)})
+            (vswap! out assoc (+ (* 128 n) l 64)
+                    {:ql (+ ql l) :qh (+ qh l) :shift 4 :high? true
+                     :scale (+ sc is 4)})
+            (vswap! out assoc (+ (* 128 n) l 96)
+                    {:ql (+ ql l 32) :qh (+ qh l) :shift 6 :high? true
+                     :scale (+ sc is 6)})))))
+    @out))
+
+;; ---------------------------------------------------------------------------
+;; the emitter's table, expanded to the same shape
+;; ---------------------------------------------------------------------------
+
+(defn- q4-table
+  "PERTURB is nil or a keyword naming a deliberate mistake."
+  [perturb]
+  (vec (mapcat (fn [{:keys [q-offset high? pair]}]
+                 (let [pair (if (= perturb :wrong-pair) (mod (inc pair) 8) pair)
+                       high? (if (= perturb :swapped-nibble) (not high?) high?)]
+                   (map (fn [e] {:byte (+ q-offset e) :high? high? :pair pair})
+                        (range 8))))
+               q4-groups)))
+
+(defn- q6-table [perturb]
+  (vec (mapcat (fn [{:keys [ql-offset qh-offset scale-offset shift high?]}]
+                 (let [scale-offset (if (= perturb :wrong-scale)
+                                      (+ 192 (mod (inc (- scale-offset 192)) 16))
+                                      scale-offset)
+                       high? (if (= perturb :swapped-nibble) (not high?) high?)]
+                   (map (fn [e] {:ql (+ ql-offset e) :qh (+ qh-offset e)
+                                 :shift shift :high? high?
+                                 :scale scale-offset})
+                        (range 8))))
+               q6-groups)))
+
+;; ---------------------------------------------------------------------------
+;; 1. the geometry
+;; ---------------------------------------------------------------------------
+
+(deftest q4-k-unrolled-groups-read-what-the-c-reads
+  (let [c (q4-k-recipe)
+        table (q4-table nil)
+        disagreements (filterv (fn [i] (not= (nth c i) (nth table i))) (range 256))]
+    (println (str "SCANNED\t256\tDISAGREEMENTS\t" (count disagreements)))
+    (is (= 256 (count c)))
+    (is (= 256 (count table)))
+    (is (empty? disagreements)
+        (str "element " (first disagreements) ": the C reads "
+             (nth c (or (first disagreements) 0)) " and the table reads "
+             (nth table (or (first disagreements) 0))))
+    (testing "every byte of the 128 is read exactly twice, once per nibble"
+      (is (= 128 (count (distinct (map :byte table)))))
+      (is (= #{2} (set (vals (frequencies (map :byte table)))))))
+    (testing "each of the eight (scale, min) pairs covers exactly 32 elements"
+      (is (= (zipmap (range 8) (repeat 32)) (frequencies (map :pair table)))))))
+
+(deftest q6-k-unrolled-groups-read-what-the-c-reads
+  (let [c (q6-k-recipe)
+        table (q6-table nil)
+        disagreements (filterv (fn [i] (not= (nth c i) (nth table i))) (range 256))]
+    (println (str "SCANNED\t256\tDISAGREEMENTS\t" (count disagreements)))
+    (is (empty? disagreements)
+        (str "element " (first disagreements) ": the C reads "
+             (nth c (or (first disagreements) 0)) " and the table reads "
+             (nth table (or (first disagreements) 0))))
+    (testing "each of the 128 low bytes is read twice and each qh byte four times"
+      (is (= #{2} (set (vals (frequencies (map :ql table))))))
+      (is (= #{4} (set (vals (frequencies (map :qh table)))))))
+    (testing "each of the sixteen scales covers exactly sixteen elements"
+      (is (= (zipmap (range 192 208) (repeat 16))
+             (frequencies (map :scale table)))))
+    (testing "each two-bit field is used by exactly 64 elements"
+      (is (= {0 64 2 64 4 64 6 64} (frequencies (map :shift table)))))))
+
+(deftest the-geometry-comparison-is-not-vacuous
+  ;; Without this, the two tests above would pass for a table that agreed with
+  ;; a port that agreed with nothing. Each perturbation is a mistake a hand
+  ;; derivation actually makes: reading the high nibble where the low one is
+  ;; meant, and taking the neighbouring scale.
+  (let [c4 (q4-k-recipe) c6 (q6-k-recipe)]
+    (doseq [p [:swapped-nibble :wrong-pair]]
+      (is (not= c4 (q4-table p))
+          (str "a Q4_K table perturbed by " p " must disagree with the C")))
+    (doseq [p [:swapped-nibble :wrong-scale]]
+      (is (not= c6 (q6-table p))
+          (str "a Q6_K table perturbed by " p " must disagree with the C")))
+    (testing "and the perturbations are not each other"
+      (is (not= (q4-table :swapped-nibble) (q4-table :wrong-pair)))
+      (is (not= (q6-table :swapped-nibble) (q6-table :wrong-scale))))))
+
+(deftest the-activation-side-is-read-straight-through
+  ;; The weights are permuted by the format; the activations are not. Group g
+  ;; reads 32 bytes at 32g, which is elements 8g..8g+7 in order, and the two
+  ;; tables must agree on that or the fold pairs the wrong numbers.
+  (is (= (mapv #(* 32 %) (range 32)) (mapv :x-offset q4-groups)))
+  (is (= (mapv #(* 32 %) (range 32)) (mapv :x-offset q6-groups))))
+
+;; ---------------------------------------------------------------------------
+;; 2. the bytes
+;; ---------------------------------------------------------------------------
+
+(def ^:private q4-avx-low-group
+  ;; Group 0 -- the low nibbles of the eight bytes at [r10+16], scaled by the
+  ;; broadcast `d1` in ymm3, biased by the broadcast `min1` in ymm4, and folded
+  ;; against [r11]:
+  ;;
+  ;;   vpmovzxbd ymm1, [r10+16]     eight bytes to eight dwords, zero-extended
+  ;;   vpslld    ymm1, ymm1, 28     `& 0xF`, as a shift pair -- the vector file
+  ;;   vpsrld    ymm1, ymm1, 28     is full and a mask needs a register
+  ;;   vcvtdq2ps ymm1, ymm1
+  ;;   vmulps    ymm1, ymm1, ymm3   * d1                       (round 1)
+  ;;   vsubps    ymm1, ymm1, ymm4   - min1                     (round 2)
+  ;;   vmovups   ymm2, [r11]
+  ;;   vmulps    ymm1, ymm1, ymm2   * the activation           (round 3)
+  ;;   vextractf128 xmm2, ymm1, 1
+  ;;   vaddps    xmm0, xmm0, xmm1   lower four, into lanes 0..3
+  ;;   vaddps    xmm0, xmm0, xmm2   upper four, into the SAME four
+  [0xc4 0xc2 0x7d 0x31 0x4a 0x10 0xc5 0xf5 0x72 0xf1 0x1c 0xc5
+   0xf5 0x72 0xd1 0x1c 0xc5 0xfc 0x5b 0xc9 0xc5 0xf4 0x59 0xcb
+   0xc5 0xf4 0x5c 0xcc 0xc4 0xc1 0x7c 0x10 0x13 0xc5 0xf4 0x59
+   0xca 0xc4 0xe3 0x7d 0x19 0xca 0x01 0xc5 0xf8 0x58 0xc1 0xc5
+   0xf8 0x58 0xc2])
+
+(def ^:private q4-avx-high-group
+  ;; Group 4 -- the HIGH nibbles of the SAME eight bytes, against the NEXT
+  ;; pair, folded against [r11+128]. One `vpsrld ymm1, ymm1, 4` replaces the
+  ;; shift pair, and that single immediate is the whole difference between a
+  ;; half and its twin.
+  [0xc4 0xc2 0x7d 0x31 0x4a 0x10 0xc5 0xf5 0x72 0xd1 0x04 0xc5
+   0xfc 0x5b 0xc9 0xc5 0xf4 0x59 0xcb 0xc5 0xf4 0x5c 0xcc 0xc4
+   0xc1 0x7c 0x10 0x93 0x80 0x00 0x00 0x00 0xc5 0xf4 0x59 0xca
+   0xc4 0xe3 0x7d 0x19 0xca 0x01 0xc5 0xf8 0x58 0xc1 0xc5 0xf8
+   0x58 0xc2])
+
+(def ^:private q6-avx-strip-0
+  ;; Group 0 of Q6_K, scale included, at strip 0 (shift 0, low nibble):
+  ;;
+  ;;   movsbq       rax, byte [r10+192]   the SIGNED scale
+  ;;   vmovd        xmm1, eax
+  ;;   vcvtdq2ps    ymm1, ymm1
+  ;;   vmulss       xmm1, xmm1, xmm4      * d                    (round 1)
+  ;;   vbroadcastss ymm3, xmm1
+  ;;   vpmovzxbd    ymm1, [r10+128]       the two-bit fields
+  ;;   vpslld/vpsrld/vpslld 30,30,4       ((qh >> 0) & 3) << 4
+  ;;   vpmovzxbd    ymm2, [r10]           the nibbles
+  ;;   vpslld/vpsrld 28,28                & 0xF
+  ;;   vpor         ymm1, ymm1, ymm2
+  ;;   vpsubd       ymm1, ymm1, ymm5      - 32, as an INTEGER, before the
+  ;;                                       conversion -- both arms round in
+  ;;                                       the same place
+  ;;   vcvtdq2ps / vmulps ymm3 / vmovups [r11] / vmulps / vextractf128 /
+  ;;   vaddps xmm0,xmm0,xmm1 / vaddps xmm0,xmm0,xmm2
+  [0x49 0x0f 0xbe 0x82 0xc0 0x00 0x00 0x00 0xc5 0xf9 0x6e 0xc8
+   0xc5 0xfc 0x5b 0xc9 0xc5 0xf2 0x59 0xcc 0xc4 0xe2 0x7d 0x18
+   0xd9 0xc4 0xc2 0x7d 0x31 0x8a 0x80 0x00 0x00 0x00 0xc5 0xf5
+   0x72 0xf1 0x1e 0xc5 0xf5 0x72 0xd1 0x1e 0xc5 0xf5 0x72 0xf1
+   0x04 0xc4 0xc2 0x7d 0x31 0x12 0xc5 0xed 0x72 0xf2 0x1c 0xc5
+   0xed 0x72 0xd2 0x1c 0xc5 0xf5 0xeb 0xca 0xc5 0xf5 0xfa 0xcd
+   0xc5 0xfc 0x5b 0xc9 0xc5 0xf4 0x59 0xcb 0xc4 0xc1 0x7c 0x10
+   0x13 0xc5 0xf4 0x59 0xca 0xc4 0xe3 0x7d 0x19 0xca 0x01 0xc5
+   0xf8 0x58 0xc1 0xc5 0xf8 0x58 0xc2])
+
+(def ^:private q6-scalar-element
+  ;; One Q6_K element of the legacy arm, at strip 0, lane 0:
+  ;;
+  ;;   movzx    rax, byte [r10+128]
+  ;;   and      rax, 3            the two-bit field, masked IN PLACE
+  ;;   shl      rax, 4            and moved to bits 4..5
+  ;;   movzx    rcx, byte [r10]
+  ;;   and      rcx, 15
+  ;;   or       rax, rcx
+  ;;   sub      rax, 32           the bias, on the integer
+  ;;   cvtsi2ss xmm4, rax         REX.W: the value is negative for most codes
+  ;;   mulss    xmm4, xmm9        * the scale                    (round 1)
+  ;;   movss    xmm5, [r11]
+  ;;   mulss    xmm4, xmm5        * the activation               (round 2)
+  ;;   addss    xmm0, xmm4        into lane e mod 4
+  [0x41 0x0f 0xb6 0x82 0x80 0x00 0x00 0x00 0x48 0x81 0xe0 0x03
+   0x00 0x00 0x00 0x48 0xc1 0xe0 0x04 0x41 0x0f 0xb6 0x0a 0x48
+   0x81 0xe1 0x0f 0x00 0x00 0x00 0x48 0x09 0xc8 0x48 0x81 0xe8
+   0x20 0x00 0x00 0x00 0xf3 0x48 0x0f 0x2a 0xe0 0xf3 0x41 0x0f
+   0x59 0xe1 0xf3 0x41 0x0f 0x10 0x2b 0xf3 0x0f 0x59 0xe5 0xf3
+   0x0f 0x58 0xc4])
+
+(deftest q4-k-emits-both-arms
+  (let [c (code 'kernel-dequant-dot-q4-k)]
+    (testing "the two group shapes, byte for byte"
+      (is (byte-run? c q4-avx-low-group))
+      (is (byte-run? c q4-avx-high-group)))
+    (testing "thirty-two groups, unrolled, in the vector arm"
+      (is (= 32 (byte-run-count c [0xc4 0xc2 0x7d 0x31]))
+          "one vpmovzxbd per group and no loop over them"))
+    (testing "sixteen low halves and sixteen high"
+      (is (= 16 (byte-run-count c [0xc5 0xf5 0x72 0xf1 0x1c]))
+          "vpslld ymm1,ymm1,28 -- the low-nibble mask's first half")
+      (is (= 16 (byte-run-count c [0xc5 0xf5 0x72 0xd1 0x04]))
+          "vpsrld ymm1,ymm1,4 -- the high nibble"))
+    (testing "eight (scale, min) pairs per block, in both arms"
+      ;; `vbroadcastss ymm4, xmm1` closes a pair on the vector side and
+      ;; `mulss xmm10, xmm7` closes it on the legacy one.
+      (is (= 8 (byte-run-count c [0xc4 0xe2 0x7d 0x18 0xe1])))
+      (is (= 8 (byte-run-count c [0xf3 0x44 0x0f 0x59 0xd7]))))
+    (testing "the block loop advances both pointers once"
+      (is (= 2 (byte-run-count c [0x49 0x81 0xc2 0x90 0x00 0x00 0x00]))
+          "add r10, 144 -- one per arm")
+      (is (= 2 (byte-run-count c [0x49 0x81 0xc3 0x00 0x04 0x00 0x00]))
+          "add r11, 1024 -- one per arm"))))
+
+(deftest q6-k-emits-both-arms
+  (let [c (code 'kernel-dequant-dot-q6-k)]
+    (is (byte-run? c q6-avx-strip-0))
+    (is (byte-run? c q6-scalar-element))
+    (testing "thirty-two scales read per arm, signed"
+      (is (= 64 (byte-run-count c [0x49 0x0f 0xbe])) "movsx from [r10+disp]"))
+    (testing "the four strips are four different shifts, eight groups each"
+      (doseq [[imm strip] [[0x1e 0] [0x1c 1] [0x1a 2] [0x18 3]]]
+        (is (= 8 (byte-run-count c [0xc5 0xf5 0x72 0xf1 imm]))
+            (str "vpslld ymm1,ymm1,(30 - 2*" strip ")"))))
+    (testing "and four different masks in the legacy arm, 64 elements each"
+      (doseq [imm [3 12 48 192]]
+        (is (= 64 (byte-run-count c [0x48 0x81 0xe0 imm 0x00 0x00 0x00]))
+            (str "and rax, " imm))))
+    (testing "the -32 bias is applied once per element, in both arms"
+      (is (= 256 (byte-run-count c [0x48 0x81 0xe8 0x20 0x00 0x00 0x00]))
+          "sub rax, 32 -- 256 elements of the legacy arm")
+      (is (= 32 (byte-run-count c [0xc5 0xf5 0xfa 0xcd]))
+          "vpsubd ymm1, ymm1, ymm5 -- once per group of the vector arm"))
+    (testing "the block loop advances both pointers once"
+      (is (= 2 (byte-run-count c [0x49 0x81 0xc2 0xd2 0x00 0x00 0x00]))
+          "add r10, 210")
+      (is (= 2 (byte-run-count c [0x49 0x81 0xc3 0x00 0x04 0x00 0x00]))
+          "add r11, 1024"))))
+
+(deftest the-legacy-arms-write-the-accumulators-in-tree-order
+  ;; THE SEQUENCE, not the histogram. DEQUANT-FUSION measured that counting
+  ;; `addss` per accumulator passes for `lane = e div 2` -- which also touches
+  ;; each of the four twice, with the right products in the wrong chains. The
+  ;; ordered ModRM byte says which chain each product joins:
+  ;;
+  ;;   0xC4 = addss xmm0, xmm4   0xCC = xmm1   0xD4 = xmm2   0xDC = xmm3
+  ;;
+  ;; and `0,1,2,3,0,1,2,3` per group is `s += lower; s += upper` per lane.
+  (doseq [head '[kernel-dequant-dot-q4-k kernel-dequant-dot-q6-k]]
+    (let [c (code head)
+          modrm (mapv #(nth c (+ % 3)) (byte-run-indexes c [0xf3 0x0f 0x58]))
+          groups (partition 8 (take 256 modrm))]
+      (is (= 259 (count modrm))
+          (str head ": 256 element adds plus the three-add reduction, and"
+               " the vector arm's `vaddps` are not this opcode"))
+      (is (= [0xc1 0xd3 0xc2] (vec (take-last 3 modrm)))
+          (str head ": the reduction is addss xmm0,xmm1; xmm2,xmm3; xmm0,xmm2"))
+      (is (= #{[0xc4 0xcc 0xd4 0xdc 0xc4 0xcc 0xd4 0xdc]}
+             (set (map vec groups)))
+          (str head ": every one of the thirty-two groups writes lanes"
+               " 0,1,2,3 then 0,1,2,3")))))
+
+(deftest the-vector-arms-end-with-vzeroupper
+  (doseq [head '[kernel-dequant-dot-q4-k kernel-dequant-dot-q6-k]]
+    (let [c (code head)]
+      (is (= 1 (byte-run-count c [0xc5 0xf8 0x77])) (str head))
+      (is (byte-run? c [0x0f 0x0b]) (str head ": ud2 on the trap path")))))
+
+(deftest no-vex-instruction-runs-before-the-guard-answers
+  ;; The same claim DEQUANT-FUSION asserts for Q8_0, restated for the arms
+  ;; that are new. A `vpmovzxbd` reached on a machine without AVX is #UD, and
+  ;; in a kernel that is a fault in the middle of feature detection. Neither
+  ;; 0xc4 nor 0xc5 appears for any other reason in this prefix range, which is
+  ;; why scanning for them is a test rather than an approximation.
+  (doseq [head '[kernel-dequant-dot-q4-k kernel-dequant-dot-q6-k]]
+    (let [c (code head)
+          guard [0x31 0xc0 0x31 0xc9 0x0f 0xa2 0x83 0xf8 0x07]
+          guard-at (first (byte-run-indexes c guard))]
+      (is (some? guard-at) (str head ": the cpuid guard is present"))
+      (is (not (some #{0xc4 0xc5} (subvec c 0 (+ guard-at 60))))
+          (str head ": a VEX prefix before the guard answers is a #UD on the"
+               " machines this guard exists to detect")))))
+
+;; ---------------------------------------------------------------------------
+;; 3. what the unrolling costs, as a count
+;; ---------------------------------------------------------------------------
+
+(deftest the-vector-arms-are-shorter-per-eight-elements
+  ;; STATIC GUEST-INSTRUCTION COUNTS, counted from the disassembly above. Not
+  ;; a speedup: the only machine on this workstation with AVX2 at all is QEMU
+  ;; TCG, whose `rdtsc` reads host time and whose cost is dominated by
+  ;; translating instructions rather than executing them -- DEQUANT-FUSION
+  ;; measured 1.46 there for Q8_0 and explained why the number means nothing.
+  ;; A count is what can be asserted.
+  ;;
+  ;;   Q4_K  low group  11 vector instructions vs 8 elements x 8 = 64
+  ;;         high group 10                     vs the same 64
+  ;;         plus one (scale, min) pair per four groups: 8 vector, 4 legacy
+  ;;   Q6_K  strip 0/1  15 (5 of them the scale) vs 3 + 8 x 12 = 99
+  ;;         strip 2/3  14                       vs 3 + 8 x 11 = 91
+  (testing "Q4_K"
+    (let [avx-low 11 avx-high 10 legacy 64]
+      (is (<= 5.8 (/ (double legacy) avx-low)))
+      (is (<= 6.4 (/ (double legacy) avx-high)))))
+  (testing "Q6_K"
+    (let [avx-low 15 avx-high 14
+          legacy-low (+ 3 (* 8 12)) legacy-high (+ 3 (* 8 11))]
+      (is (= 99 legacy-low))
+      (is (= 91 legacy-high))
+      (is (<= 6.6 (/ (double legacy-low) avx-low)))
+      (is (<= 6.5 (/ (double legacy-high) avx-high)))))
+  (testing "and the counts are the bytes' counts"
+    ;; A count nobody checks against the emitted code is a number in a
+    ;; comment. These are the instruction boundaries the runs above pin.
+    (let [c4 (code 'kernel-dequant-dot-q4-k)]
+      (is (= 51 (count q4-avx-low-group)))
+      (is (= 50 (count q4-avx-high-group)))
+      (is (byte-run? c4 q4-avx-low-group))
+      (is (byte-run? c4 q4-avx-high-group)))))
+
+;; ---------------------------------------------------------------------------
+;; 4. the refusal is still reachable
+;; ---------------------------------------------------------------------------
+
+(deftest a-format-without-arms-is-still-refused-by-name
+  ;; All three formats emit now, so no head reaches the refusal any more. It
+  ;; is kept, and tested here by taking Q8_0's arms away, because the failure
+  ;; it prevents is silent: a `case` with no arm for an encoding returns nil,
+  ;; and a group body of no bytes is a loop that runs the right number of
+  ;; times and adds nothing -- an instruction that answers +0.0 for every row,
+  ;; on every machine, agreeing with itself.
+  (let [table @#'mir/x86-dequant-formats
+        var #'mir/x86-dequant-formats]
+    (try
+      (alter-var-root var (constantly
+                           (assoc-in table
+                                     [:x86-64/kernel-dequant-dot-q8-0 :emitted?]
+                                     false)))
+      (let [thrown (try (code 'kernel-dequant-dot-q8-0)
+                        nil
+                        (catch clojure.lang.ExceptionInfo e e))]
+        (is (some? thrown) "a format with :emitted? false must be refused")
+        (is (= :dequant-format-not-emitted (:problem (ex-data thrown))))
+        (is (= :mc-encode (:phase (ex-data thrown))))
+        (is (= :x86-64/kernel-dequant-dot-q8-0
+               (:encoding (:instruction (ex-data thrown))))
+            "and must name WHICH format"))
+      (finally (alter-var-root var (constantly table)))))
+  (testing "and the other direction: with the table restored it emits again"
+    (is (pos? (count (code 'kernel-dequant-dot-q8-0))))))
