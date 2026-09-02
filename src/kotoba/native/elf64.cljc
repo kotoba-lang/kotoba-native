@@ -1,6 +1,7 @@
 (ns kotoba.native.elf64
   (:require [clojure.string :as str]
             [kotoba.artifact.core :as artifact]
+            [kotoba.native.interrupt-abi :as interrupt-abi]
             [kotoba.object.elf64 :as object-elf]
             #?(:cljs [kotoba.kir.cljs-i64 :as i64])))
 
@@ -466,6 +467,43 @@
                       {:fuel fuel :fuel-abi-initial abi-fuel})))
     fuel))
 
+;; isr: the same two helpers the JVM twin carries, for the same reasons. This
+;; file's OBJECT route is the one `kotoba.compiler.nbb.native-package` serves,
+;; and the two routes' objects are byte-identical -- so the entry rule has to
+;; be stated on both sides or the JVM-free route emits a different object.
+(defn- interrupt-entry-exports [artifact]
+  (let [named (->> (keys (:exports artifact))
+                   (filter #(str/starts-with? (name %)
+                                              interrupt-abi/entry-prefix)))
+        malformed (remove interrupt-abi/entry-vector named)]
+    (when (seq malformed)
+      (throw (ex-info "Kotoba kernel interrupt entry name does not denote a vector"
+                      {:reason :isr-name-not-a-vector
+                       :names (vec (sort malformed))
+                       :vector-limit interrupt-abi/vector-limit})))
+    (into {} (map (fn [n] [(interrupt-abi/entry-vector n)
+                           (get-in artifact [:exports n])]))
+          named)))
+
+(defn- reaches-isr-address? [artifact entry]
+  (let [functions (get-in artifact [:program :functions])
+        by-name (into {} (map (juxt :name identity)) functions)
+        heads (fn [name]
+                (->> (tree-seq coll? seq (:body (get by-name name)))
+                     (filter seq?) (map first) (filter symbol?)))]
+    (loop [seen #{} queue [entry]]
+      (if-let [n (first queue)]
+        (cond
+          (contains? seen n) (recur seen (rest queue))
+          (nil? (get by-name n)) (recur (conj seen n) (rest queue))
+          :else
+          (let [called (heads n)]
+            (if (some #(= 'kernel-isr-entry-address %) called)
+              true
+              (recur (conj seen n)
+                     (concat (rest queue) (filter by-name called))))))
+        false))))
+
 (defn package-kernel
   "Package a sealed aiueos kernel artifact as a freestanding ELF64 ET_EXEC.
   The returned byte vector has no interpreter, dynamic section, or host imports."
@@ -483,6 +521,23 @@
         export (get-in artifact [:exports source-entry])]
     (when-not export
       (throw (ex-info "Kotoba kernel entry is not exported" {:entry source-entry})))
+    ;; isr: this twin's x86-64 kernel IMAGE lays a bare 88-byte context and no
+    ;; GDT/TSS/stack -- kotoba-native ADR-0036 keeps the two files apart on
+    ;; purpose, and `kotoba.compiler.nbb.native-package` already refuses this
+    ;; route rather than serving a materially different image. The interrupt
+    ;; entry region needs a context slot at 0x148, which is past the end of
+    ;; the context this route builds.
+    ;;
+    ;; Refused rather than emitted with the base omitted. An image whose
+    ;; entries exist but whose base slot reads zero installs gate descriptors
+    ;; pointing into the first page: it boots, and the first interrupt
+    ;; triple-faults. Saying so here costs a compile and saves that.
+    (when (seq (interrupt-entry-exports artifact))
+      (throw (ex-info "the portable elf64 twin's kernel image has no interrupt entry region"
+                      {:reason :isr-image-needs-the-jvm-packager
+                       :vectors (vec (sort (keys (interrupt-entry-exports artifact))))
+                       :context-bytes kernel-image-context-size
+                       :required-slot interrupt-abi/context-entry-base-offset})))
     (let [entry-address (+ image-base text-offset)
           context-address (+ image-base x86-kernel-data-offset)
           shim (entry-shim (+ entry-address 23 (:offset export)) context-address)
@@ -686,9 +741,31 @@
     (throw (ex-info "ELF64 kernel object packaging requires a freestanding profile"
                     {:target-profile (:target-profile artifact)})))
   (let [source-entry (get-in artifact [:program :entry])
-        object-entry (or (some #(when (contains? (:exports artifact) %) %)
+        ;; isr: an interrupt entry claims the object's one public symbol
+        ;; before the table does, and an object HAS one public symbol, so two
+        ;; entries in one source have no answer here.
+        isr-exports (interrupt-entry-exports artifact)
+        _ (when (< 1 (count isr-exports))
+            (throw (ex-info "Kotoba kernel object declares more than one interrupt entry"
+                            {:reason :isr-object-has-one-entry
+                             :vectors (vec (sort (keys isr-exports)))})))
+        isr-vector (first (keys isr-exports))
+        object-entry (or (when isr-vector (interrupt-abi/entry-name isr-vector))
+                         (some #(when (contains? (:exports artifact) %) %)
                                (keys kernel-object-entries))
                          source-entry)
+        ;; isr: `kernel-isr-entry-address` has no answer in this route. The
+        ;; entry region and the context slot naming it belong to the bootable
+        ;; image; an object's context is its own private 80 bytes and offset
+        ;; 0x148 is past the end of it. Scoped to what the object's ONE public
+        ;; symbol can reach, because one compile produces both forms and a
+        ;; kernel image's `main` legitimately uses the operation.
+        _ (when (reaches-isr-address? artifact object-entry)
+            (throw (ex-info "kernel-isr-entry-address has no answer in the object route"
+                            {:reason :isr-address-needs-image
+                             :entry object-entry
+                             :context-slot interrupt-abi/context-entry-base-offset
+                             :object-context-size context-size})))
         export (get-in artifact [:exports object-entry])
         ;; `kernel-object-entries` is the WHOLE rule for an object's public
         ;; symbol, and it is an allowlist. A source that declares an
@@ -715,11 +792,18 @@
         ;;
         ;; Refusing is the only answer here that is not a guess, and a
         ;; colliding symbol is worse than no object: it links.
+        ;; isr: a well-formed `aiueos-isr-<vector>` is admitted by the name
+        ;; rule rather than by the table. A name in that shape that does not
+        ;; denote a vector never reaches here -- it was refused above.
         unlisted-aiueos-exports (->> (keys (:exports artifact))
                                      (filter #(str/starts-with? (name %) admitted-entry-prefix))
                                      (remove kernel-object-entries)
+                                     (remove interrupt-abi/entry-vector)
                                      sort vec)
-        contract (or (get kernel-object-entries object-entry)
+        contract (or (when isr-vector
+                       {:arity interrupt-abi/body-arity
+                        :symbol (interrupt-abi/entry-symbol isr-vector)})
+                     (get kernel-object-entries object-entry)
                      (when (empty? unlisted-aiueos-exports)
                        {:arity 0 :symbol "kotoba_aiueos_probe"}))
         _ (when-not contract
@@ -987,15 +1071,41 @@
                       dhcp-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x01 0x00] ; 65,536
                       high-fuel? [0x49 0xc7 0x41 0x08 0x00 0x10 0x00 0x00] ; 4096
                       :else [0x49 0xc7 0x41 0x08 0x00 0x04 0x00 0x00]) ; 1024
+          ;; isr: an entry object's public symbol IS the interrupt entry, so
+          ;; it replaces the SysV wrapper. The linked shape is unchanged --
+          ;; one R_X86_64_PC32 into the object's own `.data`, no imports --
+          ;; because the entry's `lea r9,[rip+ ]` is that relocation; only its
+          ;; offset within the text moves, which is why the relocation offset
+          ;; is computed rather than written as the literal 3. The entry's
+          ;; replenish is the ABI's per-interrupt tier, not the `replenish`
+          ;; chosen above: this symbol is entered by the CPU, not called.
+          isr-prologue (when isr-vector
+                         (interrupt-abi/entry-bytes
+                          {:vector isr-vector
+                           :fuel interrupt-abi/entry-fuel
+                           :context-displacement -4
+                           :call-displacement 0}))
+          reloc-offset (if isr-vector
+                         (interrupt-abi/context-displacement-offset isr-vector)
+                         3)
           wrapper (vec (concat [0x4c 0x8d 0x0d 0 0 0 0] replenish
                                [0x48 0x83 0xec 0x08 0xe8]))
-          call-end (+ (count wrapper) 4)
-          wrapper-size (+ call-end 5)
+          call-end (if isr-vector
+                     (+ (interrupt-abi/call-displacement-offset isr-vector) 4)
+                     (+ (count wrapper) 4))
+          wrapper-size (if isr-vector
+                         (interrupt-abi/entry-size isr-vector)
+                         (+ call-end 5))
           main-offset (+ wrapper-size (:offset export))
           call-disp (- main-offset call-end)
-          text (vec (concat wrapper (le call-disp 4)
-                            [0x48 0x83 0xc4 0x08 0xc3]
-                            (:code artifact)))
+          text (vec (concat
+                     (if isr-vector
+                       (vec (concat (subvec isr-prologue 0 (- call-end 4))
+                                    (le call-disp 4)
+                                    (subvec isr-prologue call-end)))
+                       (vec (concat wrapper (le call-disp 4)
+                                    [0x48 0x83 0xc4 0x08 0xc3])))
+                     (:code artifact)))
           context (vec (concat (repeat 8 0) (le 512 8)
                                (repeat (- context-size 16) 0)))
           shstr "\u0000.text\u0000.data\u0000.rela.text\u0000.symtab\u0000.strtab\u0000.shstrtab\u0000"
@@ -1004,7 +1114,7 @@
           text-off 64
           data-off (+ text-off (count text))
           rela-off (+ data-off (count context))
-          reloc (rela 3 2 2 -4) ; R_X86_64_PC32 against section symbol .data
+          reloc (rela reloc-offset 2 2 -4) ; R_X86_64_PC32 against section symbol .data
           symtab-off (+ rela-off (count reloc))
           ;; null, local .text/.data section symbols, local source, global probe.
           ;; ELF requires every local symbol to precede the first global one.
@@ -1044,8 +1154,13 @@
        :export public-symbol
        :source-entry object-entry
        :sections [:text :data :rela.text :symtab :strtab :shstrtab]
-       :relocations [{:section :text :offset 3 :type :r-x86-64-pc32
+       :relocations [{:section :text :offset reloc-offset :type :r-x86-64-pc32
                       :symbol :data :addend -4}]
+       ;; isr: provenance for aiueos's K16 pure-native gate, whose
+       ;; `:toolchain-stub` class exists for exactly this shape. The object
+       ;; also passes that gate's ordinary `:kotoba-object` check unchanged.
+       :stub-kind (when isr-vector :interrupt-entry)
+       :interrupt-vector isr-vector
        :imports []
        :interpreter nil
        :bytes bytes})))

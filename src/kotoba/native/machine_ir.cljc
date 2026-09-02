@@ -12,6 +12,7 @@
             [kotoba.codegen.mc :as mc]
             [kotoba.codegen.layout :as layout]
             [kotoba.native.aggregate-abi :as aggregate-abi]
+            [kotoba.native.interrupt-abi :as interrupt-abi]
             [kotoba.native.string-index :as string-index]
             [kotoba.native.string-search :as string-search]
             #?(:cljs [kotoba.kir.cljs-i64 :as i64])))
@@ -484,7 +485,13 @@
    'kernel-system-table :system-table
    'kernel-load-ptr :load-ptr
    'kernel-uefi-call2 :uefi-call2
-   'kernel-jump-to :jump-to})
+   'kernel-jump-to :jump-to
+   ;; isr: the address of the toolchain-generated interrupt entry for a
+   ;; vector, which is what the three offset fields of an IDT gate descriptor
+   ;; need. It rides this channel because it takes one ordinary operand and
+   ;; names no memory window; the answer is a load from the image's kernel
+   ;; context, not an address this encoder knows.
+   'kernel-isr-entry-address :isr-entry-address})
 
 (def ^:private kir-runtime-ops
   {'pair :pair
@@ -4836,6 +4843,25 @@
                (x86-pop :x86-64/rdx) (x86-pop :x86-64/rax))
        :x86-64/r11)
       ;; sysops: end
+      ;; isr: `entry-base + vector * stride`, where the base is a quadword the
+      ;; IMAGE packager published into the kernel context. This encoder cannot
+      ;; know the address: the entries are laid down after every byte of this
+      ;; function has been emitted, so the context is the channel -- the same
+      ;; one `:boot-info` reads one slot along.
+      ;;
+      ;; The ceiling is emitted rather than assumed. The region is indexed by
+      ;; MULTIPLICATION, not by consulting a table, so an unbounded vector
+      ;; computes an address past the region and the caller writes it into a
+      ;; gate descriptor. `ud2` is the trap the bounded memory primitives
+      ;; raise, and it surfaces as vector 6.
+      ;;
+      ;; The bytes are `kotoba.native.interrupt-abi`'s, not this file's: the
+      ;; stride, the ceiling and the context slot are stated once, where the
+      ;; packager that honours them also reads them.
+      :isr-entry-address
+      (finish (concat (copy-to :x86-64/r10 a)
+                      (interrupt-abi/entry-address-r10-to-r11))
+              :x86-64/r11)
       (:out-u8 :out-u32)
       (finish
        (concat (copy-to :x86-64/r10 a)

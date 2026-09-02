@@ -2,10 +2,10 @@
  :deps {org.clojure/clojure {:mvn/version "1.12.0"}
         io.github.kotoba-lang/kotoba-kir
         {:git/url "https://github.com/kotoba-lang/kotoba-kir.git"
-         :git/sha "f2783bfd6df28d59a4a630a1f512dda44b3db1c1"}
+         :git/sha "c4149fb120ece017ce87d0ef5e40547a2e6f3ee3"}
         io.github.kotoba-lang/kotoba-gmir
         {:git/url "https://github.com/kotoba-lang/kotoba-gmir.git"
-         :git/sha "2495036d40a20a283d789266922aedcc41473102"}
+         :git/sha "da1aa2bb700111519fcf57e5a0b076d039788d2a"}
         ;; kotoba-mir 4bf67c0: call+loop uses the scanner (:call-live), the
         ;; conservative fallback colors frame slots from CFG liveness, and
         ;; pure integer SSA segments are scheduled per basic block after physical
