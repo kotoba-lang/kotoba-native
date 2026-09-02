@@ -443,7 +443,15 @@
 (def ^:private kir-kernel-dequant-dot-ops
   {'kernel-dequant-dot-q8-0 [:gmir/kernel-dequant-dot-q8-0 65536 5]
    'kernel-dequant-dot-q4-k [:gmir/kernel-dequant-dot-q4-k 65536 5]
-   'kernel-dequant-dot-q6-k [:gmir/kernel-dequant-dot-q6-k 65536 5]})
+   'kernel-dequant-dot-q6-k [:gmir/kernel-dequant-dot-q6-k 65536 5]
+   ;; dequant-iq: the four codebook formats (kotoba-gmir ADR 0027). They
+   ;; reach the backend so that a program using one is refused BY NAME rather
+   ;; than by absence -- an unknown head falls to "unknown operation", which
+   ;; says nothing about why.
+   'kernel-dequant-dot-iq4-xs [:gmir/kernel-dequant-dot-iq4-xs 65536 5]
+   'kernel-dequant-dot-iq2-s [:gmir/kernel-dequant-dot-iq2-s 65536 5]
+   'kernel-dequant-dot-iq3-xxs [:gmir/kernel-dequant-dot-iq3-xxs 65536 5]
+   'kernel-dequant-dot-iq3-s [:gmir/kernel-dequant-dot-iq3-s 65536 5]})
 
 (def ^:private kir-region-pair-ops
   "Every head whose operands are `base length second-base second-length
@@ -4465,7 +4473,22 @@
    :x86-64/kernel-dequant-dot-q4-k {:block-bytes 144 :block-elements 256
                                     :emitted? true}
    :x86-64/kernel-dequant-dot-q6-k {:block-bytes 210 :block-elements 256
-                                    :emitted? true}})
+                                    :emitted? true}
+   ;; dequant-iq: DECLARED AND REFUSED. Their oracle exists (kotoba-kir ADR
+   ;; 0264, element by element against an independent port of the C) and the
+   ;; strides are gmir's, but this backend has no arms for them: a code in
+   ;; these four is an INDEX INTO A TABLE of 256, 512 or 1024 entries that
+   ;; belongs to the format, and three of the four also carry a per-element
+   ;; sign. The table has to reach the machine as read-only data before an
+   ;; arm can be written -- see ADR 0075 for the route and its size.
+   :x86-64/kernel-dequant-dot-iq4-xs {:block-bytes 136 :block-elements 256
+                                      :emitted? false}
+   :x86-64/kernel-dequant-dot-iq2-s {:block-bytes 82 :block-elements 256
+                                     :emitted? false}
+   :x86-64/kernel-dequant-dot-iq3-xxs {:block-bytes 98 :block-elements 256
+                                       :emitted? false}
+   :x86-64/kernel-dequant-dot-iq3-s {:block-bytes 110 :block-elements 256
+                                     :emitted? false}})
 
 (def ^:private x86-dequant-magic
   "2^112 as binary32: exponent field 112+127 = 239, mantissa zero.
@@ -6174,7 +6197,11 @@
     ;; decides the strides and the per-group arithmetic and nothing else.
     (:x86-64/kernel-dequant-dot-q8-0
      :x86-64/kernel-dequant-dot-q4-k
-     :x86-64/kernel-dequant-dot-q6-k)
+     :x86-64/kernel-dequant-dot-q6-k
+     :x86-64/kernel-dequant-dot-iq4-xs
+     :x86-64/kernel-dequant-dot-iq2-s
+     :x86-64/kernel-dequant-dot-iq3-xxs
+     :x86-64/kernel-dequant-dot-iq3-s)
     (x86-kernel-dequant-dot encoding instruction-index instruction)
     :x86-64/kernel-subregion (x86-kernel-subregion instruction-index instruction)
     (:x86-64/equal :x86-64/less-than :x86-64/greater-than
