@@ -247,6 +247,18 @@
    ;; would take different arguments and is a decision for whoever needs one.
    ;; Pinned here so the absence is an assertion rather than silence.
    [['i] '(kernel-xgetbv i)]
+   ;; xsave: the WRITE half of the same feature check (kotoba-gmir ADR 0012).
+   ;; x86-only for the reason the control registers above are: CR4 is an x86
+   ;; control register, and XCR0 is reached by an x86 instruction pair that has
+   ;; no AArch64 counterpart. AArch64's nearest equivalent -- CPACR_EL1.ZEN and
+   ;; ZCR_EL1, which is how it answers "may I use SVE" -- is a NAMED system
+   ;; register reached by `MSR`, with the register encoded in the instruction
+   ;; rather than passed at run time. There is no index to pass and no control
+   ;; register to read whole, so an AArch64 operator would take different
+   ;; arguments and is a decision for whoever needs one.
+   [[] '(kernel-read-cr4)]
+   [['v] '(kernel-write-cr4 v)]
+   [['i 'v] '(kernel-xsetbv i v)]
    ;; sysops: the three barriers, the timestamp counter and the GS-base swap.
    ;;
    ;; These sit here for a WEAKER reason than the control registers and port
@@ -409,6 +421,18 @@
 (defn- subsequence? [needle haystack]
   (some #(= needle (subvec haystack % (min (count haystack) (+ % (count needle)))))
         (range (inc (- (count haystack) (count needle))))))
+
+;; xsave: for asserting that two sequences are the same except for one
+;; instruction. Returns `haystack` with the first occurrence of `needle`
+;; deleted, or nil when it does not occur -- nil rather than the unchanged
+;; vector, so a comparison against a sequence that never contained the opcode
+;; cannot pass by accident.
+(defn- remove-first-subsequence [needle haystack]
+  (when-let [at (some #(when (= needle (subvec haystack % (min (count haystack)
+                                                              (+ % (count needle)))))
+                         %)
+                      (range (inc (- (count haystack) (count needle)))))]
+    (vec (concat (subvec haystack 0 at) (subvec haystack (+ at (count needle)))))))
 
 (deftest u32-accesses-reserve-four-bytes-not-one
   ;; A four-byte access at `length - 1` must trap. The machine-IR path first
@@ -1215,3 +1239,111 @@
                         (program ['l 's] '(kernel-cpuid-ecx l s))))]
       (is (subsequence? [0x53] cpuid) "cpuid saves rbx")
       (is (not (subsequence? [0x53] xgetbv)) "xgetbv does not, and must not"))))
+
+
+;; ---------------------------------------------------------------------------
+;; xsave: CR4 and xsetbv, on both lowering paths
+;; ---------------------------------------------------------------------------
+
+;; The write half of the same feature check (kotoba-gmir ADR 0012). `xgetbv`
+;; above reads what the operating system has agreed to save across a context
+;; switch; nothing could SET that until these three existed, so a pure-Kotoba
+;; AVX2 guard refused the vector arm on every machine -- correctly, since
+;; CR4.OSXSAVE was clear, and with no spelling available to fix it.
+;;
+;; Every sequence below was disassembled with
+;; `llvm-mc --disassemble --triple=x86_64-unknown-none --output-asm-variant=1`
+;; (Homebrew LLVM 22.1.7) and read back as the instructions named in the
+;; comments. NOT EXECUTED here: this workstation is an Apple M4. The execution
+;; evidence is in aiueos, under QEMU TCG.
+;;
+;; Two paths, for the reason the `xgetbv` block above gives: `emit-program`
+;; pilots a word-result body through `machine-ir/compile-expression`, and
+;; everything else reaches `x86_64.cljc`'s own `emit-kernel-*`. The direct arms
+;; are reached here by direct invocation, which is what can honestly be shown --
+;; no `emit-program` input was found that selects them, and the same is true of
+;; `emit-kernel-xgetbv` and `emit-kernel-cpuid` beside them.
+(deftest cr4-and-xsetbv-emit-the-published-opcodes-on-both-lowering-paths
+  (testing "CR4 is CR0 at register number 4, on the machine-IR pilot"
+    ;; mov r10,cr4  /  mov cr4,r10 -- `0f 20`/`0f 22` with the ModRM reg field
+    ;; 100 and rm 010 (R10) behind REX.B, which is `e2`.
+    (is (subsequence? [0x41 0x0f 0x20 0xe2]
+                      (vec (machine/compile-expression
+                            :x86-64 '[] '(kernel-read-cr4)))))
+    (is (subsequence? [0x41 0x0f 0x22 0xe2]
+                      (vec (machine/compile-expression
+                            :x86-64 '[v] '(kernel-write-cr4 v)))))
+    (is (subsequence? [0x41 0x0f 0x20 0xe2]
+                      (:code (x86/emit-program (program '[] '(kernel-read-cr4)))))
+        "and emit-program really does select it")
+    (is (subsequence? [0x41 0x0f 0x22 0xe2]
+                      (:code (x86/emit-program
+                              (program '[v] '(kernel-write-cr4 v))))))
+    ;; The register number is the whole of the difference from CR0 and CR3, so
+    ;; it is pinned against them: a ModRM byte off by one names a DIFFERENT
+    ;; control register and faults nowhere.
+    (is (subsequence? [0x41 0x0f 0x20 0xc2]
+                      (vec (machine/compile-expression
+                            :x86-64 '[] '(kernel-read-cr0))))
+        "cr0 is reg 000")
+    (is (subsequence? [0x41 0x0f 0x20 0xda]
+                      (vec (machine/compile-expression
+                            :x86-64 '[] '(kernel-read-cr3))))
+        "cr3 is reg 011"))
+  (testing "xsetbv is wrmsr with one opcode changed, on the machine-IR pilot"
+    ;; push rax; push rcx; push rdx; mov rcx,r10; mov rax,r11; mov rdx,r11;
+    ;; shr rdx,32; xsetbv; pop rdx; pop rcx; pop rax
+    (let [piloted [0x50 0x51 0x52
+                   0x4c 0x89 0xd1
+                   0x4c 0x89 0xd8
+                   0x4c 0x89 0xda
+                   0x48 0xc1 0xea 0x20
+                   0x0f 0x01 0xd1
+                   0x5a 0x59 0x58]]
+      (is (subsequence? piloted
+                        (vec (machine/compile-expression
+                              :x86-64 '[i v] '(kernel-xsetbv i v))))
+          "the arm saves the three registers it borrows")
+      (is (subsequence? piloted
+                        (:code (x86/emit-program
+                                (program '[i v] '(kernel-xsetbv i v)))))
+          "and emit-program really does select it"))
+    ;; The `wrmsr` arm beside it, byte-for-byte the same except for the
+    ;; opcode. Pinned so that "these two are the same sequence" is an
+    ;; assertion rather than a claim in a comment.
+    (let [xsetbv (vec (machine/compile-expression
+                       :x86-64 '[i v] '(kernel-xsetbv i v)))
+          wrmsr (vec (machine/compile-expression
+                      :x86-64 '[i v] '(kernel-write-msr i v)))]
+      (is (= (count xsetbv) (inc (count wrmsr)))
+          "xsetbv is 0f 01 d1 where wrmsr is 0f 30 -- one byte longer")
+      (is (= (remove-first-subsequence [0x0f 0x01 0xd1] xsetbv)
+             (remove-first-subsequence [0x0f 0x30] wrmsr))
+          "and identical everywhere else")))
+  (testing "the direct emitters in x86_64.cljc"
+    ;; mov eax,0 (the index); push rax; mov eax,7 (the value); pop rcx;
+    ;; mov rdx,rax; shr rdx,32; xsetbv
+    (is (= [0xb8 0x00 0x00 0x00 0x00
+            0x50
+            0xb8 0x07 0x00 0x00 0x00
+            0x59
+            0x48 0x89 0xc2
+            0x48 0xc1 0xea 0x20
+            0x0f 0x01 0xd1]
+           (@#'x86/emit-kernel-xsetbv '(0 7) {} {:temp-depth 0}))
+        "the index is spilled across the value expression, exactly as
+         emit-kernel-write-msr spills it")
+    ;; The direct CR4 arms use RAX rather than R10, so the ModRM rm field is
+    ;; 000 and the byte is `e0` with no REX prefix.
+    (is (subsequence? [0x0f 0x20 0xe0]
+                      (vec (x86/emit-expr '(kernel-read-cr4) {}
+                            {:temp-depth 0 :tail? false}))))
+    (is (subsequence? [0x0f 0x22 0xe0]
+                      (vec (x86/emit-expr '(kernel-write-cr4 262144) {}
+                            {:temp-depth 0 :tail? false})))))
+  ;; `cpuid` needs `push rbx` / `pop rbx` because it writes EBX whether or not
+  ;; the caller asked for it. `xsetbv` writes no general register at all, so
+  ;; the save would be two bytes in a kernel with nothing to explain them.
+  (testing "and needs no RBX save, unlike cpuid"
+    (let [xsetbv (:code (x86/emit-program (program '[i v] '(kernel-xsetbv i v))))]
+      (is (not (subsequence? [0x53] xsetbv)) "xsetbv does not, and must not"))))

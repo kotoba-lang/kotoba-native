@@ -1073,6 +1073,39 @@
                   0x48 0xc1 0xea 0x20                    ; shr rdx,32   (high half)
                   0x0f 0x30]))))                         ; wrmsr        <- edx:eax
 
+;; xsave: `xsetbv` -- `(kernel-xsetbv index value)` writes XCR[index] from
+;; EDX:EAX. This is `emit-kernel-write-msr` with one opcode changed, for the
+;; same reason `emit-kernel-xgetbv` is `emit-kernel-read-msr` with one opcode
+;; changed: both take an index in ECX and a 64-bit value split across EDX:EAX,
+;; so the spill of the index, the split of the value and the absence of a mask
+;; on the low half are all the same four instructions.
+;;
+;; No RBX save, for `emit-kernel-xgetbv`'s reason: `xsetbv` writes no general
+;; register at all.
+;;
+;; WHAT THIS CANNOT ENFORCE, and it is TWO things rather than the one
+;; `emit-kernel-xgetbv` carries.
+;;
+;; A SEQUENCE: `xsetbv` raises #UD unless CR4.OSXSAVE is already set, so a
+;; kernel must test `cpuid` leaf 1 ECX bit 26 (XSAVE), set CR4 bit 18, and
+;; only then reach here.
+;;
+;; A VALUE: it raises #GP when the value sets a bit XCR0 does not define, when
+;; bit 0 (x87 state) is clear, or when bit 2 (YMM) is set without bit 1 (SSE).
+;; No emitter can see that either -- and a literal check would be worse than
+;; none, because the working spelling passes
+;; `(bit-or (kernel-xgetbv 0) 6)`, which is not a literal.
+;;
+;; docs/avx2-guard-sequence.md carries both, with the rest of the sequence.
+(defn- emit-kernel-xsetbv [[index value] env {:keys [temp-depth] :as ctx}]
+  (let [ctx (assoc ctx :tail? false)]
+    (vec (concat (emit-expr index env ctx) [0x50]        ; push index
+                 (emit-expr value env (update ctx :temp-depth inc))
+                 [0x59                                   ; pop rcx      (index -> ecx)
+                  0x48 0x89 0xc2                         ; mov rdx,rax
+                  0x48 0xc1 0xea 0x20                    ; shr rdx,32   (high half)
+                  0x0f 0x01 0xd1]))))                    ; xsetbv       <- edx:eax
+
 ;; CPU feature detection. `cpuid` reads TWO inputs -- the leaf in `eax`, the
 ;; subleaf in `ecx` -- and writes ALL FOUR of `eax`/`ebx`/`ecx`/`edx`. The
 ;; language surface is four arity-2 primitives, one per result register, each
@@ -1947,6 +1980,14 @@
         (= op 'kernel-read-cr3) [0x0f 0x20 0xd8]
         (= op 'kernel-write-cr3)
         (vec (concat (emit-expr (first args) env (assoc ctx :tail? false)) [0x0f 0x22 0xd8]))
+        ;; xsave: CR4 is the same two instructions at register number 4 --
+        ;; `0f 20`/`0f 22` with the ModRM `reg` field 100 and rm=000 (RAX),
+        ;; which is `e0`. There is no `kernel-write-cr2` beside
+        ;; `kernel-read-cr2` above: CR2 is written by the CPU on a page fault,
+        ;; so a kernel that wrote it would be lying to its own handler.
+        (= op 'kernel-read-cr4) [0x0f 0x20 0xe0]
+        (= op 'kernel-write-cr4)
+        (vec (concat (emit-expr (first args) env (assoc ctx :tail? false)) [0x0f 0x22 0xe0]))
         (= op 'kernel-invlpg)
         (vec (concat (emit-expr (first args) env (assoc ctx :tail? false)) [0x0f 0x01 0x38]))
         (= op 'kernel-read-cs) [0x48 0x31 0xc0 0x66 0x8c 0xc8]
@@ -2021,6 +2062,7 @@
         (= op 'kernel-in-u8) (emit-kernel-in args 8 env ctx)
         (= op 'kernel-in-u32) (emit-kernel-in args 32 env ctx)
         (= op 'kernel-xgetbv) (emit-kernel-xgetbv args env ctx)
+        (= op 'kernel-xsetbv) (emit-kernel-xsetbv args env ctx)
         (= op 'kernel-read-msr) (emit-kernel-read-msr args env ctx)
         (= op 'kernel-write-msr) (emit-kernel-write-msr args env ctx)
         (= op 'kernel-cpuid-eax) (emit-kernel-cpuid args :eax env ctx)

@@ -121,6 +121,66 @@ Whichever shape is used, `xgetbv` must not be reached with OSXSAVE clear.
 Neither the operator nor the blob can enforce that; the ordering above is the
 enforcement.
 
+## Setting the bit the guard tests: CR4.OSXSAVE and XCR0
+
+Everything above is the READ side. It answers "may I use YMM", and on a
+machine where nobody has enabled the extended state the answer is no.
+
+Measured 2026-09-02, QEMU TCG `-cpu max`, aiueos `dot-f32-probe.kotoba`: leaf 1
+ECX bit 28 (AVX) and leaf 7 EBX bit 5 (AVX2) are both **set**, and bit 27
+(OSXSAVE) is **clear**. The guard therefore refused the vector arm on a machine
+that has AVX2 -- correctly, and with nothing in a pure-Kotoba kernel able to
+change the answer. Setting it is what the C kernel's
+`prepare_bsp_extended_state()` does.
+
+Three operators close that (kotoba-gmir ADR 0012, kotoba-sema ADR 0008,
+kotoba-kir ADR 0239, this repo's ADR 0049):
+
+| operator | arity | instruction | pilot bytes |
+|---|---|---|---|
+| `(kernel-read-cr4)` | 0 | `mov r10, cr4` | `41 0f 20 e2` |
+| `(kernel-write-cr4 v)` | 1 | `mov cr4, r10` | `41 0f 22 e2` |
+| `(kernel-xsetbv i v)` | 2 | `xsetbv` | `0f 01 d1` |
+
+The **enable** is a second ordered sequence, and it runs before the guard above:
+
+```clojure
+;; 1. does the CPU implement XSAVE at all?  leaf 1 ECX bit 26.
+;;    Reaching CR4 bit 18 without this raises #GP.
+(if (= (bit-and (kernel-cpuid-ecx 1 0) 67108864) 0)
+  0
+  (let [;; 2. OSFXSR (9) | OSXMMEXCPT (10) | OSXSAVE (18) = 0x40600.
+        ;;    Read-modify-write: CR4 already holds bits the firmware set.
+        cr4 (kernel-write-cr4 (bit-or (kernel-read-cr4) 263680))
+        ;; 3. only now is xsetbv legal at all -- it raises #UD while
+        ;;    CR4.OSXSAVE is clear.  XCR0 bit 0 (x87) is always set and
+        ;;    cannot be cleared, so the enable ors in SSE (1) | YMM (2) = 6
+        ;;    and the register reads back as 7.  Read-modify-write again.
+        xcr0 (kernel-xsetbv 0 (bit-or (kernel-xgetbv 0) 6))]
+    1))
+```
+
+Three constraints none of these operators can enforce, in the order they bite:
+
+1. **`xsetbv` before CR4.OSXSAVE raises #UD.** Same shape as the `xgetbv`
+   ordering above, and the same non-enforcement: it is a property of a
+   sequence, and each operator is one instruction.
+2. **`xsetbv` with a bad value raises #GP** -- a bit XCR0 does not define, bit
+   0 (x87) clear, or bit 2 (YMM) set without bit 1 (SSE). `(kernel-xsetbv 0 6)`
+   and `(kernel-xsetbv 0 4)` have the same shape and the second faults. A
+   literal check in the frontend would not help: the working spelling passes
+   `(bit-or (kernel-xgetbv 0) 6)`, whose value is a property of the machine.
+3. **Both writes must be read-modify-write.** CR4 and XCR0 already hold values
+   the firmware chose. `(kernel-write-cr4 263680)` compiles, runs, and clears
+   every other CR4 bit -- PAE, PGE, SMEP, whatever the loader set -- without
+   faulting anywhere near the instruction that did it.
+
+Setting bit 2 (YMM) in XCR0 is a promise: the kernel is asserting that it will
+save and restore the upper halves of the YMM registers across a context switch.
+A kernel that sets the bit and does not keep the promise does not fault. It
+computes wrong answers intermittently and only under load, which is the same
+failure the guard exists to prevent -- moved one layer down.
+
 ## What has not been verified
 
 **Nothing here has been executed.** These bytes were assembled and
