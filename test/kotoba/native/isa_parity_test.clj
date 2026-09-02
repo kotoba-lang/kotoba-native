@@ -284,7 +284,26 @@
    [[] '(kernel-system-table)]
    [['b 'o] '(kernel-load-ptr b o)]
    [['b 'o 'x 'y] '(kernel-uefi-call2 b o x y)]
-   [['a 'i] '(kernel-jump-to a i)]])
+   [['a 'i] '(kernel-jump-to a i)]
+   ;; boot-lit: the two wider firmware calls and the three literal address
+   ;; heads. The calls are x86-only for the reason kernel-uefi-call2 is -- the
+   ;; Microsoft x64 calling convention is not a thing AArch64 has.
+   ;;
+   ;; The literals are x86-only for a DIFFERENT and weaker reason, and saying
+   ;; so is the point of listing them here rather than absorbing them into the
+   ;; heading above: the rip-relative load-effective-address HAS an AArch64
+   ;; answer -- ADRP plus ADD -- whose 4 KiB page split the layout pass does
+   ;; not model. That is a gap, not a difference between the machines, and it
+   ;; is pinned here so closing it is a deliberate act rather than something
+   ;; that quietly never happens. It is also why the refusal below is checked
+   ;; against a SET of two problem keywords: the literals are refused as
+   ;; :rodata-address-target-mismatch, which is a different sentence from the
+   ;; privileged family's and should stay one.
+   [['b 'o 'x 'y] '(kernel-uefi-call4 b o x y 3 4)]
+   [['b 'o 'x 'y] '(kernel-uefi-call6 b o x y 3 4 5 6)]
+   [[] '(ucs2 "AIUEOS")]
+   [[] '(guid "5B1B31A1-9562-11D2-8E3F-00A0C969723B")]
+   [[] '(bytes-literal "deadbeef")]])
 
 (deftest privileged-x86-operators-are-x86-only-by-design
   (doseq [[params body] x86-only]
@@ -332,7 +351,12 @@
                       (catch clojure.lang.ExceptionInfo e e))]
       (is (some? thrown) (str body " must be rejected on AArch64"))
       (is (= :mir (:phase (ex-data thrown))))
-      (is (= :x86-privileged-target-mismatch (:problem (ex-data thrown)))))))
+      ;; boot-lit: two refusals, not one. The privileged channel and the
+      ;; literal pool are refused for different reasons and say so.
+      (is (contains? #{:x86-privileged-target-mismatch
+                       :rodata-address-target-mismatch}
+                     (:problem (ex-data thrown)))
+          (str body " => " (:problem (ex-data thrown)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; The u32 bound is four bytes wider than the u8 bound

@@ -470,7 +470,25 @@
    'kernel-system-table :system-table
    'kernel-load-ptr :load-ptr
    'kernel-uefi-call2 :uefi-call2
-   'kernel-jump-to :jump-to})
+   'kernel-jump-to :jump-to
+   ;; boot-lit: the two wider calls (kotoba-gmir ADR-0011).
+   'kernel-uefi-call4 :uefi-call4
+   'kernel-uefi-call6 :uefi-call6})
+
+;; boot-lit: the literal heads. NOT in the table above, because a privileged
+;; action's operands are registers and these take a piece of the source text.
+;; The value here is the `kotoba.gmir` encoding the head names.
+(def ^:private kir-rodata-address-ops
+  '{ucs2 :utf-16le-nul
+    guid :guid-mixed-endian
+    bytes-literal :hex-bytes})
+
+;; `bytes-literal-length` produces a count rather than an address, so it
+;; lowers to a plain constant and never reaches the pool. It is here rather
+;; than folded upstream because the count has to be derived from the SAME text
+;; the address is derived from -- deriving it anywhere else would be a second
+;; place that has to agree about what a literal is.
+(def ^:private kir-rodata-length-op 'bytes-literal-length)
 
 (def ^:private kir-runtime-ops
   {'pair :pair
@@ -1712,6 +1730,38 @@
                           :gmir/offset offset :gmir/size size})
                    dst])
 
+                ;; boot-lit: a literal's address. The argument is not lowered
+                ;; as an expression -- it IS the literal -- so a non-string
+                ;; argument is refused here rather than reaching `value` and
+                ;; failing as an unknown shape.
+                (and (seq? form)
+                     (contains? kir-rodata-address-ops (first form)))
+                (let [encoding (get kir-rodata-address-ops (first form))
+                      content (second form)
+                      dst (fresh-reg)]
+                  (when-not (= 2 (count form))
+                    (reject! :kir-to-gmir :rodata-literal-arity
+                             {:form form :expected 1}))
+                  (when-not (gmir/rodata-content? encoding content)
+                    (reject! :kir-to-gmir :rodata-literal-malformed
+                             {:form form :encoding encoding}))
+                  [[{:gmir/op :gmir/rodata-address :gmir/dst dst
+                     :gmir/content content :gmir/rodata-encoding encoding}]
+                   dst])
+
+                ;; boot-lit: a literal's length is a constant, derived from the
+                ;; same text the address is derived from.
+                (and (seq? form) (= kir-rodata-length-op (first form)))
+                (let [content (second form)
+                      dst (fresh-reg)]
+                  (when-not (and (= 2 (count form))
+                                 (gmir/rodata-content? :hex-bytes content))
+                    (reject! :kir-to-gmir :rodata-literal-malformed
+                             {:form form :encoding :hex-bytes}))
+                  [[{:gmir/op :gmir/constant :gmir/dst dst
+                     :gmir/value (count (gmir/rodata-bytes :hex-bytes content))}]
+                   dst])
+
                 (and (seq? form)
                      (contains? kir-x86-privileged-ops (first form)))
                 (let [action (get kir-x86-privileged-ops (first form))
@@ -2072,6 +2122,17 @@
                              (get kir-x86-privileged-ops (first form)))
                         (count (rest form)))
                      (every? #(= :scalar (shape % env)) (rest form)))
+                :scalar
+
+                ;; boot-lit: an address and a length are both one word. The
+                ;; argument's shape is deliberately NOT consulted -- it is a
+                ;; string literal, whose shape here is not `:scalar`, and the
+                ;; lowering above refuses anything else.
+                (and (seq? form)
+                     (or (contains? kir-rodata-address-ops (first form))
+                         (= kir-rodata-length-op (first form)))
+                     (= 2 (count form))
+                     (string? (second form)))
                 :scalar
 
                 (and (seq? form) (contains? kir-runtime-ops (first form))
@@ -4336,6 +4397,64 @@
           [0x48 0x8b 0xa4 0x24 0x20 0x00 0x00 0x00] ; mov rsp,[rsp+0x20]
           (if (= dst :x86-64/r10) [] (x86-rr 0x89 dst :x86-64/r10))))))
 
+;; boot-lit: the same call, four or six UEFI arguments wide.
+;;
+;; `x86-uefi-call2` above stages `a` through R10 so that writing RCX cannot
+;; destroy `b`. With four or six arguments that trick does not scale -- there
+;; is one R10 -- so the ordering problem is solved once, structurally: EVERY
+;; argument is written to the outgoing frame BEFORE any argument register is
+;; loaded. Reads all happen while the sources are still intact; writes all
+;; happen afterwards.
+;;
+;; The staging area for arguments 1-4 is the callee's own shadow space, which
+;; is exactly what shadow space is for: `[rsp+0x00..0x18]` are the home
+;; locations of RCX, RDX, R8 and R9. Arguments 5 and 6 are written to
+;; `[rsp+0x20]` and `[rsp+0x28]`, where Microsoft x64 says they go, and stay
+;; there.
+;;
+;;   +0x00..0x18  shadow space / staging for arguments 1-4
+;;   +0x20        argument 5      +0x28  argument 6
+;;   +0x30        original RSP
+;;   +0x38..0x58  RAX, RCX, RDX, R8, R9
+;;
+;; 0x60 is a multiple of 16, so RSP is still 16-aligned at the `call` after
+;; `and rsp,-16`. R11 holds the target across the whole sequence: nothing
+;; between the load and the `call` writes it.
+;;
+;; A four-argument call still allocates the six-argument frame and simply does
+;; not write +0x20/+0x28. Sizing the frame by the argument count would save
+;; sixteen bytes of stack and add a second frame layout to verify.
+(defn- x86-uefi-call-wide [dst arguments]
+  (let [[base offset & uefi] arguments
+        copy-to (fn [register value]
+                  (if (= register value) [] (x86-rr 0x89 register value)))
+        save (fn [slot register] (x86-stack-memory 0x89 register slot))
+        load (fn [slot register] (x86-stack-memory 0x8b register slot))]
+    (vec (concat
+          (copy-to :x86-64/r10 base)
+          (copy-to :x86-64/r11 offset)
+          [0x4f 0x8b 0x1c 0x1a]                 ; mov r11,[r10+r11] -> target
+          [0x49 0x89 0xe2]                      ; mov r10,rsp (original)
+          [0x48 0x83 0xe4 0xf0]                 ; and rsp,-16
+          [0x48 0x83 0xec 0x60]                 ; sub rsp,0x60
+          (save 6 :x86-64/r10)                  ; [rsp+0x30] = original rsp
+          (save 7 :x86-64/rax) (save 8 :x86-64/rcx)
+          (save 9 :x86-64/rdx) (save 10 :x86-64/r8)
+          (save 11 :x86-64/r9)
+          ;; Read every argument out of its allocated register first. The
+          ;; scratch tier has been SAVED above but not yet overwritten, so a
+          ;; source that lives there is still the caller's value.
+          (mapcat (fn [slot value] (save slot value)) (range) uefi)
+          (load 0 :x86-64/rcx) (load 1 :x86-64/rdx)
+          (load 2 :x86-64/r8) (load 3 :x86-64/r9)
+          [0x41 0xff 0xd3]                      ; call r11
+          (x86-rr 0x89 :x86-64/r10 :x86-64/rax) ; keep the status
+          (load 11 :x86-64/r9) (load 10 :x86-64/r8)
+          (load 9 :x86-64/rdx) (load 8 :x86-64/rcx)
+          (load 7 :x86-64/rax)
+          [0x48 0x8b 0xa4 0x24 0x30 0x00 0x00 0x00] ; mov rsp,[rsp+0x30]
+          (if (= dst :x86-64/r10) [] (x86-rr 0x89 dst :x86-64/r10))))))
+
 (defn- x86-privileged
   [{:mir/keys [dst action arguments] :as instruction}]
   (let [copy-to (fn [register value]
@@ -4542,6 +4661,10 @@
                    (x86-rr 0x89 :x86-64/rdi :x86-64/r11)
                    [0x41 0xff 0xe2]))
       :uefi-call2 (x86-uefi-call2 dst arguments)
+      ;; boot-lit: four and six UEFI arguments, one encoder. `:uefi-call2`
+      ;; keeps its own because its bytes are the ones that booted, and because
+      ;; its frame is 0x50 where this one's is 0x60.
+      (:uefi-call4 :uefi-call6) (x86-uefi-call-wide dst arguments)
       (:cpuid-eax :cpuid-ebx :cpuid-ecx :cpuid-edx)
       (finish
        (concat (copy-to :x86-64/r10 a)
@@ -4574,6 +4697,18 @@
     :x86-64/data-address
     [{:native/data-content (:mir/content instruction)
       :native/data-dst (:mir/dst instruction) :native/data-target :x86-64}]
+    ;; boot-lit: the literal's ADDRESS, which is not the data pool's offset.
+    ;; `:x86-64/data-address` above resolves to `mov reg, imm64` holding an
+    ;; offset from the start of the emitted buffer, and something else adds the
+    ;; base. Under firmware there is nothing else: the image is loaded wherever
+    ;; the loader chose and there are no relocations to fix up, so the address
+    ;; has to be computed from the program counter. `resolve-program-layout`
+    ;; turns this token into `lea dst,[rip+disp32]`, seven bytes.
+    :x86-64/rodata-address
+    [{:native/rodata-content (:mir/content instruction)
+      :native/rodata-encoding (:mir/rodata-encoding instruction)
+      :native/rodata-dst (:mir/dst instruction)
+      :native/rodata-target :x86-64}]
     :x86-64/add
     (let [dst (:mir/dst instruction) left (:mir/left instruction) right (:mir/right instruction)]
       (if-let [immediate (:native/x86-immediate instruction)]
@@ -5016,7 +5151,28 @@
   (or (layout/token-size token)
       (when (:native/data-content token)
         (case (:native/data-target token) :x86-64 10 :aarch64 16 nil))
+      ;; boot-lit: `lea r64,[rip+disp32]` -- REX.W, 0x8d, a mod-00 rm-101
+      ;; ModRM and four displacement bytes. Fixed width, so one layout pass
+      ;; still suffices.
+      (when (:native/rodata-content token)
+        (case (:native/rodata-target token) :x86-64 7 nil))
       (when (and (integer? token) (<= 0 token 255)) 1)))
+
+;; boot-lit: `lea dst,[rip+disp32]`. ModRM mod=00 rm=101 is RIP-relative in
+;; 64-bit mode -- the same three bits mean "disp32, no base" in 32-bit mode,
+;; which is the encoding trap here. The displacement is measured from the END
+;; of the instruction, hence the seven.
+(defn- x86-lea-rip [dst displacement]
+  (let [code (get x86-register-code dst)]
+    (when-not (some? code)
+      (reject! :mc-encode :unsupported-register {:register dst}))
+    (vec (concat [(bit-or 0x48 (if (>= code 8) 4 0))
+                  0x8d
+                  (bit-or 0x05 (bit-shift-left (bit-and code 7) 3))]
+                 (u32le (bit-and displacement 0xffffffff))))))
+
+(defn- align-to [value alignment]
+  (* alignment (quot (+ value (dec alignment)) alignment)))
 
 (defn- resolve-program-layout [tokens]
   (let [labels (layout/label-offsets tokens size-of-token)
@@ -5028,17 +5184,68 @@
                                 (+ offset (count (utf8-bytes content)))
                                 (assoc out content offset))
                          out))
+        data (vec (mapcat utf8-bytes contents))
+        ;; boot-lit: the literal pool. It follows the string pool, which
+        ;; follows the code, so neither of the two offsets above moves and the
+        ;; existing goldens are untouched. Keyed on [encoding content] rather
+        ;; than content, so `(guid "0000...")` and `(bytes-literal "0000...")`
+        ;; are two literals -- they are different bytes.
+        literals (distinct (keep (fn [token]
+                                   (when-let [content (:native/rodata-content token)]
+                                     [(:native/rodata-encoding token) content]))
+                                 tokens))
+        ;; Every entry starts 8-aligned (`gmir/rodata-alignment`): UCS-2 needs
+        ;; 2 and `EFI_GUID` needs 4, and edk2 compares a GUID as two UINT64s.
+        ;; The pool's own start is aligned too, so an entry's alignment is a
+        ;; property of the image rather than of what happens to precede it.
+        literal-plan
+        (loop [remaining (seq literals)
+               offset (align-to (+ code-size (count data)) gmir/rodata-alignment)
+               offsets {}
+               bytes []]
+          (if-let [[encoding content :as key] (first remaining)]
+            (let [encoded (or (gmir/rodata-bytes encoding content)
+                              (reject! :mc-encode :rodata-literal-malformed
+                                       {:encoding encoding :content content}))
+                  next-offset (align-to (+ offset (count encoded))
+                                        gmir/rodata-alignment)]
+              (recur (next remaining)
+                     next-offset
+                     (assoc offsets key offset)
+                     (into (into bytes encoded)
+                           (repeat (- next-offset offset (count encoded)) 0))))
+            {:offsets offsets :bytes bytes}))
+        ;; No literals, no padding. Computing the pad unconditionally appends
+        ;; alignment bytes to EVERY program, which moved the tail of the
+        ;; string pool and broke `immutable-utf8-data-is-laid-out-after-
+        ;; machine-code` on both ISAs -- caught by the full suite, 2026-09-02.
+        literal-pad (if (seq literals)
+                      (- (align-to (+ code-size (count data))
+                                   gmir/rodata-alignment)
+                         (+ code-size (count data)))
+                      0)
         code (layout/resolve-tokens
               tokens size-of-token labels encode-layout-branch
-              (fn [token _]
-                (if-let [content (:native/data-content token)]
-                  (let [offset (get data-offsets content)]
+              (fn [token position]
+                (cond
+                  (:native/data-content token)
+                  (let [offset (get data-offsets (:native/data-content token))]
                     (case (:native/data-target token)
                       :x86-64 (x86-mov-imm-fixed (:native/data-dst token) offset)
                       :aarch64 (a64-constant-fixed (:native/data-dst token) offset)))
-                  [token])))
-        data (vec (mapcat utf8-bytes contents))]
-    {:code (vec (concat code data)) :code-size code-size :labels labels}))
+
+                  (:native/rodata-content token)
+                  (let [offset (get (:offsets literal-plan)
+                                    [(:native/rodata-encoding token)
+                                     (:native/rodata-content token)])]
+                    (x86-lea-rip (:native/rodata-dst token)
+                                 (- offset (+ position 7))))
+
+                  :else [token])))]
+    {:code (vec (concat code data (repeat literal-pad 0)
+                        (:bytes literal-plan)))
+     :code-size code-size
+     :labels labels}))
 
 (defn- resolve-layout [tokens]
   (:code (resolve-program-layout tokens)))
