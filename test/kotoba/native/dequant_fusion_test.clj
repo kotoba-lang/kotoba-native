@@ -420,33 +420,23 @@
       (is (byte-run? code scalar-element-bytes)))))
 
 ;; ---------------------------------------------------------------------------
-;; the formats this backend does NOT emit yet
+;; the formats this backend emits
 ;; ---------------------------------------------------------------------------
 
-(deftest dequant-refuses-a-format-it-cannot-emit-by-name
-  ;; Q4_K and Q6_K are declared in kotoba-gmir, admitted by the frontend and
-  ;; the verifier, and IMPLEMENTED IN THE ORACLE -- kotoba-kir dequantizes
-  ;; both and is checked element by element against an independent port of the
-  ;; C. What is missing is the machine code.
+(deftest dequant-emits-every-declared-format
+  ;; dequant-iq: this test used to assert the OPPOSITE for the K-quants --
+  ;; that they were refused by name because their thirty-two groups are not a
+  ;; loop and no arm had been unrolled for them. The unrolling exists now
+  ;; (`kotoba.native.dequant-kquant-test`), so all three emit.
   ;;
-  ;; The refusal is asserted by NAME rather than merely as "an exception",
-  ;; because the alternative failure is silent: a `case` with no arm for those
-  ;; encodings returns `nil`, and a group body of no bytes is a loop that runs
-  ;; the right number of times and adds nothing -- a working instruction that
-  ;; answers +0.0 for every row, on every machine, agreeing with itself.
-  (doseq [head '[kernel-dequant-dot-q4-k kernel-dequant-dot-q6-k]]
-    (let [thrown (try (x86/emit-program
-                       {:format :kotoba.kir/v4 :exports ['main]
-                        :functions [{:name 'main :params '[w wl x xl n]
-                                     :body (list head 'w 'wl 'x 'xl 'n)}]})
-                      nil
-                      (catch clojure.lang.ExceptionInfo e e))]
-      (is (some? thrown) (str head " must be refused, not emitted"))
-      (is (= :dequant-format-not-emitted (:problem (ex-data thrown)))
-          (str head " must name the reason"))
-      (is (= :mc-encode (:phase (ex-data thrown))) (str head)))))
-
-(deftest dequant-emits-the-format-it-does-have
-  ;; The other direction of the same claim: without this, the refusal above
-  ;; would pass for a backend that refused all three.
-  (is (pos? (count (q8-0-code)))))
+  ;; The refusal itself is NOT gone and is still tested, in that namespace, by
+  ;; taking a format's arms away: the failure it prevents is silent, because a
+  ;; `case` with no arm returns `nil` and a group body of no bytes is a loop
+  ;; that runs the right number of times and adds nothing.
+  (doseq [head '[kernel-dequant-dot-q8-0 kernel-dequant-dot-q4-k
+                 kernel-dequant-dot-q6-k]]
+    (is (pos? (count (vec (:code (x86/emit-program
+                                  {:format :kotoba.kir/v4 :exports ['main]
+                                   :functions [{:name 'main :params '[w wl x xl n]
+                                                :body (list head 'w 'wl 'x 'xl 'n)}]})))))
+        (str head " must emit"))))
