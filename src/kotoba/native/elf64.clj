@@ -222,7 +222,24 @@
    'aiueos-cpu-feature-syscall {:arity 0 :symbol "kotoba_aiueos_cpu_feature_syscall"}
    ;; NOT a feature test: leaf 1 EBX 31:24 is the initial APIC ID, which pci.c
    ;; uses as the MSI-X message destination.
-   'aiueos-cpu-apic-id {:arity 0 :symbol "kotoba_aiueos_cpu_apic_id"}})
+   'aiueos-cpu-apic-id {:arity 0 :symbol "kotoba_aiueos_cpu_apic_id"}
+   ;; AES-128-GCM (FIPS 197 + SP 800-38D), the AEAD under every TLS 1.3 record
+   ;; this OS sends or accepts. It replaces `kernel/tls_aes_gcm.c` -- 275 lines
+   ;; of C holding the S-box, the key schedule, the cipher, GHASH, CTR and the
+   ;; tag comparison. aiueos ADR-0015 draws the C boundary at MECHANISM, and
+   ;; "are these the bytes the peer sent, under the key we agreed" is not
+   ;; mechanism; it is the confidentiality and integrity decision itself.
+   ;;
+   ;; NOT A BOOLEAN. Like the two DHCP rows above, this returns a REASON CODE
+   ;; and ZERO IS SUCCESS (1 ctx too small, 2 data too long, 3 aad too long,
+   ;; 4 bad mode, 5 tag mismatch). The C it replaces returned 1 for success, so
+   ;; the call sites have to change -- deliberately, because a caller writing
+   ;; `if (aes128_gcm(...))` would accept exactly the records this refuses.
+   ;;
+   ;; One region and a mode, because the ABI admits five parameters: key,
+   ;; nonce, AAD, tag and every scratch buffer live in `ctx`, and `data` is
+   ;; transformed in place. The object's own header states the layout.
+   'aiueos-aes128-gcm {:arity 5 :symbol "kotoba_aiueos_aes128_gcm"}})
 
 (def ^:private admitted-entry-prefix
   "The prefix every `kernel-object-entries` key carries, checked against the
@@ -777,6 +794,28 @@
           ;; 250,000,000 tier is unmeasured for this object. Affine exhausted
           ;; this imm32 ceiling; Solinas Jacobian completed inside it.
           ecdsa-fuel? (= 'aiueos-ecdsa-p256-sha256-verify object-entry)
+          ;; AES-128-GCM over a full 12,288-byte record. Not measured on the
+          ;; machine -- COMPUTED, and said so, because every loop bound in the
+          ;; object is a literal or a length and the cost is therefore closed
+          ;; form rather than data-dependent.
+          ;;
+          ;; One GHASH multiply is 4,565 calls (16 bytes x 8 bits x a 17-call
+          ;; XOR plus a 16-call shift, and the XOR is counted at its worst,
+          ;; every bit set). A 12,288-byte record with a 5-byte AAD takes 770
+          ;; of them -- one for the AAD block, 768 for the data, one for the
+          ;; length block -- which is 3.52M. CTR adds 768 AES blocks at 646
+          ;; calls apiece, 0.50M. The derived S-box and the key schedule are
+          ;; ~2.3K and do not move with the record. Total 4.03M calls, or 9.4M
+          ;; if the counter charges bounded-memory operations rather than
+          ;; calls; the tier covers the larger of the two 26x over.
+          ;;
+          ;; It shares X25519's constant and is a SEPARATE ARM on purpose, the
+          ;; same reason `dhcp-fuel?` is separate from `context-fuel?`:
+          ;; measuring one must not silently move the other. That the two
+          ;; magnitudes agree is a fact about the work (X25519's ladder was
+          ;; measured at 4,815,405 bounded-memory operations), not a shared
+          ;; derivation.
+          aead-fuel? (= 'aiueos-aes128-gcm object-entry)
           context-fuel? (contains? '#{aiueos-user-context-build
                                      aiueos-kernel-context-build}
                                    object-entry)
@@ -873,6 +912,7 @@
           ;; the fourth `ud2`s partway through leaving the sector half written.
           replenish (cond
                       ecdsa-fuel? [0x49 0xc7 0x41 0x08 0xff 0xff 0xff 0x7f] ; 2,147,483,647
+                      aead-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000
                       rsa-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000
                       sha-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
                       context-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x01 0x00] ; 65,536
