@@ -429,7 +429,31 @@
    ;; the caller the wrong record type.
    ;;
    ;; NOT A BOOLEAN, same convention as the two TLS rows above: zero is done.
-   'aiueos-tls13-record {:arity 5 :symbol "kotoba_aiueos_tls13_record"}})
+   'aiueos-tls13-record {:arity 5 :symbol "kotoba_aiueos_tls13_record"}
+   ;; The Murakumo device-P256 worker client (aiueos ADR-0136,
+   ;; `docs/device-worker-v3.md` in network-awai/cloud-murakumo-api). Three
+   ;; objects covering what `kernel/device_result.c` and
+   ;; `kernel/device_worker_protocol.c` do around the TLS socket: the bytes the
+   ;; device SIGNS, the bytes it SENDS, and what it believes about the bytes
+   ;; that come back.
+   ;;
+   ;; Three rather than one for the reason the qwen35 rows above give: a kernel
+   ;; object exports ONE symbol and cannot call another. The split follows the
+   ;; three different questions -- "what does this device assert", "how is that
+   ;; framed for the wire", "what did the server just tell me" -- and the first
+   ;; two are the only ones whose output is hashed.
+   ;;
+   ;; NONE OF THE THREE IS A BOOLEAN, and none of them uses `aiueos-aes128-gcm`'s
+   ;; zero-is-success convention either. They take the `aiueos-qwen35-*` shape:
+   ;; a POSITIVE result is the useful number (bytes written, or a parsed job
+   ;; kind), a NEGATIVE result is a reason code, and zero is never returned. A
+   ;; length and a reason code cannot share a non-negative value space.
+   'aiueos-device-worker-canonical
+   {:arity 4 :symbol "kotoba_aiueos_device_worker_canonical"}
+   'aiueos-device-worker-body
+   {:arity 5 :symbol "kotoba_aiueos_device_worker_body"}
+   'aiueos-device-worker-parse
+   {:arity 5 :symbol "kotoba_aiueos_device_worker_parse"}})
 
 (defn- le [n width]
   (object-elf/little-endian n width))
@@ -958,6 +982,36 @@
           ;; arm is separate from `sha-fuel?` so that measuring either one
           ;; cannot silently move the other.
           hkdf-fuel? (= 'aiueos-hkdf-sha256 object-entry)
+          ;; The device-worker client's three objects. COMPUTED, like the AEAD
+          ;; and HKDF arms above, and said so -- nothing has executed these on
+          ;; a machine yet. Every loop in all three is bounded by a literal or
+          ;; by a length the object itself refuses above, so the cost is closed
+          ;; form rather than data-dependent.
+          ;;
+          ;; canonical: the widest v3 result is 716 output bytes. Each byte is
+          ;; one charged call in `put-lit` / `copy-n` / `put-zeros` plus one in
+          ;; `wb`; the thirteen numeric slots cost nine calls apiece to read
+          ;; big-endian and about eighty-five apiece to render at seventeen
+          ;; digits. That is ~2,400 calls. 65,536 is a 27x margin.
+          ;;
+          ;; body: the same writers over a 4,096-byte JSON buffer, with the
+          ;; output-token array bounded IN THE OBJECT at 384 ids of at most six
+          ;; digits. ~24,000 calls, so the same tier is a 2.7x margin -- which
+          ;; is why it is a separate arm from `canonical` even though the two
+          ;; constants agree today: measuring one must not silently move the
+          ;; other.
+          ;;
+          ;; parse: a substring walk over an HTTP response the object refuses
+          ;; above 8,192 bytes, times a pattern of at most 24 bytes, times the
+          ;; eight fields it looks for -- 1,572,864 comparisons at the worst
+          ;; shape, each a charged call. This one takes SHA-256's 10,000,000
+          ;; tier: 65,536 would clear a short "job":null poll and `ud2` partway
+          ;; through a real job, which is the size-dependent trap this file's
+          ;; other comments keep naming.
+          device-client-fuel? (contains? '#{aiueos-device-worker-canonical
+                                            aiueos-device-worker-body}
+                                         object-entry)
+          device-parse-fuel? (= 'aiueos-device-worker-parse object-entry)
           ;; Qwen3.8 GGUF metadata scan. COMPUTED, like the two arms above,
           ;; and said so -- nothing has executed this object yet.
           ;;
@@ -1145,6 +1199,8 @@
                       ecdsa-fuel? [0x49 0xc7 0x41 0x08 0xff 0xff 0xff 0x7f] ; 2,147,483,647
                       aead-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000
                       hkdf-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
+                      device-client-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x01 0x00] ; 65,536
+                      device-parse-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
                       qwen-metadata-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000
                       qwen-tensor-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
                       qwen-dot-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x40 0x00] ; 4,194,304 (21x)
