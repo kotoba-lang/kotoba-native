@@ -1,4 +1,4 @@
-# ADR 0049: A bounded store answers with the word it stored
+# ADR 0051: A bounded store answers with the word it stored
 
 ## Status
 

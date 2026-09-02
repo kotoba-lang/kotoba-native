@@ -1,4 +1,4 @@
-# ADR 0046: MINSD is not `f64-min`
+# ADR 0050: MINSD is not `f64-min`
 
 ## Status
 
