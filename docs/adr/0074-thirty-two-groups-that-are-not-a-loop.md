@@ -84,15 +84,33 @@ machine, agreeing with itself. The next format to arrive needs that row.
 - Two AVX forms were added: `:vpslld-imm8` (`/6` on the opcode `:vpsrld-imm8`
   already used) and `:vpor`. A K-quant code is assembled from FIELDS, which
   Q8_0's whole-byte codes never needed.
-- Static guest-instruction counts per eight elements, from the disassembly:
+- Static guest-instruction counts per group of eight elements, counted by
+  `llvm-mc --disassemble` over the byte ranges the suite pins:
 
   | format | vector arm | legacy arm | ratio |
   |---|---|---|---|
   | Q8_0 (ADR 0066) | 13 | 53 | 4.08 |
-  | Q4_K low half | 11 | 64 | 5.8 |
-  | Q4_K high half | 10 | 64 | 6.4 |
-  | Q6_K strips 0,1 | 15 | 99 | 6.6 |
-  | Q6_K strips 2,3 | 14 | 91 | 6.5 |
+  | Q4_K low half | 11 | 64 | 5.82 |
+  | Q4_K high half | 10 | 64 | 6.40 |
+  | Q6_K strip 0 | 21 | 99 | 4.71 |
+  | Q6_K strip 1 | 21 | 99 | 4.71 |
+  | Q6_K strip 2 | 20 | 91 | 4.55 |
+  | Q6_K strip 3 | 20 | 99 | 4.95 |
+
+  Q6_K's vector group carries its own scale — a `movsx`, a `vmovd`, a
+  `vcvtdq2ps`, a `vmulss` and a `vbroadcastss`, five of its twenty-one — where
+  Q4_K's is amortised over four groups. Strip 2 is the only strip whose
+  two-bit field needs no shift (`(qh >> 4) & 3` moved to bits 4..5 is
+  `qh & 0x30` and nothing else), which is why its legacy group is 91 where the
+  other three are 99. Neither is a per-block figure: both arms also pay the
+  half-precision conversion of the header, and Q4_K the eight (scale, min)
+  pairs.
+
+  A FIRST VERSION OF THIS TABLE WAS WRONG. It said 15 and 14 for Q6_K's vector
+  strips against a true 21 and 20, and the suite was green because its
+  assertions were ratio floors written from the same wrong numbers. The counts
+  are now tied to byte ranges the suite extracts from the emitted code, so a
+  count that no longer matches its arm is a red rather than a stale table.
 
   These are COUNTS and not speedups. The only machine on this workstation with
   AVX2 is QEMU TCG, whose `rdtsc` without `icount` reads host time and whose

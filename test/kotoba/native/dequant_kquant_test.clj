@@ -383,38 +383,88 @@
 ;; 3. what the unrolling costs, as a count
 ;; ---------------------------------------------------------------------------
 
+(def ^:private group-body-lengths
+  "Every distinct group body, as [what, first-index, byte length, instruction
+  count]. The BYTE lengths are checked against the emitted code below; the
+  instruction counts were read from
+  `llvm-mc --disassemble --triple=x86_64-unknown-linux-gnu` (Homebrew LLVM
+  22.1.7) on 2026-09-03 over exactly those byte ranges.
+
+  Groups are delimited by the instruction that opens one: `vpmovzxbd` in the
+  Q4_K vector arm, `movsbq` (the signed scale) in both Q6_K arms."
+  {:q4-avx-low   {:bytes 51  :instructions 11}
+   :q4-avx-high  {:bytes 50  :instructions 10}
+   :q6-avx-strip0 {:bytes 103 :instructions 21}
+   :q6-avx-strip1 {:bytes 108 :instructions 21}
+   :q6-avx-strip2 {:bytes 102 :instructions 20}
+   :q6-avx-strip3 {:bytes 103 :instructions 20}
+   :q6-legacy-strip0 {:bytes 536 :instructions 99}
+   :q6-legacy-strip1 {:bytes 562 :instructions 99}
+   :q6-legacy-strip2 {:bytes 505 :instructions 91}
+   :q6-legacy-strip3 {:bytes 538 :instructions 99}})
+
+(defn- slices
+  "The code between consecutive occurrences of DELIMITER."
+  [code delimiter]
+  (let [at (byte-run-indexes code delimiter)]
+    (mapv (fn [[a b]] (subvec code a b)) (partition 2 1 at))))
+
+(deftest the-group-bodies-are-the-lengths-the-counts-were-read-from
+  ;; A count nobody checks against the emitted code is a number in a comment.
+  ;; These tie every instruction count above to a byte range, so a change to
+  ;; an arm that alters its length is a red rather than a stale table.
+  (let [q4 (slices (code 'kernel-dequant-dot-q4-k) [0xc4 0xc2 0x7d 0x31])
+        q6 (slices (code 'kernel-dequant-dot-q6-k) [0x49 0x0f 0xbe])]
+    (is (= 31 (count q4)) "thirty-two vector groups, thirty-one gaps between them")
+    (is (= 63 (count q6)) "thirty-two per arm")
+    (is (= (:bytes (:q4-avx-low group-body-lengths)) (count (nth q4 0))))
+    (is (= (:bytes (:q4-avx-high group-body-lengths)) (count (nth q4 4))))
+    (doseq [[k i] [[:q6-avx-strip0 0] [:q6-avx-strip1 4]
+                   [:q6-avx-strip2 8] [:q6-avx-strip3 12]
+                   [:q6-legacy-strip0 32] [:q6-legacy-strip1 36]
+                   [:q6-legacy-strip2 40] [:q6-legacy-strip3 44]]]
+      (is (= (:bytes (get group-body-lengths k)) (count (nth q6 i))) (str k)))))
+
 (deftest the-vector-arms-are-shorter-per-eight-elements
-  ;; STATIC GUEST-INSTRUCTION COUNTS, counted from the disassembly above. Not
-  ;; a speedup: the only machine on this workstation with AVX2 at all is QEMU
-  ;; TCG, whose `rdtsc` reads host time and whose cost is dominated by
-  ;; translating instructions rather than executing them -- DEQUANT-FUSION
-  ;; measured 1.46 there for Q8_0 and explained why the number means nothing.
-  ;; A count is what can be asserted.
+  ;; STATIC GUEST-INSTRUCTION COUNTS. Not a speedup: the only machine on this
+  ;; workstation with AVX2 at all is QEMU TCG, whose `rdtsc` without `icount`
+  ;; reads host time and whose cost is dominated by translating instructions
+  ;; rather than executing them -- DEQUANT-FUSION measured 1.46 there for
+  ;; Q8_0 and explained why the number means nothing. A count is what can be
+  ;; asserted, and only the counts above, which are tied to byte ranges.
   ;;
-  ;;   Q4_K  low group  11 vector instructions vs 8 elements x 8 = 64
-  ;;         high group 10                     vs the same 64
-  ;;         plus one (scale, min) pair per four groups: 8 vector, 4 legacy
-  ;;   Q6_K  strip 0/1  15 (5 of them the scale) vs 3 + 8 x 12 = 99
-  ;;         strip 2/3  14                       vs 3 + 8 x 11 = 91
-  (testing "Q4_K"
-    (let [avx-low 11 avx-high 10 legacy 64]
-      (is (<= 5.8 (/ (double legacy) avx-low)))
-      (is (<= 6.4 (/ (double legacy) avx-high)))))
-  (testing "Q6_K"
-    (let [avx-low 15 avx-high 14
-          legacy-low (+ 3 (* 8 12)) legacy-high (+ 3 (* 8 11))]
-      (is (= 99 legacy-low))
-      (is (= 91 legacy-high))
-      (is (<= 6.6 (/ (double legacy-low) avx-low)))
-      (is (<= 6.5 (/ (double legacy-high) avx-high)))))
-  (testing "and the counts are the bytes' counts"
-    ;; A count nobody checks against the emitted code is a number in a
-    ;; comment. These are the instruction boundaries the runs above pin.
-    (let [c4 (code 'kernel-dequant-dot-q4-k)]
-      (is (= 51 (count q4-avx-low-group)))
-      (is (= 50 (count q4-avx-high-group)))
-      (is (byte-run? c4 q4-avx-low-group))
-      (is (byte-run? c4 q4-avx-high-group)))))
+  ;; These are PER GROUP OF EIGHT ELEMENTS and exclude what both arms pay per
+  ;; block: the half-precision conversion of the header, and for Q4_K the
+  ;; eight (scale, min) pairs.
+  (testing "Q4_K -- one legacy element is eight instructions, so a group is 64"
+    (let [legacy 64]
+      (is (< 5.8 (/ (double legacy) (:instructions (:q4-avx-low group-body-lengths)))))
+      (is (< 6.3 (/ (double legacy) (:instructions (:q4-avx-high group-body-lengths)))))))
+  (testing "Q6_K -- the legacy group carries its own scale, so it is not 8 x n"
+    (doseq [[vector legacy floor]
+            [[:q6-avx-strip0 :q6-legacy-strip0 4.7]
+             [:q6-avx-strip1 :q6-legacy-strip1 4.7]
+             [:q6-avx-strip2 :q6-legacy-strip2 4.5]
+             [:q6-avx-strip3 :q6-legacy-strip3 4.9]]]
+      (let [v (:instructions (get group-body-lengths vector))
+            l (:instructions (get group-body-lengths legacy))]
+        (is (< floor (/ (double l) v)) (str vector " " l "/" v)))))
+  (testing "and the vector arm is never the longer of the two"
+    (doseq [[v l] [[:q6-avx-strip0 :q6-legacy-strip0]
+                   [:q6-avx-strip1 :q6-legacy-strip1]
+                   [:q6-avx-strip2 :q6-legacy-strip2]
+                   [:q6-avx-strip3 :q6-legacy-strip3]]]
+      (is (< (:instructions (get group-body-lengths v))
+             (:instructions (get group-body-lengths l))))))
+  (testing "strip 2 is the only Q6_K strip whose field needs no shift"
+    ;; `(qh >> 4) & 3` moved to bits 4..5 is `qh & 0x30` and nothing else, so
+    ;; that strip's legacy element is eleven instructions where the other
+    ;; three are twelve. It is the one asymmetry in the format's four strips
+    ;; and it shows up as 91 against 99.
+    (is (= 91 (:instructions (:q6-legacy-strip2 group-body-lengths))))
+    (is (= #{99} (set (map #(:instructions (get group-body-lengths %))
+                           [:q6-legacy-strip0 :q6-legacy-strip1
+                            :q6-legacy-strip3]))))))
 
 ;; ---------------------------------------------------------------------------
 ;; 4. the refusal is still reachable
