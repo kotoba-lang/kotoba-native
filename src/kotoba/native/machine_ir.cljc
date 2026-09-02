@@ -2147,6 +2147,304 @@
      0x0f opcode
      (bit-or 0xc0 (bit-shift-left (bit-and d 7) 3) (bit-and s 7))]))
 
+;; ── simdprep: VEX prefixes and the AVX/AVX2 instruction forms ───────────────
+;;
+;; Nothing in this file emitted a VEX prefix before this block: `0xc4` and
+;; `0xc5` appeared only as the second and third bytes of `add rsp, imm32`.
+;; Every encoder above builds its REX byte inline, which is correct for a
+;; one-byte prefix with three bits, and does not scale to VEX -- where the same
+;; three bits are INVERTED, live in two different places depending on which of
+;; the two prefix lengths is used, and share a byte with the opcode map, the
+;; vector length, the implied legacy prefix and a fourth register operand.
+;; Constructed inline at every site, that would be six chances to get one bit
+;; backwards per instruction; constructed once here, it is one.
+;;
+;; The bits, from the SDM (Vol. 2A §2.3):
+;;
+;;   two-byte   C5 [R~ v v v v L p p]
+;;   three-byte C4 [R~ X~ B~ m m m m m] [W v v v v L p p]
+;;
+;; `R~`/`X~`/`B~` are the REX.R/.X/.B bits INVERTED -- 1 means "register < 8".
+;; `vvvv` is a fourth register operand, also inverted, and is 1111 (that is, an
+;; encoded value of 0) on the forms that do not have one. `L` selects 128- or
+;; 256-bit operation. `pp` is the legacy mandatory prefix folded into the VEX
+;; byte: 00 none, 01 66, 10 F3, 11 F2. `mmmmm` is the opcode map: 00001 0F,
+;; 00010 0F 38, 00011 0F 3A.
+;;
+;; The two-byte form encodes only `R`, and implies X = B = W = 0 with the 0F
+;; map. `vex` therefore picks it exactly when those four hold, which is what an
+;; assembler does and what these goldens were cross-checked against
+;; (`llvm-mc --show-encoding`, see docs/adr/0028). A wrong choice here is not a
+;; wrong instruction -- both forms decode identically when both are legal -- but
+;; it would be a byte of drift against every published encoding, so the shorter
+;; form is taken deliberately rather than by accident.
+;;
+;; REGISTER AND CLOBBER DISCIPLINE for the eventual consumers of these forms
+;; (recorded here because the encoders cannot enforce it and the first caller
+;; will need it): R9 is the context register and must survive; R10 and R11 are
+;; the scratch pair every kernel sequence above already borrows; all sixteen
+;; XMM/YMM registers are scratch, because no allocator in this repository
+;; allocates one. Any OTHER general register a VEX sequence touches must be
+;; pushed and popped, exactly as `x86-quotient` does for RAX/RDX/RCX and
+;; `x86-privileged` does for RBX. And a sequence that has written a YMM
+;; register must execute `vzeroupper` before it returns or calls out: leaving
+;; the upper 128 bits dirty imposes a state-transition penalty on every
+;; subsequent legacy-SSE instruction in the process, which on this kernel means
+;; every f64 operation `x86-f64-binary` emits.
+;;
+;; This block adds no MC encoding and no KIR operation. It is the encoder half
+;; of a `kernel-dot-f32` primitive that does not exist yet, landed on its own so
+;; that the bytes can be reviewed against the SDM before anything selects them.
+
+(def ^:private vex-opcode-map-code
+  {:0f 0x01 :0f38 0x02 :0f3a 0x03})
+
+(def ^:private vex-prefix-code
+  {:none 0 :66 1 :f3 2 :f2 3})
+
+(defn- vex-bit! [field value]
+  (let [bit (or value 0)]
+    (when-not (contains? #{0 1} bit)
+      (reject! :mc-encode :vex-bit-not-boolean {:field field :value value}))
+    bit))
+
+(defn- vex-vvvv! [value]
+  (let [v (or value 0)]
+    (when-not (and (integer? v) (<= 0 v 15))
+      (reject! :mc-encode :vex-vvvv-out-of-range {:vvvv value}))
+    v))
+
+(defn- vex-length! [l]
+  (case (or l 128)
+    128 0
+    256 1
+    (reject! :mc-encode :vex-length-unsupported {:l l})))
+
+(defn- vex-pp! [pp]
+  (let [code (get vex-prefix-code (or pp :none))]
+    (when-not (some? code)
+      (reject! :mc-encode :vex-prefix-unsupported {:pp pp}))
+    code))
+
+(defn- vex-opcode-map! [opcode-map]
+  (let [code (get vex-opcode-map-code (or opcode-map :0f))]
+    (when-not (some? code)
+      (reject! :mc-encode :vex-opcode-map-unsupported {:map opcode-map}))
+    code))
+
+(defn- vex2
+  "Two-byte VEX: C5 [R~ vvvv L pp]. Legal only where X, B and W are zero and
+  the opcode map is 0F; `vex` owns that decision, this owns the bits."
+  [{:keys [r vvvv l pp]}]
+  [0xc5
+   (bit-or (if (zero? (vex-bit! :r r)) 0x80 0x00)
+           (bit-shift-left (bit-and (bit-not (vex-vvvv! vvvv)) 0x0f) 3)
+           (bit-shift-left (vex-length! l) 2)
+           (vex-pp! pp))])
+
+(defn- vex3
+  "Three-byte VEX: C4 [R~ X~ B~ mmmmm] [W vvvv L pp]."
+  [{:keys [r x b w vvvv l pp] opcode-map :map}]
+  [0xc4
+   (bit-or (if (zero? (vex-bit! :r r)) 0x80 0x00)
+           (if (zero? (vex-bit! :x x)) 0x40 0x00)
+           (if (zero? (vex-bit! :b b)) 0x20 0x00)
+           (vex-opcode-map! opcode-map))
+   (bit-or (bit-shift-left (vex-bit! :w w) 7)
+           (bit-shift-left (bit-and (bit-not (vex-vvvv! vvvv)) 0x0f) 3)
+           (bit-shift-left (vex-length! l) 2)
+           (vex-pp! pp))])
+
+(defn- vex
+  "The shorter of the two legal encodings of the same prefix."
+  [{:keys [x b w] :as spec}]
+  (if (and (zero? (or x 0)) (zero? (or b 0)) (zero? (or w 0))
+           (= :0f (or (:map spec) :0f)))
+    (vex2 spec)
+    (vex3 spec)))
+
+(defn- vex-register
+  "A VEX operand slot names either a vector register -- by its number, the way
+  `x86-gpr-to-xmm` already names XMM -- or a general register by the keywords
+  `x86-register-code` owns. A bare integer is also how an opcode EXTENSION
+  (`/2` on `vpsrlw`) reaches the ModRM reg field, which needs no separate
+  spelling: the field is three bits and an inverted R bit either way."
+  [register]
+  (cond
+    (and (integer? register) (<= 0 register 15)) register
+    (contains? x86-register-code register) (get x86-register-code register)
+    :else (reject! :mc-encode :unsupported-vex-register {:register register})))
+
+(def ^:private vex-address-register-code
+  ;; `x86-register-code` is the ALLOCATABLE set and deliberately omits RSP and
+  ;; RBP: nothing above addresses memory through them. A VEX memory operand
+  ;; may, and both are corner cases of the ModRM encoding rather than
+  ;; afterthoughts -- RSP's low three bits force a SIB byte and RBP's forbid
+  ;; the no-displacement mode. They are added here, and only here, so that
+  ;; widening the address space does not widen what an instruction may write.
+  (assoc x86-register-code :x86-64/rsp 4 :x86-64/rbp 5))
+
+(defn- vex-address-register [register]
+  (let [code (get vex-address-register-code register)]
+    (when-not (some? code)
+      (reject! :mc-encode :unsupported-address-register {:register register}))
+    code))
+
+(defn- vex-imm8! [value]
+  (when-not (and (integer? value) (<= -128 value 255))
+    (reject! :mc-encode :vex-imm8-out-of-range {:imm8 value}))
+  (bit-and value 0xff))
+
+(defn- vex-memory-operand
+  "ModRM (+ SIB, + displacement) for a memory operand, and the X and B bits the
+  addressing mode forces into the prefix. Shapes:
+
+    {:rip <disp32>}                       RIP-relative, mod 00 rm 101
+    {:base r}                             mod 00
+    {:base r :disp d}                     mod 01 or 10 by the size of `d`
+    {:base r :index r :scale 1|2|4|8}     SIB, same displacement rule
+
+  Three encodings are not free choices and are made here rather than left to
+  callers: mod 00 with rm 101 IS the RIP form in 64-bit mode, so a base whose
+  low three bits are 101 (RBP, R13) always carries a displacement, zero if
+  need be; low three bits 100 (RSP, R12) IS the SIB escape, so such a base
+  always emits a SIB byte; and SIB index 100 with X clear MEANS \"no index\",
+  which is why RSP cannot be an index and is refused rather than silently
+  dropped. R12 as an index is fine -- X is set, so the field is not 100."
+  [reg {:keys [base index scale disp rip] :as operand}]
+  (if (contains? operand :rip)
+    {:x 0 :b 0
+     :bytes (vec (concat [(bit-or (bit-shift-left (bit-and reg 7) 3) 0x05)]
+                         (u32le rip)))}
+    (do
+      (when (= :x86-64/rsp index)
+        (reject! :mc-encode :vex-index-cannot-be-rsp operand))
+      (let [b (vex-address-register base)
+            i (when index (vex-address-register index))
+            scale (or scale 1)
+            disp (or disp 0)
+            sib? (or (some? i) (= 4 (bit-and b 7)))
+            mode (cond
+                   (and (zero? disp) (not= 5 (bit-and b 7))) :none
+                   (<= -128 disp 127) :disp8
+                   :else :disp32)
+            scale-bits (case scale
+                         1 0 2 1 4 2 8 3
+                         (reject! :mc-encode :vex-scale-unsupported operand))
+            modrm (bit-or (case mode :none 0x00 :disp8 0x40 :disp32 0x80)
+                          (bit-shift-left (bit-and reg 7) 3)
+                          (if sib? 0x04 (bit-and b 7)))
+            sib (when sib?
+                  (bit-or (bit-shift-left scale-bits 6)
+                          (bit-shift-left (if (some? i) (bit-and i 7) 4) 3)
+                          (bit-and b 7)))]
+        {:x (if (and (some? i) (>= i 8)) 1 0)
+         :b (if (>= b 8) 1 0)
+         :bytes (vec (concat [modrm]
+                             (when sib? [sib])
+                             (case mode
+                               :none []
+                               :disp8 [(bit-and disp 0xff)]
+                               :disp32 (u32le disp))))}))))
+
+(defn- vex-prefix-spec [form r x b vvvv]
+  (assoc (select-keys form [:map :pp :l :w])
+         :r (if (>= r 8) 1 0)
+         :x x
+         :b b
+         :vvvv (when (some? vvvv) (vex-register vvvv))))
+
+(defn- vex-reg-field [{:keys [reg]} form]
+  (vex-register (if (some? reg) reg (:extension form))))
+
+(defn- x86-vex-rr
+  "A complete VEX instruction whose ModRM is the register-register form
+  (mod = 11). OPERANDS is {:reg :vvvv :rm :imm8}; `:reg` may be omitted when
+  the form carries an opcode `:extension`, and `:vvvv` is omitted on the forms
+  that have no third operand."
+  [{:keys [opcode] :as form} {:keys [vvvv rm imm8] :as operands}]
+  (let [r (vex-reg-field operands form)
+        m (vex-register rm)]
+    (vec (concat (vex (vex-prefix-spec form r 0 (if (>= m 8) 1 0) vvvv))
+                 [opcode
+                  (bit-or 0xc0 (bit-shift-left (bit-and r 7) 3) (bit-and m 7))]
+                 (when (some? imm8) [(vex-imm8! imm8)])))))
+
+(defn- x86-vex-rm
+  "A complete VEX instruction whose ModRM names memory. OPERANDS is
+  {:reg :vvvv :operand :imm8}, where `:operand` is a `vex-memory-operand` map."
+  [{:keys [opcode] :as form} {:keys [vvvv operand imm8] :as operands}]
+  (let [r (vex-reg-field operands form)
+        {:keys [x b bytes]} (vex-memory-operand r operand)]
+    (vec (concat (vex (vex-prefix-spec form r x b vvvv))
+                 [opcode]
+                 bytes
+                 (when (some? imm8) [(vex-imm8! imm8)])))))
+
+(def ^:private x86-avx-forms
+  "The AVX/AVX2 forms a quantized f32 dot product needs, and no others. Each
+  entry is the opcode plus the four prefix fields; the operands are supplied
+  per call. `-load`/`-store` distinguish the two directions of one mnemonic
+  (they differ only in the opcode's low bit), and `-256`/`-128` the two vector
+  lengths where both are used."
+  {:vmovups-load   {:opcode 0x10 :map :0f   :pp :none :l 256 :w 0}
+   :vmovups-store  {:opcode 0x11 :map :0f   :pp :none :l 256 :w 0}
+   :vbroadcastss   {:opcode 0x18 :map :0f38 :pp :66   :l 256 :w 0}
+   :vmulps         {:opcode 0x59 :map :0f   :pp :none :l 256 :w 0}
+   :vaddps         {:opcode 0x58 :map :0f   :pp :none :l 256 :w 0}
+   :vsubps         {:opcode 0x5c :map :0f   :pp :none :l 256 :w 0}
+   :vfmadd231ps    {:opcode 0xb8 :map :0f38 :pp :66   :l 256 :w 0}
+   :vpmovzxbw      {:opcode 0x30 :map :0f38 :pp :66   :l 256 :w 0}
+   :vpmaddubsw     {:opcode 0x04 :map :0f38 :pp :66   :l 256 :w 0}
+   :vpmaddwd       {:opcode 0xf5 :map :0f   :pp :66   :l 256 :w 0}
+   :vcvtdq2ps      {:opcode 0x5b :map :0f   :pp :none :l 256 :w 0}
+   ;; `/2` -- the shift count is an immediate, so the ModRM reg field carries
+   ;; the opcode extension and the DESTINATION travels in vvvv.
+   :vpsrlw-imm8    {:opcode 0x71 :map :0f   :pp :66   :l 256 :w 0 :extension 2}
+   :vpand          {:opcode 0xdb :map :0f   :pp :66   :l 256 :w 0}
+   :vpxor          {:opcode 0xef :map :0f   :pp :66   :l 256 :w 0}
+   ;; The source is the 256-bit register in the ModRM REG field and the
+   ;; destination the 128-bit one in rm -- the reverse of every other form
+   ;; here, and the easiest of them to encode backwards.
+   :vextractf128   {:opcode 0x19 :map :0f3a :pp :66   :l 256 :w 0}
+   :vhaddps-256    {:opcode 0x7c :map :0f   :pp :f2   :l 256 :w 0}
+   :vhaddps-128    {:opcode 0x7c :map :0f   :pp :f2   :l 128 :w 0}
+   :vmovd-to-gpr   {:opcode 0x7e :map :0f   :pp :66   :l 128 :w 0}
+   :vmovd-from-gpr {:opcode 0x6e :map :0f   :pp :66   :l 128 :w 0}
+   :vmovss-load    {:opcode 0x10 :map :0f   :pp :f3   :l 128 :w 0}
+   :vmovss-store   {:opcode 0x11 :map :0f   :pp :f3   :l 128 :w 0}
+   :vxorps-256     {:opcode 0x57 :map :0f   :pp :none :l 256 :w 0}
+   :vxorps-128     {:opcode 0x57 :map :0f   :pp :none :l 128 :w 0}})
+
+(defn- x86-avx-form [instruction]
+  (let [form (get x86-avx-forms instruction)]
+    (when-not (some? form)
+      (reject! :mc-encode :unknown-avx-form {:instruction instruction}))
+    form))
+
+(def ^:private x86-vzeroupper
+  "`vzeroupper` -- VEX.128.0F.WIG 77, no ModRM. Zeroes the upper 128 bits of
+  every YMM register, which is what removes the AVX-to-SSE transition penalty
+  a dirty upper half would otherwise impose on the legacy-SSE `x86-f64-binary`
+  sequences above. Every emitted YMM sequence owes one of these before it
+  returns or calls out."
+  (conj (vex2 {:l 128}) 0x77))
+
+(defn- x86-sse-rr
+  "Legacy, non-VEX, two-byte SSE register form: [REX] 0F OPCODE /r. `addps` is
+  encoded this way rather than as `vaddps` because the horizontal tail of a dot
+  product is the one part that has to run on a machine whose AVX check FAILED
+  -- there is no VEX prefix available on that path by definition."
+  [opcode reg rm]
+  (let [r (vex-register reg)
+        m (vex-register rm)]
+    (vec (concat (when (or (>= r 8) (>= m 8))
+                   [(bit-or 0x40 (if (>= r 8) 4 0) (if (>= m 8) 1 0))])
+                 [0x0f opcode
+                  (bit-or 0xc0 (bit-shift-left (bit-and r 7) 3) (bit-and m 7))]))))
+
+;; ── simdprep: end ───────────────────────────────────────────────────────────
+
 (defn- x86-lea-sum [dst base index]
   ;; lea dst, [base + index] -- REX.W 8D /r, SIB with scale 1, no displacement.
   ;; In this mod=00 SIB form RBP and R13 cannot be the base and RSP cannot be
