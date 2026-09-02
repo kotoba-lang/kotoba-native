@@ -5,7 +5,8 @@
   lowers through closed GMIR/MIR/MC data; unknown operations, unsupported value
   shapes, use-before-definition, register exhaustion, and malformed labels fail
   closed before either ISA encoder."
-  (:require [clojure.walk :as walk]
+  (:require [clojure.string :as str]
+            [clojure.walk :as walk]
             [kotoba.gmir :as gmir]
             [kotoba.mir :as mir]
             [kotoba.codegen.mc :as mc]
@@ -264,19 +265,103 @@
    'f64-unordered :gmir/f64-unordered})
 (def ^:private kir-f64-unary-ops
   '#{f64-from-bits f64-to-bits f64-abs f64-neg f64-sqrt})
+;; memwidth: 2^40 elements. Mirrors `kotoba.gmir/slice-item-limit` and
+;; `kotoba.mir/slice-item-limit` -- an ADDRESS-SPACE bound rather than a window
+;; profile, chosen so `length * 8` cannot wrap a 64-bit address computation.
+;; Deliberately not derived from any vector arena bound: amu ADR 0285's
+;; decision is that the bulk carrier does not travel through the arena.
+(def ^:private slice-item-limit 1099511627776)
+
 (def ^:private kir-kernel-memory-ops
-  {'kernel-load-u8 [:gmir/kernel-load-u8 512]
-   'kernel-load-u8-4k [:gmir/kernel-load-u8 4096]
-   'kernel-load-u8-16k [:gmir/kernel-load-u8 16384]
-   'kernel-store-u8 [:gmir/kernel-store-u8 512]
-   'kernel-store-u8-4k [:gmir/kernel-store-u8 4096]
-   'kernel-load-u32 [:gmir/kernel-load-u32 512]
-   'kernel-store-u32 [:gmir/kernel-store-u32 512]
+  ;; memwidth: four transfer widths by four window tiers, plus the ADR 0285
+  ;; slice family. The GMIR operation carries the width and `:gmir/maximum`
+  ;; carries the tier, which is what makes those two independent axes rather
+  ;; than a list of the combinations someone happened to need.
+  {
+   'kernel-load-u8       [:gmir/kernel-load-u8 512]
+   'kernel-store-u8      [:gmir/kernel-store-u8 512]
+   'kernel-load-u8-4k    [:gmir/kernel-load-u8 4096]
+   'kernel-store-u8-4k   [:gmir/kernel-store-u8 4096]
+   'kernel-load-u8-16k   [:gmir/kernel-load-u8 16384]
+   'kernel-store-u8-16k  [:gmir/kernel-store-u8 16384]
+   'kernel-load-u8-64k   [:gmir/kernel-load-u8 65536]
+   'kernel-store-u8-64k  [:gmir/kernel-store-u8 65536]
+   'kernel-load-u16      [:gmir/kernel-load-u16 512]
+   'kernel-store-u16     [:gmir/kernel-store-u16 512]
+   'kernel-load-u16-4k   [:gmir/kernel-load-u16 4096]
+   'kernel-store-u16-4k  [:gmir/kernel-store-u16 4096]
+   'kernel-load-u16-16k  [:gmir/kernel-load-u16 16384]
+   'kernel-store-u16-16k [:gmir/kernel-store-u16 16384]
+   'kernel-load-u16-64k  [:gmir/kernel-load-u16 65536]
+   'kernel-store-u16-64k [:gmir/kernel-store-u16 65536]
+   'kernel-load-u32      [:gmir/kernel-load-u32 512]
+   'kernel-store-u32     [:gmir/kernel-store-u32 512]
+   'kernel-load-u32-4k   [:gmir/kernel-load-u32 4096]
+   'kernel-store-u32-4k  [:gmir/kernel-store-u32 4096]
+   'kernel-load-u32-16k  [:gmir/kernel-load-u32 16384]
+   'kernel-store-u32-16k [:gmir/kernel-store-u32 16384]
+   'kernel-load-u32-64k  [:gmir/kernel-load-u32 65536]
+   'kernel-store-u32-64k [:gmir/kernel-store-u32 65536]
+   'kernel-load-u64      [:gmir/kernel-load-u64 512]
+   'kernel-store-u64     [:gmir/kernel-store-u64 512]
+   'kernel-load-u64-4k   [:gmir/kernel-load-u64 4096]
+   'kernel-store-u64-4k  [:gmir/kernel-store-u64 4096]
+   'kernel-load-u64-16k  [:gmir/kernel-load-u64 16384]
+   'kernel-store-u64-16k [:gmir/kernel-store-u64 16384]
+   'kernel-load-u64-64k  [:gmir/kernel-load-u64 65536]
+   'kernel-store-u64-64k [:gmir/kernel-store-u64 65536]
+   'slice-load-u8        [:gmir/slice-load-u8 slice-item-limit]
+   'slice-store-u8       [:gmir/slice-store-u8 slice-item-limit]
+   'slice-load-u16       [:gmir/slice-load-u16 slice-item-limit]
+   'slice-store-u16      [:gmir/slice-store-u16 slice-item-limit]
+   'slice-load-u32       [:gmir/slice-load-u32 slice-item-limit]
+   'slice-store-u32      [:gmir/slice-store-u32 slice-item-limit]
+   'slice-load-u64       [:gmir/slice-load-u64 slice-item-limit]
+   'slice-store-u64      [:gmir/slice-store-u64 slice-item-limit]
    ;; 4096 because the lock word this names lives at offset 0 of a page, and
    ;; its callers declare lengths of both 512 and 4096. A 512 ceiling would
    ;; trap the 4096 ones on the length check before reaching the shared word.
    'kernel-try-lock-u32 [:gmir/kernel-try-lock-u32 4096]
    'kernel-unlock-u32 [:gmir/kernel-unlock-u32 4096]})
+
+(def ^:private gmir-memory-store-ops
+  "memwidth: derived from the table rather than written out beside it. Every
+  store takes four operands and every load three."
+  (into #{} (comp (filter #(str/includes? (name (first %)) "store"))
+                  (map first))
+        (vals kir-kernel-memory-ops)))
+
+(def ^:private gmir-slice-ops
+  (into #{} (comp (filter #(str/starts-with? (name (first %)) "slice-"))
+                  (map first))
+        (vals kir-kernel-memory-ops)))
+
+(defn- kernel-access-bytes
+  "memwidth: the transfer width named by an operation or encoding keyword --
+  `:x86-64/kernel-load-u16` -> 2, `:gmir/slice-store-u64` -> 8. Read off the
+  name rather than carried in a field, because the name is where the two IR
+  layers and both encoders already agree it lives."
+  [op]
+  (let [n (name op)]
+    (cond (str/ends-with? n "-u8") 1
+          (str/ends-with? n "-u16") 2
+          (str/ends-with? n "-u32") 4
+          (str/ends-with? n "-u64") 8
+          :else (reject! :mc-encode :unknown-access-width {:operation op}))))
+
+(def ^:private unaligned-accesses
+  "The (operation, window) pairs that do NOT check natural alignment.
+
+  Every width>1 access checks `index mod width == 0`, because a misaligned MMIO
+  access is architecturally undefined on AArch64 device memory and splits the
+  bus lock on x86 -- the machine's answer to one is not a value. These two
+  predate the rule: retrofitting it would change the bytes of shipped aiueos
+  objects, and a caller that was misaligned was already broken in a way this
+  change is not the place to discover. The lock pair is exempt too, and does
+  not need listing here because it never reaches the memory bounds check with
+  alignment requested. `kotoba.kir`'s `unaligned-window-operations` is the
+  oracle's half of the same asymmetry."
+  #{[:gmir/kernel-load-u32 512] [:gmir/kernel-store-u32 512]})
 
 (def ^:private kir-x86-privileged-ops
   {'kernel-boot-info :boot-info
@@ -1444,9 +1529,11 @@
                       operands (mapv #(scalar-register! (second %) form) lowered)
                       dst (fresh-reg)
                       [base length index stored] operands]
-                  (when-not (= (if (contains? #{:gmir/kernel-store-u8
-                                                :gmir/kernel-store-u32} op)
-                                 4 3)
+                  ;; memwidth: every store takes four operands and every load
+                  ;; three, across both families. Naming the two u8/u32 stores
+                  ;; by hand is how a new store's fourth operand would have
+                  ;; been silently rejected as an arity error.
+                  (when-not (= (if (contains? gmir-memory-store-ops op) 4 3)
                                (count operands))
                     (reject! :kir-to-gmir :kernel-memory-arity {:form form}))
                   [(conj code
@@ -3005,22 +3092,105 @@
           modrm (bit-or (bit-shift-left (bit-and code 7) 3) 3)]
       (case kind
         :load-u8 [rex 0x0f 0xb6 modrm]
+        ;; memwidth: `movzx r32, word [r11]`. A 32-bit destination write zeroes
+        ;; bits 63:32, so the 16-bit load arrives zero-extended into the whole
+        ;; i64 without a REX.W and without a masking instruction.
+        :load-u16 [rex 0x0f 0xb7 modrm]
         :load-u32 [(bit-or rex 0x40) 0x8b modrm]
+        ;; REX.W, so this is `mov r64, qword [r11]` -- the one width that fills
+        ;; the register exactly, which is why a top byte >= 0x80 arrives as a
+        ;; negative i64. That is the correct bit pattern; `:i64` here is signed.
+        :load-u64 [(bit-or rex 0x08) 0x8b modrm]
         :store-u8 [rex 0x88 modrm]
-        :store-u32 [rex 0x89 modrm]))))
+        ;; The 0x66 operand-size prefix precedes REX, not the other way round.
+        :store-u16 [0x66 rex 0x89 modrm]
+        :store-u32 [rex 0x89 modrm]
+        :store-u64 [(bit-or rex 0x08) 0x89 modrm]))))
+
+(defn- x86-and-imm8
+  "memwidth: `and r64, imm8` -- REX.W 83 /4 ib. Used only against a
+  `width - 1` mask, which is 1, 3 or 7."
+  [register value]
+  (let [code (get x86-register-code register)]
+    (when-not (some? code)
+      (reject! :mc-encode :unsupported-register {:register register}))
+    [(bit-or 0x48 (if (>= code 8) 1 0)) 0x83
+     (bit-or 0xe0 (bit-and code 7)) value]))
+
+(defn- x86-alignment-check
+  "memwidth: branch to `trap` unless `register` is a multiple of `bytes`.
+
+  Three instructions rather than `test reg,imm32` + `jnz`, because `jnz-rel32`
+  is not one of the relative-branch kinds `kotoba.codegen.layout` reserves and
+  adding one to that table is a change to a different repository for one saved
+  instruction. `test` clears CF, so `ja` (CF=0 and ZF=0) fires exactly when the
+  masked value is non-zero. R10 is the same scratch the tail check above uses
+  and is dead afterwards.
+
+  Width 1 masks with 0 and can never trap, so it emits nothing at all rather
+  than three instructions that always fall through."
+  [trap bytes register]
+  (when (> bytes 1)
+    (vec (concat (x86-rr 0x89 :x86-64/r10 register)
+                 (x86-and-imm8 :x86-64/r10 (dec bytes))
+                 (x86-rr 0x85 :x86-64/r10 :x86-64/r10)
+                 [(layout/relative-branch :x86-64/ja-rel32 trap)]))))
+
+(defn- x86-lea-scaled
+  "memwidth: `lea dst, [base + index*bytes]` -- the scaled addressing mode that
+  is the whole point of the slice family. One instruction where the window
+  family needs a `mov` and an `add`, and the guest computes no byte offset.
+
+  Two SIB corner cases are handled rather than assumed away. A base whose low
+  three bits are 101 (RBP, R13) means `disp32, no base` under mod 00, so it
+  takes mod 01 with a zero disp8. An index whose low three bits are 100 means
+  `no index` when REX.X is 0 -- that is RSP, which no allocator tier offers, so
+  it is refused rather than silently encoded as something else; R12 has the
+  same low bits but sets REX.X and is a legal index."
+  [dst base index bytes]
+  (let [d (get x86-register-code dst)
+        b (get x86-register-code base)
+        i (get x86-register-code index)
+        scale (case bytes 1 0 2 1 4 2 8 3)]
+    (when-not (and (some? d) (some? b) (some? i))
+      (reject! :mc-encode :unsupported-register {:dst dst :base base :index index}))
+    (when (= 4 i)
+      (reject! :mc-encode :index-register-cannot-be-rsp {:index index}))
+    (let [rex (bit-or 0x48
+                      (if (>= d 8) 4 0)
+                      (if (>= i 8) 2 0)
+                      (if (>= b 8) 1 0))
+          rbp-form? (= 5 (bit-and b 7))
+          modrm (bit-or (if rbp-form? 0x40 0x00)
+                        (bit-shift-left (bit-and d 7) 3) 4)
+          sib (bit-or (bit-shift-left scale 6)
+                      (bit-shift-left (bit-and i 7) 3)
+                      (bit-and b 7))]
+      (cond-> [rex 0x8d modrm sib]
+        rbp-form? (conj 0x00)))))
 
 (defn- memory-label [instruction-index suffix]
   (keyword "kotoba.native.kernel-memory"
            (str suffix "-" instruction-index)))
 
 (defn- x86-kernel-bounds-check
-  "The shared preamble for every checked kernel access: the declared length is
-  within this operation's ceiling, the base is not null, the index is inside
-  the length, and a 32-bit access has four bytes left after it. Branches to
-  `trap` on any violation, and otherwise leaves R11 holding base+index. R10 is
-  scratch here and dead afterwards, which is what lets the lock sequence below
-  borrow it without saving anything."
-  [trap width {:mir/keys [base length index maximum]}]
+  "The shared preamble for every checked kernel WINDOW access: the declared
+  length is within this operation's ceiling, the base is not null, the index is
+  inside the length, a multi-byte access has its own width left after it, and
+  (memwidth) the index is naturally aligned. Branches to `trap` on any
+  violation, and otherwise leaves R11 holding base+index. R10 is scratch here
+  and dead afterwards, which is what lets the lock sequence below borrow it
+  without saving anything.
+
+  `aligned?` is passed rather than derived, because the two operations exempt
+  from the alignment rule are exempt by DATE, not by shape -- see
+  `unaligned-accesses` -- and the lock pair reaches this function through a
+  different caller that must not acquire the check at all.
+
+  The tail check was written as the literal 4 while four bytes was the only
+  multi-byte width. It is `(quot width 8)` now, which is still exactly 4 for
+  every operation that had it before: these bytes do not move."
+  [trap width aligned? {:mir/keys [base length index maximum]}]
   (vec (concat
         (x86-cmp-imm32 length maximum)
         [(layout/relative-branch :x86-64/ja-rel32 trap)]
@@ -3028,13 +3198,41 @@
         [(layout/relative-branch :x86-64/jz-rel32 trap)]
         (x86-rr 0x39 index length)
         [(layout/relative-branch :x86-64/jae-rel32 trap)]
-        (when (= 32 width)
+        (when (> width 8)
           (concat (x86-rr 0x89 :x86-64/r10 length)
                   (x86-rr 0x29 :x86-64/r10 index)
-                  (x86-cmp-imm32 :x86-64/r10 4)
+                  (x86-cmp-imm32 :x86-64/r10 (quot width 8))
                   [(layout/relative-branch :x86-64/jl-rel32 trap)]))
+        ;; LAST, so a program that was trapping on the window still traps on
+        ;; the window rather than reporting a different violation.
+        (when aligned? (x86-alignment-check trap (quot width 8) index))
         (x86-rr 0x89 :x86-64/r11 base)
         (x86-rr 0x01 :x86-64/r11 index))))
+
+(defn- x86-slice-bounds-check
+  "memwidth: the slice family's preamble (amu ADR 0285). Leaves R11 holding
+  `base + index * bytes`.
+
+  Four checks against the window family's five, and the difference is the
+  point of the carrier. `index` counts ELEMENTS, so `index < length` already
+  says the whole element is inside and there is no tail check. Alignment is
+  proved once on the BASE rather than per access, because a scaled index off an
+  aligned base is aligned. What is left per element is one unsigned compare and
+  one scaled load.
+
+  The ceiling needs `movabs` rather than `cmp r64, imm32`, because it is 2^40:
+  an address-space bound, not a window profile."
+  [trap bytes {:mir/keys [base length index maximum]}]
+  (vec (concat
+        (x86-mov-imm-fixed :x86-64/r10 maximum)
+        (x86-rr 0x39 length :x86-64/r10)
+        [(layout/relative-branch :x86-64/ja-rel32 trap)]
+        (x86-rr 0x85 base base)
+        [(layout/relative-branch :x86-64/jz-rel32 trap)]
+        (x86-alignment-check trap bytes base)
+        (x86-rr 0x39 index length)
+        [(layout/relative-branch :x86-64/jae-rel32 trap)]
+        (x86-lea-scaled :x86-64/r11 base index bytes))))
 
 (defn- x86-set-zero-flag
   "`sete dst8` then zero-extend, the tail `x86-compare` already uses. Written
@@ -3052,12 +3250,29 @@
                           (bit-and d 7))]))))
 
 (defn- x86-kernel-memory
-  [instruction-index width store? {:mir/keys [dst stored] :as instruction}]
+  [instruction-index width store? aligned? {:mir/keys [dst stored] :as instruction}]
   (let [trap (memory-label instruction-index "trap")
         done (memory-label instruction-index "done")
         result (if store? stored dst)]
     (vec (concat
-          (x86-kernel-bounds-check trap width instruction)
+          (x86-kernel-bounds-check trap width aligned? instruction)
+          (x86-memory-access (keyword (str (if store? "store" "load")
+                                           "-u" width)) result)
+          [(layout/relative-branch :x86-64/jmp-rel32 done)
+           (layout/label trap)]
+          [0x0f 0x0b]
+          [(layout/label done)]))))
+
+(defn- x86-slice-memory
+  "memwidth: one scaled `mov` after one unsigned compare. No context callback,
+  no byte offset computed by the guest -- which is the property amu ADR 0285
+  set out to buy."
+  [instruction-index width store? {:mir/keys [dst stored] :as instruction}]
+  (let [trap (memory-label instruction-index "slice-trap")
+        done (memory-label instruction-index "slice-done")
+        result (if store? stored dst)]
+    (vec (concat
+          (x86-slice-bounds-check trap (quot width 8) instruction)
           (x86-memory-access (keyword (str (if store? "store" "load")
                                            "-u" width)) result)
           [(layout/relative-branch :x86-64/jmp-rel32 done)
@@ -3081,7 +3296,9 @@
   (let [trap (memory-label instruction-index "lock-trap")
         done (memory-label instruction-index "lock-done")]
     (vec (concat
-          (x86-kernel-bounds-check trap 32 instruction)
+          ;; The lock pair does not acquire the alignment check: it predates
+          ;; the rule and its bytes are pinned by shipped aiueos objects.
+          (x86-kernel-bounds-check trap 32 false instruction)
           (x86-push :x86-64/rax)
           (x86-mov-imm :x86-64/rax expected)
           (x86-mov-imm :x86-64/r10 desired)
@@ -3116,11 +3333,35 @@
           [0x0f 0x0b]
           [(layout/label done)]))))
 
+(defn- a64-alignment-check
+  "memwidth: `tst xN, #(bytes-1)` then `b.ne trap`.
+
+  `TST` is `ANDS XZR, Xn, #imm` with a 64-bit logical immediate. For a mask of
+  1, 3 or 7 the encoding is immr=0 and imms = number-of-ones minus one, with
+  N=1 -- so `tst x3,#7` is 0xF240087F. Written from the field layout rather
+  than carried from an assembler, and checked by the byte golden.
+
+  Width 1 masks with 0 and can never trap, so it emits nothing at all."
+  [trap bytes register]
+  (when (> bytes 1)
+    (let [imms (case bytes 2 0 4 1 8 2)]
+      (vec (concat
+            (u32le (bit-or 0xf2400000
+                           (bit-shift-left imms 10)
+                           (bit-shift-left (a64-register register) 5)
+                           31))
+            [(layout/relative-branch :aarch64/b-ne-imm19 trap)])))))
+
 (defn- a64-kernel-bounds-check
-  "AArch64's half of the shared preamble. Same four checks as the x86 side,
-  leaving x16 holding base+index. x16/x17 are the encoder scratch pair and are
-  never admitted to allocated MIR, so neither can collide with an operand."
-  [trap width {:mir/keys [base length index maximum]}]
+  "AArch64's half of the shared window preamble. Same checks as the x86 side,
+  in the same order, leaving x16 holding base+index. x16/x17 are the encoder
+  scratch pair and are never admitted to allocated MIR, so neither can collide
+  with an operand.
+
+  memwidth: the tail check was written as the literal 4 while four bytes was
+  the only multi-byte width, and `aligned?` is passed rather than derived for
+  the same reason it is on the x86 side -- the exemptions are by date."
+  [trap width aligned? {:mir/keys [base length index maximum]}]
   (vec (concat
         (a64-constant :aarch64/x16 maximum)
         (u32le (bit-or 0xeb00001f (bit-shift-left 16 16)
@@ -3132,16 +3373,39 @@
                        (bit-shift-left (a64-register length) 16)
                        (bit-shift-left (a64-register index) 5)))
         [(layout/relative-branch :aarch64/b-hs-imm19 trap)]
-        (when (= 32 width)
+        (when (> width 8)
           (concat
            (u32le (bit-or 0xcb000000
                           (bit-shift-left (a64-register index) 16)
                           (bit-shift-left (a64-register length) 5) 16))
-           (u32le (bit-or 0xf100001f (bit-shift-left 4 10)
+           (u32le (bit-or 0xf100001f (bit-shift-left (quot width 8) 10)
                           (bit-shift-left 16 5)))
            [(layout/relative-branch :aarch64/b-lt-imm19 trap)]))
+        (when aligned? (a64-alignment-check trap (quot width 8) index))
         (u32le (bit-or 0x8b000000
                        (bit-shift-left (a64-register index) 16)
+                       (bit-shift-left (a64-register base) 5) 16)))))
+
+(defn- a64-slice-bounds-check
+  "memwidth: the slice family's preamble on AArch64 (amu ADR 0285). Leaves x16
+  holding `base + index * bytes`, which is one `ADD (shifted register)` --
+  the same instruction the window family already emits, plus an LSL amount."
+  [trap bytes {:mir/keys [base length index maximum]}]
+  (vec (concat
+        (a64-constant :aarch64/x16 maximum)
+        (u32le (bit-or 0xeb00001f (bit-shift-left 16 16)
+                       (bit-shift-left (a64-register length) 5)))
+        [(layout/relative-branch :aarch64/b-hi-imm19 trap)
+         (layout/relative-branch :aarch64/cbz-imm19 trap
+                                 [(a64-register base)])]
+        (a64-alignment-check trap bytes base)
+        (u32le (bit-or 0xeb00001f
+                       (bit-shift-left (a64-register length) 16)
+                       (bit-shift-left (a64-register index) 5)))
+        [(layout/relative-branch :aarch64/b-hs-imm19 trap)]
+        (u32le (bit-or 0x8b000000
+                       (bit-shift-left (a64-register index) 16)
+                       (bit-shift-left (case bytes 1 0 2 1 4 2 8 3) 10)
                        (bit-shift-left (a64-register base) 5) 16)))))
 
 (defn- a64-kernel-lock
@@ -3165,7 +3429,9 @@
         fail (memory-label instruction-index "lock-fail")
         done (memory-label instruction-index "lock-done")]
     (vec (concat
-          (a64-kernel-bounds-check trap 32 instruction)
+          ;; The lock pair does not acquire the alignment check: it predates
+          ;; the rule and its bytes are pinned by shipped aiueos objects.
+          (a64-kernel-bounds-check trap 32 false instruction)
           [(layout/label retry)]
           ;; ldaxr w17, [x16]
           (u32le 0x885ffe11)
@@ -3193,22 +3459,46 @@
           (u32le 0xd4200000)
           [(layout/label done)]))))
 
+(defn- a64-memory-access
+  "memwidth: LDRB/LDRH/LDR w/LDR x and their stores, all in the unsigned-offset
+  form with a zero offset off x16. Register-offset addressing would leave the
+  ESR instruction-syndrome invalid for MMIO -- see `emit-kernel-store-u8`'s note
+  in `kotoba.native.aarch64` -- so the address is computed into x16 first and
+  every width uses base-register addressing."
+  [store? width result]
+  (u32le (bit-or (case [store? width]
+                   [false 8] 0x39400000
+                   [false 16] 0x79400000
+                   [false 32] 0xb9400000
+                   [false 64] 0xf9400000
+                   [true 8] 0x39000000
+                   [true 16] 0x79000000
+                   [true 32] 0xb9000000
+                   [true 64] 0xf9000000)
+                 (bit-shift-left 16 5)
+                 (a64-register result))))
+
 (defn- a64-kernel-memory
-  [instruction-index width store? {:mir/keys [dst stored] :as instruction}]
+  [instruction-index width store? aligned? {:mir/keys [dst stored] :as instruction}]
   (let [trap (memory-label instruction-index "trap")
         done (memory-label instruction-index "done")
         result (if store? stored dst)]
     (vec (concat
-          (a64-kernel-bounds-check trap width instruction)
-          (u32le (case [store? width]
-                   [false 8] (bit-or 0x39400000 (bit-shift-left 16 5)
-                                     (a64-register result))
-                   [false 32] (bit-or 0xb9400000 (bit-shift-left 16 5)
-                                      (a64-register result))
-                   [true 8] (bit-or 0x39000000 (bit-shift-left 16 5)
-                                    (a64-register result))
-                   [true 32] (bit-or 0xb9000000 (bit-shift-left 16 5)
-                                     (a64-register result))))
+          (a64-kernel-bounds-check trap width aligned? instruction)
+          (a64-memory-access store? width result)
+          [(layout/relative-branch :aarch64/b-imm26 done)
+           (layout/label trap)]
+          (u32le 0xd4200000)
+          [(layout/label done)]))))
+
+(defn- a64-slice-memory
+  [instruction-index width store? {:mir/keys [dst stored] :as instruction}]
+  (let [trap (memory-label instruction-index "slice-trap")
+        done (memory-label instruction-index "slice-done")
+        result (if store? stored dst)]
+    (vec (concat
+          (a64-slice-bounds-check trap (quot width 8) instruction)
+          (a64-memory-access store? width result)
           [(layout/relative-branch :aarch64/b-imm26 done)
            (layout/label trap)]
           (u32le 0xd4200000)
@@ -3767,10 +4057,26 @@
      :x86-64/f64-greater-or-equal :x86-64/f64-unordered)
     (x86-f64-compare encoding (:mir/dst instruction) (:mir/left instruction)
                      (:mir/right instruction))
-    :x86-64/kernel-load-u8 (x86-kernel-memory instruction-index 8 false instruction)
-    :x86-64/kernel-store-u8 (x86-kernel-memory instruction-index 8 true instruction)
-    :x86-64/kernel-load-u32 (x86-kernel-memory instruction-index 32 false instruction)
-    :x86-64/kernel-store-u32 (x86-kernel-memory instruction-index 32 true instruction)
+    ;; memwidth: four widths, and `aligned?` is looked up rather than derived
+    ;; -- the two exemptions are exemptions by DATE, not by shape.
+    (:x86-64/kernel-load-u8 :x86-64/kernel-load-u16
+     :x86-64/kernel-load-u32 :x86-64/kernel-load-u64
+     :x86-64/kernel-store-u8 :x86-64/kernel-store-u16
+     :x86-64/kernel-store-u32 :x86-64/kernel-store-u64)
+    (let [op (keyword "gmir" (name encoding))
+          store? (str/includes? (name encoding) "store")
+          bits (* 8 (kernel-access-bytes encoding))]
+      (x86-kernel-memory instruction-index bits store?
+                         (and (> bits 8)
+                              (not (contains? unaligned-accesses
+                                              [op (:mir/maximum instruction)])))
+                         instruction))
+    (:x86-64/slice-load-u8 :x86-64/slice-load-u16
+     :x86-64/slice-load-u32 :x86-64/slice-load-u64
+     :x86-64/slice-store-u8 :x86-64/slice-store-u16
+     :x86-64/slice-store-u32 :x86-64/slice-store-u64)
+    (x86-slice-memory instruction-index (* 8 (kernel-access-bytes encoding))
+                      (str/includes? (name encoding) "store") instruction)
     ;; Acquire moves the word 0 -> 1; release moves it 1 -> 0. The comparand
     ;; and the replacement are the operation's, not the guest's.
     :x86-64/kernel-try-lock-u32 (x86-kernel-lock instruction-index 0 1 instruction)
@@ -3914,10 +4220,24 @@
                        :aarch64/f64-unordered 0x9a9f77e0)
                      (:mir/dst instruction) (:mir/left instruction)
                      (:mir/right instruction))
-    :aarch64/kernel-load-u8 (a64-kernel-memory instruction-index 8 false instruction)
-    :aarch64/kernel-store-u8 (a64-kernel-memory instruction-index 8 true instruction)
-    :aarch64/kernel-load-u32 (a64-kernel-memory instruction-index 32 false instruction)
-    :aarch64/kernel-store-u32 (a64-kernel-memory instruction-index 32 true instruction)
+    (:aarch64/kernel-load-u8 :aarch64/kernel-load-u16
+     :aarch64/kernel-load-u32 :aarch64/kernel-load-u64
+     :aarch64/kernel-store-u8 :aarch64/kernel-store-u16
+     :aarch64/kernel-store-u32 :aarch64/kernel-store-u64)
+    (let [op (keyword "gmir" (name encoding))
+          store? (str/includes? (name encoding) "store")
+          bits (* 8 (kernel-access-bytes encoding))]
+      (a64-kernel-memory instruction-index bits store?
+                         (and (> bits 8)
+                              (not (contains? unaligned-accesses
+                                              [op (:mir/maximum instruction)])))
+                         instruction))
+    (:aarch64/slice-load-u8 :aarch64/slice-load-u16
+     :aarch64/slice-load-u32 :aarch64/slice-load-u64
+     :aarch64/slice-store-u8 :aarch64/slice-store-u16
+     :aarch64/slice-store-u32 :aarch64/slice-store-u64)
+    (a64-slice-memory instruction-index (* 8 (kernel-access-bytes encoding))
+                      (str/includes? (name encoding) "store") instruction)
     :aarch64/kernel-try-lock-u32 (a64-kernel-lock instruction-index 0 1 instruction)
     :aarch64/kernel-unlock-u32 (a64-kernel-lock instruction-index 1 0 instruction)
     :aarch64/kernel-subregion (a64-kernel-subregion instruction-index instruction)

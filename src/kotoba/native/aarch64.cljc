@@ -3,7 +3,8 @@
   ;; conditional that used to wrap the whole `:require` (see
   ;; `kotoba.wasm.core`'s ns form for that original reasoning) now wraps only
   ;; the cljs-only item.
-  (:require [kotoba.codegen.layout :as layout]
+  (:require [clojure.string :as str]
+            [kotoba.codegen.layout :as layout]
             [kotoba.native.machine-ir :as machine-ir]
             [kotoba.native.peephole :as peephole]
             [kotoba.native.string-index :as string-index]
@@ -504,6 +505,133 @@
          (layout/label trap-label)]
         (insn 0xd4200000)
         [(layout/label end-label)]))))
+
+
+;; ---------------------------------------------------------------------------
+;; memwidth: the widths and tiers this fallback did not have, and the ADR 0285
+;; slice family. The four emitters above keep their bytes; everything new goes
+;; through the two below, which follow `kotoba.native.machine-ir` exactly.
+;; ---------------------------------------------------------------------------
+
+(def ^:private memwidth-window-ops
+  (into {}
+        (for [[w bytes] [["u8" 1] ["u16" 2] ["u32" 4] ["u64" 8]]
+              [suffix maximum] [["" 512] ["-4k" 4096] ["-16k" 16384] ["-64k" 65536]]
+              kind ["load" "store"]
+              :let [op (symbol (str "kernel-" kind "-" w suffix))]
+              :when (not (contains? '#{kernel-load-u8 kernel-load-u8-4k
+                                       kernel-load-u8-16k kernel-store-u8
+                                       kernel-store-u8-4k kernel-load-u32
+                                       kernel-store-u32}
+                                    op))]
+          [op [bytes maximum (> bytes 1)]])))
+
+(def ^:private memwidth-slice-ops
+  (into {} (for [[w bytes] [["u8" 1] ["u16" 2] ["u32" 4] ["u64" 8]]
+                 kind ["load" "store"]]
+             [(symbol (str "slice-" kind "-" w)) bytes])))
+
+(def ^:private memwidth-slice-item-limit 1099511627776)
+
+(defn- memwidth-access
+  "LDRB/LDRH/LDR w/LDR x and their stores, unsigned-offset form off x1 with a
+  zero offset. Base-register addressing, like the emitters above, so the ESR
+  instruction-syndrome stays valid for the MMIO these reach."
+  [store? bytes]
+  (insn (bit-or (case [store? bytes]
+                  [false 1] 0x39400020
+                  [false 2] 0x79400020
+                  [false 4] 0xb9400020
+                  [false 8] 0xf9400020
+                  [true 1] 0x39000020
+                  [true 2] 0x79000020
+                  [true 4] 0xb9000020
+                  [true 8] 0xf9000020))))
+
+(defn- memwidth-alignment
+  "`tst xN, #(bytes-1)` then `b.ne trap`. N=1, immr=0, imms = ones-1."
+  [trap-label bytes reg]
+  (when (> bytes 1)
+    (concat (insn (bit-or 0xf2400000
+                          (bit-shift-left (case bytes 2 0 4 1 8 2) 10)
+                          (bit-shift-left reg 5) 31))
+            [(layout/relative-branch :aarch64/b-ne-imm19 trap-label)])))
+
+(defn- emit-memwidth-window
+  "x1 = base, x2 = length, x3 = index, x0 = the loaded or stored value."
+  [args bytes maximum aligned? store? env depth]
+  (let [counter (or (:mir-label-counter (meta env)) (atom -1))
+        env (with-meta env (assoc (meta env) :mir-label-counter counter))
+        trap-label (fresh-label counter "memwidth-window-trap")
+        end-label (fresh-label counter "memwidth-window-end")
+        [base length index value] args]
+    (vec (concat
+          (emit-expr base env depth) (save-x0)
+          (emit-expr length env (+ depth 1)) (save-x0)
+          (if store?
+            (concat (emit-expr index env (+ depth 2)) (save-x0)
+                    (emit-expr value env (+ depth 3))
+                    (ldr-sp 3 0) (add-sp 16))
+            (concat (emit-expr index env (+ depth 2)) (mov-reg 3 0)))
+          (ldr-sp 2 0) (add-sp 16)
+          (ldr-sp 1 0) (add-sp 16)
+          (load-constant-reg 4 maximum)
+          (insn 0xeb04005f)                    ; cmp x2, x4
+          [(layout/relative-branch :aarch64/b-hi-imm19 trap-label)
+           (layout/relative-branch :aarch64/cbz-x1-imm19 trap-label)]
+          (insn 0xeb02007f)                    ; cmp x3, x2
+          [(layout/relative-branch :aarch64/b-hs-imm19 trap-label)]
+          (when (> bytes 1)
+            ;; sub x5,x2,x3 ; cmp x5,#bytes ; b.lt trap -- the non-wrapping
+            ;; form, since `length - index` cannot underflow after the `b.hs`.
+            (concat (insn 0xcb030045)
+                    (insn (bit-or 0xf100001f (bit-shift-left bytes 10)
+                                  (bit-shift-left 5 5)))
+                    [(layout/relative-branch :aarch64/b-lt-imm19 trap-label)]))
+          (when aligned? (memwidth-alignment trap-label bytes 3))
+          (insn 0x8b030021)                    ; add x1, x1, x3
+          (memwidth-access store? bytes)
+          [(layout/relative-branch :aarch64/b-imm26 end-label)
+           (layout/label trap-label)]
+          (insn 0xd4200000)
+          [(layout/label end-label)]))))
+
+(defn- emit-memwidth-slice
+  "Element-indexed (amu ADR 0285). The scale is the LSL amount of one
+  `ADD (shifted register)`; nothing per element but one unsigned compare."
+  [args bytes store? env depth]
+  (let [counter (or (:mir-label-counter (meta env)) (atom -1))
+        env (with-meta env (assoc (meta env) :mir-label-counter counter))
+        trap-label (fresh-label counter "memwidth-slice-trap")
+        end-label (fresh-label counter "memwidth-slice-end")
+        [base length index value] args]
+    (vec (concat
+          (emit-expr base env depth) (save-x0)
+          (emit-expr length env (+ depth 1)) (save-x0)
+          (if store?
+            (concat (emit-expr index env (+ depth 2)) (save-x0)
+                    (emit-expr value env (+ depth 3))
+                    (ldr-sp 3 0) (add-sp 16))
+            (concat (emit-expr index env (+ depth 2)) (mov-reg 3 0)))
+          (ldr-sp 2 0) (add-sp 16)
+          (ldr-sp 1 0) (add-sp 16)
+          (load-constant-reg 4 memwidth-slice-item-limit)
+          (insn 0xeb04005f)                    ; cmp x2, x4
+          [(layout/relative-branch :aarch64/b-hi-imm19 trap-label)
+           (layout/relative-branch :aarch64/cbz-x1-imm19 trap-label)]
+          ;; Alignment proved once on the base, not per element.
+          (memwidth-alignment trap-label bytes 1)
+          (insn 0xeb02007f)                    ; cmp x3, x2
+          [(layout/relative-branch :aarch64/b-hs-imm19 trap-label)]
+          ;; add x1, x1, x3, lsl #log2(bytes)
+          (insn (bit-or 0x8b000000 (bit-shift-left 3 16)
+                        (bit-shift-left (case bytes 1 0 2 1 4 2 8 3) 10)
+                        (bit-shift-left 1 5) 1))
+          (memwidth-access store? bytes)
+          [(layout/relative-branch :aarch64/b-imm26 end-label)
+           (layout/label trap-label)]
+          (insn 0xd4200000)
+          [(layout/label end-label)]))))
 
 ;; Same `cap-id`-is-a-cljs-`bigint` issue `kotoba.native.x86-64`'s
 ;; `emit-cap-call` documents at length -- coerced to a plain JS number once
@@ -1328,6 +1456,17 @@
         (= op 'kernel-load-u8-16k) (emit-kernel-load-u8 args 16384 env depth)
         (= op 'kernel-store-u32) (emit-kernel-store-u32 args 512 env depth)
         (= op 'kernel-load-u32) (emit-kernel-load-u32 args 512 env depth)
+
+        ;; memwidth: every width and tier the four emitters above do not cover,
+        ;; and the slice family.
+        (contains? memwidth-window-ops op)
+        (let [[bytes maximum aligned?] (get memwidth-window-ops op)]
+          (emit-memwidth-window args bytes maximum aligned?
+                                (str/includes? (name op) "store") env depth))
+
+        (contains? memwidth-slice-ops op)
+        (emit-memwidth-slice args (get memwidth-slice-ops op)
+                             (str/includes? (name op) "store") env depth)
         :else (emit-call op args env depth))))))
 
 (defn- emit-function [{:keys [name params body result]}]
