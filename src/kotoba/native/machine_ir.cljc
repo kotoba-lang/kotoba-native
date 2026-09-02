@@ -2874,6 +2874,11 @@
           (x86-kernel-bounds-check trap width instruction)
           (x86-memory-access (keyword (str (if store? "store" "load")
                                            "-u" width)) result)
+          ;; A store's expression value is the byte/word that was written.
+          ;; Allocation does not require its result vreg to share the source
+          ;; register, so materialize that value before the source dies.
+          (when (and store? (not= dst stored))
+            (x86-rr 0x89 dst stored))
           [(layout/relative-branch :x86-64/jmp-rel32 done)
            (layout/label trap)]
           [0x0f 0x0b]
@@ -3023,6 +3028,8 @@
                                     (a64-register result))
                    [true 32] (bit-or 0xb9000000 (bit-shift-left 16 5)
                                      (a64-register result))))
+          (when (and store? (not= dst stored))
+            (a64-mov dst stored))
           [(layout/relative-branch :aarch64/b-imm26 done)
            (layout/label trap)]
           (u32le 0xd4200000)

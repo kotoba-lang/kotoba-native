@@ -1073,6 +1073,28 @@
     (is (= 16384 (:gmir/maximum load)))
     (is (= :gmir/return (:gmir/op (last instructions))))))
 
+(deftest kernel-store-preserves-its-expression-result-after-allocation
+  (let [x86-instruction {:mir/dst :x86-64/r8
+                         :mir/base :x86-64/rax
+                         :mir/length :x86-64/rcx
+                         :mir/index :x86-64/rdx
+                         :mir/stored :x86-64/r9
+                         :mir/maximum 4096}
+        a64-instruction {:mir/dst :aarch64/x4
+                         :mir/base :aarch64/x0
+                         :mir/length :aarch64/x1
+                         :mir/index :aarch64/x2
+                         :mir/stored :aarch64/x3
+                         :mir/maximum 4096}
+        x86-code (#'machine/x86-kernel-memory 17 8 true x86-instruction)
+        a64-code (#'machine/a64-kernel-memory 17 8 true a64-instruction)]
+    (is (some #(= (#'machine/x86-rr 0x89 :x86-64/r8 :x86-64/r9) %)
+              (partition 3 1 x86-code))
+        "x86 copies the written value into a distinct result register")
+    (is (some #(= (#'machine/a64-mov :aarch64/x4 :aarch64/x3) %)
+              (partition 4 1 a64-code))
+        "AArch64 copies the written value into a distinct result register")))
+
 (deftest x86-privileged-operations-route-through-closed-machine-ir
   (let [cases
         [[[] '(kernel-boot-info) :boot-info [0x4d 0x8b 0x51 0x50]]
