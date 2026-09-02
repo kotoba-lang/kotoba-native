@@ -278,6 +278,20 @@
    'kernel-try-lock-u32 [:gmir/kernel-try-lock-u32 4096]
    'kernel-unlock-u32 [:gmir/kernel-unlock-u32 4096]})
 
+;; sysops: the general atomics (kotoba-gmir ADR 0007). Separate from the table
+;; above because the compare-exchanges take FIVE arguments, and the shared
+;; lowering there is written around three-or-four.
+;;
+;; `[gmir-op maximum argument-count access-bits]`.
+(def ^:private kir-kernel-atomic-ops
+  {'kernel-atomic-add-u32 [:gmir/kernel-atomic-add-u32 4096 4 32]
+   'kernel-atomic-add-u64 [:gmir/kernel-atomic-add-u64 4096 4 64]
+   'kernel-xchg-u32       [:gmir/kernel-xchg-u32 4096 4 32]
+   'kernel-xchg-u64       [:gmir/kernel-xchg-u64 4096 4 64]
+   'kernel-cmpxchg-u32    [:gmir/kernel-cmpxchg-u32 4096 5 32]
+   'kernel-cmpxchg-u64    [:gmir/kernel-cmpxchg-u64 4096 5 64]})
+;; sysops: end
+
 (def ^:private kir-x86-privileged-ops
   {'kernel-boot-info :boot-info
    'kernel-read-cr0 :read-cr0
@@ -312,7 +326,18 @@
    'kernel-cpuid-eax :cpuid-eax
    'kernel-cpuid-ebx :cpuid-ebx
    'kernel-cpuid-ecx :cpuid-ecx
-   'kernel-cpuid-edx :cpuid-edx})
+   'kernel-cpuid-edx :cpuid-edx
+   ;; sysops: barriers, the timestamp counter and the GS-base swap. They ride
+   ;; this channel rather than getting instruction shapes of their own because
+   ;; they take no operands and name no memory window -- there is no base,
+   ;; length or index to bound. `kotoba.mir` admits the channel for the x86-64
+   ;; target and no other, which is what makes them x86-only.
+   'kernel-fence-load :fence-load
+   'kernel-fence-store :fence-store
+   'kernel-fence-full :fence-full
+   'kernel-rdtsc :rdtsc
+   'kernel-rdtscp :rdtscp
+   'kernel-swapgs :swapgs})
 
 (def ^:private kir-runtime-ops
   {'pair :pair
@@ -1456,6 +1481,32 @@
                            stored (assoc :gmir/stored stored)))
                    dst])
 
+                ;; sysops: the general atomics. Five operands at most, and the
+                ;; fifth is a comparand rather than a stored word, so this does
+                ;; not fold into the three-or-four shape above.
+                (and (seq? form) (contains? kir-kernel-atomic-ops (first form)))
+                (let [[op maximum arity] (get kir-kernel-atomic-ops (first form))
+                      _ (when-not (= arity (count (rest form)))
+                          (reject! :kir-to-gmir :kernel-atomic-arity
+                                   {:form form :expected arity}))
+                      lowered (mapv #(value % env) (rest form))
+                      code (vec (mapcat first lowered))
+                      operands (mapv #(scalar-register! (second %) form) lowered)
+                      dst (fresh-reg)
+                      [base length index fourth fifth] operands]
+                  [(conj code
+                         (cond-> {:gmir/op op :gmir/dst dst :gmir/base base
+                                  :gmir/length length :gmir/index index
+                                  :gmir/maximum maximum}
+                           ;; the addend, or the replacement
+                           (= 4 arity) (assoc :gmir/stored fourth)
+                           ;; the comparand the try-lock pair withholds, then
+                           ;; the replacement
+                           (= 5 arity) (assoc :gmir/expected fourth
+                                              :gmir/stored fifth)))
+                   dst])
+                ;; sysops: end
+
                 (and (seq? form) (= 'kernel-subregion (first form))
                      (= 5 (count form)))
                 (let [lowered (mapv #(value % env) (rest form))
@@ -1805,6 +1856,15 @@
 
                 (and (seq? form) (contains? kir-kernel-memory-ops (first form))
                      (contains? #{4 5} (count form))
+                     (every? #(= :scalar (shape % env)) (rest form)))
+                :scalar
+
+                ;; sysops: the general atomics, with their own arity per
+                ;; spelling -- four for the adds and the swaps, five for the
+                ;; compare-exchanges.
+                (and (seq? form) (contains? kir-kernel-atomic-ops (first form))
+                     (= (nth (get kir-kernel-atomic-ops (first form)) 2)
+                        (count (rest form)))
                      (every? #(= :scalar (shape % env)) (rest form)))
                 :scalar
 
@@ -2718,10 +2778,14 @@
 (defn- x86-kernel-bounds-check
   "The shared preamble for every checked kernel access: the declared length is
   within this operation's ceiling, the base is not null, the index is inside
-  the length, and a 32-bit access has four bytes left after it. Branches to
-  `trap` on any violation, and otherwise leaves R11 holding base+index. R10 is
-  scratch here and dead afterwards, which is what lets the lock sequence below
-  borrow it without saving anything."
+  the length, and a multi-byte access has its own width left after it. Branches
+  to `trap` on any violation, and otherwise leaves R11 holding base+index. R10
+  is scratch here and dead afterwards, which is what lets the lock and atomic
+  sequences below borrow it without saving anything.
+
+  sysops: the tail check was written as the literal 4 while four bytes was the
+  only multi-byte width. It is `width / 8` now that eight-byte atomics exist,
+  and is still 4 for every operation that had it before."
   [trap width {:mir/keys [base length index maximum]}]
   (vec (concat
         (x86-cmp-imm32 length maximum)
@@ -2730,10 +2794,10 @@
         [(layout/relative-branch :x86-64/jz-rel32 trap)]
         (x86-rr 0x39 index length)
         [(layout/relative-branch :x86-64/jae-rel32 trap)]
-        (when (= 32 width)
+        (when (>= width 32)
           (concat (x86-rr 0x89 :x86-64/r10 length)
                   (x86-rr 0x29 :x86-64/r10 index)
-                  (x86-cmp-imm32 :x86-64/r10 4)
+                  (x86-cmp-imm32 :x86-64/r10 (quot width 8))
                   [(layout/relative-branch :x86-64/jl-rel32 trap)]))
         (x86-rr 0x89 :x86-64/r11 base)
         (x86-rr 0x01 :x86-64/r11 index))))
@@ -2798,6 +2862,62 @@
           [0x0f 0x0b]
           [(layout/label done)]))))
 
+;; sysops: the general atomic read-modify-writes.
+;;
+;; Where `x86-kernel-lock` above fixes both comparand and replacement, these
+;; take the word from the guest. Every byte string below was taken from the
+;; system assembler rather than derived by hand -- the lock's own comment
+;; records what a hand carry costs.
+;;
+;;   lock xadd    [r11], r10d   f0 45 0f c1 13     lock xadd    [r11], r10  f0 4d 0f c1 13
+;;   lock cmpxchg [r11], r10d   f0 45 0f b1 13     lock cmpxchg [r11], r10  f0 4d 0f b1 13
+;;   xchg         [r11], r10d      45 87 13        xchg         [r11], r10     4d 87 13
+;;
+;; XCHG with a memory operand asserts LOCK implicitly, so it carries no F0
+;; prefix. That is the architecture's rule and not an omission.
+;;
+;; R10 carries the guest's operand: it is dead after the bounds check, so
+;; nothing allocated is disturbed. All three answer with the word memory held
+;; BEFORE the operation, which is what the instruction leaves behind -- `xadd`
+;; and `xchg` in the source register, `cmpxchg` in EAX/RAX either way.
+;;
+;; For the 32-bit spellings the result needs no widening: a write to a 32-bit
+;; register zeroes the upper half, so `xadd`/`xchg` into R10D and `mov r10d,
+;; eax` all leave R10 holding the old word zero-extended -- which is what the
+;; KIR oracle answers.
+(defn- x86-kernel-atomic
+  [instruction-index kind width {:mir/keys [dst stored expected] :as instruction}]
+  (let [trap (memory-label instruction-index "atomic-trap")
+        done (memory-label instruction-index "atomic-done")
+        wide? (= 64 width)
+        ;; REX.R for R10 as the register operand, REX.B for R11 as the base,
+        ;; and REX.W as well for the eight-byte forms.
+        rex (if wide? 0x4d 0x45)
+        copy-to (fn [register value]
+                  (if (= register value) [] (x86-rr 0x89 register value)))]
+    (vec (concat
+          (x86-kernel-bounds-check trap width instruction)
+          ;; The guest's operand has to leave its allocated register before
+          ;; RAX is touched below: the allocator may have parked it in RAX.
+          (copy-to :x86-64/r10 stored)
+          (case kind
+            :add [0xf0 rex 0x0f 0xc1 0x13]
+            :xchg [rex 0x87 0x13]
+            :cmpxchg
+            (concat (x86-push :x86-64/rax)
+                    (copy-to :x86-64/rax expected)
+                    [0xf0 rex 0x0f 0xb1 0x13]
+                    ;; mov r10d, eax / mov r10, rax -- take the observed word
+                    ;; out of RAX before restoring the caller's.
+                    (if wide? [0x49 0x89 0xc2] [0x41 0x89 0xc2])
+                    (x86-pop :x86-64/rax)))
+          (copy-to dst :x86-64/r10)
+          [(layout/relative-branch :x86-64/jmp-rel32 done)
+           (layout/label trap)]
+          [0x0f 0x0b]
+          [(layout/label done)]))))
+;; sysops: end
+
 (defn- x86-kernel-subregion
   [instruction-index {:mir/keys [dst base length offset size]}]
   (let [trap (memory-label instruction-index "subregion-trap")
@@ -2834,12 +2954,14 @@
                        (bit-shift-left (a64-register length) 16)
                        (bit-shift-left (a64-register index) 5)))
         [(layout/relative-branch :aarch64/b-hs-imm19 trap)]
-        (when (= 32 width)
+        ;; sysops: `width / 8` rather than the literal 4, for the reason the
+        ;; x86 preamble above gives. Unchanged for every four-byte operation.
+        (when (>= width 32)
           (concat
            (u32le (bit-or 0xcb000000
                           (bit-shift-left (a64-register index) 16)
                           (bit-shift-left (a64-register length) 5) 16))
-           (u32le (bit-or 0xf100001f (bit-shift-left 4 10)
+           (u32le (bit-or 0xf100001f (bit-shift-left (quot width 8) 10)
                           (bit-shift-left 16 5)))
            [(layout/relative-branch :aarch64/b-lt-imm19 trap)]))
         (u32le (bit-or 0x8b000000
@@ -2894,6 +3016,77 @@
            (layout/label trap)]
           (u32le 0xd4200000)
           [(layout/label done)]))))
+
+;; sysops: the AArch64 general atomics, as single LSE instructions.
+;;
+;; `a64-kernel-lock` above is an LDAXR/STLXR pair, and it says why: there is no
+;; CAS below ARMv8.1-LSE. That pair cannot be generalised here, and the reason
+;; is register count rather than taste. A general atomic needs the address, the
+;; loaded word, the word to store and the store status all live at once, and
+;; this encoder has exactly two scratch registers -- x16 and x17 -- because
+;; every other register may be holding an allocated value. The lock gets away
+;; with three because its replacement is an immediate it can build in `dst`.
+;;
+;; LSE turns each of them into ONE instruction with no loop, no status register
+;; and no monitor to clear:
+;;
+;;   ldaddal w3, w17, [x16]   0xb8e30211      ldaddal x3, x17, [x16]  0xf8e30211
+;;   swpal   w3, w17, [x16]   0xb8e38211      swpal   x3, x17, [x16]  0xf8e38211
+;;   casal   w17, w3, [x16]   0x88f1fe03      casal   x17, x3, [x16]  0xc8f1fe03
+;;
+;; taken from the system assembler at `-march=armv8.1-a`, with Rs at bits
+;; 20-16, Rn at 9-5 and Rt at 4-0.
+;;
+;; THE COST, STATED PLAINLY: this raises the AArch64 baseline for a module that
+;; uses these six operations to ARMv8.1-A. FEAT_LSE is architecturally
+;; mandatory from ARMv8.1 (2014) and present on every Apple Silicon part, and
+;; nothing else in this backend needs it -- a module that uses none of these
+;; six is unchanged. The alternative is not "the same thing without LSE": it is
+;; a third scratch register taken out of the allocator's pool for every AArch64
+;; program, to serve six operations.
+;;
+;; `x17` carries the old word out of all three, and the answer is moved from it
+;; into `dst` afterwards rather than being written there directly, because
+;; `dst` may alias an operand this instruction has not finished reading.
+;; The 32-bit forms write w17, which zero-extends x17 -- the same zero-extended
+;; old word the KIR oracle answers with.
+(defn- a64-kernel-atomic
+  [instruction-index kind width {:mir/keys [dst stored expected] :as instruction}]
+  (let [trap (memory-label instruction-index "atomic-trap")
+        done (memory-label instruction-index "atomic-done")
+        wide? (= 64 width)
+        ;; mov x17, <reg> / mov w17, <reg>: ORR (shifted register) with XZR.
+        mov-to-17 (fn [source]
+                    (u32le (bit-or (if wide? 0xaa0003e0 0x2a0003e0)
+                                   (bit-shift-left (a64-register source) 16)
+                                   17)))
+        ;; mov <dst>, x17 -- always the 64-bit form; the value in x17 is
+        ;; already the width the operation produced.
+        mov-from-17 (u32le (bit-or 0xaa0003e0 (bit-shift-left 17 16)
+                                   (a64-register dst)))]
+    (vec (concat
+          (a64-kernel-bounds-check trap width instruction)
+          (case kind
+            :add (u32le (bit-or (if wide? 0xf8e00000 0xb8e00000)
+                                (bit-shift-left (a64-register stored) 16)
+                                (bit-shift-left 16 5) 17))
+            :xchg (u32le (bit-or (if wide? 0xf8e08000 0xb8e08000)
+                                 (bit-shift-left (a64-register stored) 16)
+                                 (bit-shift-left 16 5) 17))
+            ;; CAS reads its comparand from Rs AND writes the observed word
+            ;; back there, so the comparand is copied into x17 first rather
+            ;; than the guest's register being clobbered.
+            :cmpxchg (concat (mov-to-17 expected)
+                             (u32le (bit-or (if wide? 0xc8e0fc00 0x88e0fc00)
+                                            (bit-shift-left 17 16)
+                                            (bit-shift-left 16 5)
+                                            (a64-register stored)))))
+          mov-from-17
+          [(layout/relative-branch :aarch64/b-imm26 done)
+           (layout/label trap)]
+          (u32le 0xd4200000)
+          [(layout/label done)]))))
+;; sysops: end
 
 (defn- a64-kernel-memory
   [instruction-index width store? {:mir/keys [dst stored] :as instruction}]
@@ -3322,6 +3515,39 @@
                         :cli [0xfa] :sti [0xfb] :hlt [0xf4] :pause [0xf3 0x90])
                       (x86-mov-imm :x86-64/r10 0))
               :x86-64/r10)
+      ;; sysops: the three barriers and the GS-base swap take no operands and
+      ;; produce no value, so they answer 0 exactly as `:cli` does. Bytes from
+      ;; the system assembler: lfence 0f ae e8, sfence 0f ae f8, mfence
+      ;; 0f ae f0, swapgs 0f 01 f8.
+      (:fence-load :fence-store :fence-full :swapgs)
+      (finish (concat (case action
+                        :fence-load [0x0f 0xae 0xe8]
+                        :fence-store [0x0f 0xae 0xf8]
+                        :fence-full [0x0f 0xae 0xf0]
+                        :swapgs [0x0f 0x01 0xf8])
+                      (x86-mov-imm :x86-64/r10 0))
+              :x86-64/r10)
+      ;; The timestamp counter arrives split across EDX:EAX, so it is
+      ;; reassembled the way `:read-msr` below reassembles an MSR -- shift the
+      ;; high half up and OR the low half in. RDTSC zeroes the upper 32 bits of
+      ;; both, so no masking is needed.
+      ;;
+      ;; RDTSCP additionally writes the processor id to ECX, which is why RCX
+      ;; is saved for it and not for RDTSC. That id is discarded: an operation
+      ;; answering with two values would need a second spelling, and the
+      ;; caller that wants the id can have one when someone needs it.
+      (:rdtsc :rdtscp)
+      (finish
+       (concat (x86-push :x86-64/rax) (x86-push :x86-64/rdx)
+               (when (= action :rdtscp) (x86-push :x86-64/rcx))
+               (if (= action :rdtscp) [0x0f 0x01 0xf9] [0x0f 0x31])
+               (x86-rr 0x89 :x86-64/r11 :x86-64/rdx)
+               [0x49 0xc1 0xe3 0x20]
+               (x86-rr 0x09 :x86-64/r11 :x86-64/rax)
+               (when (= action :rdtscp) (x86-pop :x86-64/rcx))
+               (x86-pop :x86-64/rdx) (x86-pop :x86-64/rax))
+       :x86-64/r11)
+      ;; sysops: end
       (:out-u8 :out-u32)
       (finish
        (concat (copy-to :x86-64/r10 a)
@@ -3477,6 +3703,14 @@
     ;; and the replacement are the operation's, not the guest's.
     :x86-64/kernel-try-lock-u32 (x86-kernel-lock instruction-index 0 1 instruction)
     :x86-64/kernel-unlock-u32 (x86-kernel-lock instruction-index 1 0 instruction)
+    ;; sysops:
+    :x86-64/kernel-atomic-add-u32 (x86-kernel-atomic instruction-index :add 32 instruction)
+    :x86-64/kernel-atomic-add-u64 (x86-kernel-atomic instruction-index :add 64 instruction)
+    :x86-64/kernel-xchg-u32 (x86-kernel-atomic instruction-index :xchg 32 instruction)
+    :x86-64/kernel-xchg-u64 (x86-kernel-atomic instruction-index :xchg 64 instruction)
+    :x86-64/kernel-cmpxchg-u32 (x86-kernel-atomic instruction-index :cmpxchg 32 instruction)
+    :x86-64/kernel-cmpxchg-u64 (x86-kernel-atomic instruction-index :cmpxchg 64 instruction)
+    ;; sysops: end
     :x86-64/kernel-subregion (x86-kernel-subregion instruction-index instruction)
     (:x86-64/equal :x86-64/less-than :x86-64/greater-than
      :x86-64/less-or-equal :x86-64/greater-or-equal)
@@ -3622,6 +3856,14 @@
     :aarch64/kernel-store-u32 (a64-kernel-memory instruction-index 32 true instruction)
     :aarch64/kernel-try-lock-u32 (a64-kernel-lock instruction-index 0 1 instruction)
     :aarch64/kernel-unlock-u32 (a64-kernel-lock instruction-index 1 0 instruction)
+    ;; sysops:
+    :aarch64/kernel-atomic-add-u32 (a64-kernel-atomic instruction-index :add 32 instruction)
+    :aarch64/kernel-atomic-add-u64 (a64-kernel-atomic instruction-index :add 64 instruction)
+    :aarch64/kernel-xchg-u32 (a64-kernel-atomic instruction-index :xchg 32 instruction)
+    :aarch64/kernel-xchg-u64 (a64-kernel-atomic instruction-index :xchg 64 instruction)
+    :aarch64/kernel-cmpxchg-u32 (a64-kernel-atomic instruction-index :cmpxchg 32 instruction)
+    :aarch64/kernel-cmpxchg-u64 (a64-kernel-atomic instruction-index :cmpxchg 64 instruction)
+    ;; sysops: end
     :aarch64/kernel-subregion (a64-kernel-subregion instruction-index instruction)
     (:aarch64/equal :aarch64/less-than :aarch64/greater-than
      :aarch64/less-or-equal :aarch64/greater-or-equal)

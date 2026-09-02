@@ -2951,3 +2951,156 @@
       "sete into SIL carries the 0x40 REX that names the low byte")
   (is (= [0x41 0x0f 0x94 0xc0] (#'machine/x86-setcc 0x94 :x86-64/r8))
       "sete into R8B carries REX.B"))
+
+;; ---------------------------------------------------------------------------
+;; sysops: the general atomics and the x86 system operations.
+;;
+;; Every byte string asserted below was produced by the system assembler
+;; (clang, `-target x86_64-unknown-none` and `-target aarch64-unknown-none
+;; -march=armv8.1-a`) and copied from its object file, not derived by hand.
+;; `a64-kernel-lock`'s own comment records what a hand carry costs: an earlier
+;; STLXR was written as 0x8910fe00, which decodes as nothing at all.
+;; ---------------------------------------------------------------------------
+
+(defn- sysops-program [params body]
+  {:format :kotoba.kir/v4 :exports ['main]
+   :functions [{:name 'main :params params :body body}]})
+
+(defn- sysops-x86 [params body]
+  (:code (x86/emit-program (sysops-program params body))))
+
+(defn- sysops-arm [params body]
+  (:code (arm/emit-program (sysops-program params body))))
+
+(defn- contains-bytes? [code needle]
+  (boolean (some #(= (vec needle) %)
+                 (partition (count needle) 1 code))))
+
+(deftest general-atomics-emit-their-x86-instruction
+  (doseq [[body needle description]
+          [['(kernel-atomic-add-u32 b l i d) [0xf0 0x45 0x0f 0xc1 0x13]
+            "lock xadd [r11], r10d"]
+           ['(kernel-atomic-add-u64 b l i d) [0xf0 0x4d 0x0f 0xc1 0x13]
+            "lock xadd [r11], r10"]
+           ['(kernel-xchg-u32 b l i d) [0x45 0x87 0x13]
+            "xchg [r11], r10d -- LOCK is implicit for XCHG with memory"]
+           ['(kernel-xchg-u64 b l i d) [0x4d 0x87 0x13]
+            "xchg [r11], r10"]]]
+    (testing description
+      (is (contains-bytes? (sysops-x86 '[b l i d] body) needle) body)))
+  (doseq [[body needle description]
+          [['(kernel-cmpxchg-u32 b l i e d) [0xf0 0x45 0x0f 0xb1 0x13]
+            "lock cmpxchg [r11], r10d"]
+           ['(kernel-cmpxchg-u64 b l i e d) [0xf0 0x4d 0x0f 0xb1 0x13]
+            "lock cmpxchg [r11], r10"]]]
+    (testing description
+      (is (contains-bytes? (sysops-x86 '[b l i e d] body) needle) body))))
+
+(deftest compare-exchange-brackets-its-comparand-register
+  ;; `lock cmpxchg` fixes RAX as comparand and result, and RAX is allocatable,
+  ;; so it is pushed and popped around the sequence. The observed word has to
+  ;; leave RAX BEFORE the pop, or the pop overwrites the answer.
+  (let [code (sysops-x86 '[b l i e d] '(kernel-cmpxchg-u32 b l i e d))]
+    (is (contains-bytes? code [0x50]) "push rax")
+    (is (contains-bytes? code [0xf0 0x45 0x0f 0xb1 0x13]))
+    (is (contains-bytes? code [0x41 0x89 0xc2 0x58])
+        "mov r10d, eax then pop rax -- in that order, and adjacent"))
+  (let [code (sysops-x86 '[b l i e d] '(kernel-cmpxchg-u64 b l i e d))]
+    (is (contains-bytes? code [0x49 0x89 0xc2 0x58])
+        "mov r10, rax then pop rax for the eight-byte form")))
+
+(deftest eight-byte-atomics-check-eight-bytes-of-tail
+  ;; The shared bounds preamble's tail check is the operation's own width.
+  ;; `cmp r10, 4` for the four-byte forms, `cmp r10, 8` for the eight-byte
+  ;; ones -- and every operation that had this check before still gets 4.
+  (is (contains-bytes? (sysops-x86 '[b l i d] '(kernel-atomic-add-u32 b l i d))
+                       [0x49 0x81 0xfa 0x04 0x00 0x00 0x00])
+      "cmp r10, 4")
+  (is (contains-bytes? (sysops-x86 '[b l i d] '(kernel-atomic-add-u64 b l i d))
+                       [0x49 0x81 0xfa 0x08 0x00 0x00 0x00])
+      "cmp r10, 8")
+  (is (contains-bytes? (sysops-x86 '[b l i] '(kernel-load-u32 b l i))
+                       [0x49 0x81 0xfa 0x04 0x00 0x00 0x00])
+      "the pre-existing four-byte check is unchanged")
+  ;; and the same on AArch64: cmp x16, #4 / cmp x16, #8
+  (is (contains-bytes? (sysops-arm '[b l i d] '(kernel-atomic-add-u32 b l i d))
+                       [0x1f 0x12 0x00 0xf1]))
+  (is (contains-bytes? (sysops-arm '[b l i d] '(kernel-atomic-add-u64 b l i d))
+                       [0x1f 0x22 0x00 0xf1])))
+
+(deftest general-atomics-emit-one-lse-instruction-on-aarch64
+  ;; Single LSE instructions, so there is no monitor loop and no third scratch
+  ;; register. This raises the AArch64 baseline to ARMv8.1-A for a module that
+  ;; uses them, and nothing else in this backend needs LSE.
+  ;;
+  ;; Rs is the operand register the allocator chose, so the assertions below
+  ;; mask it out and pin the opcode, Rn (x16, the checked address) and Rt.
+  (letfn [(words [code]
+            (mapv (fn [[a b c d]]
+                    (bit-or a (bit-shift-left b 8)
+                            (bit-shift-left c 16) (bit-shift-left d 24)))
+                  (partition 4 code)))
+          (has-shape? [code mask expected]
+            (boolean (some #(= expected (bit-and % mask)) (words code))))]
+    ;; mask: everything but Rs (bits 20-16)
+    (let [mask (bit-not (bit-shift-left 0x1f 16))]
+      (testing "ldaddal w<s>, w17, [x16] / ldaddal x<s>, x17, [x16]"
+        (is (has-shape? (sysops-arm '[b l i d] '(kernel-atomic-add-u32 b l i d))
+                        mask (bit-or 0xb8e00000 (bit-shift-left 16 5) 17)))
+        (is (has-shape? (sysops-arm '[b l i d] '(kernel-atomic-add-u64 b l i d))
+                        mask (bit-or 0xf8e00000 (bit-shift-left 16 5) 17))))
+      (testing "swpal w<s>, w17, [x16] / swpal x<s>, x17, [x16]"
+        (is (has-shape? (sysops-arm '[b l i d] '(kernel-xchg-u32 b l i d))
+                        mask (bit-or 0xb8e08000 (bit-shift-left 16 5) 17)))
+        (is (has-shape? (sysops-arm '[b l i d] '(kernel-xchg-u64 b l i d))
+                        mask (bit-or 0xf8e08000 (bit-shift-left 16 5) 17)))))
+    ;; CASAL fixes Rs = x17 (the comparand, copied there first, and where the
+    ;; observed word comes back), so only Rt varies.
+    (let [mask (bit-not 0x1f)]
+      (testing "casal w17, w<t>, [x16] / casal x17, x<t>, [x16]"
+        (is (has-shape? (sysops-arm '[b l i e d] '(kernel-cmpxchg-u32 b l i e d))
+                        mask (bit-or 0x88e0fc00 (bit-shift-left 17 16)
+                                     (bit-shift-left 16 5))))
+        (is (has-shape? (sysops-arm '[b l i e d] '(kernel-cmpxchg-u64 b l i e d))
+                        mask (bit-or 0xc8e0fc00 (bit-shift-left 17 16)
+                                     (bit-shift-left 16 5))))))))
+
+(deftest x86-system-operations-emit-their-instruction-and-answer-zero
+  (doseq [[body needle description]
+          [['(kernel-fence-load) [0x0f 0xae 0xe8] "lfence"]
+           ['(kernel-fence-store) [0x0f 0xae 0xf8] "sfence"]
+           ['(kernel-fence-full) [0x0f 0xae 0xf0] "mfence"]
+           ['(kernel-swapgs) [0x0f 0x01 0xf8] "swapgs"]]]
+    (testing description
+      (let [code (sysops-x86 [] body)]
+        (is (contains-bytes? code needle) body)
+        (is (contains-bytes? code [0x41 0xba 0x00 0x00 0x00 0x00])
+            "mov r10d, 0 -- these answer with a word, and the word is zero")))))
+
+(deftest the-timestamp-counter-is-reassembled-from-edx-eax
+  ;; RDTSC delivers the counter split across EDX:EAX and zeroes the upper half
+  ;; of both, so the answer is the high half shifted up with the low half
+  ;; ORed in -- the same reassembly `:read-msr` performs.
+  (let [code (sysops-x86 [] '(kernel-rdtsc))]
+    (is (contains-bytes? code [0x0f 0x31]) "rdtsc")
+    (is (contains-bytes? code [0x49 0x89 0xd3]) "mov r11, rdx")
+    (is (contains-bytes? code [0x49 0xc1 0xe3 0x20]) "shl r11, 32")
+    (is (contains-bytes? code [0x49 0x09 0xc3]) "or r11, rax")
+    (is (not (contains-bytes? code [0x51]))
+        "RDTSC does not write ECX, so RCX is not saved"))
+  (let [code (sysops-x86 [] '(kernel-rdtscp))]
+    (is (contains-bytes? code [0x0f 0x01 0xf9]) "rdtscp")
+    (is (contains-bytes? code [0x51]) "push rcx -- RDTSCP writes the id to ECX")
+    (is (contains-bytes? code [0x59]) "pop rcx")))
+
+(deftest general-atomics-refuse-a-wrong-argument-count
+  ;; Four for the adds and the swaps, five for the compare-exchanges. A form
+  ;; with any other count has no lowering and must fail here rather than reach
+  ;; a backend with a missing operand.
+  (doseq [[params body] [['[b l i] '(kernel-atomic-add-u32 b l i)]
+                         ['[b l i d e] '(kernel-xchg-u64 b l i d e)]
+                         ['[b l i d] '(kernel-cmpxchg-u32 b l i d)]
+                         ['[b l i d e f] '(kernel-cmpxchg-u64 b l i d e f)]]]
+    (testing (str body)
+      (is (thrown? clojure.lang.ExceptionInfo (sysops-x86 params body)) body)
+      (is (thrown? clojure.lang.ExceptionInfo (sysops-arm params body)) body))))

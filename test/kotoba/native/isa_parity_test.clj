@@ -75,6 +75,16 @@
    ;; below, which is for facilities the other ISA genuinely lacks.
    [['b 'l 'i] '(kernel-try-lock-u32 b l i)]
    [['b 'l 'i] '(kernel-unlock-u32 b l i)]
+   ;; sysops: the general atomics. Portable, and this is the list they belong
+   ;; in rather than the x86-only one below: AArch64 has all six as single LSE
+   ;; instructions (LDADDAL / SWPAL / CASAL), so an absence here would be a gap
+   ;; and not a difference between the machines.
+   [['b 'l 'i 'd] '(kernel-atomic-add-u32 b l i d)]
+   [['b 'l 'i 'd] '(kernel-atomic-add-u64 b l i d)]
+   [['b 'l 'i 'd] '(kernel-xchg-u32 b l i d)]
+   [['b 'l 'i 'd] '(kernel-xchg-u64 b l i d)]
+   [['b 'l 'i 'e 'd] '(kernel-cmpxchg-u32 b l i e d)]
+   [['b 'l 'i 'e 'd] '(kernel-cmpxchg-u64 b l i e d)]
    [['b 'l 'o 's] '(kernel-subregion b l o s)]
    ;; vector-i64 and vector-f64. Both families lower to the same six host
    ;; calls, so a gap on one ISA would be a gap on every one of the fourteen
@@ -155,7 +165,34 @@
    [['l 's] '(kernel-cpuid-eax l s)]
    [['l 's] '(kernel-cpuid-ebx l s)]
    [['l 's] '(kernel-cpuid-ecx l s)]
-   [['l 's] '(kernel-cpuid-edx l s)]])
+   [['l 's] '(kernel-cpuid-edx l s)]
+   ;; sysops: the three barriers, the timestamp counter and the GS-base swap.
+   ;;
+   ;; These sit here for a WEAKER reason than the control registers and port
+   ;; I/O above, and the difference has to be said rather than absorbed by the
+   ;; list's own heading. AArch64 does have barriers -- `dmb ishld`, `dmb
+   ;; ishst`, `dmb ish` -- so this is not "a facility only x86 has".
+   ;;
+   ;; What makes them x86-only is that they ride the x86 privileged channel,
+   ;; which `kotoba.mir` admits for one target, and that a portable barrier
+   ;; would have to name the ORDERING it guarantees rather than the instruction
+   ;; it emits: `lfence` under x86-TSO and `dmb ishld` under a weak memory
+   ;; model do not answer the same question. That is a separate operator family
+   ;; and a separate decision. Pinned here so the asymmetry is asserted rather
+   ;; than merely true, and so it cannot grow by accident.
+   ;;
+   ;; `rdtsc` is the same shape for a different reason: AArch64's nearest
+   ;; reading, `mrs cntvct_el0`, is a fixed-frequency system counter rather
+   ;; than a core cycle counter -- a DIFFERENT CLOCK, not a translation.
+   ;;
+   ;; `swapgs` genuinely has no counterpart; AArch64 banks its stack pointer
+   ;; and thread pointer by exception level instead.
+   [[] '(kernel-fence-load)]
+   [[] '(kernel-fence-store)]
+   [[] '(kernel-fence-full)]
+   [[] '(kernel-rdtsc)]
+   [[] '(kernel-rdtscp)]
+   [[] '(kernel-swapgs)]])
 
 (deftest privileged-x86-operators-are-x86-only-by-design
   (doseq [[params body] x86-only]
