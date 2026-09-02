@@ -365,6 +365,10 @@
    'kernel-cpuid-ebx :cpuid-ebx
    'kernel-cpuid-ecx :cpuid-ecx
    'kernel-cpuid-edx :cpuid-edx
+   ;; simdprep: the OTHER half of a feature check. The four above say what the
+   ;; CPU implements; this says what the operating system has agreed to save
+   ;; and restore across a context switch.
+   'kernel-xgetbv :xgetbv
    ;; sysops: barriers, the timestamp counter and the GS-base swap. They ride
    ;; this channel rather than getting instruction shapes of their own because
    ;; they take no operands and name no memory window -- there is no base,
@@ -4141,6 +4145,29 @@
                [(if (= action :in-u8) 0xec 0xed)]
                (x86-rr 0x89 :x86-64/r11 :x86-64/rax)
                (x86-pop :x86-64/rdx) (x86-pop :x86-64/rax))
+       :x86-64/r11)
+      ;; simdprep: `xgetbv` is `rdmsr` with a different opcode and one less
+      ;; hazard. Both read a 64-bit quantity into EDX:EAX selected by ECX, so
+      ;; the operand marshalling, the RAX/RCX/RDX saves and the shift-and-or
+      ;; that rejoins the halves are identical. It differs from `cpuid`, which
+      ;; is otherwise its closer relative, in NOT writing EBX -- so unlike the
+      ;; `cpuid` arm this one needs no RBX save.
+      ;;
+      ;; No mask is needed on either half: the instruction writes the 32-bit
+      ;; EAX and EDX, and a 32-bit write zeroes the upper half of the
+      ;; containing 64-bit register, so both arrive already isolated.
+      :xgetbv
+      (finish
+       (concat (copy-to :x86-64/r10 a)
+               (x86-push :x86-64/rax) (x86-push :x86-64/rcx)
+               (x86-push :x86-64/rdx)
+               (x86-rr 0x89 :x86-64/rcx :x86-64/r10)
+               [0x0f 0x01 0xd0]
+               (x86-rr 0x89 :x86-64/r11 :x86-64/rdx)
+               [0x49 0xc1 0xe3 0x20]
+               (x86-rr 0x09 :x86-64/r11 :x86-64/rax)
+               (x86-pop :x86-64/rdx) (x86-pop :x86-64/rcx)
+               (x86-pop :x86-64/rax))
        :x86-64/r11)
       :read-msr
       (finish
