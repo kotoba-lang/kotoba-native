@@ -472,6 +472,13 @@
    ;; CPU implements; this says what the operating system has agreed to save
    ;; and restore across a context switch.
    'kernel-xgetbv :xgetbv
+   ;; xsave: the WRITE half (kotoba-gmir ADR 0012). `xgetbv` above reads what
+   ;; the operating system has agreed to save; these three are how an
+   ;; operating system agrees. CR4 bit 18 is the bit `xgetbv` faults without,
+   ;; and `xsetbv` is the only way to set the XCR0 bits it then reports.
+   'kernel-read-cr4 :read-cr4
+   'kernel-write-cr4 :write-cr4
+   'kernel-xsetbv :xsetbv
    ;; sysops: barriers, the timestamp counter and the GS-base swap. They ride
    ;; this channel rather than getting instruction shapes of their own because
    ;; they take no operands and name no memory window -- there is no base,
@@ -4934,6 +4941,20 @@
       (finish (concat (copy-to :x86-64/r10 a)
                       [0x41 0x0f 0x22 0xda])
               :x86-64/r10)
+      ;; xsave: CR4 is CR0 and CR3's twin at register number 4, so the same
+      ;; two instructions with the ModRM `reg` field changed: `0f 20`/`0f 22`
+      ;; with reg=100 and rm=010 (R10) behind REX.B, which is `e2`.
+      ;;
+      ;; There is no `:write-cr2` beside `:read-cr2` above, and the absence is
+      ;; a decision rather than an omission: CR2 is written by the CPU when a
+      ;; page fault is taken, so a kernel that wrote it would be lying to its
+      ;; own handler about the faulting address.
+      :read-cr4
+      (finish [0x41 0x0f 0x20 0xe2] :x86-64/r10)
+      :write-cr4
+      (finish (concat (copy-to :x86-64/r10 a)
+                      [0x41 0x0f 0x22 0xe2])
+              :x86-64/r10)
       :invlpg
       (finish (concat (copy-to :x86-64/r10 a)
                       [0x41 0x0f 0x01 0x3a])
@@ -5104,6 +5125,40 @@
                (x86-rr 0x89 :x86-64/rax :x86-64/r11)
                (x86-rr 0x89 :x86-64/rdx :x86-64/r11)
                [0x48 0xc1 0xea 0x20 0x0f 0x30]
+               (x86-pop :x86-64/rdx) (x86-pop :x86-64/rcx)
+               (x86-pop :x86-64/rax))
+       :x86-64/r11)
+      ;; xsave: `xsetbv` is `wrmsr` with a different opcode -- index in ECX,
+      ;; value in EDX:EAX -- so the operand marshalling, the three register
+      ;; saves and the shift that splits the value are byte-for-byte the arm
+      ;; above with `0f 30` replaced by `0f 01 d1`.
+      ;;
+      ;; No mask on the low half, for the reason the `wrmsr` arm already
+      ;; gives: the instruction READS only EAX and EDX, so the upper 32 bits
+      ;; of RAX are ignored and only the high half has to be produced.
+      ;;
+      ;; It leaves the value that was written in the result, which is what
+      ;; `:write-msr` and `:write-cr0` leave and therefore what a caller who
+      ;; binds the result of a kernel write already expects.
+      ;;
+      ;; WHAT THIS CANNOT ENFORCE, twice over. `xsetbv` raises #UD unless
+      ;; CR4.OSXSAVE is already set -- an ordering between two operators, the
+      ;; same shape of constraint `:xgetbv` carries. And it raises #GP for a
+      ;; value that sets an undefined XCR0 bit, that clears bit 0 (x87), or
+      ;; that sets bit 2 (YMM) without bit 1 (SSE) -- a property of a VALUE
+      ;; that is not a literal at the call sites that matter, since the
+      ;; working spelling is `(bit-or (kernel-xgetbv 0) 6)`.
+      ;; docs/avx2-guard-sequence.md carries both.
+      :xsetbv
+      (finish
+       (concat (copy-to :x86-64/r10 a)
+               (copy-to :x86-64/r11 b)
+               (x86-push :x86-64/rax) (x86-push :x86-64/rcx)
+               (x86-push :x86-64/rdx)
+               (x86-rr 0x89 :x86-64/rcx :x86-64/r10)
+               (x86-rr 0x89 :x86-64/rax :x86-64/r11)
+               (x86-rr 0x89 :x86-64/rdx :x86-64/r11)
+               [0x48 0xc1 0xea 0x20 0x0f 0x01 0xd1]
                (x86-pop :x86-64/rdx) (x86-pop :x86-64/rcx)
                (x86-pop :x86-64/rax))
        :x86-64/r11)
