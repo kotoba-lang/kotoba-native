@@ -8,11 +8,11 @@
   the ADR.
 
   NOT EXECUTED HERE. This repository does not run compiled programs, so a
-  green suite is encodings only. The entry is executed under QEMU by the
-  fixture in `test/kotoba/native/isr_qemu_fixture.cljs`, which is what stands
-  in for execution -- and the two are different claims: this file says the
-  bytes are the instructions they are named for, and that says they do what
-  the instructions mean."
+  green suite is encodings only. The entry is executed under QEMU by
+  `scripts/isr-qemu-fixture.cljs` against `test/fixtures/isr-qemu.kotoba`,
+  which is what stands in for execution -- and the two are different claims:
+  this file says the bytes are the instructions they are named for, and that
+  says they do what the instructions mean."
   (:require [clojure.test :refer [deftest is testing]]
             [kotoba.artifact.core :as artifact]
             [kotoba.native.elf64 :as elf64]
