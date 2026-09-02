@@ -172,3 +172,37 @@
       (is (= symbol-name (:export packaged)) (str entry))
       (is (= fuel immediate)
           (str entry " must carry its own tier, not the 1024 default")))))
+
+;; The streaming SHA-256 tranche (aiueos ADR-0139). Same two assertions as the
+;; qwen35 test above and for the same reason -- the export symbol, and the fuel
+;; word the packager writes.
+;;
+;; A THIRD assertion here, which that one does not need: the three tiers must be
+;; DISTINCT. The whole argument for three symbols over one is that a fuel tier
+;; is a per-CALL budget and these three calls are not the same size --
+;; 30,129 for the dearest single `stream` call against 244,038,584 for a
+;; whole-megabyte `region` one. If a future edit collapsed them onto one arm,
+;; every other assertion here would still pass and the reason the split exists
+;; would be gone.
+(deftest streaming-sha256-objects-carry-their-measured-fuel-tiers
+  (let [rows [['aiueos-sha256-stream        5 "kotoba_aiueos_sha256_stream"        262144]
+              ['aiueos-sha256-region        4 "kotoba_aiueos_sha256_region"        2147483647]
+              ['aiueos-device-worker-digest 4 "kotoba_aiueos_device_worker_digest" 250000000]]]
+    (doseq [[entry arity symbol-name fuel] rows]
+      (let [artifact (-> (sealed-kernel :x86_64-aiueos-kernel-v1 512)
+                         (assoc :exports {entry {:offset 0 :arity arity}
+                                          'main {:offset 1 :arity 0}}
+                                :code [0xc3 0xc3])
+                         (dissoc :sha256)
+                         artifact/seal)
+            packaged (elf64/package-kernel-object artifact)
+            image (:bytes packaged)
+            immediate (reduce (fn [v i] (+ v (bit-shift-left (long (nth image (+ 75 i)))
+                                                             (* 8 i))))
+                              0 (range 4))]
+        (is (= symbol-name (:export packaged)) (str entry))
+        (is (= fuel immediate)
+            (str entry " must carry its own MEASURED tier, not the 1024 default"))))
+    (is (= 3 (count (set (map last rows))))
+        "the three tiers must stay distinct; one shared arm would undo the
+         reason these are three symbols rather than one")))
