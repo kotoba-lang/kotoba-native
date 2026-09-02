@@ -3665,6 +3665,33 @@
                           (bit-shift-left (bit-and d 7) 3)
                           (bit-and d 7))]))))
 
+(defn- x86-store-answer
+  "storefix: `mov dst, stored`, the instruction that makes a store's VALUE the
+  word it stored.
+
+  A store is an expression here, not a statement: the KIR oracle
+  (`kotoba.kir`, the `kernel-store-*` / `slice-store-*` arm) answers with the
+  stored operand, and guests written against it read that answer -- aiueos
+  `os/aiueos/kotoba/kernel.kotoba` threads it through `let` bindings, and the
+  ISR probe compares it against the word it just wrote. The x86 store
+  instruction writes memory and no register, so without this move the
+  allocator's destination register is whatever it happened to hold: in the
+  measured fixture `(kernel-store-u8 b l i v)` it was the incoming BASE, so the
+  function answered `b` where the oracle answers `v`.
+
+  The oracle answers with the operand UNTRUNCATED -- `kernel-store-u8` of 300
+  stores 44 and answers 300 -- so this is a full REX.W move and not a
+  width-masked one.
+
+  It is emitted after the access rather than before it because `dst` may alias
+  a source: the allocator is free to give a definition the register of an
+  operand that dies at the same instruction, and both measured fixtures do
+  exactly that. Every source has been consumed by then (the address is already
+  in R11), so the move cannot disturb one. The one alias it must skip is
+  `stored` itself, where the move would be a no-op."
+  [dst stored]
+  (when-not (= dst stored) (x86-rr 0x89 dst stored)))
+
 (defn- x86-kernel-memory
   [instruction-index width store? aligned? {:mir/keys [dst stored] :as instruction}]
   (let [trap (memory-label instruction-index "trap")
@@ -3674,6 +3701,7 @@
           (x86-kernel-bounds-check trap width aligned? instruction)
           (x86-memory-access (keyword (str (if store? "store" "load")
                                            "-u" width)) result)
+          (when store? (x86-store-answer dst stored))
           [(layout/relative-branch :x86-64/jmp-rel32 done)
            (layout/label trap)]
           [0x0f 0x0b]
@@ -3691,6 +3719,10 @@
           (x86-slice-bounds-check trap (quot width 8) instruction)
           (x86-memory-access (keyword (str (if store? "store" "load")
                                            "-u" width)) result)
+          ;; storefix: the slice family answers the same way the window family
+          ;; does -- the oracle's `slice-store-*` arm shares its evaluator with
+          ;; `kernel-store-*` and returns the same operand.
+          (when store? (x86-store-answer dst stored))
           [(layout/relative-branch :x86-64/jmp-rel32 done)
            (layout/label trap)]
           [0x0f 0x0b]
@@ -4321,6 +4353,18 @@
           [(layout/label done)]))))
 ;; sysops: end
 
+(defn- a64-store-answer
+  "storefix: the AArch64 twin of `x86-store-answer` -- `mov dst, stored`, which
+  is `orr dst, xzr, stored`. Same reason, same shape, same skip when the
+  allocator has already put the answer where it belongs.
+
+  It matters more visibly here: on x86 the destination of the measured fixture
+  held the incoming base, which is at least a defined value. On AArch64 the
+  allocator hands out the leaf tier and the fixture's destination was X5 --
+  never written by anything, so the answer was whatever the caller left there."
+  [dst stored]
+  (when-not (= dst stored) (a64-mov dst stored)))
+
 (defn- a64-kernel-memory
   [instruction-index width store? aligned? {:mir/keys [dst stored] :as instruction}]
   (let [trap (memory-label instruction-index "trap")
@@ -4329,6 +4373,7 @@
     (vec (concat
           (a64-kernel-bounds-check trap width aligned? instruction)
           (a64-memory-access store? width result)
+          (when store? (a64-store-answer dst stored))
           [(layout/relative-branch :aarch64/b-imm26 done)
            (layout/label trap)]
           (u32le 0xd4200000)
@@ -4342,6 +4387,7 @@
     (vec (concat
           (a64-slice-bounds-check trap (quot width 8) instruction)
           (a64-memory-access store? width result)
+          (when store? (a64-store-answer dst stored))
           [(layout/relative-branch :aarch64/b-imm26 done)
            (layout/label trap)]
           (u32le 0xd4200000)
