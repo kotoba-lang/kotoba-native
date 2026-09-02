@@ -3804,3 +3804,68 @@
     (is (= [0x0f 0x10 0x08]
            (#'machine/x86-sse-rm nil 0x10 1 {:base :x86-64/rax}))
         "movups xmm1, [rax] -- no prefix, no REX")))
+
+;; ---------------------------------------------------------------------------
+;; f64 min/max: the production encoder, not the instruction of the same name
+;; ---------------------------------------------------------------------------
+;;
+;; `minsd`/`maxsd` compute `(a<b) ? a : b`, which returns the SECOND operand on
+;; every false comparison -- including the two the oracle says the first should
+;; win: either input NaN, and (-0.0, +0.0). Measured under the Rosetta loader
+;; on 2026-09-02 (amu `isa_execution_test`), the single-instruction encoding got
+;; six of twelve NaN/zero rows wrong while AArch64's FMIN/FMAX got twelve of
+;; twelve right. Every byte below came from
+;; `llvm-mc -arch=x86-64 -show-encoding`.
+
+(def ^:private f64-min-max-fixed-prefix
+  ;; The part that does not depend on which of the two operations it is.
+  [0x66 0x0f 0x28 0xd0        ; movapd xmm2, xmm0
+   0x66 0x0f 0x28 0xd8        ; movapd xmm3, xmm0
+   0xf2 0x0f 0xc2 0xd1 0x00]) ; cmpeqsd xmm2, xmm1     (mask: a == b)
+
+(def ^:private f64-min-max-fixed-suffix
+  [0x66 0x0f 0x54 0xda        ; andpd xmm3, xmm2
+   0x66 0x0f 0x28 0xe0])      ; movapd xmm4, xmm0      (keep a)
+
+(def ^:private f64-min-max-tail
+  [0x66 0x0f 0x55 0xd0        ; andnpd xmm2, xmm0
+   0x66 0x0f 0x56 0xda        ; orpd xmm3, xmm2        (ordered answer)
+   0x66 0x0f 0x28 0xc4        ; movapd xmm0, xmm4
+   0xf2 0x0f 0xc2 0xc0 0x03   ; cmpunordsd xmm0, xmm0  (mask: a is NaN)
+   0x66 0x0f 0x54 0xe0        ; andpd xmm4, xmm0
+   0x66 0x0f 0x55 0xc3        ; andnpd xmm0, xmm3
+   0x66 0x0f 0x56 0xc4])      ; orpd xmm0, xmm4
+
+(defn- f64-min-max-bytes [fixup select]
+  (vec (concat f64-min-max-fixed-prefix
+               [0x66 0x0f fixup 0xd9]     ; orpd (min) / andpd (max) xmm3, xmm1
+               f64-min-max-fixed-suffix
+               [0xf2 0x0f select 0xc1]    ; minsd / maxsd xmm0, xmm1
+               f64-min-max-tail)))
+
+(deftest x86-f64-min-max-emit-the-corrected-sequence
+  (let [emit (fn [op] (vec (machine/compile-expression
+                            :x86-64 [] (list op (list 'f64-from-bits 1)
+                                             (list 'f64-from-bits 2)))))]
+    (testing "min fixes the equal-inputs case with ORPD, so -0.0 wins"
+      (is (byte-run? (emit 'f64-min) (f64-min-max-bytes 0x56 0x5d))))
+    (testing "max fixes it with ANDPD, so +0.0 wins"
+      (is (byte-run? (emit 'f64-max) (f64-min-max-bytes 0x54 0x5f))))
+    (testing "neither is a bare MINSD/MAXSD between the two MOVQs any more"
+      ;; movq xmm1,rcx-shaped source ... minsd xmm0,xmm1 ... movq rax,xmm0 was
+      ;; the whole encoding before. If that run reappears the repair is gone.
+      (is (not (byte-run? (emit 'f64-min)
+                          [0xf2 0x0f 0x5d 0xc1 0x66 0x48 0x0f 0x7e 0xc0])))
+      (is (not (byte-run? (emit 'f64-max)
+                          [0xf2 0x0f 0x5f 0xc1 0x66 0x48 0x0f 0x7e 0xc0]))))
+    (testing "the other four f64 binaries keep their one-instruction encoding"
+      (doseq [[op opcode] {'f64-add 0x58 'f64-sub 0x5c 'f64-mul 0x59 'f64-div 0x5e}]
+        (is (byte-run? (emit op) [0xf2 0x0f opcode 0xc1]) (str op))))))
+
+(deftest aarch64-f64-min-max-are-unchanged
+  (testing "FMIN/FMAX already agree with the oracle, so the repair is x86-only"
+    (let [emit (fn [op] (vec (machine/compile-expression
+                              :aarch64 [] (list op (list 'f64-from-bits 1)
+                                                (list 'f64-from-bits 2)))))]
+      (is (byte-run? (emit 'f64-min) [0x00 0x58 0x61 0x1e]) "fmin d0, d0, d1")
+      (is (byte-run? (emit 'f64-max) [0x00 0x48 0x61 0x1e]) "fmax d0, d0, d1"))))

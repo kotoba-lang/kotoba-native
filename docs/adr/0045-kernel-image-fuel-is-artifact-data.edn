@@ -1,4 +1,4 @@
-{:adr/id 30
+{:adr/id 45
  :adr/title "Kernel image fuel is artifact data"
  :adr/status :accepted
  :decision :copy-sealed-fuel-into-kernel-context

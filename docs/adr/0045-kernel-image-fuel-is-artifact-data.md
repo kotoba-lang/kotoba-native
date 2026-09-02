@@ -1,4 +1,4 @@
-# ADR 0030: Kernel image fuel is artifact data
+# ADR 0045: Kernel image fuel is artifact data
 
 ## Finding
 
