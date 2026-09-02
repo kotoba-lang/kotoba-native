@@ -98,6 +98,34 @@
    [['v 'i 'x] '(vector-assoc v i x)]
    [['v 'x] '(vector-conj v x)]
    [['v 'n] '(vector-drop v n)]
+   ;; f32, the binary32 family (kotoba-lang
+   ;; ADR-kotoba-floating-point-on-native). Portable with two exceptions that
+   ;; are NOT listed in `x86-only` below, because they are not facilities one
+   ;; ISA has and the other lacks: `f32-min`/`f32-max` are absent from BOTH,
+   ;; because x86's MINSS/MAXSS return the second operand when either input is
+   ;; NaN while AArch64's FMIN and the KIR oracle return the NaN. An operation
+   ;; that cannot mean one thing on both is refused upstream at admission
+   ;; rather than implemented twice. `kotoba.native.f32-test` pins that absence
+   ;; on both backends so it cannot be closed on one of them by accident.
+   [['a 'b] '(f32-add a b)]
+   [['a 'b] '(f32-sub a b)]
+   [['a 'b] '(f32-mul a b)]
+   [['a 'b] '(f32-div a b)]
+   [['a 'b] '(f32-eq a b)]
+   [['a 'b] '(f32-lt a b)]
+   [['a 'b] '(f32-le a b)]
+   [['a 'b] '(f32-gt a b)]
+   [['a 'b] '(f32-ge a b)]
+   [['a 'b] '(f32-unordered a b)]
+   [['a] '(f32-neg a)]
+   [['a] '(f32-abs a)]
+   [['a] '(f32-sqrt a)]
+   [['a] '(f32-from-bits a)]
+   [['a] '(f32-to-bits a)]
+   [['a] '(f32-to-f64-exact a)]
+   [['a] '(f64-to-f32-rounded a)]
+   [['a] '(i64-to-f32-rounded a)]
+   [['a] '(i64-to-f64-rounded a)]
    [[] '(vector-f64-new)]
    [['v] '(vector-f64-count v)]
    [['v 'i] '(vector-f64-at v i)]

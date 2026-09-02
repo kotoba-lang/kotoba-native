@@ -264,6 +264,44 @@
    'f64-unordered :gmir/f64-unordered})
 (def ^:private kir-f64-unary-ops
   '#{f64-from-bits f64-to-bits f64-abs f64-neg f64-sqrt})
+
+;; f32: binary32 (kotoba-lang docs/adr/ADR-kotoba-floating-point-on-native.md).
+;;
+;; The representation is the f64 one at the narrower width, with one difference
+;; that is the whole design: the word holds the binary32 pattern SIGN-EXTENDED
+;; from bit 31. That is what keeps `f32-to-bits` an identity the way
+;; `f64-to-bits` is, because the KIR oracle's `f32-to-i64-bits` yields a SIGNED
+;; i32 -- a zero-extended word would disagree with it for every negative float.
+;; So `f32-from-bits` is the one member of the family that is NOT an identity
+;; here: it is `signed-i32-value`, which also canonicalises the zero-extended
+;; u32 that `kernel-load-u32` returns.
+;;
+;; `f32-min`/`f32-max` are absent, and the absence is the decision rather than
+;; an omission. x86's MINSS/MAXSS return the SECOND operand when either input
+;; is NaN; AArch64's FMIN/FMAX and the oracle's Math/min return the NaN. The
+;; f64 table above admits both, so x86 already disagrees with the other ISA and
+;; with the oracle on shipped code -- a pre-existing defect recorded in the ADR,
+;; not repaired here because repairing it moves f64 goldens. This width does not
+;; inherit it. `kotoba.kir` refuses them at admission for both backends.
+(def ^:private kir-f32-binary-ops
+  {'f32-add :gmir/f32-add 'f32-sub :gmir/f32-subtract
+   'f32-mul :gmir/f32-multiply 'f32-div :gmir/f32-divide
+   'f32-eq :gmir/f32-equal 'f32-lt :gmir/f32-less-than
+   'f32-le :gmir/f32-less-or-equal 'f32-gt :gmir/f32-greater-than
+   'f32-ge :gmir/f32-greater-or-equal
+   'f32-unordered :gmir/f32-unordered})
+
+(def ^:private kir-f32-unary-ops
+  '#{f32-from-bits f32-to-bits f32-abs f32-neg f32-sqrt})
+
+;; Width conversions, all one-source/one-value. Only the four on which both
+;; ISAs and the KIR oracle agree for EVERY input; the `-checked` and truncating
+;; float-to-int families are refused at admission and are named in the ADR.
+(def ^:private kir-f32-conversion-ops
+  {'f32-to-f64-exact :gmir/f32-to-f64
+   'f64-to-f32-rounded :gmir/f64-to-f32
+   'i64-to-f32-rounded :gmir/i64-to-f32
+   'i64-to-f64-rounded :gmir/i64-to-f64})
 (def ^:private kir-kernel-memory-ops
   {'kernel-load-u8 [:gmir/kernel-load-u8 512]
    'kernel-load-u8-4k [:gmir/kernel-load-u8 4096]
@@ -1465,6 +1503,49 @@
                       [(conj code {:gmir/op :gmir/f64-sqrt :gmir/dst dst
                                    :gmir/input (scalar-register! input form)})
                        dst])))
+
+                (and (seq? form) (contains? kir-f32-binary-ops (first form))
+                     (= 3 (count form)))
+                (binary-value (get kir-f32-binary-ops (first form))
+                              (value (second form) env)
+                              (value (nth form 2) env) form)
+
+                (and (seq? form) (contains? kir-f32-unary-ops (first form))
+                     (= 2 (count form)))
+                (let [lowered (value (second form) env)]
+                  (case (first form)
+                    ;; The word already holds the sign-extended pattern.
+                    f32-to-bits lowered
+                    ;; The one member that is NOT an identity: it canonicalises
+                    ;; a zero-extended u32 into the signed i32 the oracle
+                    ;; requires, and re-establishes the invariant every other
+                    ;; producer here maintains.
+                    f32-from-bits (signed-i32-value lowered form)
+                    ;; Clearing bit 31 of a sign-extended word also clears every
+                    ;; bit above it, which IS the sign-extended form of a
+                    ;; positive binary32 pattern -- no re-extension needed.
+                    f32-abs (binary-value :gmir/bit-and lowered
+                                          (constant-value 2147483647) form)
+                    ;; XOR with 0xFFFFFFFF80000000 flips bit 31 AND the whole
+                    ;; upper half, so the result stays sign-extended in both
+                    ;; directions. This is the f64 `bit-xor Long/MIN_VALUE`
+                    ;; trick moved down 32 bits.
+                    f32-neg (binary-value :gmir/bit-xor lowered
+                                          (constant-value -2147483648) form)
+                    f32-sqrt
+                    (let [[code input] lowered, dst (fresh-reg)]
+                      [(conj code {:gmir/op :gmir/f32-sqrt :gmir/dst dst
+                                   :gmir/input (scalar-register! input form)})
+                       dst])))
+
+                (and (seq? form) (contains? kir-f32-conversion-ops (first form))
+                     (= 2 (count form)))
+                (let [[code input] (value (second form) env)
+                      dst (fresh-reg)]
+                  [(conj code {:gmir/op (get kir-f32-conversion-ops (first form))
+                               :gmir/dst dst
+                               :gmir/input (scalar-register! input form)})
+                   dst])
 
                 (and (seq? form) (contains? kir-kernel-memory-ops (first form))
                      (contains? #{4 5} (count form)))
@@ -2717,6 +2798,70 @@
                [0xf2 0x0f (get x86-f64-binary-opcode encoding) 0xc1]
                (x86-xmm-to-gpr dst 0))))
 
+;; ── f32 encoders ─────────────────────────────────────────────────────────
+;;
+;; Every byte below was assembled with `clang -target x86_64-apple-macos` and
+;; read back with `otool -t`, not derived from the manual and trusted. The
+;; AArch64 twin's FADD came out wrong by hand (0x1E202800 derived, 0x1E212800
+;; assembled), which is the whole argument for doing it this way.
+;;
+;; MOVD, not MOVQ: the operand is 32 bits and the upper half of the word is not
+;; part of the value. Writing a 32-bit destination also ZEROES the upper half of
+;; the 64-bit register, which is why every f32-producing sequence ends in a
+;; MOVSXD -- the canonical word is the pattern SIGN-extended from bit 31.
+
+(defn- x86-gpr-to-xmm32 [xmm src]
+  (let [s (get x86-register-code src)]
+    (when-not (and (integer? xmm) (<= 0 xmm 15) (some? s))
+      (reject! :mc-encode :unsupported-f32-register {:xmm xmm :src src}))
+    (let [rex (bit-or 0x40 (if (>= xmm 8) 4 0) (if (>= s 8) 1 0))]
+      (vec (concat [0x66]
+                   (when (not= 0x40 rex) [rex])
+                   [0x0f 0x6e
+                    (bit-or 0xc0 (bit-shift-left (bit-and xmm 7) 3)
+                            (bit-and s 7))])))))
+
+(defn- x86-xmm-to-gpr32 [dst xmm]
+  (let [d (get x86-register-code dst)]
+    (when-not (and (some? d) (integer? xmm) (<= 0 xmm 15))
+      (reject! :mc-encode :unsupported-f32-register {:dst dst :xmm xmm}))
+    (let [rex (bit-or 0x40 (if (>= xmm 8) 4 0) (if (>= d 8) 1 0))]
+      (vec (concat [0x66]
+                   (when (not= 0x40 rex) [rex])
+                   [0x0f 0x7e
+                    (bit-or 0xc0 (bit-shift-left (bit-and xmm 7) 3)
+                            (bit-and d 7))])))))
+
+;; movsxd r64, r32 over the same register: re-establish the sign extension a
+;; 32-bit write has just destroyed.
+(defn- x86-movsxd [register]
+  (let [d (get x86-register-code register)]
+    (when-not (some? d)
+      (reject! :mc-encode :unsupported-register {:register register}))
+    [(bit-or 0x48 (if (>= d 8) 5 0)) 0x63
+     (bit-or 0xc0 (bit-shift-left (bit-and d 7) 3) (bit-and d 7))]))
+
+;; cvtsi2ss / cvtsi2sd read the 64-bit general register directly, so there is no
+;; move in -- only out. `prefix` is 0xf3 for single, 0xf2 for double.
+(defn- x86-cvtsi2 [prefix xmm src]
+  (let [s (get x86-register-code src)]
+    (when-not (and (integer? xmm) (<= 0 xmm 15) (some? s))
+      (reject! :mc-encode :unsupported-f32-register {:xmm xmm :src src}))
+    [prefix (bit-or 0x48 (if (>= xmm 8) 4 0) (if (>= s 8) 1 0))
+     0x0f 0x2a
+     (bit-or 0xc0 (bit-shift-left (bit-and xmm 7) 3) (bit-and s 7))]))
+
+(def ^:private x86-f32-binary-opcode
+  {:x86-64/f32-add 0x58 :x86-64/f32-subtract 0x5c
+   :x86-64/f32-multiply 0x59 :x86-64/f32-divide 0x5e})
+
+(defn- x86-f32-binary [encoding dst left right]
+  (vec (concat (x86-gpr-to-xmm32 0 left)
+               (x86-gpr-to-xmm32 1 right)
+               [0xf3 0x0f (get x86-f32-binary-opcode encoding) 0xc1]
+               (x86-xmm-to-gpr32 dst 0)
+               (x86-movsxd dst))))
+
 (defn- x86-f64-compare [encoding dst left right]
   (let [swapped? (contains? #{:x86-64/f64-less-than
                               :x86-64/f64-less-or-equal} encoding)
@@ -2733,6 +2878,32 @@
                      [0x66 0x0f 0x2e 0xc1])
                  (x86-setcc condition dst)
                  (when (= :x86-64/f64-equal encoding)
+                   (concat (x86-setcc 0x9b :x86-64/r11)
+                           [(bit-or 0x40 4 (if (= :x86-64/r8 dst) 1 0))
+                            0x20
+                            (bit-or 0xc0 (bit-shift-left 3 3)
+                                    (bit-and (get x86-register-code dst) 7))]))
+                 (x86-movzx-byte dst)))))
+
+;; UCOMISS is UCOMISD without the 0x66 prefix and sets identical flags --
+;; ZF=PF=CF=1 when either operand is NaN -- so the condition codes, the operand
+;; swap for lt/le, and the extra PF test for equality are the f64 sequence
+;; unchanged. The result is a 0/1 word, so no sign extension is involved.
+(defn- x86-f32-compare [encoding dst left right]
+  (let [swapped? (contains? #{:x86-64/f32-less-than
+                              :x86-64/f32-less-or-equal} encoding)
+        condition (case encoding
+                    :x86-64/f32-equal 0x94
+                    :x86-64/f32-less-than 0x97
+                    :x86-64/f32-less-or-equal 0x93
+                    :x86-64/f32-greater-than 0x97
+                    :x86-64/f32-greater-or-equal 0x93
+                    :x86-64/f32-unordered 0x9a)]
+    (vec (concat (x86-gpr-to-xmm32 0 left)
+                 (x86-gpr-to-xmm32 1 right)
+                 (if swapped? [0x0f 0x2e 0xc8] [0x0f 0x2e 0xc1])
+                 (x86-setcc condition dst)
+                 (when (= :x86-64/f32-equal encoding)
                    (concat (x86-setcc 0x9b :x86-64/r11)
                            [(bit-or 0x40 4 (if (= :x86-64/r8 dst) 1 0))
                             0x20
@@ -3053,6 +3224,49 @@
                        (bit-shift-left (a64-register right) 5)))
         (u32le 0x1e612000)
         (u32le (bit-or cset (a64-register dst))))))
+
+;; ── AArch64 f32 encoders ─────────────────────────────────────────────────
+;;
+;; Each single-precision word is its double-precision twin with the `ftype`
+;; field narrowed (bit 22 cleared); the two FMOV general-register forms clear
+;; `sf` as well. That is a derivation, so it was checked and not trusted: every
+;; word here was assembled with `clang -target arm64-apple-macos` and read back
+;; with `otool -t`. It earned its keep -- FADD S0,S0,S1 derives to 0x1E202800
+;; by hand and assembles to 0x1E212800.
+;;
+;; FMOV S,W and FMOV W,S, not FMOV D,X / FMOV X,D: the value is 32 bits.
+;; Writing a W register zeroes the upper half of its X register, which is why
+;; every f32-producing sequence ends in SXTW.
+
+(defn- a64-fmov-s0-w [register]
+  (u32le (bit-or 0x1e270000 (bit-shift-left (a64-register register) 5))))
+
+(defn- a64-fmov-s1-w [register]
+  (u32le (bit-or 0x1e270001 (bit-shift-left (a64-register register) 5))))
+
+(defn- a64-fmov-w-s0 [register]
+  (u32le (bit-or 0x1e260000 (a64-register register))))
+
+;; SXTW Xd, Wd -- re-establish the sign extension the FMOV W has destroyed.
+(defn- a64-sxtw [register]
+  (let [r (a64-register register)]
+    (u32le (bit-or 0x93407c00 (bit-shift-left r 5) r))))
+
+(defn- a64-f32-binary [base dst left right]
+  (vec (concat (a64-fmov-s0-w left)
+               (a64-fmov-s1-w right)
+               (u32le base)
+               (a64-fmov-w-s0 dst)
+               (a64-sxtw dst))))
+
+;; FCMP sets exactly the same flags for single as for double, including
+;; N=0 Z=0 C=1 V=1 when unordered, so the CSET words are the f64 table's
+;; unchanged and only the compare narrows.
+(defn- a64-f32-compare [cset dst left right]
+  (vec (concat (a64-fmov-s0-w left)
+               (a64-fmov-s1-w right)
+               (u32le 0x1e212000)
+               (u32le (bit-or cset (a64-register dst))))))
 
 (defn- x86-cmp-imm32 [register value]
   (let [code (get x86-register-code register)]
@@ -4083,6 +4297,40 @@
      :x86-64/f64-greater-or-equal :x86-64/f64-unordered)
     (x86-f64-compare encoding (:mir/dst instruction) (:mir/left instruction)
                      (:mir/right instruction))
+    ;; f32. The scalar-SINGLE opcodes: 0xf3, not 0xf2.
+    (:x86-64/f32-add :x86-64/f32-subtract :x86-64/f32-multiply
+     :x86-64/f32-divide)
+    (x86-f32-binary encoding (:mir/dst instruction) (:mir/left instruction)
+                    (:mir/right instruction))
+    :x86-64/f32-sqrt
+    (vec (concat (x86-gpr-to-xmm32 0 (:mir/input instruction))
+                 [0xf3 0x0f 0x51 0xc0]
+                 (x86-xmm-to-gpr32 (:mir/dst instruction) 0)
+                 (x86-movsxd (:mir/dst instruction))))
+    (:x86-64/f32-equal :x86-64/f32-less-than
+     :x86-64/f32-less-or-equal :x86-64/f32-greater-than
+     :x86-64/f32-greater-or-equal :x86-64/f32-unordered)
+    (x86-f32-compare encoding (:mir/dst instruction) (:mir/left instruction)
+                     (:mir/right instruction))
+    ;; Width conversions. Which move comes back is decided by the RESULT's
+    ;; width, not the operand's: an f64 or i64 result fills the whole register
+    ;; and must NOT be sign-extended from bit 31.
+    :x86-64/f32-to-f64
+    (vec (concat (x86-gpr-to-xmm32 0 (:mir/input instruction))
+                 [0xf3 0x0f 0x5a 0xc0]
+                 (x86-xmm-to-gpr (:mir/dst instruction) 0)))
+    :x86-64/f64-to-f32
+    (vec (concat (x86-gpr-to-xmm 0 (:mir/input instruction))
+                 [0xf2 0x0f 0x5a 0xc0]
+                 (x86-xmm-to-gpr32 (:mir/dst instruction) 0)
+                 (x86-movsxd (:mir/dst instruction))))
+    :x86-64/i64-to-f32
+    (vec (concat (x86-cvtsi2 0xf3 0 (:mir/input instruction))
+                 (x86-xmm-to-gpr32 (:mir/dst instruction) 0)
+                 (x86-movsxd (:mir/dst instruction))))
+    :x86-64/i64-to-f64
+    (vec (concat (x86-cvtsi2 0xf2 0 (:mir/input instruction))
+                 (x86-xmm-to-gpr (:mir/dst instruction) 0)))
     :x86-64/kernel-load-u8 (x86-kernel-memory instruction-index 8 false instruction)
     :x86-64/kernel-store-u8 (x86-kernel-memory instruction-index 8 true instruction)
     :x86-64/kernel-load-u32 (x86-kernel-memory instruction-index 32 false instruction)
@@ -4238,6 +4486,55 @@
                        :aarch64/f64-unordered 0x9a9f77e0)
                      (:mir/dst instruction) (:mir/left instruction)
                      (:mir/right instruction))
+    ;; f32. Each word is the f64 one with ftype (bit 22) cleared.
+    (:aarch64/f32-add :aarch64/f32-subtract :aarch64/f32-multiply
+     :aarch64/f32-divide)
+    (a64-f32-binary (case encoding
+                      :aarch64/f32-add 0x1e212800
+                      :aarch64/f32-subtract 0x1e213800
+                      :aarch64/f32-multiply 0x1e210800
+                      :aarch64/f32-divide 0x1e211800)
+                    (:mir/dst instruction) (:mir/left instruction)
+                    (:mir/right instruction))
+    :aarch64/f32-sqrt
+    (vec (concat (a64-fmov-s0-w (:mir/input instruction))
+                 (u32le 0x1e21c000)
+                 (a64-fmov-w-s0 (:mir/dst instruction))
+                 (a64-sxtw (:mir/dst instruction))))
+    (:aarch64/f32-equal :aarch64/f32-less-than
+     :aarch64/f32-less-or-equal :aarch64/f32-greater-than
+     :aarch64/f32-greater-or-equal :aarch64/f32-unordered)
+    (a64-f32-compare (case encoding
+                       :aarch64/f32-equal 0x9a9f17e0
+                       :aarch64/f32-less-than 0x9a9f57e0
+                       :aarch64/f32-less-or-equal 0x9a9f87e0
+                       :aarch64/f32-greater-than 0x9a9fd7e0
+                       :aarch64/f32-greater-or-equal 0x9a9fb7e0
+                       :aarch64/f32-unordered 0x9a9f77e0)
+                     (:mir/dst instruction) (:mir/left instruction)
+                     (:mir/right instruction))
+    ;; Width conversions. Which FMOV comes back is decided by the RESULT's
+    ;; width: an f64 or i64 result fills the whole X register and gets no SXTW.
+    :aarch64/f32-to-f64
+    (vec (concat (a64-fmov-s0-w (:mir/input instruction))
+                 (u32le 0x1e22c000)
+                 (u32le (bit-or 0x9e660000 (a64-register (:mir/dst instruction))))))
+    :aarch64/f64-to-f32
+    (vec (concat (u32le (bit-or 0x9e670000
+                                (bit-shift-left (a64-register (:mir/input instruction)) 5)))
+                 (u32le 0x1e624000)
+                 (a64-fmov-w-s0 (:mir/dst instruction))
+                 (a64-sxtw (:mir/dst instruction))))
+    ;; SCVTF reads the 64-bit general register directly, so there is no FMOV in.
+    :aarch64/i64-to-f32
+    (vec (concat (u32le (bit-or 0x9e220000
+                                (bit-shift-left (a64-register (:mir/input instruction)) 5)))
+                 (a64-fmov-w-s0 (:mir/dst instruction))
+                 (a64-sxtw (:mir/dst instruction))))
+    :aarch64/i64-to-f64
+    (vec (concat (u32le (bit-or 0x9e620000
+                                (bit-shift-left (a64-register (:mir/input instruction)) 5)))
+                 (u32le (bit-or 0x9e660000 (a64-register (:mir/dst instruction))))))
     :aarch64/kernel-load-u8 (a64-kernel-memory instruction-index 8 false instruction)
     :aarch64/kernel-store-u8 (a64-kernel-memory instruction-index 8 true instruction)
     :aarch64/kernel-load-u32 (a64-kernel-memory instruction-index 32 false instruction)
@@ -4389,6 +4686,15 @@
     :aarch64/f64-sqrt :aarch64/f64-equal :aarch64/f64-less-than
     :aarch64/f64-less-or-equal :aarch64/f64-greater-than
     :aarch64/f64-greater-or-equal :aarch64/f64-unordered
+    ;; f32 uses the same x0/x1 sources, the same FP scratch bank and no other
+    ;; register, so it is cache-safe on exactly the grounds its f64 twin is.
+    :aarch64/f32-add :aarch64/f32-subtract :aarch64/f32-multiply
+    :aarch64/f32-divide
+    :aarch64/f32-sqrt :aarch64/f32-equal :aarch64/f32-less-than
+    :aarch64/f32-less-or-equal :aarch64/f32-greater-than
+    :aarch64/f32-greater-or-equal :aarch64/f32-unordered
+    :aarch64/f32-to-f64 :aarch64/f64-to-f32
+    :aarch64/i64-to-f32 :aarch64/i64-to-f64
     :aarch64/equal :aarch64/less-than :aarch64/greater-than
     :aarch64/less-or-equal :aarch64/greater-or-equal
     :aarch64/spill-load :aarch64/spill-store :aarch64/move :aarch64/return
