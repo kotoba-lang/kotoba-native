@@ -3568,3 +3568,19 @@
     (is (= 1 (shift-of '(slice-load-u16 b l i))))
     (is (= 0 (shift-of '(slice-load-u8 b l i)))
         "and a byte slice needs no scale at all")))
+
+(deftest memory-stores-preserve-their-expression-result-after-allocation
+  (let [x86 {:mir/dst :x86-64/r8 :mir/stored :x86-64/r9
+             :mir/base :x86-64/rax :mir/length :x86-64/rcx
+             :mir/index :x86-64/rdx :mir/maximum 512}
+        a64 {:mir/dst :aarch64/x4 :mir/stored :aarch64/x3
+             :mir/base :aarch64/x0 :mir/length :aarch64/x1
+             :mir/index :aarch64/x2 :mir/maximum 512}]
+    (doseq [code [(#'machine/x86-kernel-memory 17 16 true false x86)
+                  (#'machine/x86-slice-memory 18 16 true x86)]]
+      (is (some #(= (#'machine/x86-rr 0x89 :x86-64/r8 :x86-64/r9) %)
+                (partition 3 1 code))))
+    (doseq [code [(#'machine/a64-kernel-memory 17 16 true false a64)
+                  (#'machine/a64-slice-memory 18 16 true a64)]]
+      (is (some #(= (#'machine/a64-mov :aarch64/x4 :aarch64/x3) %)
+                (partition 4 1 code))))))

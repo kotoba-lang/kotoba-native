@@ -3565,6 +3565,11 @@
           (x86-kernel-bounds-check trap width aligned? instruction)
           (x86-memory-access (keyword (str (if store? "store" "load")
                                            "-u" width)) result)
+          ;; A store expression evaluates to the value written. Register
+          ;; allocation need not coalesce its destination with `stored`, so
+          ;; materialize that language-level result before the source dies.
+          (when (and store? (not= dst stored))
+            (x86-rr 0x89 dst stored))
           [(layout/relative-branch :x86-64/jmp-rel32 done)
            (layout/label trap)]
           [0x0f 0x0b]
@@ -3582,6 +3587,8 @@
           (x86-slice-bounds-check trap (quot width 8) instruction)
           (x86-memory-access (keyword (str (if store? "store" "load")
                                            "-u" width)) result)
+          (when (and store? (not= dst stored))
+            (x86-rr 0x89 dst stored))
           [(layout/relative-branch :x86-64/jmp-rel32 done)
            (layout/label trap)]
           [0x0f 0x0b]
@@ -3931,6 +3938,8 @@
     (vec (concat
           (a64-kernel-bounds-check trap width aligned? instruction)
           (a64-memory-access store? width result)
+          (when (and store? (not= dst stored))
+            (a64-mov dst stored))
           [(layout/relative-branch :aarch64/b-imm26 done)
            (layout/label trap)]
           (u32le 0xd4200000)
@@ -3944,6 +3953,8 @@
     (vec (concat
           (a64-slice-bounds-check trap (quot width 8) instruction)
           (a64-memory-access store? width result)
+          (when (and store? (not= dst stored))
+            (a64-mov dst stored))
           [(layout/relative-branch :aarch64/b-imm26 done)
            (layout/label trap)]
           (u32le 0xd4200000)
