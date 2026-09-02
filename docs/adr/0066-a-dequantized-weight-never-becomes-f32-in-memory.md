@@ -1,4 +1,4 @@
-# ADR 0052: a dequantized weight never becomes f32 in memory
+# ADR 0066: a dequantized weight never becomes f32 in memory
 
 Status: accepted. Date: 2026-09-02.
 
@@ -157,14 +157,27 @@ right number of times and adds nothing — a working instruction that answers
   (LLVM 22.1.7), not derived from the manual.
 - Full suite at this commit: 337 tests / 4671 assertions / 0 failures.
 - **Executed in QEMU**, both arms, same artifact:
-  `os/aiueos/scripts/smoke-qemu-dequant-dot.cljs` (aiueos). `-cpu max` reports
-  `arm=avx2` and `-cpu qemu64` reports `arm=scalar`, and both print
-  `4B80000C` — which is what `kotoba.kir` answers for the same bytes, and is
-  not what a left-to-right sum answers (`4B800000`).
-- Break-checked five ways, each reddening the test named for it: dropping
-  `vzeroupper`; the scalar lane assignment as `e div 2`; the packed span
-  derived with the element stride; the half-precision constant as 2^111; the
-  AVX2 arm adding its upper half before its lower.
+  `os/aiueos/scripts/smoke-qemu-dequant-dot.cljs` (aiueos, ADR 0165). `-cpu
+  max` reports `arm=avx2` and `-cpu qemu64` reports `arm=scalar`, and both
+  print `4C800012` — which is what `kotoba.kir` answers for the same bytes,
+  and is neither what a left-to-right sum answers (`4C800010`) nor what this
+  sequence's own upper-half-first twin answers (`4C800011`).
+
+  **The fixture had to be replaced to make that third number exist.** The
+  first one copied `dot-f32-probe`'s `[2^24, 1, 1, ... 1]`, which separates the
+  contract from a left-to-right sum and NOT from the twin: with every element
+  equal and the accumulator starting at zero, `(0+a)+b` and `(0+b)+a` are the
+  same number. Measured 2026-09-02, an emitter with the two `vaddps` swapped
+  was built, booted, and printed the expected digits under both CPU models.
+  With the replacement fixture the same broken emitter makes `-cpu max` print
+  `4C800011` while `-cpu qemu64` prints `4C800012` — the two arms disagree on
+  one machine, and the smoke exits 1.
+- Break-checked five ways in this repository, each reddening the test named for
+  it: dropping `vzeroupper`; the scalar lane assignment as `e div 2`; the
+  packed span derived with the element stride; the half-precision constant as
+  2^111; the AVX2 arm adding its upper half before its lower. The last of those
+  was ALSO carried through to a booted machine, which is the only place the two
+  arms can be compared with each other rather than with their own goldens.
 
 One of those five is a finding rather than a demonstration. The lane
 assignment `e div 2` initially passed: the test counted how many times each
@@ -183,9 +196,11 @@ It is NOT a measured speedup. The only machine on this workstation with AVX2 at
 all is QEMU TCG — this is an Apple M4 and Rosetta exposes no AVX — and TCG
 spends its time translating instructions rather than executing them, so a
 256-bit vector operation costs it about what a scalar one costs. Measured
-2026-09-02 with `kernel-rdtsc` around a 4096-element fold, after a warm-up call
-and with a 256-element fold subtracted to remove the guard's constant: 66.67
-host ticks per element scalar against 57.03 vectorised, a ratio of 1.17.
-**That number does not support the instruction-count ratio and is not offered
-as if it did.** TCG cannot answer this question; silicon can, and this
+2026-09-02 with `kernel-rdtsc` around a 4096-element fold, after a THROWAWAY
+fold that is not timed and with a 256-element fold subtracted to remove the
+guard's constant: 88.54 host ticks per element scalar against 56.51
+vectorised, a ratio of 1.57. Four runs under changing load gave 1.17, 1.45,
+1.55 and 1.57 — the spread is this workstation's load, not the code.
+**None of those numbers supports the instruction-count ratio and none is
+offered as if it did.** TCG cannot answer this question; silicon can, and this
 workspace has none with AVX2.

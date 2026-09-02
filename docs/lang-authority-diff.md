@@ -121,6 +121,15 @@ ADR 0285's second decision and it is honoured literally.
 
 ## 3. What the authority must NOT yet say
 
+> **Superseded 2026-09-02 by the SLICE-VALUE stream.** This section said
+> `[:slice T]` was not a type and must not become one until something could
+> produce a slice value. Something now can: kotoba-sema ADR 0022 admits
+> `[:slice T]` for `T ∈ {:u8 :u16 :u32 :u64}` as a type of the SOURCE SYNTAX
+> and erases it into the two i64 words below before HIR. The four steps at the
+> end of this section are answered in the addendum after them — three of them
+> by turning out not to be needed. `[:slice :f32]` remains declared and not
+> admitted, exactly as this section asks.
+
 **`[:slice T]` is not a type.** ADR 0285 asks for a two-word (base, length)
 carrier a `let` binds, a function parameter carries and `slice-sub` narrows.
 What exists is the machine layer it lowers to: three separate i64 operands.
@@ -159,6 +168,45 @@ can do is carry a two-word value.
 Route 3-by-erasure is the cheapest and needs no new IR value: a slice
 parameter becomes two i64 parameters and a slice `let` becomes two bindings,
 which is exactly the shape the operations landed here already take.
+
+### Addendum, 2026-09-02: what the four steps cost
+
+Route 3-by-erasure was taken, in `kotoba.compiler.frontend/erase-slice-values`
+(kotoba-sema ADR 0022). Reading the four steps back against it:
+
+1. **`pilot-expression?` needed no second value shape.** It already answers
+   `:scalar` for a four-operand `slice-load-u8`, because
+   `kir-kernel-memory-ops` has carried the slice family since the lowering
+   landed. This step was not merely dearer than route 3 — after erasure there
+   is nothing to widen.
+2. **The x86-64 fallback needed no second accumulator or two-slot spill**, for
+   the same reason: the erased program has no two-word value in it.
+3. **`kotoba.gmir` / `kotoba.mir` needed no two-register SSA value.** This was
+   the step written as "or the frontend needs to erase slices before KIR",
+   and that is the half that happened.
+4. **`kotoba.compiler.frontend` gained `[:slice T]`** with construction
+   restricted to a parameter, a literal, `kernel-boot-info`, a
+   `kernel-subregion`-derived region or `slice-sub`. The provenance rule is
+   the one `kernel_region_provenance_test.clj` already enforced — the carrier
+   inherits it rather than restating it, because after erasure the base sits
+   at argument 0 of a machine operation where `kernel-base-uses` already
+   looks. A computed base is refused twice: once by name at the constructor
+   (`:kotoba.error/slice-region-provenance`) and once by the generic rule
+   after erasure. Both directions are pinned by test.
+
+**This repository is unchanged by the carrier.** Not one encoder, table or
+gate here moved. The evidence is amu ADR 0314: a carried traversal and the
+same traversal written with the machine operations compile to **identical
+objects** on both ISAs at every element width, and aiueos ADR 0160 boots one
+of them — a `[:slice :u8]` passed as a function parameter, summed on a real
+page under QEMU (`0000082000000410SLC`, exit 33).
+
+Sections 1 and 2 above still stand as the diff to apply to `kotoba-lang`, with
+one change: `:slice-carrier`'s `:limits` should now read
+`[:element-type-f32-declared-not-admitted]` — `:no-single-value-carrier` is
+no longer true — and the family gains the eight carried operations
+`slice-of-u{8,16,32,64}`, `slice-length`, `slice-get`, `slice-set!` and
+`slice-sub` beside the eight machine ones.
 
 ---
 
