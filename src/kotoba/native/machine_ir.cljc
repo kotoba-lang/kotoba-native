@@ -416,6 +416,16 @@
    'kernel-cmpxchg-u64    [:gmir/kernel-cmpxchg-u64 4096 5 64]})
 ;; sysops: end
 
+;; simd: the f32 dot product (kotoba-gmir ADR 0010). Its own table because its
+;; operands are two regions and a count rather than `base length index [value]`,
+;; so neither of the shared lowerings above fits it.
+;;
+;; `[gmir-op maximum arity]`. The ceiling bounds BOTH lengths and is pinned to
+;; one value; the element ceiling the emitter checks is derived from it.
+(def ^:private kir-kernel-dot-f32-ops
+  {'kernel-dot-f32 [:gmir/kernel-dot-f32 65536 5]})
+;; simd: end
+
 (def ^:private kir-x86-privileged-ops
   {'kernel-boot-info :boot-info
    'kernel-read-cr0 :read-cr0
@@ -1700,6 +1710,30 @@
                    dst])
                 ;; sysops: end
 
+                ;; simd: the f32 dot product. Five operands, none of them an
+                ;; index, so it does not fold into either shape above.
+                (and (seq? form) (contains? kir-kernel-dot-f32-ops (first form)))
+                (let [[op maximum arity] (get kir-kernel-dot-f32-ops (first form))
+                      _ (when-not (= arity (count (rest form)))
+                          (reject! :kir-to-gmir :kernel-dot-arity
+                                   {:form form :expected arity}))
+                      lowered (mapv #(value % env) (rest form))
+                      code (vec (mapcat first lowered))
+                      [base length second-base second-length elements]
+                      (mapv #(scalar-register! (second %) form) lowered)
+                      dst (fresh-reg)]
+                  [(conj code
+                         {:gmir/op op :gmir/dst dst
+                          :gmir/base base :gmir/length length
+                          :gmir/second-base second-base
+                          :gmir/second-length second-length
+                          :gmir/count elements
+                          :gmir/maximum maximum})
+                   dst])
+                ;; simd: end
+
+                ;; sysops: end
+
                 (and (seq? form) (= 'kernel-subregion (first form))
                      (= 5 (count form)))
                 (let [lowered (mapv #(value % env) (rest form))
@@ -2057,6 +2091,13 @@
                 ;; compare-exchanges.
                 (and (seq? form) (contains? kir-kernel-atomic-ops (first form))
                      (= (nth (get kir-kernel-atomic-ops (first form)) 2)
+                        (count (rest form)))
+                     (every? #(= :scalar (shape % env)) (rest form)))
+                :scalar
+
+                ;; simd: the f32 dot product, with its own arity.
+                (and (seq? form) (contains? kir-kernel-dot-f32-ops (first form))
+                     (= (nth (get kir-kernel-dot-f32-ops (first form)) 2)
                         (count (rest form)))
                      (every? #(= :scalar (shape % env)) (rest form)))
                 :scalar
@@ -2667,7 +2708,23 @@
    :vmovss-load    {:opcode 0x10 :map :0f   :pp :f3   :l 128 :w 0}
    :vmovss-store   {:opcode 0x11 :map :0f   :pp :f3   :l 128 :w 0}
    :vxorps-256     {:opcode 0x57 :map :0f   :pp :none :l 256 :w 0}
-   :vxorps-128     {:opcode 0x57 :map :0f   :pp :none :l 128 :w 0}})
+   :vxorps-128     {:opcode 0x57 :map :0f   :pp :none :l 128 :w 0}
+   ;; simd: the three the dot product needs and the table did not have.
+   ;;
+   ;; `:vaddps-128` is `:vaddps` at the other length, and it is a SEPARATE
+   ;; entry rather than a length argument for the reason `:vhaddps-256` and
+   ;; `:vhaddps-128` are two entries: the length is part of what an
+   ;; instruction IS here, and a caller that passed the wrong one would get a
+   ;; working instruction that read four floats it did not mean to.
+   ;;
+   ;; `:vmulss` and `:vaddss` are the scalar-single forms -- the same opcodes
+   ;; as their packed twins under the F3 prefix. They exist so the AVX arm's
+   ;; TAIL can stay VEX-encoded: mixing legacy SSE into a sequence that has
+   ;; written a YMM register is what `vzeroupper` exists to avoid, and doing
+   ;; it inside the loop would pay that penalty per element.
+   :vaddps-128     {:opcode 0x58 :map :0f   :pp :none :l 128 :w 0}
+   :vmulss         {:opcode 0x59 :map :0f   :pp :f3   :l 128 :w 0}
+   :vaddss         {:opcode 0x58 :map :0f   :pp :f3   :l 128 :w 0}})
 
 (defn- x86-avx-form [instruction]
   (let [form (get x86-avx-forms instruction)]
@@ -2684,17 +2741,44 @@
   (conj (vex2 {:l 128}) 0x77))
 
 (defn- x86-sse-rr
-  "Legacy, non-VEX, two-byte SSE register form: [REX] 0F OPCODE /r. `addps` is
+  "Legacy, non-VEX SSE register form: [PREFIX] [REX] 0F OPCODE /r. `addps` is
   encoded this way rather than as `vaddps` because the horizontal tail of a dot
   product is the one part that has to run on a machine whose AVX check FAILED
-  -- there is no VEX prefix available on that path by definition."
-  [opcode reg rm]
+  -- there is no VEX prefix available on that path by definition.
+
+  simd: the four-argument arity carries the MANDATORY PREFIX -- 0xf3 for the
+  scalar-single forms (`movss`, `mulss`, `addss`), 0x66 for the packed-double
+  ones. It is a separate leading byte and not part of the opcode, and it comes
+  BEFORE the REX byte, which is the one ordering rule that is easy to get
+  backwards and impossible to see afterwards: a REX before an F3 is a
+  different instruction, not a rejected one."
+  ([opcode reg rm] (x86-sse-rr nil opcode reg rm))
+  ([prefix opcode reg rm]
+   (let [r (vex-register reg)
+         m (vex-register rm)]
+     (vec (concat (when prefix [prefix])
+                  (when (or (>= r 8) (>= m 8))
+                    [(bit-or 0x40 (if (>= r 8) 4 0) (if (>= m 8) 1 0))])
+                  [0x0f opcode
+                   (bit-or 0xc0 (bit-shift-left (bit-and r 7) 3) (bit-and m 7))])))))
+
+(defn- x86-sse-rm
+  "Legacy, non-VEX SSE form whose ModRM names memory:
+  [PREFIX] [REX] 0F OPCODE <modrm+sib+disp>.
+
+  simd: the addressing half is `vex-memory-operand`'s, reused rather than
+  written twice -- it already owns the three encodings that are not free
+  choices (RIP-relative mod 00 rm 101, the SIB escape at low bits 100, and the
+  forced displacement at low bits 101). What differs is only how its X and B
+  bits are spelled: inverted inside a VEX prefix, upright inside a REX one."
+  [prefix opcode reg operand]
   (let [r (vex-register reg)
-        m (vex-register rm)]
-    (vec (concat (when (or (>= r 8) (>= m 8))
-                   [(bit-or 0x40 (if (>= r 8) 4 0) (if (>= m 8) 1 0))])
-                 [0x0f opcode
-                  (bit-or 0xc0 (bit-shift-left (bit-and r 7) 3) (bit-and m 7))]))))
+        {:keys [x b bytes]} (vex-memory-operand r operand)
+        rex (bit-or 0x40 (if (>= r 8) 4 0) (bit-shift-left x 1) b)]
+    (vec (concat (when prefix [prefix])
+                 (when (not= 0x40 rex) [rex])
+                 [0x0f opcode]
+                 bytes))))
 
 ;; ── simdprep: end ───────────────────────────────────────────────────────────
 
@@ -3719,6 +3803,295 @@
                            (bit-shift-left (a64-register register) 5)
                            31))
             [(layout/relative-branch :aarch64/b-ne-imm19 trap)])))))
+;; ── simd: the f32 dot product ───────────────────────────────────────────────
+;;
+;; kotoba-gmir ADR 0010's `kernel-dot-f32`, as ONE opaque MC instruction.
+;;
+;; THE ACCUMULATION TREE IS THE CONTRACT (kotoba-kir ADR 0233), and the two
+;; arms below are required to produce BIT-IDENTICAL results. They do, by
+;; construction rather than by measurement:
+;;
+;;   four lane accumulators, all +0.0
+;;   while eight or more elements remain:
+;;       lane k += a[i+k]   * b[i+k]      for k = 0..3   (the lower half)
+;;       lane k += a[i+4+k] * b[i+4+k]    for k = 0..3   (the upper half)
+;;       i += 8
+;;   sum = (lane0 + lane1) + (lane2 + lane3)
+;;   for each remaining element: sum += a[i] * b[i]
+;;
+;; Each lane is an INDEPENDENT chain of the same additions in the same order in
+;; both arms -- four lanes of one XMM register in the AVX2 arm, four separate
+;; XMM registers in the scalar one -- and interleaving between independent
+;; chains cannot change a result. The reduction is two `vhaddps` on 128 bits in
+;; the AVX2 arm and three `addss` in the scalar one, which compute the same
+;; pairwise tree: `HADDPS x,x` yields [s0+s1, s2+s3, ...], so a second one
+;; yields (s0+s1)+(s2+s3) in lane 0.
+;;
+;; That is why the reduction is pairwise rather than the left-to-right chain
+;; `dot_avx2` uses in aiueos: a left-to-right chain needs three lane
+;; extractions, where the pairwise one is an instruction the AVX arm already
+;; has. The LOOP is `dot_avx2`'s (eight at a time, lower before upper) rather
+;; than `dot_scalar`'s (four at a time) because eight is what a 256-bit
+;; register does, and a scalar sequence can imitate a vector while a vector
+;; cannot imitate an arbitrary scalar order.
+;;
+;; No FMA. `vfmadd231ps` rounds once where `vmulps` + `vaddps` round twice, so
+;; it computes a DIFFERENT value -- and it is a separate feature bit (leaf 1
+;; ECX[12]) that an AVX2 CPU is not required to have, so a third arm would be a
+;; third answer.
+;;
+;; CLOBBER DISCIPLINE. R9 is the context register and is untouched. R10, R11
+;; and every XMM/YMM register are scratch, because no allocator in this
+;; repository allocates one. Everything else this sequence writes is pushed and
+;; popped by the sequence itself: RAX, RCX and RDX because `cpuid` writes them
+;; unconditionally, and RBX because `cpuid` writes it AND it is callee-saved.
+;; That last one is not a courtesy -- `kotoba.mir/saved-registers` derives a
+;; function's frame saves from a tree-seq over the INSTRUCTION MAPS, so a
+;; register a byte sequence clobbers without naming is a register nothing
+;; saves.
+;;
+;; THE OPERANDS ARE RESCUED TO THE STACK BEFORE THE GUARD RUNS. They may be
+;; allocated to RAX, RCX, RDX or RBX, all four of which `cpuid` destroys, and
+;; only two scratch registers exist to hold five values. So the sequence pushes
+;; the three it still needs, runs the guard, and pops them into R10/R11/RBX
+;; afterwards. `test` sets ZF before the pops and POP does not touch the flags,
+;; which is what lets the branch happen after six of them -- the same property
+;; `x86-kernel-lock` already relies on.
+;;
+;; The four branch encodings used are the four the layout pass has: `ja`,
+;; `jae`, `jz`, `jmp`. There is no `jb` and no `jne` at rel32 width, so the
+;; three guard failures are spelled as "jump over a jump" rather than as a
+;; conditional branch to the failure label. That is three extra bytes each and
+;; no new layout encoding, which is the right trade for a sequence that runs
+;; once per call.
+
+(defn- x86-dot-avx2-guard
+  "The AVX2 availability check, resolved against LABELS rather than against
+  fixed displacements (docs/avx2-guard-sequence.md owns the reasoning; this
+  owns the bytes as the emitter needs them).
+
+  Four questions, and each closes a hole the others leave open. Leaf 0 first,
+  because `cpuid` above the CPU's maximum leaf does not fault -- it returns the
+  highest leaf's data, so bit 5 of a leaf-7 EBX read on a CPU whose maximum is
+  6 means nothing. Then leaf 1 ECX bits 27 and 28: 28 is the CPU, 27 is the
+  OPERATING SYSTEM, and 27 must be tested BEFORE the XCR0 read because
+  `xgetbv` raises #UD when CR4.OSXSAVE is clear. Then XCR0 bits 1 and 2, which
+  say the OS actually saves the SSE and YMM state across a context switch -- a
+  kernel that skips this and uses YMM anyway does not fault, it computes wrong
+  answers intermittently and only under load. Then leaf 7 subleaf 0 EBX bit 5,
+  AVX2 proper.
+
+  Leaves EAX = 1 when AVX2 is usable and 0 otherwise, and ends with the `test`
+  whose ZF the caller branches on. Does NOT save RBX: the caller has already
+  pushed it, along with the three registers `cpuid` also destroys."
+  [leaf1 xcr0 leaf7 fail done]
+  (vec (concat
+        [0x31 0xc0                          ; xor eax, eax          -- leaf 0
+         0x31 0xc9                          ; xor ecx, ecx
+         0x0f 0xa2                          ; cpuid
+         0x83 0xf8 0x07                     ; cmp eax, 7
+         (layout/relative-branch :x86-64/jae-rel32 leaf1)
+         (layout/relative-branch :x86-64/jmp-rel32 fail)
+         (layout/label leaf1)
+         0xb8 0x01 0x00 0x00 0x00           ; mov eax, 1            -- leaf 1
+         0x31 0xc9                          ; xor ecx, ecx
+         0x0f 0xa2                          ; cpuid
+         0x81 0xe1 0x00 0x00 0x00 0x18      ; and ecx, 0x18000000   -- 27 | 28
+         0x81 0xf9 0x00 0x00 0x00 0x18      ; cmp ecx, 0x18000000
+         (layout/relative-branch :x86-64/jz-rel32 xcr0)
+         (layout/relative-branch :x86-64/jmp-rel32 fail)
+         (layout/label xcr0)
+         0x31 0xc9                          ; xor ecx, ecx          -- XCR0
+         0x0f 0x01 0xd0                     ; xgetbv
+         0x83 0xe0 0x06                     ; and eax, 6            -- SSE | YMM
+         0x83 0xf8 0x06                     ; cmp eax, 6
+         (layout/relative-branch :x86-64/jz-rel32 leaf7)
+         (layout/relative-branch :x86-64/jmp-rel32 fail)
+         (layout/label leaf7)
+         0xb8 0x07 0x00 0x00 0x00           ; mov eax, 7            -- leaf 7
+         0x31 0xc9                          ; xor ecx, ecx          -- subleaf 0
+         0x0f 0xa2                          ; cpuid
+         0x89 0xd8                          ; mov eax, ebx          -- bit 5 = AVX2
+         0xc1 0xe8 0x05                     ; shr eax, 5
+         0x83 0xe0 0x01                     ; and eax, 1
+         (layout/relative-branch :x86-64/jmp-rel32 done)
+         (layout/label fail)
+         0x31 0xc0                          ; xor eax, eax
+         (layout/label done)]
+        ;; ZF is read after six POPs, which do not touch the flags.
+        (x86-rr 0x85 :x86-64/rax :x86-64/rax))))
+
+(defn- x86-kernel-dot-f32
+  [instruction-index
+   {:mir/keys [dst base length second-base second-length maximum] :as instruction}]
+  (let [elements (:mir/count instruction)
+        ;; The element ceiling is DERIVED from the byte one, so the two cannot
+        ;; disagree. It is checked before `count * 4` is formed, which is the
+        ;; whole point of having it: a count of 2^62 scaled by four wraps to
+        ;; zero, and a wrapped span passes every length check there is.
+        element-limit (quot maximum 4)
+        label (fn [suffix] (memory-label instruction-index (str "dot-" suffix)))
+        trap (label "trap")
+        scalar (label "scalar")
+        join (label "join")
+        done (label "done")
+        pa :x86-64/r10
+        pb :x86-64/r11
+        remaining :x86-64/rbx
+        ;; One eight-element block of the scalar arm: load, multiply, and add
+        ;; into the lane this element belongs to. `disp` is its byte offset
+        ;; within the block and `lane` the accumulator register.
+        scalar-step
+        (fn [disp lane]
+          (concat (x86-sse-rm 0xf3 0x10 4 {:base pa :disp disp})   ; movss xmm4,[pa+d]
+                  (x86-sse-rm 0xf3 0x10 5 {:base pb :disp disp})   ; movss xmm5,[pb+d]
+                  (x86-sse-rr 0xf3 0x59 4 5)                       ; mulss xmm4, xmm5
+                  (x86-sse-rr 0xf3 0x58 lane 4)))                  ; addss lane, xmm4
+        ;; The AVX2 arm's tail, one element at a time onto lane 0 of xmm0. VEX
+        ;; encoded rather than legacy SSE so the arm never mixes encodings
+        ;; after writing a YMM register.
+        avx-step
+        (concat (x86-vex-rm (x86-avx-form :vmovss-load) {:reg 1 :operand {:base pa}})
+                (x86-vex-rm (x86-avx-form :vmovss-load) {:reg 2 :operand {:base pb}})
+                (x86-vex-rr (x86-avx-form :vmulss) {:reg 1 :vvvv 1 :rm 2})
+                (x86-vex-rr (x86-avx-form :vaddss) {:reg 0 :vvvv 0 :rm 1}))
+        ;; `jmp check; body: ...; check: cmp reg, k; jae body`. The layout pass
+        ;; has `jae` and not `jb`, so the loop is bottom-tested rather than
+        ;; top-tested; `cmp reg, 1` + `jae` is "reg is not zero", unsigned.
+        counted-loop
+        (fn [body-label check-label bound body]
+          (concat [(layout/relative-branch :x86-64/jmp-rel32 check-label)
+                   (layout/label body-label)]
+                  body
+                  [(layout/label check-label)]
+                  (x86-cmp-imm32 remaining bound)
+                  [(layout/relative-branch :x86-64/jae-rel32 body-label)]))]
+    (vec (concat
+          ;; ── the checks, in the oracle's order ──────────────────────────
+          (x86-cmp-imm32 length maximum)
+          [(layout/relative-branch :x86-64/ja-rel32 trap)]
+          (x86-cmp-imm32 second-length maximum)
+          [(layout/relative-branch :x86-64/ja-rel32 trap)]
+          (x86-rr 0x85 base base)
+          [(layout/relative-branch :x86-64/jz-rel32 trap)]
+          (x86-rr 0x85 second-base second-base)
+          [(layout/relative-branch :x86-64/jz-rel32 trap)]
+          (x86-cmp-imm32 elements element-limit)
+          [(layout/relative-branch :x86-64/ja-rel32 trap)]
+          ;; span = count * 4, as two doublings rather than a shift: the
+          ;; encoders here have `add` and do not have a shift-by-immediate,
+          ;; and the count is already bounded so neither doubling can wrap.
+          (x86-rr 0x89 pa elements)
+          (x86-rr 0x01 pa pa)
+          (x86-rr 0x01 pa pa)
+          (x86-rr 0x39 pa length)
+          [(layout/relative-branch :x86-64/ja-rel32 trap)]
+          (x86-rr 0x39 pa second-length)
+          [(layout/relative-branch :x86-64/ja-rel32 trap)]
+
+          ;; ── rescue the operands, then ask the CPU ──────────────────────
+          ;; RBX is saved first and deepest; the three values are pushed while
+          ;; their registers still hold them, because the guard is about to
+          ;; destroy RAX, RCX, RDX and RBX.
+          (x86-push remaining)
+          (x86-push base)
+          (x86-push second-base)
+          (x86-push elements)
+          (x86-push :x86-64/rax)
+          (x86-push :x86-64/rcx)
+          (x86-push :x86-64/rdx)
+          (x86-dot-avx2-guard (label "guard-leaf1") (label "guard-xcr0")
+                              (label "guard-leaf7") (label "guard-fail")
+                              (label "guard-done"))
+          (x86-pop :x86-64/rdx)
+          (x86-pop :x86-64/rcx)
+          (x86-pop :x86-64/rax)
+          (x86-pop remaining)
+          (x86-pop pb)
+          (x86-pop pa)
+          [(layout/relative-branch :x86-64/jz-rel32 scalar)]
+
+          ;; ── the AVX2 arm ──────────────────────────────────────────────
+          ;; `vxorps` at 128 bits clears the upper half of YMM0 as well, so the
+          ;; accumulator starts at +0.0 in all four lanes and nowhere else.
+          (x86-vex-rr (x86-avx-form :vxorps-128) {:reg 0 :vvvv 0 :rm 0})
+          (counted-loop
+           (label "avx-block") (label "avx-block-check") 8
+           (concat
+            (x86-vex-rm (x86-avx-form :vmovups-load) {:reg 1 :operand {:base pa}})
+            (x86-vex-rm (x86-avx-form :vmovups-load) {:reg 2 :operand {:base pb}})
+            (x86-vex-rr (x86-avx-form :vmulps) {:reg 1 :vvvv 1 :rm 2})
+            ;; The upper half goes to XMM2 before the lower half is consumed:
+            ;; XMM1 IS the lower half of YMM1, so a 128-bit add reads it
+            ;; without a move.
+            (x86-vex-rr (x86-avx-form :vextractf128) {:reg 1 :rm 2 :imm8 1})
+            (x86-vex-rr (x86-avx-form :vaddps-128) {:reg 0 :vvvv 0 :rm 1})
+            (x86-vex-rr (x86-avx-form :vaddps-128) {:reg 0 :vvvv 0 :rm 2})
+            (x86-alu-imm 0 pa 32)
+            (x86-alu-imm 0 pb 32)
+            (x86-alu-imm 5 remaining 8)))
+          ;; [s0 s1 s2 s3] -> [s0+s1, s2+s3, ...] -> [(s0+s1)+(s2+s3), ...]
+          (x86-vex-rr (x86-avx-form :vhaddps-128) {:reg 0 :vvvv 0 :rm 0})
+          (x86-vex-rr (x86-avx-form :vhaddps-128) {:reg 0 :vvvv 0 :rm 0})
+          (counted-loop
+           (label "avx-tail") (label "avx-tail-check") 1
+           (concat avx-step
+                   (x86-alu-imm 0 pa 4)
+                   (x86-alu-imm 0 pb 4)
+                   (x86-alu-imm 5 remaining 1)))
+          ;; The result leaves XMM0 into R10, which held the A pointer and is
+          ;; dead. `vzeroupper` after it, before anything legacy-SSE runs.
+          (x86-vex-rr (x86-avx-form :vmovd-to-gpr) {:reg 0 :rm pa})
+          x86-vzeroupper
+          [(layout/relative-branch :x86-64/jmp-rel32 join)]
+
+          ;; ── the scalar arm ────────────────────────────────────────────
+          ;; Four separate accumulators where the AVX2 arm has four lanes, and
+          ;; the SAME sequence of additions into each one.
+          [(layout/label scalar)]
+          (x86-sse-rr 0x57 0 0)                                    ; xorps xmm0,xmm0
+          (x86-sse-rr 0x57 1 1)
+          (x86-sse-rr 0x57 2 2)
+          (x86-sse-rr 0x57 3 3)
+          (counted-loop
+           (label "sc-block") (label "sc-block-check") 8
+           (concat
+            ;; lower half, elements 0..3 into lanes 0..3
+            (scalar-step 0 0) (scalar-step 4 1)
+            (scalar-step 8 2) (scalar-step 12 3)
+            ;; upper half, elements 4..7 into the same four lanes in the same
+            ;; order -- which is what `s += lower; s += upper` does per lane.
+            (scalar-step 16 0) (scalar-step 20 1)
+            (scalar-step 24 2) (scalar-step 28 3)
+            (x86-alu-imm 0 pa 32)
+            (x86-alu-imm 0 pb 32)
+            (x86-alu-imm 5 remaining 8)))
+          ;; (s0+s1) + (s2+s3), the tree the two `vhaddps` above compute.
+          (x86-sse-rr 0xf3 0x58 0 1)
+          (x86-sse-rr 0xf3 0x58 2 3)
+          (x86-sse-rr 0xf3 0x58 0 2)
+          (counted-loop
+           (label "sc-tail") (label "sc-tail-check") 1
+           (concat (scalar-step 0 0)
+                   (x86-alu-imm 0 pa 4)
+                   (x86-alu-imm 0 pb 4)
+                   (x86-alu-imm 5 remaining 1)))
+          (x86-xmm-to-gpr32 pa 0)
+
+          ;; ── the answer ────────────────────────────────────────────────
+          [(layout/label join)]
+          (x86-pop remaining)
+          ;; MOVD wrote a 32-bit register, which zeroed the upper half. The
+          ;; canonical f32 word is the pattern SIGN-extended from bit 31, so
+          ;; the extension is re-established here -- without it every negative
+          ;; result would be a word `f32-from-bits` refuses.
+          (when-not (= dst pa) (x86-rr 0x89 dst pa))
+          (x86-movsxd dst)
+          [(layout/relative-branch :x86-64/jmp-rel32 done)
+           (layout/label trap)]
+          [0x0f 0x0b]
+          [(layout/label done)]))))
+;; simd: end
 
 (defn- a64-kernel-bounds-check
   "AArch64's half of the shared window preamble. Same checks as the x86 side,
@@ -4709,6 +5082,8 @@
     :x86-64/kernel-cmpxchg-u32 (x86-kernel-atomic instruction-index :cmpxchg 32 instruction)
     :x86-64/kernel-cmpxchg-u64 (x86-kernel-atomic instruction-index :cmpxchg 64 instruction)
     ;; sysops: end
+    ;; simd:
+    :x86-64/kernel-dot-f32 (x86-kernel-dot-f32 instruction-index instruction)
     :x86-64/kernel-subregion (x86-kernel-subregion instruction-index instruction)
     (:x86-64/equal :x86-64/less-than :x86-64/greater-than
      :x86-64/less-or-equal :x86-64/greater-or-equal)
