@@ -3,7 +3,7 @@
 ;; those let it decide something?
 ;;
 ;; The evidence behind the blast-radius table in
-;; docs/adr/0049-a-bounded-store-answers-with-the-word-it-stored.md. It is an
+;; docs/adr/0051-a-bounded-store-answers-with-the-word-it-stored.md. It is an
 ;; AUDIT, not a gate: it takes the directory to read as an argument, it lives
 ;; outside this repository's tree, and nothing here runs it in CI. A check
 ;; whose input is not in the tree it is attached to cannot be green or red for
