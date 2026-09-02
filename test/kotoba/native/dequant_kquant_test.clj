@@ -446,3 +446,53 @@
       (finally (alter-var-root var (constantly table)))))
   (testing "and the other direction: with the table restored it emits again"
     (is (pos? (count (code 'kernel-dequant-dot-q8-0))))))
+
+;; ---------------------------------------------------------------------------
+;; 5. the codebook family: declared here, refused here
+;; ---------------------------------------------------------------------------
+
+(deftest the-codebook-formats-are-refused-by-name-and-not-by-absence
+  ;; dequant-iq: IQ4_XS, IQ2_S, IQ3_XXS and IQ3_S are 306 of the Qwen3.5
+  ;; model's 866 tensors -- more than any other family. They are declared in
+  ;; kotoba-gmir, admitted by kotoba-mir, kotoba-codegen and the verifier, and
+  ;; ANSWERED BY THE ORACLE (kotoba-kir ADR 0264, element by element against
+  ;; an independent port of the C, for all four). What is missing is the
+  ;; machine code, and it is missing for a measurable reason: a code in these
+  ;; four is an INDEX INTO A TABLE of 256, 512 or 1024 entries that belongs to
+  ;; the format, and the table has to reach the machine as read-only data
+  ;; before an arm can be written.
+  ;;
+  ;; They are carried through this backend's tables anyway so that the refusal
+  ;; NAMES them. Measured 2026-09-03: with the four declared everywhere except
+  ;; kotoba-codegen, this backend answered `:non-canonical-instruction` for
+  ;; all four and said nothing about codebooks.
+  (doseq [head '[kernel-dequant-dot-iq4-xs kernel-dequant-dot-iq2-s
+                 kernel-dequant-dot-iq3-xxs kernel-dequant-dot-iq3-s]]
+    (let [thrown (try (code head) nil
+                      (catch clojure.lang.ExceptionInfo e e))
+          data (ex-data thrown)]
+      (is (some? thrown) (str head " must be refused, not emitted"))
+      (is (= :dequant-format-not-emitted (:problem data))
+          (str head " must name the reason, not fall to a general one"))
+      (is (= :mc-encode (:phase data)) (str head))
+      (is (= (keyword "x86-64" (name head)) (:encoding (:instruction data)))
+          (str head " must name WHICH format"))))
+  (testing "and the three that do have arms still emit"
+    ;; Without this the test above passes for a backend that refused all seven.
+    (doseq [head '[kernel-dequant-dot-q8-0 kernel-dequant-dot-q4-k
+                   kernel-dequant-dot-q6-k]]
+      (is (pos? (count (code head))) (str head)))))
+
+(deftest the-family-is-seven-formats-and-three-of-them-emit
+  (let [table @#'mir/x86-dequant-formats]
+    (is (= 7 (count table)))
+    (is (= 3 (count (filter :emitted? (vals table)))))
+    (testing "and every stride is distinct"
+      ;; Two formats with the same stride derive the same span from the same
+      ;; count, and one of them reads the wrong bytes without tripping any
+      ;; length check.
+      (is (= 7 (count (distinct (map :block-bytes (vals table)))))))
+    (testing "every block is a whole number of eight-element groups"
+      ;; What makes the tail impossible, for all seven.
+      (doseq [[encoding {:keys [block-elements]}] table]
+        (is (zero? (mod block-elements 8)) (str encoding))))))
