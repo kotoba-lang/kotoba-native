@@ -34,7 +34,7 @@
   `test/fixtures/store-answer-qemu.kotoba` on a real x86-64 CPU under QEMU and
   reads the console it wrote.
 
-  Decided by docs/adr/0046-a-bounded-store-answers-with-the-word-it-stored.md."
+  Decided by docs/adr/0049-a-bounded-store-answers-with-the-word-it-stored.md."
   (:require [clojure.test :refer [deftest is testing]]
             [kotoba.native.machine-ir :as machine]))
 
