@@ -594,6 +594,12 @@
    {:arity 5 :symbol "kotoba_aiueos_rtl8125_program"}
    'aiueos-rtl8125-tx-submit
    {:arity 5 :symbol "kotoba_aiueos_rtl8125_tx_submit"}
+   ;; fuel64: a probe, and deliberately not a workload. Arity 1: the caller
+   ;; hands it how much fuel to spend, so one object serves both a cheap
+   ;; discriminating run (a spend between the truncated low word and the real
+   ;; tier) and a long one that walks past 2^31. See aiueos ADR-0195.
+   'aiueos-fuel-wide-probe
+   {:arity 1 :symbol "kotoba_aiueos_fuel_wide_probe"}
    'aiueos-rtl8125-rx-poll
    {:arity 2 :symbol "kotoba_aiueos_rtl8125_rx_poll"}})
 
@@ -619,6 +625,78 @@
 
 (defn- le [n width]
   (object-elf/little-endian n width))
+
+
+;; fuel64: the per-call budget an object's wrapper writes, and the two forms it
+;; can write it in.
+;;
+;; THE CONTEXT FIELD WAS NEVER 32 BITS. `kexe_context_v4`'s `fuel` is a
+;; `uint64_t`, the charge is `cmp qword [r9+8],0` / `dec qword [r9+8]`, and the
+;; IMAGE route has always written the word as eight data bytes
+;; (`(le (artifact-fuel artifact) 8)`). The 2,147,483,647 ceiling quoted
+;; everywhere -- aiueos ADR-0142's reason for the 1 MiB `sha256-region` window,
+;; and QWEN-KERNELS-2's reason `evaluate_token` cannot be one object -- was
+;; THIS INSTRUCTION and nothing else: `mov qword [r9+8], imm32` (REX.W C7 /0)
+;; carries a 32-bit immediate that the CPU sign-extends, so 0x7fffffff is the
+;; largest budget it can put in a qword.
+;;
+;; Two forms, chosen by the tier and by nothing else, so no shipped object's
+;; bytes move:
+;;
+;;   fuel <= 2147483647   49 c7 41 08 <imm32>      mov qword [r9+8],imm32   8 B
+;;   fuel >  2147483647   49 ba <imm64>            movabs r10,imm64        10 B
+;;                        4d 89 51 08              mov [r9+8],r10           4 B
+;;
+;; r10 rather than a saved register, and the reason is that the wrapper runs
+;; BEFORE the call: the only live values at that point are the SysV argument
+;; registers rdi/rsi/rdx/rcx/r8, which pass straight through (this is why an
+;; object's arity ceiling is five and not six -- r9 is spent on the context),
+;; and r9 itself, which the `lea` two instructions earlier has just loaded.
+;; r10 and r11 are caller-saved in SysV and carry no argument; the callee's own
+;; prologue (`fuel-charge-tokens`, then the parameter pushes) writes both before
+;; it reads either. Confirmed by reading the entry contract rather than assumed:
+;; `kotoba.native.x86-64/emit-function` refuses a sixth parameter by name.
+;;
+;; THE NARROW FORM'S CEILING IS SIGNED, NOT UNSIGNED, and the encoder will not
+;; say so. `kotoba.object.elf64/little-endian` at width 4 admits anything below
+;; 2^32, so a tier of 3,000,000,000 would encode without complaint and land in
+;; the context as -1,294,967,296. `cmp qword [r9+8],0` reads that as "has fuel"
+;; and `dec` walks it FURTHER from zero: the object would never trap on fuel
+;; again. That is why the split below tests `<= 2147483647` rather than
+;; deferring to what the encoder happens to accept.
+
+(def max-object-fuel
+  "The largest per-call budget this packager will write into an object.
+
+  DECIDED IN `kotoba.kir` (`max-fuel`) and restated here rather than required.
+  This namespace does not depend on the interpreter and should not start: the
+  JVM-free packaging path (`kotoba.compiler.nbb.native-package`) would load the
+  whole evaluator for one integer. The two literals are compared where both are
+  actually on one classpath, which is amu -- see its
+  `the-object-tier-ceiling-is-the-interpreters-ceiling` test.
+
+  2^53-1, not the 2^63-1 the instruction and the qword could carry. A budget
+  has to be counted DOWN by every runtime that counts it, and one of those --
+  the KIR oracle on Node, whose counter is a JavaScript double -- stops being
+  exact there. Measured 2026-09-03: at 9,007,199,254,740,996 (2^53+4) the
+  expression `x - 1 === x` is already true, and from 2^54 up it is true of
+  every value. A budget above this line is one the oracle would never see
+  reach zero, so it would answer `:ok` for a program that does not terminate.
+  That is the single answer a fuel bound exists to prevent, so the ceiling is
+  set where both counters are still exact rather than where the wider of them
+  stops."
+  9007199254740991)
+
+(defn- replenish-bytes
+  "The `mov` an object's wrapper uses to replenish its own fuel word."
+  [fuel]
+  (when-not (and (integer? fuel) (pos? fuel) (<= fuel max-object-fuel))
+    (throw (ex-info "kernel object fuel tier is outside the admitted range"
+                    {:reason :object-fuel-tier-outside-admitted-range
+                     :fuel fuel :maximum max-object-fuel})))
+  (if (<= fuel 2147483647)
+    (vec (concat [0x49 0xc7 0x41 0x08] (le fuel 4)))
+    (vec (concat [0x49 0xba] (le fuel 8) [0x4d 0x89 0x51 0x08]))))
 
 (defn- padded [bytes size]
   (object-elf/pad-to bytes size))
@@ -1582,6 +1660,13 @@
           ;; aiueos's own gate, so the bound is at least tested at its worst.
           dhcp-fuel? (contains? '#{aiueos-dhcp-reply-valid aiueos-dhcp-option-u32}
                                 object-entry)
+          ;; fuel64: the wide-form probe. See its tier below and aiueos
+          ;; ADR-0195. It is the only object in the table whose budget does not
+          ;; fit `mov qword [r9+8], imm32`, and it is here so that the wide
+          ;; encoding is exercised by the production packager on every build
+          ;; rather than only by a unit test -- a second encoding that only a
+          ;; test ever reaches is a second encoding nobody has shipped.
+          fuel-wide-probe? (= 'aiueos-fuel-wide-probe object-entry)
           high-fuel? (contains? '#{aiueos-user-object-journal-build
                                     aiueos-user-object-journal-valid
                                     aiueos-ipv4-checksum
@@ -1639,34 +1724,55 @@
           ;; net-arp-reply-valid on frame 86, and SERVICE-REGISTRY-BUILD ON ITS
           ;; FOURTH CALL -- three service-registry journal writes per boot, and
           ;; the fourth `ud2`s partway through leaving the sector half written.
-          replenish (cond
-                      ecdsa-fuel? [0x49 0xc7 0x41 0x08 0xff 0xff 0xff 0x7f] ; 2,147,483,647
-                      aead-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000
-                      hkdf-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
-                      device-client-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x01 0x00] ; 65,536
-                      device-parse-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
-                      sha-region-fuel? [0x49 0xc7 0x41 0x08 0xff 0xff 0xff 0x7f] ; 2,147,483,647 (8.8x)
-                      sha-stream-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x04 0x00] ; 262,144 (8.7x)
-                      device-digest-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000 (7.9x)
-                      rtl8125-program-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
-                      qwen-metadata-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000
-                      qwen-tensor-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
-                      qwen-dot-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x40 0x00] ; 4,194,304 (21x)
-                      qwen-dequant-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x00 0x01] ; 16,777,216 (13x)
-                      qwen-matvec-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000 (3.8x)
-                      qwen-activation-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x00 0x01] ; 16,777,216 (12x)
-                      qwen-norm-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000 (9x)
-                      qwen-attention-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x00 0x02] ; 33,554,432 (12.7x)
-                      qwen-recurrent-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x40 0x00] ; 4,194,304 (10.9x)
-                      qwen-index-fuel? [0x49 0xc7 0x41 0x08 0xff 0xff 0xff 0x7f] ; 2,147,483,647
-                      qwen-tokenize-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000
-                      qwen-detokenize-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
-                      rsa-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000
-                      sha-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
-                      context-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x01 0x00] ; 65,536
-                      dhcp-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x01 0x00] ; 65,536
-                      high-fuel? [0x49 0xc7 0x41 0x08 0x00 0x10 0x00 0x00] ; 4096
-                      :else [0x49 0xc7 0x41 0x08 0x00 0x04 0x00 0x00]) ; 1024
+          ;; fuel64: TIERS ARE NUMBERS NOW, NOT BYTES. They were hand-encoded
+          ;; `mov qword [r9+8], imm32` vectors with the decimal value in a
+          ;; trailing comment -- which is how a ceiling nobody chose became a
+          ;; ceiling everybody quoted: the largest number expressible in that
+          ;; hand-written shape is 0x7fffffff, and two ADRs (aiueos ADR-0142's
+          ;; 1 MiB region window, QWEN-KERNELS-2's "evaluate_token cannot be
+          ;; one object") reasoned from it as though it were the ABI.
+          ;; `replenish-bytes` picks the encoding; the number below stays the
+          ;; measurement it always was, and every number here still fits the
+          ;; 8-byte narrow form, so no shipped object's bytes move.
+          replenish (replenish-bytes
+                     (cond
+                       ecdsa-fuel? 2147483647
+                       aead-fuel? 250000000
+                       hkdf-fuel? 10000000
+                       device-client-fuel? 65536
+                       device-parse-fuel? 10000000
+                       sha-region-fuel? 2147483647    ; 8.8x
+                       sha-stream-fuel? 262144        ; 8.7x
+                       device-digest-fuel? 250000000  ; 7.9x
+                       rtl8125-program-fuel? 10000000
+                       qwen-metadata-fuel? 250000000
+                       qwen-tensor-fuel? 10000000
+                       qwen-dot-fuel? 4194304         ; 21x
+                       qwen-dequant-fuel? 16777216    ; 13x
+                       qwen-matvec-fuel? 250000000    ; 3.8x
+                       qwen-activation-fuel? 16777216 ; 12x
+                       qwen-norm-fuel? 250000000      ; 9x
+                       qwen-attention-fuel? 33554432  ; 12.7x
+                       qwen-recurrent-fuel? 4194304   ; 10.9x
+                       qwen-index-fuel? 2147483647
+                       qwen-tokenize-fuel? 250000000
+                       qwen-detokenize-fuel? 10000000
+                       rsa-fuel? 250000000
+                       sha-fuel? 10000000
+                       context-fuel? 65536
+                       dhcp-fuel? 65536
+                       ;; fuel64: THE ONE OBJECT ABOVE THE OLD CEILING. A
+                       ;; deliberate probe, not a workload -- it exists so the
+                       ;; wide form is reachable in production rather than only
+                       ;; from a test, and so a machine can be asked whether a
+                       ;; budget past 2^31 is honoured. Its low 32 bits are
+                       ;; 5,032,704, which is what a truncating encoder would
+                       ;; have written; the probe is called with a spend
+                       ;; between the two, so truncation traps and the wide
+                       ;; form returns.
+                       fuel-wide-probe? 4300000000
+                       high-fuel? 4096
+                       :else 1024))
           ;; isr: an entry object's public symbol IS the interrupt entry, so
           ;; it replaces the SysV wrapper rather than sitting beside it. The
           ;; shape a linked object has to satisfy is unchanged -- one
