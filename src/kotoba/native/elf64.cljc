@@ -1312,20 +1312,23 @@
           qwen-activation-fuel? (= 'aiueos-qwen35-activation object-entry)
           qwen-norm-fuel? (= 'aiueos-qwen35-norm object-entry)
           ;; The third Qwen tranche. MEASURED by bisection in the `kotoba.kir`
-          ;; interpreter at two geometries and extrapolated to the K16 one,
-          ;; the same method as the first two tranches -- and, like the second,
-          ;; with the earlier tranches' hardware returns behind it.
+          ;; interpreter and extrapolated to the ceiling each object ADMITS --
+          ;; not to the geometry K16 passes, because a tier is a per-call
+          ;; budget and a caller may legally ask for the ceiling.
           ;;
-          ;;   attention        mode 1 at 24 heads x 256 wide x 8 positions is
-          ;;                    the worst case: 24 x (8 scores of 256 binary64
-          ;;                    products + 8 x 256 weighted adds + 256
-          ;;                    sigmoids). ~2,800 per head-position and ~62,000
-          ;;                    per head -> ~1,500,000, against a tier chosen
-          ;;                    for the ceiling the object ADMITS (64 heads,
-          ;;                    256 wide, 8 positions), not the geometry K16
-          ;;                    passes.
-          ;;   recurrent-step   three passes over d*d cells at d <= 128:
-          ;;                    ~35 per cell x 3 x 16,384 -> ~1,800,000.
+          ;;   attention       two positions measured at 2 heads, 256 wide:
+          ;;                   29,991 at position 1 and 47,539 at position 3,
+          ;;                   so 4,387 per head-prior and 6,221 per head
+          ;;                   fixed. Head scaling is linear BY CONSTRUCTION
+          ;;                   (one pass per head, no cross-head state), so
+          ;;                   the admitted ceiling of 64 heads x 8 priors is
+          ;;                   64 * (6,221 + 8 * 4,387) = 2,644,288.
+          ;;                   Tier 33,554,432 is 12.7x that.
+          ;;   recurrent-step  three dimensions measured: 1,762 at d=8, 6,721
+          ;;                   at d=16, 25,414 at d=32. The fit is
+          ;;                   22.85 d^2 + 71.5 d - 272, which at the admitted
+          ;;                   ceiling d=128 is 383,254. Tier 4,194,304 is
+          ;;                   10.9x that.
           ;;
           ;; Two arms, so that re-measuring one cannot silently move the other.
           qwen-attention-fuel? (= 'aiueos-qwen35-attention object-entry)
@@ -1469,8 +1472,8 @@
                       qwen-matvec-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000 (3.8x)
                       qwen-activation-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x00 0x01] ; 16,777,216 (12x)
                       qwen-norm-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000 (9x)
-                      qwen-attention-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000
-                      qwen-recurrent-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x00 0x04] ; 67,108,864
+                      qwen-attention-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x00 0x02] ; 33,554,432 (12.7x)
+                      qwen-recurrent-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x40 0x00] ; 4,194,304 (10.9x)
                       qwen-index-fuel? [0x49 0xc7 0x41 0x08 0xff 0xff 0xff 0x7f] ; 2,147,483,647
                       qwen-tokenize-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000
                       qwen-detokenize-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
