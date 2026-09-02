@@ -215,6 +215,19 @@ That is the whole claim this fixture makes and it is the one the encodings
 cannot make: the CPU entered a byte sequence this compiler generated, and the
 sequence called a Kotoba function with the frame the CPU had built.
 
+**Shown to discriminate.** Rebuilding the same fixture with the body comparing
+its first argument against 7 instead of 6 changed the console to `DXSRP...` --
+`X` where `I` was, and `S`, `R` and `P` unchanged. The letter that moved is the
+letter the break targeted, and the runner refuses on the console mismatch.
+
+**One thing that run did that is NOT explained here.** The broken image
+repeated `XSRP` about sixty-six times before exiting, where the correct one
+printed its five letters once and stopped. The body's last expression is the
+exit-port write in both, so the correct image exits on its first interrupt and
+the broken one evidently did not until much later. No explanation is offered
+because none was measured; it is recorded rather than smoothed over, and it
+does not bear on the green result, whose console and exit status are exact.
+
 ## A defect this fixture found, in code that is not this change
 
 **A bounded store's answer is an undefined register on the machine.**
@@ -248,7 +261,7 @@ stronger claim: it says the byte reached memory, which is what an IDT needs.
 
 ## Evidence
 
-`clojure -M:test`: 294 tests, 4033 assertions, 0 failures.
+`clojure -M:test`: 302 tests, 4096 assertions, 0 failures (after merging origin/main).
 
 Five deliberate breaks, each producing the failure it names and no other:
 
