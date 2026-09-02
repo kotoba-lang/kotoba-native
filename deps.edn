@@ -5,7 +5,7 @@
          :git/sha "136a62e0ad93585c5ecfa6755c82aa4ac2637e14"}
         io.github.kotoba-lang/kotoba-gmir
         {:git/url "https://github.com/kotoba-lang/kotoba-gmir.git"
-         :git/sha "682a0d50e8fe0957ada1e1808a2cf2f54da16966"}
+         :git/sha "4a88b8982d6f920e3f6aadce7fa1ca69e2c53254"}
         ;; kotoba-mir 4bf67c0: call+loop uses the scanner (:call-live), the
         ;; conservative fallback colors frame slots from CFG liveness, and
         ;; pure integer SSA segments are scheduled per basic block after physical
@@ -35,10 +35,10 @@
         ;; the dead-quotient-save elision below it.
         io.github.kotoba-lang/kotoba-mir
         {:git/url "https://github.com/kotoba-lang/kotoba-mir.git"
-         :git/sha "9b3a42edd6ade854f2a46eb81617199b91bf94af"}
+         :git/sha "360128eda25a4f89190a745f484e9c0f813a0e67"}
         io.github.kotoba-lang/kotoba-codegen
         {:git/url "https://github.com/kotoba-lang/kotoba-codegen.git"
-         :git/sha "54a3f3b1c335cae69b7ac15744831c0a2c8ddd7c"}
+         :git/sha "105181684af6d977eeea847f629765fe29978623"}
         io.github.kotoba-lang/kotoba-object
         {:git/url "https://github.com/kotoba-lang/kotoba-object.git"
          :git/sha "eb460265e15743b85a37f4432277173ad5cedc06"}

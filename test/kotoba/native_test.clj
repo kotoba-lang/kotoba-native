@@ -96,6 +96,39 @@
       (is (contains-bytes? x86-code [0xf2 0x0f 0x58 0xc1]))
       (is (contains-bytes? arm-code [0x00 0x28 0x61 0x1e])))))
 
+(deftest f32-production-slice-routes-through-machine-ir
+  (let [binary-forms
+        {'f32-add '(f32-add (f32-from-bits 1065353216)
+                            (f32-from-bits 1073741824))
+         'f32-sub '(f32-sub 1 2) 'f32-mul '(f32-mul 1 2)
+         'f32-div '(f32-div 1 2) 'f32-min '(f32-min 1 2)
+         'f32-max '(f32-max 1 2) 'f32-eq '(f32-eq 1 2)
+         'f32-lt '(f32-lt 1 2) 'f32-le '(f32-le 1 2)
+         'f32-gt '(f32-gt 1 2) 'f32-ge '(f32-ge 1 2)
+         'f32-unordered '(f32-unordered 1 2)}
+        unary-forms {'f32-from-bits '(f32-from-bits 1)
+                     'f32-to-bits '(f32-to-bits 1)
+                     'f32-abs '(f32-abs 1) 'f32-neg '(f32-neg 1)
+                     'f32-sqrt '(f32-sqrt 1)}]
+    (doseq [[op form] (concat binary-forms unary-forms)]
+      (is (machine/pilot-expression? [] form) (str op))
+      (is (seq (machine/compile-expression :x86-64 [] form)) (str op " x86"))
+      (is (seq (machine/compile-expression :aarch64 [] form)) (str op " arm")))
+    (let [gmir (machine/lower-kir-expression []
+                 '(f32-sqrt (f32-add (f32-from-bits 1065353216)
+                                     (f32-from-bits 1073741824))))
+          ops (mapv :gmir/op (:gmir/instructions gmir))
+          x86-code (machine/compile-expression :x86-64 []
+                     '(f32-add (f32-from-bits 1065353216)
+                               (f32-from-bits 1073741824)))
+          arm-code (machine/compile-expression :aarch64 []
+                     '(f32-add (f32-from-bits 1065353216)
+                               (f32-from-bits 1073741824)))]
+      (is (some #{:gmir/f32-add} ops))
+      (is (some #{:gmir/f32-sqrt} ops))
+      (is (contains-bytes? x86-code [0xf3 0x0f 0x58 0xc1]))
+      (is (contains-bytes? arm-code [0x00 0x28 0x20 0x1e])))))
+
 ;; ── f64 scalar ops (ADR-2608030300 stage 1) ──────────────────────────────
 ;;
 ;; Encodings are asserted against what `clang -target arm64-apple-macos`
