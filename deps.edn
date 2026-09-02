@@ -2,10 +2,10 @@
  :deps {org.clojure/clojure {:mvn/version "1.12.0"}
         io.github.kotoba-lang/kotoba-kir
         {:git/url "https://github.com/kotoba-lang/kotoba-kir.git"
-         :git/sha "f2783bfd6df28d59a4a630a1f512dda44b3db1c1"}
+         :git/sha "c4149fb120ece017ce87d0ef5e40547a2e6f3ee3"}
         io.github.kotoba-lang/kotoba-gmir
         {:git/url "https://github.com/kotoba-lang/kotoba-gmir.git"
-         :git/sha "2495036d40a20a283d789266922aedcc41473102"}
+         :git/sha "fe238166e932c29700f3f447701e1f9893aedce1"}
         ;; kotoba-mir 4bf67c0: call+loop uses the scanner (:call-live), the
         ;; conservative fallback colors frame slots from CFG liveness, and
         ;; pure integer SSA segments are scheduled per basic block after physical
@@ -33,9 +33,15 @@
         ;; superseded allocate-call-live is deleted.
         ;; 4a75623 steers quotient-leaf values away from RAX/RDX, arming
         ;; the dead-quotient-save elision below it.
+        ;; e266a86: the parallel copy's cycle-breaking temporary is carried
+        ;; into the body only when something reserved it. Carried unreserved it
+        ;; named the slot the body's first spill was then handed, and the next
+        ;; cycle break stored over a live value -- measured on aiueos
+        ;; hkdf-sha256.kotoba, whose `hmac-mode` passed the literal 92 as its
+        ;; own context pointer (kotoba-mir ADR-0017).
         io.github.kotoba-lang/kotoba-mir
         {:git/url "https://github.com/kotoba-lang/kotoba-mir.git"
-         :git/sha "f588a256dc0e11548b4eacdfa8c703d3d44cd9b8"}
+         :git/sha "e266a862a4b3c83013e3bd3995080ac3230503fd"}
         io.github.kotoba-lang/kotoba-codegen
         {:git/url "https://github.com/kotoba-lang/kotoba-codegen.git"
          :git/sha "2887671d0b99daf9076e1acbd623f144313f8459"}

@@ -3869,3 +3869,35 @@
                                                 (list 'f64-from-bits 2)))))]
       (is (byte-run? (emit 'f64-min) [0x00 0x58 0x61 0x1e]) "fmin d0, d0, d1")
       (is (byte-run? (emit 'f64-max) [0x00 0x48 0x61 0x1e]) "fmax d0, d0, d1"))))
+
+(deftest dot-f32-keeps-the-definitions-of-its-literal-operands
+  ;; A caller with fixed-size regions writes `(kernel-dot-f32 a 48 b 48 12)`,
+  ;; and three of those five operands are literals. `dce-gmir` drops a
+  ;; `:gmir/constant` whose dst appears in no SOURCE position, and the source
+  ;; positions are a hand-written list of keys -- so two of the three lost
+  ;; their definitions and the operation kept reading the vregs.
+  ;;
+  ;; The one that survived did so only because `:gmir/length` was already in
+  ;; that list, which is why the shape with all five operands as parameters
+  ;; compiled cleanly and this one did not. Exactly the defect the sysops
+  ;; stream recorded for `:gmir/expected`, one stream later.
+  ;;
+  ;; Asserted on the GMIR rather than on the emitted bytes: the failure
+  ;; surfaces only in the CONSERVATIVE allocator, so a program under less
+  ;; register pressure reaches an allocator with an undefined operand instead
+  ;; of a rejection.
+  (let [gmir (#'machine/lower-kir-expression
+              '[a b] '(kernel-dot-f32 a 48 b 48 12))
+        instructions (:gmir/instructions gmir)
+        defined (set (keep :gmir/dst instructions))
+        dot (first (filter #(= :gmir/kernel-dot-f32 (:gmir/op %)) instructions))]
+    (is (some? dot) "SCANNED dot instruction")
+    (doseq [key [:gmir/base :gmir/length :gmir/second-base
+                 :gmir/second-length :gmir/count]]
+      (is (contains? defined (get dot key))
+          (str key " is read by the operation and must be defined before it)")))
+    (testing "and the whole program still reaches bytes"
+      (is (pos? (count (:code (x86/emit-program
+                               {:format :kotoba.kir/v4 :exports ['main]
+                                :functions [{:name 'main :params '[a b]
+                                             :body '(kernel-dot-f32 a 48 b 48 12)}]}))))))))
