@@ -1,6 +1,7 @@
 (ns kotoba.native.elf64
   (:require [clojure.string :as str]
             [kotoba.artifact.core :as artifact]
+            [kotoba.native.interrupt-abi :as interrupt-abi]
             [kotoba.object.elf64 :as object-elf]))
 
 (def ^:private kernel-target :x86_64-aiueos-kernel-v1)
@@ -30,6 +31,57 @@
 (def ^:private live-syscall-shim-size 192)
 (def ^:private user-context-size 88)
 (def ^:private user-image-base 0x1e0000)
+
+(defn- align16 [n] (* 16 (quot (+ n 15) 16)))
+
+;; isr: the toolchain-generated interrupt entries an image carries.
+;;
+;; `interrupt-entry-exports` answers vector -> export for every `aiueos-isr-*`
+;; export, and REFUSES a name that reads as an entry and is not one. There is
+;; no third answer: a name in that shape either denotes a vector this packager
+;; will lay an entry down for, or it is a mistake that would otherwise compile
+;; into a function nothing can ever reach.
+(defn- interrupt-entry-exports [artifact]
+  (let [named (->> (keys (:exports artifact))
+                   (filter #(str/starts-with? (name %)
+                                              interrupt-abi/entry-prefix)))
+        malformed (remove interrupt-abi/entry-vector named)]
+    (when (seq malformed)
+      (throw (ex-info "Kotoba kernel interrupt entry name does not denote a vector"
+                      {:reason :isr-name-not-a-vector
+                       :names (vec (sort malformed))
+                       :vector-limit interrupt-abi/vector-limit})))
+    (into {} (map (fn [n] [(interrupt-abi/entry-vector n)
+                           (get-in artifact [:exports n])]))
+          named)))
+
+;; isr: does the function `entry` reach `kernel-isr-entry-address`?
+;;
+;; Reachability and not mere presence, because an OBJECT has exactly one
+;; public symbol: code the object's entry cannot reach can never execute
+;; there, and the same compile produces both an image and an object (amu's
+;; `compile-source*` calls both packagers). A kernel image's `main` builds an
+;; IDT and so uses the operation; the entry bodies it installs do not, and
+;; refusing their object because a sibling function used it would refuse the
+;; object route to every image that has one.
+(defn- reaches-isr-address? [artifact entry]
+  (let [functions (get-in artifact [:program :functions])
+        by-name (into {} (map (juxt :name identity)) functions)
+        heads (fn [name]
+                (->> (tree-seq coll? seq (:body (get by-name name)))
+                     (filter seq?) (map first) (filter symbol?)))]
+    (loop [seen #{} queue [entry]]
+      (if-let [n (first queue)]
+        (cond
+          (contains? seen n) (recur seen (rest queue))
+          (nil? (get by-name n)) (recur (conj seen n) (rest queue))
+          :else
+          (let [called (heads n)]
+            (if (some #(= 'kernel-isr-entry-address %) called)
+              true
+              (recur (conj seen n)
+                     (concat (rest queue) (filter by-name called))))))
+        false))))
 
 (defn- kernel-data-offset-for [text-size]
   (max minimum-kernel-data-offset
@@ -290,6 +342,29 @@
    ;; narrowing checked -- the caller has already been told where it starts.
    'aiueos-qwen35-tensor-table-bind
    {:arity 5 :symbol "kotoba_aiueos_qwen35_tensor_table_bind"}
+   ;; The tokenizer beside them. The three admission objects above answer
+   ;; "is this the file" without ever reading a token STRING; these three read
+   ;; the two arrays those coordinates name -- 248,320 vocabulary entries and
+   ;; 247,587 merge rules -- and turn text into token ids and back.
+   ;;
+   ;; Three rather than one for the same reason as above: one exported symbol
+   ;; per object, no cross-object calls. The split follows the cost. The index
+   ;; is built ONCE per boot and costs a walk of both arrays; tokenize and
+   ;; detokenize then run per prompt and per emitted token against tables that
+   ;; are already there. Folding the build into the tokenizer would pay 4.7 MB
+   ;; of string walking on every prompt.
+   ;;
+   ;; None of the three copies the vocabulary. The index holds a 4-byte file
+   ;; offset per id and the strings stay in the model mapping, so an object
+   ;; that needs the bytes of token 173,092 reads them where the GGUF put them.
+   ;; Same reason-code convention: zero admits, negative refuses, and neither
+   ;; tokenize nor detokenize returns a count.
+   'aiueos-qwen35-vocab-index-build
+   {:arity 4 :symbol "kotoba_aiueos_qwen35_vocab_index_build"}
+   'aiueos-qwen35-tokenize
+   {:arity 4 :symbol "kotoba_aiueos_qwen35_tokenize"}
+   'aiueos-qwen35-detokenize
+   {:arity 4 :symbol "kotoba_aiueos_qwen35_detokenize"}
    ;; The TLS 1.3 record layer (RFC 8446 5.2), which is `aiueos-aes128-gcm`
    ;; plus the framing that decides what the AEAD is applied TO. It replaces
    ;; `protect` and `unprotect` in aiueos `kernel/tls13.c`. The framing is
@@ -376,7 +451,7 @@
      (bit-and (quot base 281474976710656) 255)
      (bit-and (quot base 72057594037927936) 255) 0 0 0 0]))
 
-(defn- kernel-runtime-data [fuel context-address]
+(defn- kernel-runtime-data [fuel context-address isr-base]
   (let [gdt-address (+ context-address kernel-gdt-offset)
         tss-address (+ context-address kernel-tss-offset)
         stack-top (+ context-address kernel-runtime-data-size)
@@ -398,7 +473,44 @@
         (into gdtr)
         (padded kernel-tss-offset)
         (into tss)
+        ;; isr: the base of the interrupt entry region, which is what
+        ;; `kernel-isr-entry-address` loads. Zero when the image declares no
+        ;; entry -- and zero is the right answer there rather than an omission,
+        ;; because an image with no entries has no region, and a guest that
+        ;; asks anyway gets an address of `vector * 128` in the first page,
+        ;; which is unmapped. It faults instead of jumping into the image.
+        (padded interrupt-abi/context-entry-base-offset)
+        (into (le (or isr-base 0) 8))
         (padded kernel-runtime-data-size))))
+
+;; isr: the entry region an image lays down -- one fixed-size slot per vector
+;; in the table, whether or not a body exists for it, because
+;; `kernel-isr-entry-address` finds a slot by MULTIPLYING rather than by
+;; consulting a table.
+;;
+;; `isr-base` is where the region starts, `artifact-address` where the
+;; compiled code starts, `exports` the vector -> export map.
+(defn- interrupt-entry-region [isr-base artifact-address context-address exports]
+  (vec (mapcat
+        (fn [vector]
+          (if-let [export (get exports vector)]
+            (let [address (+ isr-base (* vector interrupt-abi/entry-stride))
+                  ctx-field (+ address (interrupt-abi/context-displacement-offset vector))
+                  call-field (+ address (interrupt-abi/call-displacement-offset vector))
+                  bytes (interrupt-abi/entry-bytes
+                         {:vector vector
+                          :fuel interrupt-abi/entry-fuel
+                          :context-displacement (- context-address (+ ctx-field 4))
+                          :call-displacement (- (+ artifact-address (:offset export))
+                                                (+ call-field 4))})]
+              (when-not (= interrupt-abi/body-arity (:arity export))
+                (throw (ex-info "Kotoba interrupt entry body has an invalid SysV arity"
+                                {:reason :isr-body-arity
+                                 :vector vector :arity (:arity export)
+                                 :expected interrupt-abi/body-arity})))
+              (into bytes (repeat (- interrupt-abi/entry-stride (count bytes)) 0xcc)))
+            interrupt-abi/absent-entry-bytes))
+        (range interrupt-abi/vector-limit))))
 
 (defn- entry-shim [main-address context-address syscall-address]
   ;; Enter on an image-owned 64 KiB stack, install the closed GDT/TSS, reload
@@ -565,7 +677,18 @@
           syscall-size (if live? live-syscall-shim-size 0)
           prefix-size (+ boot-size syscall-size)
           artifact-address (+ entry-address prefix-size)
-          data-offset (kernel-data-offset-for (+ prefix-size (count (:code artifact))))
+          ;; isr: the entry region follows the compiled code, so nothing above
+          ;; it moves and an image that declares no entry is byte-identical to
+          ;; what it was. Its size is the WHOLE table, not the number of
+          ;; bodies: `kernel-isr-entry-address` finds a slot by multiplying,
+          ;; so a slot has to exist for every vector the table admits.
+          isr-exports (interrupt-entry-exports artifact)
+          isr-offset (align16 (+ prefix-size (count (:code artifact))))
+          isr-region-size (if (seq isr-exports)
+                            (* interrupt-abi/vector-limit interrupt-abi/entry-stride)
+                            0)
+          isr-base (when (seq isr-exports) (+ entry-address isr-offset))
+          data-offset (kernel-data-offset-for (+ isr-offset isr-region-size))
           context-address (+ image-base data-offset)
           syscall-address (when live? (+ entry-address boot-size))
           boot (entry-shim (+ artifact-address (:offset export))
@@ -575,8 +698,16 @@
                      syscall-address context-address
                      (+ artifact-address (:offset planner))
                      (+ artifact-address (:offset runtime-entry))))
-          text (vec (concat boot syscall (:code artifact)))
-          context (kernel-runtime-data (artifact-fuel artifact) context-address)
+          isr-region (when isr-base
+                       (interrupt-entry-region isr-base artifact-address
+                                               context-address isr-exports))
+          text (vec (concat boot syscall (:code artifact)
+                            (repeat (- isr-offset prefix-size
+                                       (count (:code artifact)))
+                                    0xcc)
+                            isr-region))
+          context (kernel-runtime-data (artifact-fuel artifact) context-address
+                                       isr-base)
           names (mapv int (.getBytes "\u0000.text\u0000.data\u0000.shstrtab\u0000" "UTF-8"))
           names-offset (+ data-offset kernel-runtime-data-size)
           section-offset (+ names-offset (count names)
@@ -600,6 +731,15 @@
        :entry-address entry-address
        :syscall-entry-address syscall-address
        :value-runtime-live? live?
+       ;; isr: the manifest half. A caller that wants to check what the image
+       ;; installed, or to build an IDT outside it, reads these rather than
+       ;; recomputing the layout.
+       :interrupt-entry-base isr-base
+       :interrupt-entry-stride interrupt-abi/entry-stride
+       :interrupt-entries (into (sorted-map)
+                                (map (fn [[v _]]
+                                       [v (+ isr-base (* v interrupt-abi/entry-stride))]))
+                                isr-exports)
        :sections [:text :data :shstrtab]
        :imports []
        :interpreter nil
@@ -769,9 +909,39 @@
     (throw (ex-info "ELF64 kernel object packaging requires a freestanding profile"
                     {:target-profile (:target-profile artifact)})))
   (let [source-entry (get-in artifact [:program :entry])
-        object-entry (or (some #(when (contains? (:exports artifact) %) %)
+        ;; isr: an interrupt entry claims the object's one public symbol
+        ;; before the table does. A source that declares one is an entry
+        ;; object -- the C IDT builder in the transitional image installs
+        ;; `kotoba_aiueos_isr_<vector>` directly -- and an object has exactly
+        ;; one public symbol, so two entries in one source have no answer.
+        isr-exports (interrupt-entry-exports artifact)
+        _ (when (< 1 (count isr-exports))
+            (throw (ex-info "Kotoba kernel object declares more than one interrupt entry"
+                            {:reason :isr-object-has-one-entry
+                             :vectors (vec (sort (keys isr-exports)))})))
+        isr-vector (first (keys isr-exports))
+        object-entry (or (when isr-vector (interrupt-abi/entry-name isr-vector))
+                         (some #(when (contains? (:exports artifact) %) %)
                                (keys kernel-object-entries))
                          source-entry)
+        ;; isr: `kernel-isr-entry-address` has no answer in this route, and
+        ;; the refusal is scoped to what this object can REACH from its one
+        ;; public symbol. The entry region and the context slot that names it
+        ;; belong to the bootable image; an object's context is its own
+        ;; private 80 bytes, and offset 0x148 is past the end of it. Reading
+        ;; there would answer with whatever follows the object's `.data`.
+        ;;
+        ;; Scoped rather than whole-artifact because ONE compile produces both
+        ;; forms (amu's `compile-source*` calls both packagers), and a kernel
+        ;; image's `main` uses this operation to build its IDT. Refusing the
+        ;; object because a sibling function used it would refuse the object
+        ;; route to every image that installs an entry.
+        _ (when (reaches-isr-address? artifact object-entry)
+            (throw (ex-info "kernel-isr-entry-address has no answer in the object route"
+                            {:reason :isr-address-needs-image
+                             :entry object-entry
+                             :context-slot interrupt-abi/context-entry-base-offset
+                             :object-context-size context-size})))
         export (get-in artifact [:exports object-entry])
         ;; `kernel-object-entries` is the WHOLE rule for an object's public
         ;; symbol, and it is an allowlist. A source that declares an
@@ -798,11 +968,20 @@
         ;;
         ;; Refusing is the only answer here that is not a guess, and a
         ;; colliding symbol is worse than no object: it links.
+        ;; isr: a well-formed `aiueos-isr-<vector>` is admitted by the name
+        ;; rule rather than by the table, which is what "prefix matching"
+        ;; means here -- there is no row to add per vector. A name in that
+        ;; shape that does NOT denote a vector never reaches this line:
+        ;; `interrupt-entry-exports` above has already refused it.
         unlisted-aiueos-exports (->> (keys (:exports artifact))
                                      (filter #(str/starts-with? (name %) admitted-entry-prefix))
                                      (remove kernel-object-entries)
+                                     (remove interrupt-abi/entry-vector)
                                      sort vec)
-        contract (or (get kernel-object-entries object-entry)
+        contract (or (when isr-vector
+                       {:arity interrupt-abi/body-arity
+                        :symbol (interrupt-abi/entry-symbol isr-vector)})
+                     (get kernel-object-entries object-entry)
                      (when (empty? unlisted-aiueos-exports)
                        {:arity 0 :symbol "kotoba_aiueos_probe"}))
         _ (when-not contract
@@ -933,6 +1112,40 @@
           ;; starts. A separate arm, so that measuring either one cannot
           ;; silently move the other.
           qwen-tensor-fuel? (= 'aiueos-qwen35-tensor-table-bind object-entry)
+          ;; The GPT-2 BPE index build. COMPUTED, and the computation depends
+          ;; on an argument, which is why the object refuses a model window
+          ;; above 16 MiB: every token and every merge string is hashed and
+          ;; compared byte by byte, so this object's cost is LINEAR IN THE
+          ;; WINDOW IT IS GIVEN, not in the element counts. Handed the whole
+          ;; 10.9 GiB mapping instead of the 10,996,640-byte metadata prefix
+          ;; it needs, no finite bound would hold; the object refuses that
+          ;; instead of trapping partway through.
+          ;;
+          ;; Within a 16 MiB window and the ceilings the object enforces
+          ;; (1,048,576 tokens, 1,048,576 merges): clearing both tables is
+          ;; C1 + 3*C2 <= 8,388,608 stores; the token pass is ~16 charged
+          ;; calls per id plus one FNV step per byte of the array; the merge
+          ;; pass is ~55 per rule plus two hashes and up to two comparisons
+          ;; over the same bytes. That is ~120,000,000 at the ceiling and
+          ;; ~50,000,000 for the admitted artifact. 2,147,483,647 is ~18x the
+          ;; former; it shares the ECDSA arm's constant by coincidence of
+          ;; magnitude, and is a separate arm so that measuring either one
+          ;; cannot silently move the other.
+          qwen-index-fuel? (= 'aiueos-qwen35-vocab-index-build object-entry)
+          ;; Tokenize. COMPUTED. The merge loop is quadratic in the length of
+          ;; ONE pre-tokenizer chunk -- it rescans the chunk's symbol list to
+          ;; find the lowest-rank adjacent pair, and there are as many merges
+          ;; as symbols -- so the object refuses a chunk above 512 symbols and
+          ;; an input above 32,768 bytes. Worst case is then
+          ;; 512 * 98,304 = 50,331,648 scan steps (98,304 because normalising
+          ;; invalid UTF-8 to U+FFFD can triple the byte count), plus the
+          ;; encode and the per-symbol vocabulary lookups. ~60,000,000, so
+          ;; 250,000,000 is a 4x margin.
+          qwen-tokenize-fuel? (= 'aiueos-qwen35-tokenize object-entry)
+          ;; Detokenize. COMPUTED. Bounded by the ids it is given (at most
+          ;; 32,768) and by the output capacity it refuses to exceed (at most
+          ;; 65,536 bytes), at a handful of calls each: ~1,400,000.
+          qwen-detokenize-fuel? (= 'aiueos-qwen35-detokenize object-entry)
           context-fuel? (contains? '#{aiueos-user-context-build
                                      aiueos-kernel-context-build}
                                    object-entry)
@@ -1033,21 +1246,59 @@
                       hkdf-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
                       qwen-metadata-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000
                       qwen-tensor-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
+                      qwen-index-fuel? [0x49 0xc7 0x41 0x08 0xff 0xff 0xff 0x7f] ; 2,147,483,647
+                      qwen-tokenize-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000
+                      qwen-detokenize-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
                       rsa-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000
                       sha-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
                       context-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x01 0x00] ; 65,536
                       dhcp-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x01 0x00] ; 65,536
                       high-fuel? [0x49 0xc7 0x41 0x08 0x00 0x10 0x00 0x00] ; 4096
                       :else [0x49 0xc7 0x41 0x08 0x00 0x04 0x00 0x00]) ; 1024
+          ;; isr: an entry object's public symbol IS the interrupt entry, so
+          ;; it replaces the SysV wrapper rather than sitting beside it. The
+          ;; shape a linked object has to satisfy is unchanged -- one
+          ;; R_X86_64_PC32 into its own `.data` and no imports (aiueos's
+          ;; `verify-kotoba-kernel-object.py`) -- because the entry's
+          ;; `lea r9,[rip+ ]` is that one relocation, exactly as the wrapper's
+          ;; was. Only its OFFSET within the text moves, which is why the
+          ;; relocation offset is computed from the ABI rather than written as
+          ;; the literal 3.
+          ;;
+          ;; The entry's own replenish is the ABI's per-interrupt tier and not
+          ;; the `replenish` chosen above: this symbol is entered by the CPU,
+          ;; not called by C, and its budget is per interrupt.
+          isr-prologue (when isr-vector
+                         (interrupt-abi/entry-bytes
+                          {:vector isr-vector
+                           :fuel interrupt-abi/entry-fuel
+                           :context-displacement -4
+                           :call-displacement 0}))
+          reloc-offset (if isr-vector
+                         (interrupt-abi/context-displacement-offset isr-vector)
+                         3)
           wrapper (vec (concat [0x4c 0x8d 0x0d 0 0 0 0] replenish
                                [0x48 0x83 0xec 0x08 0xe8]))
-          call-end (+ (count wrapper) 4)
-          wrapper-size (+ call-end 5)
+          call-end (if isr-vector
+                     (+ (interrupt-abi/call-displacement-offset isr-vector) 4)
+                     (+ (count wrapper) 4))
+          wrapper-size (if isr-vector
+                         (interrupt-abi/entry-size isr-vector)
+                         (+ call-end 5))
           main-offset (+ wrapper-size (:offset export))
           call-disp (- main-offset call-end)
-          text (vec (concat wrapper (le call-disp 4)
-                            [0x48 0x83 0xc4 0x08 0xc3]
-                            (:code artifact)))
+          text (vec (concat
+                     (if isr-vector
+                       ;; The call displacement is the one field the ABI could
+                       ;; not know: it depends on where this packager put the
+                       ;; body. Patch it rather than rebuild, so the bytes
+                       ;; either side are the ABI's own.
+                       (vec (concat (subvec isr-prologue 0 (- call-end 4))
+                                    (le call-disp 4)
+                                    (subvec isr-prologue call-end)))
+                       (vec (concat wrapper (le call-disp 4)
+                                    [0x48 0x83 0xc4 0x08 0xc3])))
+                     (:code artifact)))
           context (vec (concat (repeat 8 0) (le 512 8)
                                (repeat (- context-size 16) 0)))
           shstr "\u0000.text\u0000.data\u0000.rela.text\u0000.symtab\u0000.strtab\u0000.shstrtab\u0000"
@@ -1056,7 +1307,7 @@
           text-off 64
           data-off (+ text-off (count text))
           rela-off (+ data-off (count context))
-          reloc (rela 3 2 2 -4) ; R_X86_64_PC32 against section symbol .data
+          reloc (rela reloc-offset 2 2 -4) ; R_X86_64_PC32 against section symbol .data
           symtab-off (+ rela-off (count reloc))
           ;; null, local .text/.data section symbols, local source, global probe.
           ;; ELF requires every local symbol to precede the first global one.
@@ -1096,8 +1347,20 @@
        :export public-symbol
        :source-entry object-entry
        :sections [:text :data :rela.text :symtab :strtab :shstrtab]
-       :relocations [{:section :text :offset 3 :type :r-x86-64-pc32
+       :relocations [{:section :text :offset reloc-offset :type :r-x86-64-pc32
                       :symbol :data :addend -4}]
        :imports []
        :interpreter nil
+       ;; isr: provenance, not structure. aiueos's K16 pure-native gate
+       ;; classifies an object from the receipt its build writes, and its
+       ;; `:toolchain-stub` class exists for exactly this shape ("an interrupt
+       ;; entry, a context switch"). This field is what that build copies into
+       ;; the receipt's `:stub`. The object also passes the gate's ordinary
+       ;; `:kotoba-object` check unchanged -- it has Kotoba source, one global
+       ;; function whose name starts `kotoba_aiueos_`, and one PC32 relocation
+       ;; into its own `.data` -- so no aiueos change is required for it to be
+       ;; admitted; the field lets that build say what it is rather than let
+       ;; the structure imply it.
+       :stub-kind (when isr-vector :interrupt-entry)
+       :interrupt-vector isr-vector
        :bytes bytes})))

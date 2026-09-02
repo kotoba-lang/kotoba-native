@@ -285,6 +285,23 @@
    [['b 'o] '(kernel-load-ptr b o)]
    [['b 'o 'x 'y] '(kernel-uefi-call2 b o x y)]
    [['a 'i] '(kernel-jump-to a i)]
+   ;; simd: the f32 dot product (kotoba-gmir ADR 0010). Here for a reason
+   ;; that is weaker than the control registers' and stronger than the
+   ;; barriers': AArch64 has SIMD -- it has NEON, and a dot product is one of
+   ;; the things NEON is for. So this is not "a facility only x86 has".
+   ;;
+   ;; What makes it x86-only is the ACCUMULATION TREE. Floating-point
+   ;; addition is not associative, so this operation is not "the dot product"
+   ;; -- it is one specific order of summation (kotoba-kir ADR 0233), chosen
+   ;; because it is what a 256-bit register forces and because a scalar
+   ;; sequence can imitate a vector while a vector cannot imitate an
+   ;; arbitrary scalar order. An AArch64 spelling would have to decide
+   ;; whether to keep that tree, at whatever it costs in NEON instructions,
+   ;; or to answer a different number. That is a decision for whoever needs
+   ;; one and it is not a translation of this. `kotoba.mir` refuses the
+   ;; operation for every target but x86-64; pinned here so the asymmetry is
+   ;; asserted rather than merely true.
+   [['a 'al 'b 'bl 'n] '(kernel-dot-f32 a al b bl n)]
    ;; boot-lit: the two wider firmware calls and the three literal address
    ;; heads. The calls are x86-only for the reason kernel-uefi-call2 is -- the
    ;; Microsoft x64 calling convention is not a thing AArch64 has.
@@ -346,17 +363,44 @@
   ;; These are closed GMIR operations now, but only x86-64 admits their target
   ;; selection. AArch64 fails at MIR selection instead of falling through an
   ;; ISA emitter or being mistaken for a source-level function call.
+  ;;
+  ;; simd: the REASON is pinned per operation and not merely "some mismatch".
+  ;; The list is no longer homogeneous -- `kernel-dot-f32` is refused because
+  ;; its accumulation tree is an x86 decision, not because it rides the
+  ;; privileged channel -- and collapsing the two reasons into one assertion
+  ;; would let a privileged operation start being refused for the SIMD reason,
+  ;; or the reverse, without anything going red.
   (doseq [[params body] x86-only]
     (let [thrown (try (arm/emit-program (program params body)) nil
-                      (catch clojure.lang.ExceptionInfo e e))]
+                      (catch clojure.lang.ExceptionInfo e e))
+          expected (cond
+                     (= 'kernel-dot-f32 (first body)) :x86-simd-target-mismatch
+                     ;; boot-lit: a THIRD reason. The literal pool is refused
+                     ;; because the rip-relative load-effective-address has no
+                     ;; modelled AArch64 translation, which is a gap; the
+                     ;; privileged channel is
+                     ;; refused because the instructions do not exist there,
+                     ;; which is not. Collapsing them would let a gap start
+                     ;; being reported as a difference between the machines.
+                     (contains? '#{ucs2 guid bytes-literal} (first body))
+                     :rodata-address-target-mismatch
+                     :else :x86-privileged-target-mismatch)]
       (is (some? thrown) (str body " must be rejected on AArch64"))
       (is (= :mir (:phase (ex-data thrown))))
-      ;; boot-lit: two refusals, not one. The privileged channel and the
-      ;; literal pool are refused for different reasons and say so.
-      (is (contains? #{:x86-privileged-target-mismatch
-                       :rodata-address-target-mismatch}
-                     (:problem (ex-data thrown)))
-          (str body " => " (:problem (ex-data thrown)))))))
+      (is (= expected (:problem (ex-data thrown))) (str body))))
+  (testing "every reason is actually reached -- no branch is dead"
+    (is (= 1 (count (filter #(= 'kernel-dot-f32 (first (second %))) x86-only)))
+        "SCANNED simd rows")
+    ;; boot-lit: three literal heads. The COUNT is asserted rather than the
+    ;; presence, so dropping two of them is a red test.
+    (is (= 3 (count (filter #(contains? '#{ucs2 guid bytes-literal}
+                                        (first (second %)))
+                            x86-only)))
+        "SCANNED rodata rows")
+    (is (< 1 (count (remove #(contains? '#{kernel-dot-f32 ucs2 guid bytes-literal}
+                                        (first (second %)))
+                            x86-only)))
+        "SCANNED privileged rows")))
 
 ;; ---------------------------------------------------------------------------
 ;; The u32 bound is four bytes wider than the u8 bound

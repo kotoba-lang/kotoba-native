@@ -3568,3 +3568,271 @@
     (is (= 1 (shift-of '(slice-load-u16 b l i))))
     (is (= 0 (shift-of '(slice-load-u8 b l i)))
         "and a byte slice needs no scale at all")))
+;; ---------------------------------------------------------------------------
+;; simd: the f32 dot product (kotoba-gmir ADR 0010, kotoba-kir ADR 0233).
+;; ---------------------------------------------------------------------------
+
+(def ^:private dot-f32-program
+  {:format :kotoba.kir/v4 :exports ['main]
+   :functions [{:name 'main :params '[a al b bl n]
+                :body '(kernel-dot-f32 a al b bl n)}]})
+
+(defn- dot-f32-code [] (vec (:code (x86/emit-program dot-f32-program))))
+
+(defn- byte-run?
+  "Does NEEDLE appear in HAYSTACK as a contiguous run?"
+  [haystack needle]
+  (boolean (some #(= needle (subvec haystack % (+ % (count needle))))
+                 (range (inc (- (count haystack) (count needle)))))))
+
+(defn- byte-run-index [haystack needle]
+  (first (filter #(= needle (subvec haystack % (+ % (count needle))))
+                 (range (inc (- (count haystack) (count needle)))))))
+
+;; Every run below was assembled and read back with
+;; `llvm-mc --disassemble --triple=x86_64-unknown-linux-gnu` (LLVM 22.1.7),
+;; not derived from the manual and trusted. The displacements are the ones the
+;; layout pass resolved for THIS sequence and no other.
+
+(def ^:private dot-f32-guard-bytes
+  ;; The AVX2 availability check. Leaf 0 first (a `cpuid` above the CPU's
+  ;; maximum leaf returns the highest leaf's data rather than faulting), then
+  ;; leaf 1 ECX bits 27|28 (OSXSAVE before AVX, because `xgetbv` raises #UD
+  ;; with CR4.OSXSAVE clear), then XCR0 bits 1|2, then leaf 7 subleaf 0 EBX
+  ;; bit 5. The three failures are spelled "jump over a jump" because the
+  ;; layout pass has `jae` and `jz` at rel32 width and has no `jb`/`jne`.
+  [0x31 0xc0 0x31 0xc9 0x0f 0xa2 0x83 0xf8 0x07
+   0x0f 0x83 0x05 0x00 0x00 0x00 0xe9 0x4c 0x00 0x00 0x00
+   0xb8 0x01 0x00 0x00 0x00 0x31 0xc9 0x0f 0xa2
+   0x81 0xe1 0x00 0x00 0x00 0x18 0x81 0xf9 0x00 0x00 0x00 0x18
+   0x0f 0x84 0x05 0x00 0x00 0x00 0xe9 0x2c 0x00 0x00 0x00
+   0x31 0xc9 0x0f 0x01 0xd0 0x83 0xe0 0x06 0x83 0xf8 0x06
+   0x0f 0x84 0x05 0x00 0x00 0x00 0xe9 0x16 0x00 0x00 0x00
+   0xb8 0x07 0x00 0x00 0x00 0x31 0xc9 0x0f 0xa2
+   0x89 0xd8 0xc1 0xe8 0x05 0x83 0xe0 0x01
+   0xe9 0x02 0x00 0x00 0x00 0x31 0xc0
+   0x48 0x85 0xc0])
+
+(def ^:private dot-f32-avx-block-bytes
+  ;; vmovups ymm1,[r10] / vmovups ymm2,[r11] / vmulps ymm1,ymm1,ymm2 /
+  ;; vextractf128 xmm2,ymm1,1 / vaddps xmm0,xmm0,xmm1 / vaddps xmm0,xmm0,xmm2
+  ;;
+  ;; XMM1 IS the lower half of YMM1, so the lower half needs no move; the
+  ;; upper half is extracted to XMM2 first. Lane k therefore takes the lower
+  ;; half's element k and THEN the upper half's, which is the tree.
+  [0xc4 0xc1 0x7c 0x10 0x0a
+   0xc4 0xc1 0x7c 0x10 0x13
+   0xc5 0xf4 0x59 0xca
+   0xc4 0xe3 0x7d 0x19 0xca 0x01
+   0xc5 0xf8 0x58 0xc1
+   0xc5 0xf8 0x58 0xc2])
+
+(def ^:private dot-f32-avx-reduce-bytes
+  ;; Two `vhaddps xmm0,xmm0,xmm0`. The first yields [s0+s1, s2+s3, ...] and
+  ;; the second (s0+s1)+(s2+s3) in lane 0 -- the tree, in two instructions,
+  ;; where a left-to-right chain would need three lane extractions.
+  [0xc5 0xfb 0x7c 0xc0 0xc5 0xfb 0x7c 0xc0])
+
+(def ^:private dot-f32-avx-tail-bytes
+  ;; vmovss xmm1,[r10] / vmovss xmm2,[r11] / vmulss / vaddss. VEX-encoded, so
+  ;; the arm never mixes legacy SSE into a sequence that has written YMM.
+  [0xc4 0xc1 0x7a 0x10 0x0a
+   0xc4 0xc1 0x7a 0x10 0x13
+   0xc5 0xf2 0x59 0xca
+   0xc5 0xfa 0x58 0xc1])
+
+(def ^:private dot-f32-scalar-block-bytes
+  ;; Eight elements, into four accumulators, lower half (offsets 0/4/8/12)
+  ;; then upper half (16/20/24/28) -- the AVX2 arm's order, element for
+  ;; element, which is what makes the two arms bit-identical.
+  (vec (mapcat (fn [[disp lane]]
+                 (concat [0xf3 0x41 0x0f 0x10 (+ 0x22 (if (pos? disp) 0x40 0))]
+                         (when (pos? disp) [disp])
+                         [0xf3 0x41 0x0f 0x10 (+ 0x2b (if (pos? disp) 0x40 0))]
+                         (when (pos? disp) [disp])
+                         [0xf3 0x0f 0x59 0xe5]
+                         [0xf3 0x0f 0x58 (+ 0xc4 (* 8 lane))]))
+               [[0 0] [4 1] [8 2] [12 3] [16 0] [20 1] [24 2] [28 3]])))
+
+(def ^:private dot-f32-scalar-reduce-bytes
+  ;; addss xmm0,xmm1 / addss xmm2,xmm3 / addss xmm0,xmm2 -- (s0+s1)+(s2+s3),
+  ;; the same tree the two `vhaddps` above compute.
+  [0xf3 0x0f 0x58 0xc1 0xf3 0x0f 0x58 0xd3 0xf3 0x0f 0x58 0xc2])
+
+(deftest dot-f32-emits-a-guard-and-two-arms
+  (let [code (dot-f32-code)]
+    (is (pos? (count code)) "SCANNED bytes")
+    (testing "the AVX2 guard is emitted verbatim"
+      (is (byte-run? code dot-f32-guard-bytes)))
+    (testing "the AVX2 arm"
+      (is (byte-run? code dot-f32-avx-block-bytes) "the eight-wide block")
+      (is (byte-run? code dot-f32-avx-reduce-bytes) "two vhaddps")
+      (is (byte-run? code dot-f32-avx-tail-bytes) "the scalar-single tail")
+      (is (byte-run? code [0xc5 0xf8 0x57 0xc0]) "vxorps xmm0,xmm0,xmm0")
+      (is (byte-run? code [0xc4 0xc1 0x79 0x7e 0xc2]) "vmovd r10d,xmm0")
+      (is (byte-run? code [0xc5 0xf8 0x77]) "vzeroupper"))
+    (testing "the scalar arm is the sequence claimed, not a stub"
+      (is (byte-run? code dot-f32-scalar-block-bytes)
+          "eight elements into four accumulators, lower half then upper")
+      (is (byte-run? code dot-f32-scalar-reduce-bytes)
+          "addss xmm0,xmm1 / addss xmm2,xmm3 / addss xmm0,xmm2")
+      (is (byte-run? code [0x0f 0x57 0xc0 0x0f 0x57 0xc9
+                           0x0f 0x57 0xd2 0x0f 0x57 0xdb])
+          "four xorps, one per accumulator")
+      (is (byte-run? code [0x66 0x41 0x0f 0x7e 0xc2]) "movd r10d,xmm0"))))
+
+(deftest dot-f32-executes-no-vex-instruction-before-the-guard-answers
+  ;; The one ordering error that does not fail on a machine that HAS AVX2, and
+  ;; therefore the one nobody would notice until K16 met a CPU without it.
+  ;; Asserted as a position, not as presence: both bytes exist later.
+  (let [code (dot-f32-code)
+        guard-at (byte-run-index code dot-f32-guard-bytes)
+        guard-end (+ guard-at (count dot-f32-guard-bytes))
+        prefix (subvec code 0 guard-end)]
+    (is (some? guard-at) "SCANNED guard")
+    (is (not-any? #{0xc4 0xc5} prefix)
+        "no VEX prefix byte may appear before the guard has answered")))
+
+(deftest dot-f32-saves-every-register-it-clobbers-that-it-does-not-own
+  ;; R10, R11 and the XMM/YMM file are scratch; R9 is the context register.
+  ;; Everything else the sequence writes -- RAX, RCX and RDX because `cpuid`
+  ;; writes them unconditionally, RBX because `cpuid` writes it AND it is
+  ;; callee-saved -- is pushed and popped here, because
+  ;; `kotoba.mir/saved-registers` reads the instruction MAPS and cannot see a
+  ;; register a byte sequence clobbers without naming.
+  (let [code (dot-f32-code)]
+    (testing "RBX is saved around the whole sequence"
+      (is (byte-run? code [0x53]) "push rbx")
+      (is (byte-run? code [0x5b]) "pop rbx"))
+    (testing "the three cpuid-clobbered caller registers are saved around it"
+      (is (byte-run? code [0x50 0x51 0x52]) "push rax / rcx / rdx")
+      (is (byte-run? code [0x5a 0x59 0x58]) "pop rdx / rcx / rax"))
+    (testing "the operands are rescued to the stack BEFORE the guard runs"
+      ;; They may be allocated to any of the four registers `cpuid` destroys,
+      ;; and only two scratch registers exist to hold five values.
+      (let [guard-at (byte-run-index code dot-f32-guard-bytes)
+            pops [0x5a 0x59 0x58 0x5b 0x41 0x5b 0x41 0x5a]]
+        (is (> guard-at (byte-run-index code [0x53])) "the pushes precede it")
+        (is (byte-run? code pops)
+            "and six pops restore rdx/rcx/rax and load rbx/r11/r10")
+        (is (> (byte-run-index code pops) guard-at)
+            "after the guard, not before")))
+    (testing "R9 is never written"
+      ;; Every write to R9 needs REX.B or REX.R with a ModRM naming register
+      ;; 1 in the low three bits; the cheapest true statement is that no
+      ;; instruction in this sequence encodes R9 at all.
+      (is (not (byte-run? code [0x49 0x89 0xc1])) "mov r9, rax")
+      (is (not (byte-run? code [0x41 0x51])) "push r9"))))
+
+(deftest dot-f32-checks-both-regions-before-it-touches-either
+  (let [code (dot-f32-code)]
+    (testing "each length against the 65536 ceiling"
+      ;; Two `cmp r64, imm32` with 0x00010000, and two `ja`.
+      (is (= 2 (count (filter #(= [0x00 0x00 0x01 0x00]
+                                  (subvec code % (+ % 4)))
+                              (range (- (count code) 4)))))
+          "SCANNED 65536 immediates"))
+    (testing "the element ceiling is derived, and checked before the scale"
+      (is (byte-run? code [0x00 0x40 0x00 0x00]) "16384 = 65536 / 4")
+      (let [limit-at (byte-run-index code [0x00 0x40 0x00 0x00])
+            ;; `mov r10, count` then two doublings: the scale.
+            scale-at (byte-run-index code [0x4d 0x01 0xd2 0x4d 0x01 0xd2])]
+        (is (some? scale-at) "SCANNED scale")
+        (is (< limit-at scale-at)
+            "a count of 2^62 scaled by four wraps to zero, and a wrapped span passes every length check there is")))
+    (testing "a violation traps"
+      (is (byte-run? code [0x0f 0x0b]) "ud2"))))
+
+(deftest dot-f32-sign-extends-its-answer
+  ;; MOVD writes a 32-bit register, which zeroes the upper half. The canonical
+  ;; f32 word is the pattern SIGN-extended from bit 31, and without the
+  ;; extension every negative result would be a word `f32-from-bits` refuses.
+  ;;
+  ;; Asserted as the WHOLE tail run and not as a bare `48 63`: `movsxd` occurs
+  ;; elsewhere in a compiled function, so the two-byte prefix alone passes for
+  ;; a sequence that has dropped this one -- measured, by deleting it.
+  (let [code (dot-f32-code)]
+    (is (byte-run? code [0x5b               ; pop rbx     -- the join
+                         0x4c 0x89 0xd6     ; mov rsi, r10
+                         0x48 0x63 0xf6])   ; movsxd rsi, esi
+        "the answer leaves R10 and is sign-extended in place")))
+
+(deftest dot-f32-is-outside-the-two-peephole-sets
+  ;; It writes R10 and it branches. Admitting it to either scan would let a
+  ;; reciprocal ride across a sequence that destroys R10, or a dead-save scan
+  ;; walk past a label.
+  (is (not (contains? @#'machine/x86-reciprocal-cache-safe-encodings
+                      :x86-64/kernel-dot-f32)))
+  (is (not (contains? @#'machine/x86-straight-line-encodings
+                      :x86-64/kernel-dot-f32))))
+
+(deftest dot-f32-new-encoders-emit-the-published-bytes
+  (testing "the three AVX forms this operation added"
+    (is (= [0xc5 0xf8 0x58 0xc1]
+           (#'machine/x86-vex-rr (#'machine/x86-avx-form :vaddps-128)
+                                 {:reg 0 :vvvv 0 :rm 1}))
+        "vaddps xmm0, xmm0, xmm1 -- 128 bits, not 256")
+    (is (= [0xc5 0xf2 0x59 0xca]
+           (#'machine/x86-vex-rr (#'machine/x86-avx-form :vmulss)
+                                 {:reg 1 :vvvv 1 :rm 2}))
+        "vmulss xmm1, xmm1, xmm2")
+    (is (= [0xc5 0xfa 0x58 0xc1]
+           (#'machine/x86-vex-rr (#'machine/x86-avx-form :vaddss)
+                                 {:reg 0 :vvvv 0 :rm 1}))
+        "vaddss xmm0, xmm0, xmm1")
+    (testing "and :vaddps-128 is NOT :vaddps at another length by accident"
+      (is (not= (#'machine/x86-avx-form :vaddps)
+                (#'machine/x86-avx-form :vaddps-128)))))
+  (testing "the mandatory-prefix SSE forms"
+    (is (= [0xf3 0x0f 0x59 0xe5] (#'machine/x86-sse-rr 0xf3 0x59 4 5))
+        "mulss xmm4, xmm5")
+    (is (= [0xf3 0x0f 0x58 0xc4] (#'machine/x86-sse-rr 0xf3 0x58 0 4))
+        "addss xmm0, xmm4")
+    (is (= [0x0f 0x57 0xdb] (#'machine/x86-sse-rr 0x57 3 3))
+        "xorps xmm3, xmm3 -- the no-prefix arity is unchanged")
+    (testing "the prefix comes BEFORE the REX byte"
+      ;; A REX before an F3 is a different instruction, not a rejected one.
+      (is (= [0xf3 0x44 0x0f 0x58 0xc0] (#'machine/x86-sse-rr 0xf3 0x58 8 0))
+          "addss xmm8, xmm0")))
+  (testing "the memory form"
+    (is (= [0xf3 0x41 0x0f 0x10 0x22]
+           (#'machine/x86-sse-rm 0xf3 0x10 4 {:base :x86-64/r10}))
+        "movss xmm4, [r10]")
+    (is (= [0xf3 0x41 0x0f 0x10 0x6b 0x04]
+           (#'machine/x86-sse-rm 0xf3 0x10 5 {:base :x86-64/r11 :disp 4}))
+        "movss xmm5, [r11+4]")
+    (is (= [0x0f 0x10 0x08]
+           (#'machine/x86-sse-rm nil 0x10 1 {:base :x86-64/rax}))
+        "movups xmm1, [rax] -- no prefix, no REX")))
+
+(deftest dot-f32-keeps-the-definitions-of-its-literal-operands
+  ;; A caller with fixed-size regions writes `(kernel-dot-f32 a 48 b 48 12)`,
+  ;; and three of those five operands are literals. `dce-gmir` drops a
+  ;; `:gmir/constant` whose dst appears in no SOURCE position, and the source
+  ;; positions are a hand-written list of keys -- so two of the three lost
+  ;; their definitions and the operation kept reading the vregs.
+  ;;
+  ;; The one that survived did so only because `:gmir/length` was already in
+  ;; that list, which is why the shape with all five operands as parameters
+  ;; compiled cleanly and this one did not. Exactly the defect the sysops
+  ;; stream recorded for `:gmir/expected`, one stream later.
+  ;;
+  ;; Asserted on the GMIR rather than on the emitted bytes: the failure
+  ;; surfaces only in the CONSERVATIVE allocator, so a program under less
+  ;; register pressure reaches an allocator with an undefined operand instead
+  ;; of a rejection.
+  (let [gmir (#'machine/lower-kir-expression
+              '[a b] '(kernel-dot-f32 a 48 b 48 12))
+        instructions (:gmir/instructions gmir)
+        defined (set (keep :gmir/dst instructions))
+        dot (first (filter #(= :gmir/kernel-dot-f32 (:gmir/op %)) instructions))]
+    (is (some? dot) "SCANNED dot instruction")
+    (doseq [key [:gmir/base :gmir/length :gmir/second-base
+                 :gmir/second-length :gmir/count]]
+      (is (contains? defined (get dot key))
+          (str key " is read by the operation and must be defined before it)")))
+    (testing "and the whole program still reaches bytes"
+      (is (pos? (count (:code (x86/emit-program
+                               {:format :kotoba.kir/v4 :exports ['main]
+                                :functions [{:name 'main :params '[a b]
+                                             :body '(kernel-dot-f32 a 48 b 48 12)}]}))))))))
