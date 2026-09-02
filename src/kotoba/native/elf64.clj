@@ -396,6 +396,37 @@
    ;; 4 GiB. The plan also carries a ROW RANGE, which is what makes the fuel
    ;; bound finite and an SMP split expressible without a second object.
    'aiueos-qwen35-matvec {:arity 4 :symbol "kotoba_aiueos_qwen35_matvec"}
+   ;; The Qwen3.5 forward pass, second tranche: the scalar functions between the
+   ;; matvecs. Two rows because they split on WHAT THEY REDUCE OVER -- the
+   ;; activations are elementwise and stateless, the normalisations carry a
+   ;; whole-vector sum -- and because a mode selector inside one object would
+   ;; put an elementwise `silu` and a two-pass `rms_norm` under one fuel bound
+   ;; whose worst case is the second.
+   ;;
+   ;; `[mode a b count spare]`. Modes 0..3 are silu / sigmoid / softplus /
+   ;; local_exp applied elementwise in place; mode 4 is `ffn`'s
+   ;; `scratch_a[i] = silu(scratch_a[i]) * scratch_b[i]`, which is one statement
+   ;; in the C and is kept as one here so the intermediate never reaches memory.
+   ;;
+   ;; `local_exp` needs `(int32_t)(scaled + 0.5f)` and this dialect has NO
+   ;; float-to-int operation -- `f32-to-i64-truncating` and `-checked` are both
+   ;; refused for native, because x86 yields INT64_MIN out of domain, AArch64
+   ;; saturates and the oracle traps, so there is no one answer to admit. The
+   ;; object truncates from the bit pattern instead, which is exact over the
+   ;; only range that reaches it: the C clamps to [-87, 88] first.
+   'aiueos-qwen35-activation
+   {:arity 5 :symbol "kotoba_aiueos_qwen35_activation"}
+   ;; `[mode a b c d]`: rms_norm (0), l2_norm_heads (1) and
+   ;; rms_norm_heads_weighted (2). Zero is the success value.
+   ;;
+   ;; THE ACCUMULATOR IS f64 AND THE PRODUCT IS f32, which is what the C does
+   ;; (`sum += (double)(v[i] * v[i])`) and not what a careful reimplementation
+   ;; would do. The two reductions then narrow at different points --
+   ;; `(float)(sum / (double)count) + EPSILON` for rms_norm against
+   ;; `(float)sum + EPSILON` for l2_norm_heads -- and that is a difference in
+   ;; the answer, not in the spelling.
+   'aiueos-qwen35-norm
+   {:arity 5 :symbol "kotoba_aiueos_qwen35_norm"}
    ;; The tokenizer beside them. The three admission objects above answer
    ;; "is this the file" without ever reading a token STRING; these three read
    ;; the two arrays those coordinates name -- 248,320 vocabulary entries and
@@ -1328,6 +1359,23 @@
           qwen-dot-fuel? (= 'aiueos-qwen35-dot-f32 object-entry)
           qwen-dequant-fuel? (= 'aiueos-qwen35-dequant-row object-entry)
           qwen-matvec-fuel? (= 'aiueos-qwen35-matvec object-entry)
+          ;; The second Qwen tranche. MEASURED the same way as the first --
+          ;; bisected in the `kotoba.kir` interpreter at two sizes and the line
+          ;; fitted -- and, unlike the first, the first tranche has since
+          ;; RETURNED ON HARDWARE, so the method now has one confirmation
+          ;; behind it rather than none.
+          ;;
+          ;;   activation  ~20 per element (softplus, the dearest of the five
+          ;;               modes at 18.6; silu 17.1, exp 13.9) at a 65,536
+          ;;               ceiling -> 1,310,720
+          ;;   norm        ~66 per element on mode 2's ordinary path, ~106 with
+          ;;               its rescaled fallback, at a 262,144-element ceiling
+          ;;               (heads * width) -> ~27,800,000. Modes 0 and 1 are
+          ;;               18 and 30.
+          ;;
+          ;; Two arms, so that re-measuring one cannot silently move the other.
+          qwen-activation-fuel? (= 'aiueos-qwen35-activation object-entry)
+          qwen-norm-fuel? (= 'aiueos-qwen35-norm object-entry)
           ;; The GPT-2 BPE index build. COMPUTED, and the computation depends
           ;; on an argument, which is why the object refuses a model window
           ;; above 16 MiB: every token and every merge string is hashed and
@@ -1468,6 +1516,8 @@
                       qwen-dot-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x40 0x00] ; 4,194,304 (21x)
                       qwen-dequant-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x00 0x01] ; 16,777,216 (13x)
                       qwen-matvec-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000 (3.8x)
+                      qwen-activation-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x00 0x01] ; 16,777,216 (12x)
+                      qwen-norm-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000 (9x)
                       qwen-index-fuel? [0x49 0xc7 0x41 0x08 0xff 0xff 0xff 0x7f] ; 2,147,483,647
                       qwen-tokenize-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000
                       qwen-detokenize-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
