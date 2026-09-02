@@ -5,6 +5,7 @@
   ;; branch needed no requires at all) now wraps only the cljs-only item.
   (:require [clojure.string :as str]
             [kotoba.codegen.layout :as layout]
+            [kotoba.native.interrupt-abi :as interrupt-abi]
             [kotoba.native.machine-ir :as machine-ir]
             [kotoba.native.peephole :as peephole]
             [kotoba.native.string-index :as string-index]
@@ -1926,6 +1927,20 @@
         (let [n (count page-fault-recovery-handler-bytes)]
           (vec (concat [0xe9] (le32 n) page-fault-recovery-handler-bytes
                        [0x48 0x8d 0x05] (le32 (- (+ n 7))))))
+        ;; isr: `entry-base + vector * stride`, the address of the
+        ;; toolchain-generated interrupt entry for that vector. Unlike the
+        ;; three canned handler addresses around it, this one is not a byte
+        ;; sequence embedded here and pointed at -- the entries live in a
+        ;; region the IMAGE packager lays down, and it publishes the base into
+        ;; the kernel context because it runs after every byte of this
+        ;; function has been emitted.
+        ;;
+        ;; The bytes come from `kotoba.native.interrupt-abi`, which also owns
+        ;; the stride, the ceiling and the context slot, so this arm and the
+        ;; packager cannot drift.
+        (= op 'kernel-isr-entry-address)
+        (vec (concat (emit-expr (first args) env (assoc ctx :tail? false))
+                     (interrupt-abi/entry-address-from-rax)))
         (= op 'kernel-double-fault-handler-address)
         (let [n (count double-fault-handler-bytes)]
           (vec (concat [0xe9] (le32 n) double-fault-handler-bytes

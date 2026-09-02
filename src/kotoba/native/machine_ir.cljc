@@ -12,6 +12,7 @@
             [kotoba.codegen.mc :as mc]
             [kotoba.codegen.layout :as layout]
             [kotoba.native.aggregate-abi :as aggregate-abi]
+            [kotoba.native.interrupt-abi :as interrupt-abi]
             [kotoba.native.string-index :as string-index]
             [kotoba.native.string-search :as string-search]
             #?(:cljs [kotoba.kir.cljs-i64 :as i64])))
@@ -118,6 +119,10 @@
            :mir/addend :mir/base :mir/length :mir/index :mir/stored
            ;; sysops: the compare-exchange comparand -- see `gmir-source-keys`.
            :mir/expected
+           ;; simd: the dot product's second region and element count. It
+           ;; never reaches an AArch64 emitter, but this list is not only
+           ;; read by one -- and a key that is present costs nothing.
+           :mir/second-base :mir/second-length :mir/count
            :mir/offset :mir/size :mir/arguments]))
 
 (defn- a64-used-before-definition?
@@ -480,7 +485,13 @@
    'kernel-system-table :system-table
    'kernel-load-ptr :load-ptr
    'kernel-uefi-call2 :uefi-call2
-   'kernel-jump-to :jump-to})
+   'kernel-jump-to :jump-to
+   ;; isr: the address of the toolchain-generated interrupt entry for a
+   ;; vector, which is what the three offset fields of an IDT gate descriptor
+   ;; need. It rides this channel because it takes one ordinary operand and
+   ;; names no memory window; the answer is a load from the image's kernel
+   ;; context, not an address this encoder knows.
+   'kernel-isr-entry-address :isr-entry-address})
 
 (def ^:private kir-runtime-ops
   {'pair :pair
@@ -1129,9 +1140,23 @@
   ;; only runs when the scanner has already given up, so the same program
   ;; under less register pressure would have reached an allocator with an
   ;; undefined operand.
+  ;;
+  ;; simd: `:gmir/second-base`, `:gmir/second-length` and `:gmir/count` are
+  ;; here for the reason `:gmir/expected` is, and they were left out first --
+  ;; the same defect, one stream later, found the same way. `(kernel-dot-f32 a
+  ;; 48 b 48 12)` is the shape a caller with fixed-size regions actually
+  ;; writes, and three of its five operands are literals; two of those three
+  ;; lost their `:gmir/constant` definitions here and the operation kept
+  ;; reading the vregs. The one that survived did so only because
+  ;; `:gmir/length` was already in this list.
+  ;;
+  ;; The comment above is still the whole explanation of why nothing upstream
+  ;; catches it. Adding a key to an operation's keyset does not add it here,
+  ;; and this list is the one place where that omission is silent.
   [:gmir/test :gmir/value :gmir/src :gmir/input :gmir/left :gmir/right
    :gmir/addend :gmir/base :gmir/length :gmir/index :gmir/stored
    :gmir/expected
+   :gmir/second-base :gmir/second-length :gmir/count
    :gmir/offset :gmir/size :gmir/arguments])
 
 (def ^:private gmir-block-boundary
@@ -4818,6 +4843,25 @@
                (x86-pop :x86-64/rdx) (x86-pop :x86-64/rax))
        :x86-64/r11)
       ;; sysops: end
+      ;; isr: `entry-base + vector * stride`, where the base is a quadword the
+      ;; IMAGE packager published into the kernel context. This encoder cannot
+      ;; know the address: the entries are laid down after every byte of this
+      ;; function has been emitted, so the context is the channel -- the same
+      ;; one `:boot-info` reads one slot along.
+      ;;
+      ;; The ceiling is emitted rather than assumed. The region is indexed by
+      ;; MULTIPLICATION, not by consulting a table, so an unbounded vector
+      ;; computes an address past the region and the caller writes it into a
+      ;; gate descriptor. `ud2` is the trap the bounded memory primitives
+      ;; raise, and it surfaces as vector 6.
+      ;;
+      ;; The bytes are `kotoba.native.interrupt-abi`'s, not this file's: the
+      ;; stride, the ceiling and the context slot are stated once, where the
+      ;; packager that honours them also reads them.
+      :isr-entry-address
+      (finish (concat (copy-to :x86-64/r10 a)
+                      (interrupt-abi/entry-address-r10-to-r11))
+              :x86-64/r11)
       (:out-u8 :out-u32)
       (finish
        (concat (copy-to :x86-64/r10 a)
@@ -5614,10 +5658,16 @@
     cache)))
 
 (def ^:private a64-source-keys
+  ;; Named for AArch64 and read by `x86-propagate-copies` as well, which is
+  ;; why a missing key here is not an AArch64-only problem: that pass counts
+  ;; the uses of a copied register before deciding a `mov` is dead, and a use
+  ;; it cannot see is a `mov` it removes while something still needs it.
   [:mir/test :mir/value :mir/src :mir/input :mir/left :mir/right :mir/addend
    :mir/base :mir/length :mir/index :mir/stored
    ;; sysops: the compare-exchange comparand -- see `gmir-source-keys`.
    :mir/expected
+   ;; simd: the dot product's second region and element count -- same reason.
+   :mir/second-base :mir/second-length :mir/count
    :mir/offset :mir/size
    :mir/arguments])
 
