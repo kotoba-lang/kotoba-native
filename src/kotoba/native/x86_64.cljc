@@ -3,7 +3,8 @@
   ;; conditional that used to wrap the whole `:require` (see
   ;; `kotoba.wasm.core`'s ns form for that original reasoning -- the `:clj`
   ;; branch needed no requires at all) now wraps only the cljs-only item.
-  (:require [kotoba.codegen.layout :as layout]
+  (:require [clojure.string :as str]
+            [kotoba.codegen.layout :as layout]
             [kotoba.native.machine-ir :as machine-ir]
             [kotoba.native.peephole :as peephole]
             [kotoba.native.string-index :as string-index]
@@ -768,6 +769,158 @@
          (layout/label trap-label)]
         [0x0f 0x0b]
         [(layout/label end-label)]))))
+
+
+;; ---------------------------------------------------------------------------
+;; memwidth: the widths and tiers this fallback did not have, and the ADR 0285
+;; slice family.
+;;
+;; The four emitters above stay byte for byte as they were. They are reached by
+;; nothing today (measured 2026-08-31 by instrumenting both vars), but their
+;; bytes are the ones shipped aiueos objects were built with, and a
+;; generalisation that changed them would move a pinned artifact for no reason
+;; of its own. Everything NEW goes through the two emitters below, which follow
+;; `kotoba.native.machine-ir` exactly rather than the older wrapping form:
+;; `index < length` first, then `length - index >= width`, which cannot wrap by
+;; construction.
+;; ---------------------------------------------------------------------------
+
+(def ^:private memwidth-window-ops
+  "op -> [access-bytes profile-maximum aligned?]. Only the operations this
+  fallback did not already have: the original seven keep their own emitters."
+  (into {}
+        (for [[w bytes] [["u8" 1] ["u16" 2] ["u32" 4] ["u64" 8]]
+              [suffix maximum] [["" 512] ["-4k" 4096] ["-16k" 16384] ["-64k" 65536]]
+              kind ["load" "store"]
+              :let [op (symbol (str "kernel-" kind "-" w suffix))]
+              :when (not (contains? '#{kernel-load-u8 kernel-load-u8-4k
+                                       kernel-load-u8-16k kernel-store-u8
+                                       kernel-store-u8-4k kernel-load-u32
+                                       kernel-store-u32}
+                                    op))]
+          ;; Alignment for every width above one byte. The two exemptions --
+          ;; `kernel-{load,store}-u32` at 512 -- are exempt by date, and both
+          ;; are among the seven that never reach this table.
+          [op [bytes maximum (> bytes 1)]])))
+
+(def ^:private memwidth-slice-ops
+  (into {} (for [[w bytes] [["u8" 1] ["u16" 2] ["u32" 4] ["u64" 8]]
+                 kind ["load" "store"]]
+             [(symbol (str "slice-" kind "-" w)) bytes])))
+
+(def ^:private memwidth-slice-item-limit 1099511627776)
+
+(defn- x86-test-imm32
+  "`test r64, imm32`. `ja` after it fires exactly when the masked value is
+  non-zero, because `test` clears CF."
+  [reg-code mask]
+  (vec (concat [0x48 0xf7 (bit-or 0xc0 reg-code)] (le32 mask))))
+
+(defn- memwidth-access-bytes
+  "The access instruction at `[rdx + index*scale]`, with the value in RAX
+  (loads and byte stores) or the register the caller names."
+  [store? bytes index-code scale]
+  (let [sib (bit-or (bit-shift-left (case scale 1 0 2 1 4 2 8 3) 6)
+                    (bit-shift-left index-code 3) 2)]
+    (if store?
+      (case bytes
+        1 [0x88 0x04 sib]
+        2 [0x66 0x89 0x04 sib]
+        4 [0x89 0x04 sib]
+        8 [0x48 0x89 0x04 sib])
+      (case bytes
+        1 [0x0f 0xb6 0x04 sib]
+        2 [0x0f 0xb7 0x04 sib]
+        4 [0x8b 0x04 sib]
+        8 [0x48 0x8b 0x04 sib]))))
+
+(defn- emit-memwidth-window
+  "A checked window access at any width and tier. RCX holds the length, RDX the
+  base, and the index lands in RAX for a load and RDI for a store -- the same
+  register plan the four older emitters use, so the access bytes are the same
+  shape."
+  [args bytes maximum aligned? store? env {:keys [temp-depth] :as ctx}]
+  (let [ctx (assoc ctx :tail? false)
+        counter (or (:mir-label-counter ctx) (atom -1))
+        ctx (assoc ctx :mir-label-counter counter)
+        trap-label (fresh-label counter "memwidth-window-trap")
+        end-label (fresh-label counter "memwidth-window-end")
+        index-code (if store? 7 0)
+        [base length index value] args]
+    (vec (concat
+          (emit-expr base env ctx) [0x50]
+          (emit-expr length env (update ctx :temp-depth inc)) [0x50]
+          (if store?
+            (concat (emit-expr index env (update ctx :temp-depth + 2)) [0x50]
+                    (emit-expr value env (update ctx :temp-depth + 3))
+                    [0x5f 0x59 0x5a])           ; rdi=index, rcx=length, rdx=base
+            (concat (emit-expr index env (update ctx :temp-depth + 2))
+                    [0x59 0x5a]))               ; rcx=length, rdx=base
+          [0x48 0x81 0xf9] (le32 maximum)       ; cmp rcx,maximum
+          [(layout/relative-branch :x86-64/ja-rel32 trap-label)]
+          [0x48 0x85 0xd2]                      ; test rdx,rdx
+          [(layout/relative-branch :x86-64/jz-rel32 trap-label)]
+          [0x48 0x39 (if store? 0xcf 0xc8)]     ; cmp index,rcx
+          [(layout/relative-branch :x86-64/jae-rel32 trap-label)]
+          (when (> bytes 1)
+            ;; mov rsi,rcx ; sub rsi,index ; cmp rsi,bytes ; jl trap.
+            ;; The non-wrapping form `kotoba.native.machine-ir` uses, not the
+            ;; `lea index+width` one: `length - index` cannot underflow because
+            ;; the `jae` above has already refused every index at or past it.
+            (concat [0x48 0x89 0xce]
+                    [0x48 0x29 (if store? 0xfe 0xc6)]
+                    [0x48 0x81 0xfe] (le32 bytes)
+                    [(layout/relative-branch :x86-64/jl-rel32 trap-label)]))
+          (when aligned?
+            (concat (x86-test-imm32 index-code (dec bytes))
+                    [(layout/relative-branch :x86-64/ja-rel32 trap-label)]))
+          (memwidth-access-bytes store? bytes index-code 1)
+          [(layout/relative-branch :x86-64/jmp-rel32 end-label)
+           (layout/label trap-label)]
+          [0x0f 0x0b]
+          [(layout/label end-label)]))))
+
+(defn- emit-memwidth-slice
+  "An element-indexed access (amu ADR 0285). Four checks, and the scale lives
+  in the SIB byte -- the guest computes no byte offset and there is no context
+  callback in the loop."
+  [args bytes store? env {:keys [temp-depth] :as ctx}]
+  (let [ctx (assoc ctx :tail? false)
+        counter (or (:mir-label-counter ctx) (atom -1))
+        ctx (assoc ctx :mir-label-counter counter)
+        trap-label (fresh-label counter "memwidth-slice-trap")
+        end-label (fresh-label counter "memwidth-slice-end")
+        index-code (if store? 7 0)
+        [base length index value] args]
+    (vec (concat
+          (emit-expr base env ctx) [0x50]
+          (emit-expr length env (update ctx :temp-depth inc)) [0x50]
+          (if store?
+            (concat (emit-expr index env (update ctx :temp-depth + 2)) [0x50]
+                    (emit-expr value env (update ctx :temp-depth + 3))
+                    [0x5f 0x59 0x5a])
+            (concat (emit-expr index env (update ctx :temp-depth + 2))
+                    [0x59 0x5a]))
+          ;; movabs rsi,limit ; cmp rcx,rsi ; ja trap. The ceiling is 2^40 and
+          ;; does not fit an imm32, which is the visible sign that it is an
+          ;; address-space bound rather than a window profile.
+          [0x48 0xbe] (le64 memwidth-slice-item-limit)
+          [0x48 0x39 0xf1]
+          [(layout/relative-branch :x86-64/ja-rel32 trap-label)]
+          [0x48 0x85 0xd2]
+          [(layout/relative-branch :x86-64/jz-rel32 trap-label)]
+          (when (> bytes 1)
+            ;; Alignment is proved once on the BASE. A scaled index off an
+            ;; aligned base is aligned, so nothing is checked per element.
+            (concat (x86-test-imm32 2 (dec bytes))
+                    [(layout/relative-branch :x86-64/ja-rel32 trap-label)]))
+          [0x48 0x39 (if store? 0xcf 0xc8)]
+          [(layout/relative-branch :x86-64/jae-rel32 trap-label)]
+          (memwidth-access-bytes store? bytes index-code bytes)
+          [(layout/relative-branch :x86-64/jmp-rel32 end-label)
+           (layout/label trap-label)]
+          [0x0f 0x0b]
+          [(layout/label end-label)]))))
 
 (defn- emit-kernel-out [[port value] width env {:keys [temp-depth] :as ctx}]
   (let [ctx (assoc ctx :tail? false)]
@@ -1742,6 +1895,17 @@
 
         (= op 'kernel-store-u32)
         (emit-kernel-store-u32 args 512 env ctx)
+
+        ;; memwidth: every width and tier the four emitters above do not cover,
+        ;; and the slice family.
+        (contains? memwidth-window-ops op)
+        (let [[bytes maximum aligned?] (get memwidth-window-ops op)]
+          (emit-memwidth-window args bytes maximum aligned?
+                                (str/includes? (name op) "store") env ctx))
+
+        (contains? memwidth-slice-ops op)
+        (emit-memwidth-slice args (get memwidth-slice-ops op)
+                             (str/includes? (name op) "store") env ctx)
 
         (= op 'kernel-boot-info) [0x49 0x8b 0x41 0x50]
         (= op 'kernel-read-cr0) [0x0f 0x20 0xc0]
