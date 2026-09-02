@@ -102,3 +102,34 @@ Four deliberate breaks, each producing the failure it names and no other:
 Nothing here is executed. This repository does not run compiled programs, so a
 green suite is encodings only -- and the assembler agreement above is what
 stands in for execution.
+
+## Addendum: a literal comparand was being deleted
+
+Found after landing, by compiling a driver-shaped guest **from source** rather
+than from a hand-written KIR program.
+
+`gmir-source-keys` did not list `:gmir/expected`, so `dce-gmir` -- which drops
+a `:gmir/constant` whose destination appears in no source position -- deleted
+the definition of a **literal** comparand. `(kernel-cmpxchg-u32 base length
+index 0 1)`, which is the shape a doorbell claim actually has, went on reading
+a vreg nothing defined.
+
+**Nothing upstream catches that.** GMIR's own `validate!` checks that an
+operand IS a virtual register, not that anything defines it, and MIR's
+`select-target` does not check definition order either. It surfaced as
+`MIR rejected: use-before-definition` from the CONSERVATIVE allocator, which
+only runs once the scanner has given up -- so the same program under less
+register pressure reached an allocator with an undefined operand.
+
+Three more field lists had the same omission and are fixed with it:
+`a64-source-registers-mir` (feeds `a64-used-before-definition?`),
+the alias-remap key list, and `a64-source-keys` (feeds AArch64 constant
+rematerialisation).
+
+**Why the existing tests did not see it:** every assertion in
+`machine_ir_test` and in `isa_parity_test` passes the comparand as a
+PARAMETER, and a parameter is never dead. The tests were written from the
+instruction's shape rather than from a caller's, and a caller supplies
+literals. `a-literal-comparand-survives-dead-constant-elimination` now covers
+it, and deleting `:gmir/expected` again reproduces
+`MIR rejected: use-before-definition` on exactly those cases.

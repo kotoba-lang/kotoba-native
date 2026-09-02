@@ -115,6 +115,8 @@
                     :else [])))
           [:mc/test :mir/test :mir/value :mir/src :mir/input :mir/left :mir/right
            :mir/addend :mir/base :mir/length :mir/index :mir/stored
+           ;; sysops: the compare-exchange comparand -- see `gmir-source-keys`.
+           :mir/expected
            :mir/offset :mir/size :mir/arguments]))
 
 (defn- a64-used-before-definition?
@@ -1019,8 +1021,23 @@
      :cljs (i64/wrap-i64 (+ (i64/->bigint a) (i64/->bigint b)))))
 
 (def ^:private gmir-source-keys
+  ;; sysops: `:gmir/expected` is here because leaving it out DELETED the
+  ;; instruction's comparand. `dce-gmir` below drops a `:gmir/constant` whose
+  ;; dst appears in no source position, so a compare-exchange against a
+  ;; literal -- `(kernel-cmpxchg-u32 base length index 0 1)`, the shape a
+  ;; doorbell claim actually has -- lost the definition of its comparand and
+  ;; kept reading the vreg.
+  ;;
+  ;; Nothing upstream catches that. GMIR's own `validate!` checks that an
+  ;; operand IS a virtual register, not that one defines it, and MIR's
+  ;; `select-target` does not check definition order either. It surfaces in
+  ;; the conservative allocator's `validate-ssa-definition-order` -- which
+  ;; only runs when the scanner has already given up, so the same program
+  ;; under less register pressure would have reached an allocator with an
+  ;; undefined operand.
   [:gmir/test :gmir/value :gmir/src :gmir/input :gmir/left :gmir/right
    :gmir/addend :gmir/base :gmir/length :gmir/index :gmir/stored
+   :gmir/expected
    :gmir/offset :gmir/size :gmir/arguments])
 
 (def ^:private gmir-block-boundary
@@ -4739,7 +4756,10 @@
                    (get aliases value value))))))
    instruction
    [:mir/test :mir/value :mir/src :mir/input :mir/left :mir/right :mir/addend
-    :mir/base :mir/length :mir/index :mir/stored :mir/offset :mir/size
+    :mir/base :mir/length :mir/index :mir/stored
+    ;; sysops: the compare-exchange comparand -- see `gmir-source-keys`.
+    :mir/expected
+    :mir/offset :mir/size
     :mir/arguments]))
 
 (defn- positive-mersenne-shift [value]
@@ -4888,7 +4908,10 @@
 
 (def ^:private a64-source-keys
   [:mir/test :mir/value :mir/src :mir/input :mir/left :mir/right :mir/addend
-   :mir/base :mir/length :mir/index :mir/stored :mir/offset :mir/size
+   :mir/base :mir/length :mir/index :mir/stored
+   ;; sysops: the compare-exchange comparand -- see `gmir-source-keys`.
+   :mir/expected
+   :mir/offset :mir/size
    :mir/arguments])
 
 (defn- a64-source-registers [instruction]

@@ -3330,3 +3330,42 @@
   (is (= :vex-opcode-map-unsupported
          (vex-rejection #(#'machine/vex3 {:map :0f0f :b 1}))))
   (is (= :vex-vvvv-out-of-range (vex-rejection #(#'machine/vex2 {:vvvv 16})))))
+
+(deftest a-literal-comparand-survives-dead-constant-elimination
+  ;; The shape a doorbell claim actually has: the comparand is a LITERAL, not
+  ;; a parameter. `dce-gmir` drops a `:gmir/constant` whose destination appears
+  ;; in no source position, and `gmir-source-keys` did not list
+  ;; `:gmir/expected` -- so the constant defining the comparand was deleted and
+  ;; the instruction went on reading the vreg.
+  ;;
+  ;; Nothing upstream catches that: GMIR's `validate!` checks that an operand
+  ;; IS a virtual register, not that anything defines it, and MIR's
+  ;; `select-target` does not check definition order either. It surfaced as
+  ;; `MIR rejected: use-before-definition` from the CONSERVATIVE allocator --
+  ;; which only runs once the scanner has given up, so the same program under
+  ;; less register pressure reached an allocator with an undefined operand.
+  ;;
+  ;; Every earlier assertion in this namespace passed a comparand as a
+  ;; parameter, which is never dead, which is why none of them saw it. So did
+  ;; `isa_parity_test`. It was found by compiling a driver-shaped guest from
+  ;; source, end to end.
+  (doseq [[params body] [['[b] '(kernel-cmpxchg-u32 b 4096 0 0 1)]
+                         ['[b] '(kernel-cmpxchg-u64 b 4096 0 0 1)]
+                         ['[b l i] '(kernel-cmpxchg-u32 b l i 0 1)]
+                         ['[b l i] '(kernel-cmpxchg-u64 b l i 0 1)]
+                         ;; the replacement is a literal too, and it was safe
+                         ;; only because `:gmir/stored` was already listed
+                         ['[b l i e] '(kernel-cmpxchg-u32 b l i e 1)]
+                         ;; and the adds and swaps, whose operand is `stored`
+                         ['[b] '(kernel-atomic-add-u32 b 4096 0 1)]
+                         ['[b] '(kernel-xchg-u64 b 4096 0 1)]]]
+    (testing (str body)
+      (is (seq (sysops-x86 params body)) body)
+      (is (seq (sysops-arm params body)) body)))
+  (testing "the comparand's own constant is still emitted"
+    ;; mov r?, 0x2a somewhere in the stream -- if the definition were dropped
+    ;; again, the emit above would throw rather than produce these bytes, but
+    ;; asserting the constant reaches the code says WHICH definition survived.
+    (let [code (sysops-x86 '[b l i] '(kernel-cmpxchg-u32 b l i 42 1))]
+      (is (contains-bytes? code [0x2a 0x00 0x00 0x00])
+          "the literal comparand 42 is materialised"))))
