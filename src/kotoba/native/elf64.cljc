@@ -1316,19 +1316,19 @@
           ;; not to the geometry K16 passes, because a tier is a per-call
           ;; budget and a caller may legally ask for the ceiling.
           ;;
-          ;;   attention       two positions measured at 2 heads, 256 wide:
-          ;;                   29,991 at position 1 and 47,539 at position 3,
-          ;;                   so 4,387 per head-prior and 6,221 per head
-          ;;                   fixed. Head scaling is linear BY CONSTRUCTION
-          ;;                   (one pass per head, no cross-head state), so
-          ;;                   the admitted ceiling of 64 heads x 8 priors is
-          ;;                   64 * (6,221 + 8 * 4,387) = 2,644,288.
+          ;;   attention       29,991 at 2 heads / position 1 and 47,539 at 2
+          ;;                   heads / position 3, so 4,387 per head-prior and
+          ;;                   6,221 per head fixed. Head scaling is linear and
+          ;;                   was MEASURED rather than argued: 4 heads at
+          ;;                   position 3 is 95,604, which is 2.011x the 2-head
+          ;;                   figure. The admitted ceiling of 64 heads x 8
+          ;;                   priors is 64 * (6,221 + 8 * 4,387) = 2,644,288.
           ;;                   Tier 33,554,432 is 12.7x that.
-          ;;   recurrent-step  three dimensions measured: 1,762 at d=8, 6,721
-          ;;                   at d=16, 25,414 at d=32. The fit is
-          ;;                   22.85 d^2 + 71.5 d - 272, which at the admitted
-          ;;                   ceiling d=128 is 383,254. Tier 4,194,304 is
-          ;;                   10.9x that.
+          ;;   recurrent-step  1,762 at d=8, 6,721 at d=16, 25,414 at d=32.
+          ;;                   The fit 22.85 d^2 + 71.5 d - 272 predicts 55,806
+          ;;                   at d=48 against 56,312 measured, so it holds to
+          ;;                   1% one octave out; at the admitted ceiling
+          ;;                   d=128 it is 383,254. Tier 4,194,304 is 10.9x.
           ;;
           ;; Two arms, so that re-measuring one cannot silently move the other.
           qwen-attention-fuel? (= 'aiueos-qwen35-attention object-entry)
