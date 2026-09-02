@@ -272,6 +272,44 @@
 ;; decision is that the bulk carrier does not travel through the arena.
 (def ^:private slice-item-limit 1099511627776)
 
+
+;; f32: binary32 (kotoba-lang docs/adr/ADR-kotoba-floating-point-on-native.md).
+;;
+;; The representation is the f64 one at the narrower width, with one difference
+;; that is the whole design: the word holds the binary32 pattern SIGN-EXTENDED
+;; from bit 31. That is what keeps `f32-to-bits` an identity the way
+;; `f64-to-bits` is, because the KIR oracle's `f32-to-i64-bits` yields a SIGNED
+;; i32 -- a zero-extended word would disagree with it for every negative float.
+;; So `f32-from-bits` is the one member of the family that is NOT an identity
+;; here: it is `signed-i32-value`, which also canonicalises the zero-extended
+;; u32 that `kernel-load-u32` returns.
+;;
+;; `f32-min`/`f32-max` are absent, and the absence is the decision rather than
+;; an omission. x86's MINSS/MAXSS return the SECOND operand when either input
+;; is NaN; AArch64's FMIN/FMAX and the oracle's Math/min return the NaN. The
+;; f64 table above admits both, so x86 already disagrees with the other ISA and
+;; with the oracle on shipped code -- a pre-existing defect recorded in the ADR,
+;; not repaired here because repairing it moves f64 goldens. This width does not
+;; inherit it. `kotoba.kir` refuses them at admission for both backends.
+(def ^:private kir-f32-binary-ops
+  {'f32-add :gmir/f32-add 'f32-sub :gmir/f32-subtract
+   'f32-mul :gmir/f32-multiply 'f32-div :gmir/f32-divide
+   'f32-eq :gmir/f32-equal 'f32-lt :gmir/f32-less-than
+   'f32-le :gmir/f32-less-or-equal 'f32-gt :gmir/f32-greater-than
+   'f32-ge :gmir/f32-greater-or-equal
+   'f32-unordered :gmir/f32-unordered})
+
+(def ^:private kir-f32-unary-ops
+  '#{f32-from-bits f32-to-bits f32-abs f32-neg f32-sqrt})
+
+;; Width conversions, all one-source/one-value. Only the four on which both
+;; ISAs and the KIR oracle agree for EVERY input; the `-checked` and truncating
+;; float-to-int families are refused at admission and are named in the ADR.
+(def ^:private kir-f32-conversion-ops
+  {'f32-to-f64-exact :gmir/f32-to-f64
+   'f64-to-f32-rounded :gmir/f64-to-f32
+   'i64-to-f32-rounded :gmir/i64-to-f32
+   'i64-to-f64-rounded :gmir/i64-to-f64})
 (def ^:private kir-kernel-memory-ops
   ;; memwidth: four transfer widths by four window tiers, plus the ADR 0285
   ;; slice family. The GMIR operation carries the width and `:gmir/maximum`
@@ -362,6 +400,19 @@
   alignment requested. `kotoba.kir`'s `unaligned-window-operations` is the
   oracle's half of the same asymmetry."
   #{[:gmir/kernel-load-u32 512] [:gmir/kernel-store-u32 512]})
+;; sysops: the general atomics (kotoba-gmir ADR 0007). Separate from the table
+;; above because the compare-exchanges take FIVE arguments, and the shared
+;; lowering there is written around three-or-four.
+;;
+;; `[gmir-op maximum argument-count access-bits]`.
+(def ^:private kir-kernel-atomic-ops
+  {'kernel-atomic-add-u32 [:gmir/kernel-atomic-add-u32 4096 4 32]
+   'kernel-atomic-add-u64 [:gmir/kernel-atomic-add-u64 4096 4 64]
+   'kernel-xchg-u32       [:gmir/kernel-xchg-u32 4096 4 32]
+   'kernel-xchg-u64       [:gmir/kernel-xchg-u64 4096 4 64]
+   'kernel-cmpxchg-u32    [:gmir/kernel-cmpxchg-u32 4096 5 32]
+   'kernel-cmpxchg-u64    [:gmir/kernel-cmpxchg-u64 4096 5 64]})
+;; sysops: end
 
 (def ^:private kir-x86-privileged-ops
   {'kernel-boot-info :boot-info
@@ -397,7 +448,27 @@
    'kernel-cpuid-eax :cpuid-eax
    'kernel-cpuid-ebx :cpuid-ebx
    'kernel-cpuid-ecx :cpuid-ecx
-   'kernel-cpuid-edx :cpuid-edx})
+   'kernel-cpuid-edx :cpuid-edx
+   ;; simdprep: the OTHER half of a feature check. The four above say what the
+   ;; CPU implements; this says what the operating system has agreed to save
+   ;; and restore across a context switch.
+   'kernel-xgetbv :xgetbv
+   ;; sysops: barriers, the timestamp counter and the GS-base swap. They ride
+   ;; this channel rather than getting instruction shapes of their own because
+   ;; they take no operands and name no memory window -- there is no base,
+   ;; length or index to bound. `kotoba.mir` admits the channel for the x86-64
+   ;; target and no other, which is what makes them x86-only.
+   'kernel-fence-load :fence-load
+   'kernel-fence-store :fence-store
+   'kernel-fence-full :fence-full
+   'kernel-rdtsc :rdtsc
+   'kernel-rdtscp :rdtscp
+   'kernel-swapgs :swapgs
+   ;; boot: the UEFI firmware boundary (kotoba-gmir ADR-0008).
+   'kernel-system-table :system-table
+   'kernel-load-ptr :load-ptr
+   'kernel-uefi-call2 :uefi-call2
+   'kernel-jump-to :jump-to})
 
 (def ^:private kir-runtime-ops
   {'pair :pair
@@ -1521,6 +1592,49 @@
                                    :gmir/input (scalar-register! input form)})
                        dst])))
 
+                (and (seq? form) (contains? kir-f32-binary-ops (first form))
+                     (= 3 (count form)))
+                (binary-value (get kir-f32-binary-ops (first form))
+                              (value (second form) env)
+                              (value (nth form 2) env) form)
+
+                (and (seq? form) (contains? kir-f32-unary-ops (first form))
+                     (= 2 (count form)))
+                (let [lowered (value (second form) env)]
+                  (case (first form)
+                    ;; The word already holds the sign-extended pattern.
+                    f32-to-bits lowered
+                    ;; The one member that is NOT an identity: it canonicalises
+                    ;; a zero-extended u32 into the signed i32 the oracle
+                    ;; requires, and re-establishes the invariant every other
+                    ;; producer here maintains.
+                    f32-from-bits (signed-i32-value lowered form)
+                    ;; Clearing bit 31 of a sign-extended word also clears every
+                    ;; bit above it, which IS the sign-extended form of a
+                    ;; positive binary32 pattern -- no re-extension needed.
+                    f32-abs (binary-value :gmir/bit-and lowered
+                                          (constant-value 2147483647) form)
+                    ;; XOR with 0xFFFFFFFF80000000 flips bit 31 AND the whole
+                    ;; upper half, so the result stays sign-extended in both
+                    ;; directions. This is the f64 `bit-xor Long/MIN_VALUE`
+                    ;; trick moved down 32 bits.
+                    f32-neg (binary-value :gmir/bit-xor lowered
+                                          (constant-value -2147483648) form)
+                    f32-sqrt
+                    (let [[code input] lowered, dst (fresh-reg)]
+                      [(conj code {:gmir/op :gmir/f32-sqrt :gmir/dst dst
+                                   :gmir/input (scalar-register! input form)})
+                       dst])))
+
+                (and (seq? form) (contains? kir-f32-conversion-ops (first form))
+                     (= 2 (count form)))
+                (let [[code input] (value (second form) env)
+                      dst (fresh-reg)]
+                  [(conj code {:gmir/op (get kir-f32-conversion-ops (first form))
+                               :gmir/dst dst
+                               :gmir/input (scalar-register! input form)})
+                   dst])
+
                 (and (seq? form) (contains? kir-kernel-memory-ops (first form))
                      (contains? #{4 5} (count form)))
                 (let [[op maximum] (get kir-kernel-memory-ops (first form))
@@ -1542,6 +1656,32 @@
                                   :gmir/maximum maximum}
                            stored (assoc :gmir/stored stored)))
                    dst])
+
+                ;; sysops: the general atomics. Five operands at most, and the
+                ;; fifth is a comparand rather than a stored word, so this does
+                ;; not fold into the three-or-four shape above.
+                (and (seq? form) (contains? kir-kernel-atomic-ops (first form)))
+                (let [[op maximum arity] (get kir-kernel-atomic-ops (first form))
+                      _ (when-not (= arity (count (rest form)))
+                          (reject! :kir-to-gmir :kernel-atomic-arity
+                                   {:form form :expected arity}))
+                      lowered (mapv #(value % env) (rest form))
+                      code (vec (mapcat first lowered))
+                      operands (mapv #(scalar-register! (second %) form) lowered)
+                      dst (fresh-reg)
+                      [base length index fourth fifth] operands]
+                  [(conj code
+                         (cond-> {:gmir/op op :gmir/dst dst :gmir/base base
+                                  :gmir/length length :gmir/index index
+                                  :gmir/maximum maximum}
+                           ;; the addend, or the replacement
+                           (= 4 arity) (assoc :gmir/stored fourth)
+                           ;; the comparand the try-lock pair withholds, then
+                           ;; the replacement
+                           (= 5 arity) (assoc :gmir/expected fourth
+                                              :gmir/stored fifth)))
+                   dst])
+                ;; sysops: end
 
                 (and (seq? form) (= 'kernel-subregion (first form))
                      (= 5 (count form)))
@@ -1892,6 +2032,15 @@
 
                 (and (seq? form) (contains? kir-kernel-memory-ops (first form))
                      (contains? #{4 5} (count form))
+                     (every? #(= :scalar (shape % env)) (rest form)))
+                :scalar
+
+                ;; sysops: the general atomics, with their own arity per
+                ;; spelling -- four for the adds and the swaps, five for the
+                ;; compare-exchanges.
+                (and (seq? form) (contains? kir-kernel-atomic-ops (first form))
+                     (= (nth (get kir-kernel-atomic-ops (first form)) 2)
+                        (count (rest form)))
                      (every? #(= :scalar (shape % env)) (rest form)))
                 :scalar
 
@@ -2739,6 +2888,70 @@
                [0xf2 0x0f (get x86-f64-binary-opcode encoding) 0xc1]
                (x86-xmm-to-gpr dst 0))))
 
+;; ── f32 encoders ─────────────────────────────────────────────────────────
+;;
+;; Every byte below was assembled with `clang -target x86_64-apple-macos` and
+;; read back with `otool -t`, not derived from the manual and trusted. The
+;; AArch64 twin's FADD came out wrong by hand (0x1E202800 derived, 0x1E212800
+;; assembled), which is the whole argument for doing it this way.
+;;
+;; MOVD, not MOVQ: the operand is 32 bits and the upper half of the word is not
+;; part of the value. Writing a 32-bit destination also ZEROES the upper half of
+;; the 64-bit register, which is why every f32-producing sequence ends in a
+;; MOVSXD -- the canonical word is the pattern SIGN-extended from bit 31.
+
+(defn- x86-gpr-to-xmm32 [xmm src]
+  (let [s (get x86-register-code src)]
+    (when-not (and (integer? xmm) (<= 0 xmm 15) (some? s))
+      (reject! :mc-encode :unsupported-f32-register {:xmm xmm :src src}))
+    (let [rex (bit-or 0x40 (if (>= xmm 8) 4 0) (if (>= s 8) 1 0))]
+      (vec (concat [0x66]
+                   (when (not= 0x40 rex) [rex])
+                   [0x0f 0x6e
+                    (bit-or 0xc0 (bit-shift-left (bit-and xmm 7) 3)
+                            (bit-and s 7))])))))
+
+(defn- x86-xmm-to-gpr32 [dst xmm]
+  (let [d (get x86-register-code dst)]
+    (when-not (and (some? d) (integer? xmm) (<= 0 xmm 15))
+      (reject! :mc-encode :unsupported-f32-register {:dst dst :xmm xmm}))
+    (let [rex (bit-or 0x40 (if (>= xmm 8) 4 0) (if (>= d 8) 1 0))]
+      (vec (concat [0x66]
+                   (when (not= 0x40 rex) [rex])
+                   [0x0f 0x7e
+                    (bit-or 0xc0 (bit-shift-left (bit-and xmm 7) 3)
+                            (bit-and d 7))])))))
+
+;; movsxd r64, r32 over the same register: re-establish the sign extension a
+;; 32-bit write has just destroyed.
+(defn- x86-movsxd [register]
+  (let [d (get x86-register-code register)]
+    (when-not (some? d)
+      (reject! :mc-encode :unsupported-register {:register register}))
+    [(bit-or 0x48 (if (>= d 8) 5 0)) 0x63
+     (bit-or 0xc0 (bit-shift-left (bit-and d 7) 3) (bit-and d 7))]))
+
+;; cvtsi2ss / cvtsi2sd read the 64-bit general register directly, so there is no
+;; move in -- only out. `prefix` is 0xf3 for single, 0xf2 for double.
+(defn- x86-cvtsi2 [prefix xmm src]
+  (let [s (get x86-register-code src)]
+    (when-not (and (integer? xmm) (<= 0 xmm 15) (some? s))
+      (reject! :mc-encode :unsupported-f32-register {:xmm xmm :src src}))
+    [prefix (bit-or 0x48 (if (>= xmm 8) 4 0) (if (>= s 8) 1 0))
+     0x0f 0x2a
+     (bit-or 0xc0 (bit-shift-left (bit-and xmm 7) 3) (bit-and s 7))]))
+
+(def ^:private x86-f32-binary-opcode
+  {:x86-64/f32-add 0x58 :x86-64/f32-subtract 0x5c
+   :x86-64/f32-multiply 0x59 :x86-64/f32-divide 0x5e})
+
+(defn- x86-f32-binary [encoding dst left right]
+  (vec (concat (x86-gpr-to-xmm32 0 left)
+               (x86-gpr-to-xmm32 1 right)
+               [0xf3 0x0f (get x86-f32-binary-opcode encoding) 0xc1]
+               (x86-xmm-to-gpr32 dst 0)
+               (x86-movsxd dst))))
+
 (defn- x86-f64-compare [encoding dst left right]
   (let [swapped? (contains? #{:x86-64/f64-less-than
                               :x86-64/f64-less-or-equal} encoding)
@@ -2755,6 +2968,32 @@
                      [0x66 0x0f 0x2e 0xc1])
                  (x86-setcc condition dst)
                  (when (= :x86-64/f64-equal encoding)
+                   (concat (x86-setcc 0x9b :x86-64/r11)
+                           [(bit-or 0x40 4 (if (= :x86-64/r8 dst) 1 0))
+                            0x20
+                            (bit-or 0xc0 (bit-shift-left 3 3)
+                                    (bit-and (get x86-register-code dst) 7))]))
+                 (x86-movzx-byte dst)))))
+
+;; UCOMISS is UCOMISD without the 0x66 prefix and sets identical flags --
+;; ZF=PF=CF=1 when either operand is NaN -- so the condition codes, the operand
+;; swap for lt/le, and the extra PF test for equality are the f64 sequence
+;; unchanged. The result is a 0/1 word, so no sign extension is involved.
+(defn- x86-f32-compare [encoding dst left right]
+  (let [swapped? (contains? #{:x86-64/f32-less-than
+                              :x86-64/f32-less-or-equal} encoding)
+        condition (case encoding
+                    :x86-64/f32-equal 0x94
+                    :x86-64/f32-less-than 0x97
+                    :x86-64/f32-less-or-equal 0x93
+                    :x86-64/f32-greater-than 0x97
+                    :x86-64/f32-greater-or-equal 0x93
+                    :x86-64/f32-unordered 0x9a)]
+    (vec (concat (x86-gpr-to-xmm32 0 left)
+                 (x86-gpr-to-xmm32 1 right)
+                 (if swapped? [0x0f 0x2e 0xc8] [0x0f 0x2e 0xc1])
+                 (x86-setcc condition dst)
+                 (when (= :x86-64/f32-equal encoding)
                    (concat (x86-setcc 0x9b :x86-64/r11)
                            [(bit-or 0x40 4 (if (= :x86-64/r8 dst) 1 0))
                             0x20
@@ -3076,6 +3315,49 @@
         (u32le 0x1e612000)
         (u32le (bit-or cset (a64-register dst))))))
 
+;; ── AArch64 f32 encoders ─────────────────────────────────────────────────
+;;
+;; Each single-precision word is its double-precision twin with the `ftype`
+;; field narrowed (bit 22 cleared); the two FMOV general-register forms clear
+;; `sf` as well. That is a derivation, so it was checked and not trusted: every
+;; word here was assembled with `clang -target arm64-apple-macos` and read back
+;; with `otool -t`. It earned its keep -- FADD S0,S0,S1 derives to 0x1E202800
+;; by hand and assembles to 0x1E212800.
+;;
+;; FMOV S,W and FMOV W,S, not FMOV D,X / FMOV X,D: the value is 32 bits.
+;; Writing a W register zeroes the upper half of its X register, which is why
+;; every f32-producing sequence ends in SXTW.
+
+(defn- a64-fmov-s0-w [register]
+  (u32le (bit-or 0x1e270000 (bit-shift-left (a64-register register) 5))))
+
+(defn- a64-fmov-s1-w [register]
+  (u32le (bit-or 0x1e270001 (bit-shift-left (a64-register register) 5))))
+
+(defn- a64-fmov-w-s0 [register]
+  (u32le (bit-or 0x1e260000 (a64-register register))))
+
+;; SXTW Xd, Wd -- re-establish the sign extension the FMOV W has destroyed.
+(defn- a64-sxtw [register]
+  (let [r (a64-register register)]
+    (u32le (bit-or 0x93407c00 (bit-shift-left r 5) r))))
+
+(defn- a64-f32-binary [base dst left right]
+  (vec (concat (a64-fmov-s0-w left)
+               (a64-fmov-s1-w right)
+               (u32le base)
+               (a64-fmov-w-s0 dst)
+               (a64-sxtw dst))))
+
+;; FCMP sets exactly the same flags for single as for double, including
+;; N=0 Z=0 C=1 V=1 when unordered, so the CSET words are the f64 table's
+;; unchanged and only the compare narrows.
+(defn- a64-f32-compare [cset dst left right]
+  (vec (concat (a64-fmov-s0-w left)
+               (a64-fmov-s1-w right)
+               (u32le 0x1e212000)
+               (u32le (bit-or cset (a64-register dst))))))
+
 (defn- x86-cmp-imm32 [register value]
   (let [code (get x86-register-code register)]
     (when-not (some? code)
@@ -3188,8 +3470,14 @@
   different caller that must not acquire the check at all.
 
   The tail check was written as the literal 4 while four bytes was the only
-  multi-byte width. It is `(quot width 8)` now, which is still exactly 4 for
-  every operation that had it before: these bytes do not move."
+  multi-byte width. It is `(quot width 8)` now -- the sysops branch reached the
+  same conclusion for its eight-byte atomics -- and is still exactly 4 for
+  every operation that had it before: those bytes do not move. The GUARD is
+  `(> width 8)` rather than `(>= width 32)`, because a two-byte access needs
+  `length - index >= 2` just as much as a four-byte one needs 4.
+
+  R10 is scratch here and dead afterwards, which is what lets the lock and
+  atomic sequences below borrow it without saving anything."
   [trap width aligned? {:mir/keys [base length index maximum]}]
   (vec (concat
         (x86-cmp-imm32 length maximum)
@@ -3198,6 +3486,8 @@
         [(layout/relative-branch :x86-64/jz-rel32 trap)]
         (x86-rr 0x39 index length)
         [(layout/relative-branch :x86-64/jae-rel32 trap)]
+        ;; memwidth: `(> width 8)`, not `(>= width 32)` -- a two-byte access
+        ;; needs `length - index >= 2` just as a four-byte one needs 4.
         (when (> width 8)
           (concat (x86-rr 0x89 :x86-64/r10 length)
                   (x86-rr 0x29 :x86-64/r10 index)
@@ -3313,6 +3603,67 @@
           [0x0f 0x0b]
           [(layout/label done)]))))
 
+;; sysops: the general atomic read-modify-writes.
+;;
+;; Where `x86-kernel-lock` above fixes both comparand and replacement, these
+;; take the word from the guest. Every byte string below was taken from the
+;; system assembler rather than derived by hand -- the lock's own comment
+;; records what a hand carry costs.
+;;
+;;   lock xadd    [r11], r10d   f0 45 0f c1 13     lock xadd    [r11], r10  f0 4d 0f c1 13
+;;   lock cmpxchg [r11], r10d   f0 45 0f b1 13     lock cmpxchg [r11], r10  f0 4d 0f b1 13
+;;   xchg         [r11], r10d      45 87 13        xchg         [r11], r10     4d 87 13
+;;
+;; XCHG with a memory operand asserts LOCK implicitly, so it carries no F0
+;; prefix. That is the architecture's rule and not an omission.
+;;
+;; R10 carries the guest's operand: it is dead after the bounds check, so
+;; nothing allocated is disturbed. All three answer with the word memory held
+;; BEFORE the operation, which is what the instruction leaves behind -- `xadd`
+;; and `xchg` in the source register, `cmpxchg` in EAX/RAX either way.
+;;
+;; For the 32-bit spellings the result needs no widening: a write to a 32-bit
+;; register zeroes the upper half, so `xadd`/`xchg` into R10D and `mov r10d,
+;; eax` all leave R10 holding the old word zero-extended -- which is what the
+;; KIR oracle answers.
+(defn- x86-kernel-atomic
+  [instruction-index kind width {:mir/keys [dst stored expected] :as instruction}]
+  (let [trap (memory-label instruction-index "atomic-trap")
+        done (memory-label instruction-index "atomic-done")
+        wide? (= 64 width)
+        ;; REX.R for R10 as the register operand, REX.B for R11 as the base,
+        ;; and REX.W as well for the eight-byte forms.
+        rex (if wide? 0x4d 0x45)
+        copy-to (fn [register value]
+                  (if (= register value) [] (x86-rr 0x89 register value)))]
+    (vec (concat
+          ;; memwidth: the general atomics do not acquire the alignment
+          ;; check. `lock`-prefixed and LSE atomics require natural alignment
+          ;; architecturally, so adding it would be a real change to their
+          ;; admitted set -- and their bytes are pinned by the sysops goldens.
+          ;; Recorded as a follow-on beside the two u32 window exemptions.
+          (x86-kernel-bounds-check trap width false instruction)
+          ;; The guest's operand has to leave its allocated register before
+          ;; RAX is touched below: the allocator may have parked it in RAX.
+          (copy-to :x86-64/r10 stored)
+          (case kind
+            :add [0xf0 rex 0x0f 0xc1 0x13]
+            :xchg [rex 0x87 0x13]
+            :cmpxchg
+            (concat (x86-push :x86-64/rax)
+                    (copy-to :x86-64/rax expected)
+                    [0xf0 rex 0x0f 0xb1 0x13]
+                    ;; mov r10d, eax / mov r10, rax -- take the observed word
+                    ;; out of RAX before restoring the caller's.
+                    (if wide? [0x49 0x89 0xc2] [0x41 0x89 0xc2])
+                    (x86-pop :x86-64/rax)))
+          (copy-to dst :x86-64/r10)
+          [(layout/relative-branch :x86-64/jmp-rel32 done)
+           (layout/label trap)]
+          [0x0f 0x0b]
+          [(layout/label done)]))))
+;; sysops: end
+
 (defn- x86-kernel-subregion
   [instruction-index {:mir/keys [dst base length offset size]}]
   (let [trap (memory-label instruction-index "subregion-trap")
@@ -3373,6 +3724,8 @@
                        (bit-shift-left (a64-register length) 16)
                        (bit-shift-left (a64-register index) 5)))
         [(layout/relative-branch :aarch64/b-hs-imm19 trap)]
+        ;; memwidth: `(> width 8)`, not `(>= width 32)` -- a two-byte access
+        ;; needs `length - index >= 2` just as a four-byte one needs 4.
         (when (> width 8)
           (concat
            (u32le (bit-or 0xcb000000
@@ -3477,6 +3830,81 @@
                    [true 64] 0xf9000000)
                  (bit-shift-left 16 5)
                  (a64-register result))))
+;; sysops: the AArch64 general atomics, as single LSE instructions.
+;;
+;; `a64-kernel-lock` above is an LDAXR/STLXR pair, and it says why: there is no
+;; CAS below ARMv8.1-LSE. That pair cannot be generalised here, and the reason
+;; is register count rather than taste. A general atomic needs the address, the
+;; loaded word, the word to store and the store status all live at once, and
+;; this encoder has exactly two scratch registers -- x16 and x17 -- because
+;; every other register may be holding an allocated value. The lock gets away
+;; with three because its replacement is an immediate it can build in `dst`.
+;;
+;; LSE turns each of them into ONE instruction with no loop, no status register
+;; and no monitor to clear:
+;;
+;;   ldaddal w3, w17, [x16]   0xb8e30211      ldaddal x3, x17, [x16]  0xf8e30211
+;;   swpal   w3, w17, [x16]   0xb8e38211      swpal   x3, x17, [x16]  0xf8e38211
+;;   casal   w17, w3, [x16]   0x88f1fe03      casal   x17, x3, [x16]  0xc8f1fe03
+;;
+;; taken from the system assembler at `-march=armv8.1-a`, with Rs at bits
+;; 20-16, Rn at 9-5 and Rt at 4-0.
+;;
+;; THE COST, STATED PLAINLY: this raises the AArch64 baseline for a module that
+;; uses these six operations to ARMv8.1-A. FEAT_LSE is architecturally
+;; mandatory from ARMv8.1 (2014) and present on every Apple Silicon part, and
+;; nothing else in this backend needs it -- a module that uses none of these
+;; six is unchanged. The alternative is not "the same thing without LSE": it is
+;; a third scratch register taken out of the allocator's pool for every AArch64
+;; program, to serve six operations.
+;;
+;; `x17` carries the old word out of all three, and the answer is moved from it
+;; into `dst` afterwards rather than being written there directly, because
+;; `dst` may alias an operand this instruction has not finished reading.
+;; The 32-bit forms write w17, which zero-extends x17 -- the same zero-extended
+;; old word the KIR oracle answers with.
+(defn- a64-kernel-atomic
+  [instruction-index kind width {:mir/keys [dst stored expected] :as instruction}]
+  (let [trap (memory-label instruction-index "atomic-trap")
+        done (memory-label instruction-index "atomic-done")
+        wide? (= 64 width)
+        ;; mov x17, <reg> / mov w17, <reg>: ORR (shifted register) with XZR.
+        mov-to-17 (fn [source]
+                    (u32le (bit-or (if wide? 0xaa0003e0 0x2a0003e0)
+                                   (bit-shift-left (a64-register source) 16)
+                                   17)))
+        ;; mov <dst>, x17 -- always the 64-bit form; the value in x17 is
+        ;; already the width the operation produced.
+        mov-from-17 (u32le (bit-or 0xaa0003e0 (bit-shift-left 17 16)
+                                   (a64-register dst)))]
+    (vec (concat
+          ;; memwidth: the general atomics do not acquire the alignment
+          ;; check. `lock`-prefixed and LSE atomics require natural alignment
+          ;; architecturally, so adding it would be a real change to their
+          ;; admitted set -- and their bytes are pinned by the sysops goldens.
+          ;; Recorded as a follow-on beside the two u32 window exemptions.
+          (a64-kernel-bounds-check trap width false instruction)
+          (case kind
+            :add (u32le (bit-or (if wide? 0xf8e00000 0xb8e00000)
+                                (bit-shift-left (a64-register stored) 16)
+                                (bit-shift-left 16 5) 17))
+            :xchg (u32le (bit-or (if wide? 0xf8e08000 0xb8e08000)
+                                 (bit-shift-left (a64-register stored) 16)
+                                 (bit-shift-left 16 5) 17))
+            ;; CAS reads its comparand from Rs AND writes the observed word
+            ;; back there, so the comparand is copied into x17 first rather
+            ;; than the guest's register being clobbered.
+            :cmpxchg (concat (mov-to-17 expected)
+                             (u32le (bit-or (if wide? 0xc8e0fc00 0x88e0fc00)
+                                            (bit-shift-left 17 16)
+                                            (bit-shift-left 16 5)
+                                            (a64-register stored)))))
+          mov-from-17
+          [(layout/relative-branch :aarch64/b-imm26 done)
+           (layout/label trap)]
+          (u32le 0xd4200000)
+          [(layout/label done)]))))
+;; sysops: end
 
 (defn- a64-kernel-memory
   [instruction-index width store? aligned? {:mir/keys [dst stored] :as instruction}]
@@ -3834,6 +4262,63 @@
    0x48 0x83 0xc4 0x10 0x49 0xc7 0xc2 0x01 0x00 0x00 0x00 0xeb 0x02
    0x0f 0x0b])
 
+;; boot: one Microsoft x64 call out of a Kotoba guest, and back.
+;;
+;; Three things have to be true at the `call` and none of them is true on
+;; arrival. RSP must be 16-byte aligned; the callee owns 32 bytes of shadow
+;; space above it; and every volatile register must be a value the guest can
+;; afford to lose. The guest's own frame is `sub rsp, frame-bytes` from an
+;; alignment this encoder cannot know statically, so the alignment is done at
+;; run time rather than assumed.
+;;
+;; The register discipline is the part worth reading twice. MS x64 preserves
+;; RBX, RBP, RDI, RSI and R12-R15, which is the whole of `kotoba.mir`'s leaf
+;; and preserved tiers -- those survive by contract. What does NOT survive is
+;; the four-register scratch tier (RAX, RCX, RDX, R8) and R9, which carries
+;; the guest's hidden context. All five are saved here rather than at the MIR
+;; layer, because `:mir/x86-privileged` is not a `call-operation?`: the
+;; scanner does not treat it as a barrier and may hold a live value in the
+;; scratch tier across it.
+;;
+;; The argument order (R10 <- a, RDX <- b, RCX <- R10) is not cosmetic. `a`
+;; and `b` arrive in allocator registers that may BE RCX or RDX, so writing
+;; RCX first would destroy `b` whenever `b` lives there. Staging `a` through
+;; R10 -- outside the pool -- makes every assignment safe.
+(defn- x86-uefi-call2 [dst arguments]
+  (let [[base offset a b] arguments
+        copy-to (fn [register value]
+                  (if (= register value) [] (x86-rr 0x89 register value)))
+        ;; slots are 8 bytes: 4 = +0x20, 5 = +0x28, ... 9 = +0x48.
+        save (fn [slot register] (x86-stack-memory 0x89 register slot))
+        load (fn [slot register] (x86-stack-memory 0x8b register slot))]
+    (vec (concat
+          (copy-to :x86-64/r10 base)
+          (copy-to :x86-64/r11 offset)
+          [0x4f 0x8b 0x1c 0x1a]                 ; mov r11,[r10+r11] -> target
+          ;; RSP is deliberately absent from `x86-register-code` -- no
+          ;; allocator tier contains it -- so these two write it by hand.
+          [0x49 0x89 0xe2]                      ; mov r10,rsp (original)
+          [0x48 0x83 0xe4 0xf0]                 ; and rsp,-16
+          ;; 0x50 = 32 bytes of shadow space the callee owns, plus six saved
+          ;; words at +0x20..+0x48. 0x50 is itself a multiple of 16, so RSP is
+          ;; still 16-aligned at the `call`, which is the whole point of the
+          ;; two instructions above.
+          [0x48 0x83 0xec 0x50]                 ; sub rsp,0x50
+          (save 4 :x86-64/r10)                  ; [rsp+0x20] = original rsp
+          (save 5 :x86-64/rax) (save 6 :x86-64/rcx)
+          (save 7 :x86-64/rdx) (save 8 :x86-64/r8)
+          (save 9 :x86-64/r9)
+          (copy-to :x86-64/r10 a)               ; stage `a` outside the pool
+          (copy-to :x86-64/rdx b)
+          (x86-rr 0x89 :x86-64/rcx :x86-64/r10)
+          [0x41 0xff 0xd3]                      ; call r11
+          (x86-rr 0x89 :x86-64/r10 :x86-64/rax) ; keep the status
+          (load 9 :x86-64/r9) (load 8 :x86-64/r8)
+          (load 7 :x86-64/rdx) (load 6 :x86-64/rcx)
+          (load 5 :x86-64/rax)
+          [0x48 0x8b 0xa4 0x24 0x20 0x00 0x00 0x00] ; mov rsp,[rsp+0x20]
+          (if (= dst :x86-64/r10) [] (x86-rr 0x89 dst :x86-64/r10))))))
+
 (defn- x86-privileged
   [{:mir/keys [dst action arguments] :as instruction}]
   (let [copy-to (fn [register value]
@@ -3910,6 +4395,39 @@
                         :cli [0xfa] :sti [0xfb] :hlt [0xf4] :pause [0xf3 0x90])
                       (x86-mov-imm :x86-64/r10 0))
               :x86-64/r10)
+      ;; sysops: the three barriers and the GS-base swap take no operands and
+      ;; produce no value, so they answer 0 exactly as `:cli` does. Bytes from
+      ;; the system assembler: lfence 0f ae e8, sfence 0f ae f8, mfence
+      ;; 0f ae f0, swapgs 0f 01 f8.
+      (:fence-load :fence-store :fence-full :swapgs)
+      (finish (concat (case action
+                        :fence-load [0x0f 0xae 0xe8]
+                        :fence-store [0x0f 0xae 0xf8]
+                        :fence-full [0x0f 0xae 0xf0]
+                        :swapgs [0x0f 0x01 0xf8])
+                      (x86-mov-imm :x86-64/r10 0))
+              :x86-64/r10)
+      ;; The timestamp counter arrives split across EDX:EAX, so it is
+      ;; reassembled the way `:read-msr` below reassembles an MSR -- shift the
+      ;; high half up and OR the low half in. RDTSC zeroes the upper 32 bits of
+      ;; both, so no masking is needed.
+      ;;
+      ;; RDTSCP additionally writes the processor id to ECX, which is why RCX
+      ;; is saved for it and not for RDTSC. That id is discarded: an operation
+      ;; answering with two values would need a second spelling, and the
+      ;; caller that wants the id can have one when someone needs it.
+      (:rdtsc :rdtscp)
+      (finish
+       (concat (x86-push :x86-64/rax) (x86-push :x86-64/rdx)
+               (when (= action :rdtscp) (x86-push :x86-64/rcx))
+               (if (= action :rdtscp) [0x0f 0x01 0xf9] [0x0f 0x31])
+               (x86-rr 0x89 :x86-64/r11 :x86-64/rdx)
+               [0x49 0xc1 0xe3 0x20]
+               (x86-rr 0x09 :x86-64/r11 :x86-64/rax)
+               (when (= action :rdtscp) (x86-pop :x86-64/rcx))
+               (x86-pop :x86-64/rdx) (x86-pop :x86-64/rax))
+       :x86-64/r11)
+      ;; sysops: end
       (:out-u8 :out-u32)
       (finish
        (concat (copy-to :x86-64/r10 a)
@@ -3929,6 +4447,29 @@
                [(if (= action :in-u8) 0xec 0xed)]
                (x86-rr 0x89 :x86-64/r11 :x86-64/rax)
                (x86-pop :x86-64/rdx) (x86-pop :x86-64/rax))
+       :x86-64/r11)
+      ;; simdprep: `xgetbv` is `rdmsr` with a different opcode and one less
+      ;; hazard. Both read a 64-bit quantity into EDX:EAX selected by ECX, so
+      ;; the operand marshalling, the RAX/RCX/RDX saves and the shift-and-or
+      ;; that rejoins the halves are identical. It differs from `cpuid`, which
+      ;; is otherwise its closer relative, in NOT writing EBX -- so unlike the
+      ;; `cpuid` arm this one needs no RBX save.
+      ;;
+      ;; No mask is needed on either half: the instruction writes the 32-bit
+      ;; EAX and EDX, and a 32-bit write zeroes the upper half of the
+      ;; containing 64-bit register, so both arrive already isolated.
+      :xgetbv
+      (finish
+       (concat (copy-to :x86-64/r10 a)
+               (x86-push :x86-64/rax) (x86-push :x86-64/rcx)
+               (x86-push :x86-64/rdx)
+               (x86-rr 0x89 :x86-64/rcx :x86-64/r10)
+               [0x0f 0x01 0xd0]
+               (x86-rr 0x89 :x86-64/r11 :x86-64/rdx)
+               [0x49 0xc1 0xe3 0x20]
+               (x86-rr 0x09 :x86-64/r11 :x86-64/rax)
+               (x86-pop :x86-64/rdx) (x86-pop :x86-64/rcx)
+               (x86-pop :x86-64/rax))
        :x86-64/r11)
       :read-msr
       (finish
@@ -3956,6 +4497,34 @@
                (x86-pop :x86-64/rdx) (x86-pop :x86-64/rcx)
                (x86-pop :x86-64/rax))
        :x86-64/r11)
+      ;; boot: the UEFI firmware boundary.
+      ;;
+      ;; `:system-table` is `:boot-info`'s twin one slot along. The entry shim
+      ;; amu emits for the two-arity EFI contract parks RCX (ImageHandle) at
+      ;; context+0x50 and RDX (SystemTable) at +0x58, so `:boot-info` reads
+      ;; the first and this reads the second, with the identical instruction
+      ;; at the identical cost.
+      :system-table
+      (finish [0x4d 0x8b 0x51 0x58] :x86-64/r10)
+      ;; `:load-ptr` is `mov r10,[r10+r11]` -- one unchecked 64-bit read at
+      ;; the address the firmware handed over. R10/R11 are the encoder's
+      ;; scratch pair and are never in the allocator's pool, so copying into
+      ;; them cannot clobber the other operand.
+      :load-ptr
+      (finish (concat (copy-to :x86-64/r10 a)
+                      (copy-to :x86-64/r11 b)
+                      [0x4f 0x8b 0x14 0x1a])
+              :x86-64/r10)
+      ;; `:jump-to` is the only action here that does not come back. RDI is
+      ;; the SysV first argument, which is the handoff every aiueos kernel
+      ;; entry expects; `jmp r10` leaves no return address, so the kernel's
+      ;; own stack discipline starts clean.
+      :jump-to
+      (vec (concat (copy-to :x86-64/r10 a)
+                   (copy-to :x86-64/r11 b)
+                   (x86-rr 0x89 :x86-64/rdi :x86-64/r11)
+                   [0x41 0xff 0xe2]))
+      :uefi-call2 (x86-uefi-call2 dst arguments)
       (:cpuid-eax :cpuid-ebx :cpuid-ecx :cpuid-edx)
       (finish
        (concat (copy-to :x86-64/r10 a)
@@ -4057,6 +4626,40 @@
      :x86-64/f64-greater-or-equal :x86-64/f64-unordered)
     (x86-f64-compare encoding (:mir/dst instruction) (:mir/left instruction)
                      (:mir/right instruction))
+    ;; f32. The scalar-SINGLE opcodes: 0xf3, not 0xf2.
+    (:x86-64/f32-add :x86-64/f32-subtract :x86-64/f32-multiply
+     :x86-64/f32-divide)
+    (x86-f32-binary encoding (:mir/dst instruction) (:mir/left instruction)
+                    (:mir/right instruction))
+    :x86-64/f32-sqrt
+    (vec (concat (x86-gpr-to-xmm32 0 (:mir/input instruction))
+                 [0xf3 0x0f 0x51 0xc0]
+                 (x86-xmm-to-gpr32 (:mir/dst instruction) 0)
+                 (x86-movsxd (:mir/dst instruction))))
+    (:x86-64/f32-equal :x86-64/f32-less-than
+     :x86-64/f32-less-or-equal :x86-64/f32-greater-than
+     :x86-64/f32-greater-or-equal :x86-64/f32-unordered)
+    (x86-f32-compare encoding (:mir/dst instruction) (:mir/left instruction)
+                     (:mir/right instruction))
+    ;; Width conversions. Which move comes back is decided by the RESULT's
+    ;; width, not the operand's: an f64 or i64 result fills the whole register
+    ;; and must NOT be sign-extended from bit 31.
+    :x86-64/f32-to-f64
+    (vec (concat (x86-gpr-to-xmm32 0 (:mir/input instruction))
+                 [0xf3 0x0f 0x5a 0xc0]
+                 (x86-xmm-to-gpr (:mir/dst instruction) 0)))
+    :x86-64/f64-to-f32
+    (vec (concat (x86-gpr-to-xmm 0 (:mir/input instruction))
+                 [0xf2 0x0f 0x5a 0xc0]
+                 (x86-xmm-to-gpr32 (:mir/dst instruction) 0)
+                 (x86-movsxd (:mir/dst instruction))))
+    :x86-64/i64-to-f32
+    (vec (concat (x86-cvtsi2 0xf3 0 (:mir/input instruction))
+                 (x86-xmm-to-gpr32 (:mir/dst instruction) 0)
+                 (x86-movsxd (:mir/dst instruction))))
+    :x86-64/i64-to-f64
+    (vec (concat (x86-cvtsi2 0xf2 0 (:mir/input instruction))
+                 (x86-xmm-to-gpr (:mir/dst instruction) 0)))
     ;; memwidth: four widths, and `aligned?` is looked up rather than derived
     ;; -- the two exemptions are exemptions by DATE, not by shape.
     (:x86-64/kernel-load-u8 :x86-64/kernel-load-u16
@@ -4081,6 +4684,14 @@
     ;; and the replacement are the operation's, not the guest's.
     :x86-64/kernel-try-lock-u32 (x86-kernel-lock instruction-index 0 1 instruction)
     :x86-64/kernel-unlock-u32 (x86-kernel-lock instruction-index 1 0 instruction)
+    ;; sysops:
+    :x86-64/kernel-atomic-add-u32 (x86-kernel-atomic instruction-index :add 32 instruction)
+    :x86-64/kernel-atomic-add-u64 (x86-kernel-atomic instruction-index :add 64 instruction)
+    :x86-64/kernel-xchg-u32 (x86-kernel-atomic instruction-index :xchg 32 instruction)
+    :x86-64/kernel-xchg-u64 (x86-kernel-atomic instruction-index :xchg 64 instruction)
+    :x86-64/kernel-cmpxchg-u32 (x86-kernel-atomic instruction-index :cmpxchg 32 instruction)
+    :x86-64/kernel-cmpxchg-u64 (x86-kernel-atomic instruction-index :cmpxchg 64 instruction)
+    ;; sysops: end
     :x86-64/kernel-subregion (x86-kernel-subregion instruction-index instruction)
     (:x86-64/equal :x86-64/less-than :x86-64/greater-than
      :x86-64/less-or-equal :x86-64/greater-or-equal)
@@ -4220,6 +4831,55 @@
                        :aarch64/f64-unordered 0x9a9f77e0)
                      (:mir/dst instruction) (:mir/left instruction)
                      (:mir/right instruction))
+    ;; f32. Each word is the f64 one with ftype (bit 22) cleared.
+    (:aarch64/f32-add :aarch64/f32-subtract :aarch64/f32-multiply
+     :aarch64/f32-divide)
+    (a64-f32-binary (case encoding
+                      :aarch64/f32-add 0x1e212800
+                      :aarch64/f32-subtract 0x1e213800
+                      :aarch64/f32-multiply 0x1e210800
+                      :aarch64/f32-divide 0x1e211800)
+                    (:mir/dst instruction) (:mir/left instruction)
+                    (:mir/right instruction))
+    :aarch64/f32-sqrt
+    (vec (concat (a64-fmov-s0-w (:mir/input instruction))
+                 (u32le 0x1e21c000)
+                 (a64-fmov-w-s0 (:mir/dst instruction))
+                 (a64-sxtw (:mir/dst instruction))))
+    (:aarch64/f32-equal :aarch64/f32-less-than
+     :aarch64/f32-less-or-equal :aarch64/f32-greater-than
+     :aarch64/f32-greater-or-equal :aarch64/f32-unordered)
+    (a64-f32-compare (case encoding
+                       :aarch64/f32-equal 0x9a9f17e0
+                       :aarch64/f32-less-than 0x9a9f57e0
+                       :aarch64/f32-less-or-equal 0x9a9f87e0
+                       :aarch64/f32-greater-than 0x9a9fd7e0
+                       :aarch64/f32-greater-or-equal 0x9a9fb7e0
+                       :aarch64/f32-unordered 0x9a9f77e0)
+                     (:mir/dst instruction) (:mir/left instruction)
+                     (:mir/right instruction))
+    ;; Width conversions. Which FMOV comes back is decided by the RESULT's
+    ;; width: an f64 or i64 result fills the whole X register and gets no SXTW.
+    :aarch64/f32-to-f64
+    (vec (concat (a64-fmov-s0-w (:mir/input instruction))
+                 (u32le 0x1e22c000)
+                 (u32le (bit-or 0x9e660000 (a64-register (:mir/dst instruction))))))
+    :aarch64/f64-to-f32
+    (vec (concat (u32le (bit-or 0x9e670000
+                                (bit-shift-left (a64-register (:mir/input instruction)) 5)))
+                 (u32le 0x1e624000)
+                 (a64-fmov-w-s0 (:mir/dst instruction))
+                 (a64-sxtw (:mir/dst instruction))))
+    ;; SCVTF reads the 64-bit general register directly, so there is no FMOV in.
+    :aarch64/i64-to-f32
+    (vec (concat (u32le (bit-or 0x9e220000
+                                (bit-shift-left (a64-register (:mir/input instruction)) 5)))
+                 (a64-fmov-w-s0 (:mir/dst instruction))
+                 (a64-sxtw (:mir/dst instruction))))
+    :aarch64/i64-to-f64
+    (vec (concat (u32le (bit-or 0x9e620000
+                                (bit-shift-left (a64-register (:mir/input instruction)) 5)))
+                 (u32le (bit-or 0x9e660000 (a64-register (:mir/dst instruction))))))
     (:aarch64/kernel-load-u8 :aarch64/kernel-load-u16
      :aarch64/kernel-load-u32 :aarch64/kernel-load-u64
      :aarch64/kernel-store-u8 :aarch64/kernel-store-u16
@@ -4240,6 +4900,14 @@
                       (str/includes? (name encoding) "store") instruction)
     :aarch64/kernel-try-lock-u32 (a64-kernel-lock instruction-index 0 1 instruction)
     :aarch64/kernel-unlock-u32 (a64-kernel-lock instruction-index 1 0 instruction)
+    ;; sysops:
+    :aarch64/kernel-atomic-add-u32 (a64-kernel-atomic instruction-index :add 32 instruction)
+    :aarch64/kernel-atomic-add-u64 (a64-kernel-atomic instruction-index :add 64 instruction)
+    :aarch64/kernel-xchg-u32 (a64-kernel-atomic instruction-index :xchg 32 instruction)
+    :aarch64/kernel-xchg-u64 (a64-kernel-atomic instruction-index :xchg 64 instruction)
+    :aarch64/kernel-cmpxchg-u32 (a64-kernel-atomic instruction-index :cmpxchg 32 instruction)
+    :aarch64/kernel-cmpxchg-u64 (a64-kernel-atomic instruction-index :cmpxchg 64 instruction)
+    ;; sysops: end
     :aarch64/kernel-subregion (a64-kernel-subregion instruction-index instruction)
     (:aarch64/equal :aarch64/less-than :aarch64/greater-than
      :aarch64/less-or-equal :aarch64/greater-or-equal)
@@ -4377,6 +5045,15 @@
     :aarch64/f64-sqrt :aarch64/f64-equal :aarch64/f64-less-than
     :aarch64/f64-less-or-equal :aarch64/f64-greater-than
     :aarch64/f64-greater-or-equal :aarch64/f64-unordered
+    ;; f32 uses the same x0/x1 sources, the same FP scratch bank and no other
+    ;; register, so it is cache-safe on exactly the grounds its f64 twin is.
+    :aarch64/f32-add :aarch64/f32-subtract :aarch64/f32-multiply
+    :aarch64/f32-divide
+    :aarch64/f32-sqrt :aarch64/f32-equal :aarch64/f32-less-than
+    :aarch64/f32-less-or-equal :aarch64/f32-greater-than
+    :aarch64/f32-greater-or-equal :aarch64/f32-unordered
+    :aarch64/f32-to-f64 :aarch64/f64-to-f32
+    :aarch64/i64-to-f32 :aarch64/i64-to-f64
     :aarch64/equal :aarch64/less-than :aarch64/greater-than
     :aarch64/less-or-equal :aarch64/greater-or-equal
     :aarch64/spill-load :aarch64/spill-store :aarch64/move :aarch64/return

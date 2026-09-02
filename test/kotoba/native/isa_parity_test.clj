@@ -16,7 +16,8 @@
   `kotoba.compiler.frontend` admits for every native target."
   (:require [clojure.test :refer [deftest is testing]]
             [kotoba.native.x86-64 :as x86]
-            [kotoba.native.aarch64 :as arm]))
+            [kotoba.native.aarch64 :as arm]
+            [kotoba.native.machine-ir :as machine]))
 
 (def ^:private emitters
   [["x86-64" x86/emit-program]
@@ -113,6 +114,16 @@
    ;; below, which is for facilities the other ISA genuinely lacks.
    [['b 'l 'i] '(kernel-try-lock-u32 b l i)]
    [['b 'l 'i] '(kernel-unlock-u32 b l i)]
+   ;; sysops: the general atomics. Portable, and this is the list they belong
+   ;; in rather than the x86-only one below: AArch64 has all six as single LSE
+   ;; instructions (LDADDAL / SWPAL / CASAL), so an absence here would be a gap
+   ;; and not a difference between the machines.
+   [['b 'l 'i 'd] '(kernel-atomic-add-u32 b l i d)]
+   [['b 'l 'i 'd] '(kernel-atomic-add-u64 b l i d)]
+   [['b 'l 'i 'd] '(kernel-xchg-u32 b l i d)]
+   [['b 'l 'i 'd] '(kernel-xchg-u64 b l i d)]
+   [['b 'l 'i 'e 'd] '(kernel-cmpxchg-u32 b l i e d)]
+   [['b 'l 'i 'e 'd] '(kernel-cmpxchg-u64 b l i e d)]
    [['b 'l 'o 's] '(kernel-subregion b l o s)]
    ;; vector-i64 and vector-f64. Both families lower to the same six host
    ;; calls, so a gap on one ISA would be a gap on every one of the fourteen
@@ -126,6 +137,34 @@
    [['v 'i 'x] '(vector-assoc v i x)]
    [['v 'x] '(vector-conj v x)]
    [['v 'n] '(vector-drop v n)]
+   ;; f32, the binary32 family (kotoba-lang
+   ;; ADR-kotoba-floating-point-on-native). Portable with two exceptions that
+   ;; are NOT listed in `x86-only` below, because they are not facilities one
+   ;; ISA has and the other lacks: `f32-min`/`f32-max` are absent from BOTH,
+   ;; because x86's MINSS/MAXSS return the second operand when either input is
+   ;; NaN while AArch64's FMIN and the KIR oracle return the NaN. An operation
+   ;; that cannot mean one thing on both is refused upstream at admission
+   ;; rather than implemented twice. `kotoba.native.f32-test` pins that absence
+   ;; on both backends so it cannot be closed on one of them by accident.
+   [['a 'b] '(f32-add a b)]
+   [['a 'b] '(f32-sub a b)]
+   [['a 'b] '(f32-mul a b)]
+   [['a 'b] '(f32-div a b)]
+   [['a 'b] '(f32-eq a b)]
+   [['a 'b] '(f32-lt a b)]
+   [['a 'b] '(f32-le a b)]
+   [['a 'b] '(f32-gt a b)]
+   [['a 'b] '(f32-ge a b)]
+   [['a 'b] '(f32-unordered a b)]
+   [['a] '(f32-neg a)]
+   [['a] '(f32-abs a)]
+   [['a] '(f32-sqrt a)]
+   [['a] '(f32-from-bits a)]
+   [['a] '(f32-to-bits a)]
+   [['a] '(f32-to-f64-exact a)]
+   [['a] '(f64-to-f32-rounded a)]
+   [['a] '(i64-to-f32-rounded a)]
+   [['a] '(i64-to-f64-rounded a)]
    [[] '(vector-f64-new)]
    [['v] '(vector-f64-count v)]
    [['v 'i] '(vector-f64-at v i)]
@@ -193,7 +232,59 @@
    [['l 's] '(kernel-cpuid-eax l s)]
    [['l 's] '(kernel-cpuid-ebx l s)]
    [['l 's] '(kernel-cpuid-ecx l s)]
-   [['l 's] '(kernel-cpuid-edx l s)]])
+   [['l 's] '(kernel-cpuid-edx l s)]
+   ;; simdprep: the OTHER half of a feature check, and x86-only for the same
+   ;; reason the four above are. `cpuid` says what the CPU implements; XCR0
+   ;; says what the OPERATING SYSTEM has agreed to save and restore across a
+   ;; context switch, and a kernel that reads only the first and uses YMM
+   ;; anyway does not fault -- it computes wrong answers intermittently and
+   ;; only under load, because its vector registers are not preserved.
+   ;;
+   ;; AArch64 has no counterpart. Its equivalent question -- may I use SVE --
+   ;; is answered by CPACR_EL1.ZEN and ZCR_EL1, named system registers reached
+   ;; by `MRS`/`MSR` with the register encoded in the instruction rather than
+   ;; passed at run time. There is no index to pass, so an AArch64 operator
+   ;; would take different arguments and is a decision for whoever needs one.
+   ;; Pinned here so the absence is an assertion rather than silence.
+   [['i] '(kernel-xgetbv i)]
+   ;; sysops: the three barriers, the timestamp counter and the GS-base swap.
+   ;;
+   ;; These sit here for a WEAKER reason than the control registers and port
+   ;; I/O above, and the difference has to be said rather than absorbed by the
+   ;; list's own heading. AArch64 does have barriers -- `dmb ishld`, `dmb
+   ;; ishst`, `dmb ish` -- so this is not "a facility only x86 has".
+   ;;
+   ;; What makes them x86-only is that they ride the x86 privileged channel,
+   ;; which `kotoba.mir` admits for one target, and that a portable barrier
+   ;; would have to name the ORDERING it guarantees rather than the instruction
+   ;; it emits: `lfence` under x86-TSO and `dmb ishld` under a weak memory
+   ;; model do not answer the same question. That is a separate operator family
+   ;; and a separate decision. Pinned here so the asymmetry is asserted rather
+   ;; than merely true, and so it cannot grow by accident.
+   ;;
+   ;; `rdtsc` is the same shape for a different reason: AArch64's nearest
+   ;; reading, `mrs cntvct_el0`, is a fixed-frequency system counter rather
+   ;; than a core cycle counter -- a DIFFERENT CLOCK, not a translation.
+   ;;
+   ;; `swapgs` genuinely has no counterpart; AArch64 banks its stack pointer
+   ;; and thread pointer by exception level instead.
+   [[] '(kernel-fence-load)]
+   [[] '(kernel-fence-store)]
+   [[] '(kernel-fence-full)]
+   [[] '(kernel-rdtsc)]
+   [[] '(kernel-rdtscp)]
+   [[] '(kernel-swapgs)]
+   ;; boot: the UEFI firmware boundary. x86-only for a reason that is not
+   ;; about the instruction set at all -- there IS AArch64 UEFI, and its
+   ;; calling convention for an EFI image entry is AAPCS64 with the arguments
+   ;; in x0/x1 rather than RCX/RDX. So an AArch64 counterpart would be a
+   ;; different operator set with a different ABI, decided by whoever needs
+   ;; one, and NOT a translation of these four. Pinned here so a partial
+   ;; translation shows up as a failure rather than as silence.
+   [[] '(kernel-system-table)]
+   [['b 'o] '(kernel-load-ptr b o)]
+   [['b 'o 'x 'y] '(kernel-uefi-call2 b o x y)]
+   [['a 'i] '(kernel-jump-to a i)]])
 
 (deftest privileged-x86-operators-are-x86-only-by-design
   (doseq [[params body] x86-only]
@@ -989,3 +1080,70 @@
         (is (some? cmp-at) "cmp x3,x2 (index vs length) must be emitted")
         (is (some? add-at) "add x5,x3,#4 must still be emitted")
         (is (< cmp-at add-at) "the index check must precede the wrapping add")))))
+
+
+;; ---------------------------------------------------------------------------
+;; simdprep: xgetbv is 0f 01 d0 on both lowering paths
+;; ---------------------------------------------------------------------------
+
+;; `0f 01 d0`, verified by disassembling the emitted bytes with
+;; `llvm-mc --disassemble --output-asm-variant=1` (LLVM 22.1.7), which reads
+;; the sequences below back as `xgetbv` surrounded by the moves named in the
+;; comments. NOT EXECUTED: this workstation is an Apple M4 and Rosetta exposes
+;; no AVX, so nothing here observes the instruction run.
+;;
+;; Two paths are asserted because there are two, and they are independent
+;; code. `emit-program` sends a word-result function whose body pilots through
+;; `machine-ir/compile-expression`; everything else reaches `x86_64.cljc`'s own
+;; `emit-kernel-*`. An operator added to one and forgotten in the other is
+;; exactly the class of gap this namespace exists for.
+;;
+;; MEASURED HONESTLY: no `emit-program` input was found that reaches the direct
+;; arm for this operator. Every shape tried -- plain, `let`-bound, inside `if`,
+;; nested argument, mixed with a string call, split across two functions, and
+;; with `:vector-i64` and `:string` results -- piloted. The same appears to be
+;; true of `emit-kernel-cpuid` beside it. The direct arm is kept for parity
+;; with its siblings (leaving `xgetbv` the one privileged operator without one
+;; would make it the one that breaks if the pilot ever declines) and is
+;; exercised here by direct invocation rather than through `emit-program`,
+;; which is what can honestly be shown.
+(deftest xgetbv-emits-the-published-opcode-on-both-lowering-paths
+  (testing "the machine-IR pilot, which is what emit-program selects"
+    ;; push rax; push rcx; push rdx; mov rcx,r10; xgetbv;
+    ;; mov r11,rdx; shl r11,32; or r11,rax; pop rdx; pop rcx; pop rax
+    (let [piloted [0x50 0x51 0x52
+                   0x4c 0x89 0xd1
+                   0x0f 0x01 0xd0
+                   0x49 0x89 0xd3
+                   0x49 0xc1 0xe3 0x20
+                   0x49 0x09 0xc3
+                   0x5a 0x59 0x58]]
+      (is (subsequence? piloted
+                        (vec (machine/compile-expression
+                              :x86-64 '[i] '(kernel-xgetbv i))))
+          "the arm saves the three registers it borrows")
+      (is (subsequence? piloted
+                        (:code (x86/emit-program
+                                (program '[i] '(kernel-xgetbv i)))))
+          "and emit-program really does select it")))
+  (testing "the direct emitter in x86_64.cljc"
+    ;; mov eax,0 (the literal index); mov rcx,rax; xgetbv; shl rdx,32; or rax,rdx
+    (is (= [0xb8 0x00 0x00 0x00 0x00
+            0x48 0x89 0xc1
+            0x0f 0x01 0xd0
+            0x48 0xc1 0xe2 0x20
+            0x48 0x09 0xd0]
+           (@#'x86/emit-kernel-xgetbv '(0) {} {:temp-depth 0}))
+        "EDX:EAX joined with no mask, because a 32-bit write already zeroed
+         the upper half of each half"))
+  ;; `cpuid` needs `push rbx` / `pop rbx` because it writes EBX whether or not
+  ;; the caller asked for it. `xgetbv` writes EAX and EDX only, so the save
+  ;; would be two bytes in a kernel with nothing to explain them. Asserted
+  ;; rather than merely omitted, because "we did not add it" and "it must not
+  ;; be there" read identically in a diff.
+  (testing "and needs no RBX save, unlike cpuid"
+    (let [xgetbv (:code (x86/emit-program (program '[i] '(kernel-xgetbv i))))
+          cpuid (:code (x86/emit-program
+                        (program ['l 's] '(kernel-cpuid-ecx l s))))]
+      (is (subsequence? [0x53] cpuid) "cpuid saves rbx")
+      (is (not (subsequence? [0x53] xgetbv)) "xgetbv does not, and must not"))))

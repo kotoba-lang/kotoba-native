@@ -1,4 +1,4 @@
-# ADR 0039: Transfer width, window tier, and the ADR 0285 slice carrier
+# ADR 0042: Transfer width, window tier, and the ADR 0285 slice carrier
 
 - Status: accepted
 - Date: 2026-09-02
@@ -116,7 +116,9 @@ weaker of the two.
 
 ## Evidence
 
-`clojure -M:test` — **250 tests, 3000 assertions, 0 failures**.
+`clojure -M:test` — **271 tests, 3411 assertions, 0 failures**, after merging
+`origin/main` (the sysops general atomics, the SIMD-prep VEX work, f32 on both
+ISAs, and the UEFI firmware boundary).
 
 Every encoding was disassembled with `llvm-mc --disassemble` (LLVM 22.1.7)
 *before* it was written into a golden, and the disassembly is quoted beside it.
@@ -148,6 +150,16 @@ Four deliberate breaks, each red for its own reason and then restored:
 | slice SIB scale fixed at 1 | `"slice-load-u16 scales the index by 2"` and the u32/u64 siblings |
 | `unaligned-accesses` emptied | the two exemption assertions, on **both** ISAs |
 
+The merge with `origin/main` found one thing worth recording. The sysops
+general atomics call `x86-kernel-bounds-check` and its AArch64 twin, so
+widening that function's signature with `aligned?` made six of their goldens
+fail with an `ArityException` — loudly, at the call site, which is what a
+positional argument buys over a derived one. They pass `false`: `lock`-prefixed
+and LSE atomics require natural alignment architecturally, so adding the check
+there would be a real change to their admitted set and would move bytes their
+own goldens pin. Recorded as a follow-on beside the two u32 window exemptions,
+not done in passing.
+
 The goldens decode **fields** rather than pinning whole words wherever the
 destination register is the allocator's choice. `ldrh w3, [x16]` and
 `ldrh w0, [x16]` are the same claim about this encoder; pinning the register
@@ -160,5 +172,8 @@ namespace exists.
 
 ## Upstream
 
-kotoba-gmir `cb935ce`, kotoba-mir `37345aa`, kotoba-codegen `c024b11`,
-kotoba-kir `7aa6d2d`, kotoba-sema `87f7d32` — all merged, all pins bumped here.
+kotoba-kir `7aa6d2d` and kotoba-sema `87f7d32` carry the oracle and the
+frontend halves. The gmir/mir/codegen pins land at `origin/main`'s values
+(`11282bb` / `be99446` / `d450d46`), each of which was checked with
+`git merge-base --is-ancestor` to contain this stream's own merges
+(`cb935ce` / `37345aa` / `c024b11`) rather than assumed to.

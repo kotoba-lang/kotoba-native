@@ -981,6 +981,36 @@
 ;; already-saturated field: every such register would read back as -1's upper
 ;; word, silently. The negative i64 that a bit-63 MSR produces is the correct
 ;; result -- the bit pattern is exact, and `:i64` in this language is signed.
+;; simdprep: `xgetbv` -- `(kernel-xgetbv index)` -> the extended control
+;; register at that index, EDX:EAX rejoined into one i64.
+;;
+;; Structurally this is `emit-kernel-read-msr` with one opcode changed: both
+;; read a 64-bit quantity into EDX:EAX selected by ECX, so the operand
+;; marshalling and the shift-and-or that rejoins the halves are the same four
+;; instructions. Its closer RELATIVE is `cpuid` -- both answer "what can this
+;; machine do" -- but it does not share `cpuid`'s hazard: `xgetbv` writes EAX
+;; and EDX only, never EBX, so THE RBX SAVE THAT `emit-kernel-cpuid` NEEDS IS
+;; NOT NEEDED HERE. Adding one would be harmless and would also be an
+;; unexplained pair of bytes in a kernel.
+;;
+;; No mask on either half, for the reason `emit-kernel-read-msr` already
+;; gives: the instruction writes the 32-bit EAX and EDX, and a 32-bit write
+;; zeroes the upper half of its containing 64-bit register, so both halves
+;; arrive already isolated.
+;;
+;; WHAT THIS CANNOT ENFORCE, and the reason a caller can still fault: `xgetbv`
+;; raises #UD unless CR4.OSXSAVE is set, and the bit that reports CR4.OSXSAVE
+;; is `cpuid` leaf 1 ECX bit 27. A guard must test 27 BEFORE reaching here.
+;; That is an ordering constraint between two separate operators and no
+;; emitter can express it; docs/avx2-guard-sequence.md carries it.
+(defn- emit-kernel-xgetbv [[index] env {:keys [temp-depth] :as ctx}]
+  (let [ctx (assoc ctx :tail? false)]
+    (vec (concat (emit-expr index env ctx)
+                 [0x48 0x89 0xc1                         ; mov rcx,rax  (index -> ecx)
+                  0x0f 0x01 0xd0                         ; xgetbv       -> edx:eax
+                  0x48 0xc1 0xe2 0x20                    ; shl rdx,32
+                  0x48 0x09 0xd0]))))                    ; or  rax,rdx
+
 (defn- emit-kernel-read-msr [[index] env {:keys [temp-depth] :as ctx}]
   (let [ctx (assoc ctx :tail? false)]
     (vec (concat (emit-expr index env ctx)
@@ -1944,6 +1974,7 @@
         (= op 'kernel-out-u32) (emit-kernel-out args 32 env ctx)
         (= op 'kernel-in-u8) (emit-kernel-in args 8 env ctx)
         (= op 'kernel-in-u32) (emit-kernel-in args 32 env ctx)
+        (= op 'kernel-xgetbv) (emit-kernel-xgetbv args env ctx)
         (= op 'kernel-read-msr) (emit-kernel-read-msr args env ctx)
         (= op 'kernel-write-msr) (emit-kernel-write-msr args env ctx)
         (= op 'kernel-cpuid-eax) (emit-kernel-cpuid args :eax env ctx)

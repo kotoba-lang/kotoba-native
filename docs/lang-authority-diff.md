@@ -91,7 +91,7 @@ following the `:native-homogeneous-vectors` template:
                     pinned by a test, and closable only with a re-pin."}
    :provenance :base-must-name-a-region-not-compute-one
    :host-abi {:trap :ud2-or-brk}
-   :evidence "kotoba-native ADR 0039; byte goldens cross-checked against
+   :evidence "kotoba-native ADR 0042; byte goldens cross-checked against
               llvm-mc 22.1.7; kotoba-kir ADR 0229 oracle parity"}
 
   :slice-carrier
@@ -107,7 +107,7 @@ following the `:native-homogeneous-vectors` template:
    :element-cost "one unsigned compare and one scaled load; no context callback"
    :limits [:no-single-value-carrier :element-type-f32-declared-not-admitted]
    :decided-by "amu ADR 0285"
-   :evidence "kotoba-native ADR 0039; the scale is read out of the x86 SIB byte
+   :evidence "kotoba-native ADR 0042; the scale is read out of the x86 SIB byte
               and the AArch64 ADD shift field by byte goldens"}}
 ```
 
