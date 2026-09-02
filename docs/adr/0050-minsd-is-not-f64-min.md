@@ -28,9 +28,11 @@ row:
 | -0.0 | -0.0 | -0.0 | -0.0 |
 | 1.0 | 2.0 | 1.0 | 2.0 |
 
-Then the same twelve rows were compiled and **executed** on both ISAs through
-amu's `isa_execution_test` loader — AArch64 natively on an M4, x86-64 under
-Rosetta 2. Forty-eight observations, six wrong, all six on x86-64:
+Then the same twelve operand pairs were compiled and **executed** for both
+operations on both ISAs through amu's `isa_execution_test` loader — AArch64
+natively on an M4, x86-64 under Rosetta 2. Forty-eight observations, twenty-four
+per ISA (eighteen NaN/signed-zero rows and six ordered ones). Six wrong, all six
+inside x86-64's eighteen:
 
 ```
 x86  f64-min  (  nan,  3.0) expected=9221120237041090560  got=4613937818241073152
@@ -41,9 +43,10 @@ x86  f64-max  (  0.0, -0.0) expected=0                    got=-92233720368547758
 x86  f64-max  (  nan, -2.0) expected=9221120237041090560  got=-4611686018427387904
 ```
 
-AArch64 got twelve of twelve right. This was not a hypothetical divergence
-noted in a comment; it was a wrong answer on shipped code, and the comment that
-recorded it had been read three times as a reason not to admit `f32-min`.
+AArch64 was right on all twenty-four of its observations. This was not a
+hypothetical divergence noted in a comment; it was a wrong answer on shipped
+code, and the comment that recorded it had been read three times as a reason not
+to admit `f32-min`.
 
 ## Why one instruction cannot do it
 
@@ -116,5 +119,6 @@ x86 NaN behaviour as the *reason* have been corrected to say so.
 
 - `clojure -M:test -n kotoba.native-test -n kotoba.native.machine-ir-test`:
   143 tests, 1653 assertions, 0 failures (before the new goldens).
-- Execution, before: SCANNED 48, MISMATCHES 6 (all x86-64).
+- Execution, before: SCANNED 48, MISMATCHES 6 — all six on x86-64, none on
+  AArch64, which is 24 observations per ISA.
 - Execution, after: SCANNED 48, MISMATCHES 0.

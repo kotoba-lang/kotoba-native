@@ -3095,10 +3095,11 @@
 ;; A bare `minsd xmm0, xmm1` computes `(a < b) ? a : b`, so it returns the
 ;; SECOND operand whenever the comparison is false -- which is exactly the two
 ;; cases above where the first operand should win. Executed through the Rosetta
-;; loader on 2026-09-02 this cost SIX of the twelve NaN/zero rows (`min(NaN,x)`,
-;; `min(-0,+0)`, `max(NaN,x)`, `max(+0,-0)` and their -2.0 twins), while
-;; AArch64 got all twelve right. Not a hypothetical: the previous encoding was
-;; a silent wrong answer on shipped code.
+;; loader on 2026-09-02 this cost six of the EIGHTEEN NaN/zero rows on x86-64
+;; (`min(NaN,x)`, `min(-0,+0)`, `max(NaN,x)`, `max(+0,-0)` and their -2.0
+;; twins), while AArch64 was right on all twenty-four of its observations. Not
+;; a hypothetical: the previous encoding was a silent wrong answer on shipped
+;; code.
 ;;
 ;; The repair is straight-line and branchless. `minsd a,b` is already correct
 ;; except in two situations, and each has a mask that names it:
