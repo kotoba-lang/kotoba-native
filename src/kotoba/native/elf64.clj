@@ -239,7 +239,28 @@
    ;; One region and a mode, because the ABI admits five parameters: key,
    ;; nonce, AAD, tag and every scratch buffer live in `ctx`, and `data` is
    ;; transformed in place. The object's own header states the layout.
-   'aiueos-aes128-gcm {:arity 5 :symbol "kotoba_aiueos_aes128_gcm"}})
+   'aiueos-aes128-gcm {:arity 5 :symbol "kotoba_aiueos_aes128_gcm"}
+   ;; HMAC-SHA256 and HKDF-Expand-Label (RFC 5869 + RFC 8446 7.1) -- the key
+   ;; schedule that turns the X25519 shared secret into the traffic keys the
+   ;; row above encrypts with. It replaces four static functions in
+   ;; `kernel/tls13.c` (`hmac_sha256`, `hkdf_extract`, `hkdf_expand_label` and
+   ;; the HMAC half of `finish_check`). Which bytes become the traffic key is
+   ;; not mechanism.
+   ;;
+   ;; NOT A BOOLEAN, same convention as the row above: zero is done, 1..6 name
+   ;; the clause that refused.
+   ;;
+   ;; RFC 5869's Extract is not a mode. It is `HMAC(salt, ikm)` with the salt
+   ;; in the key slot, and the C's "an empty salt means 32 zero bytes" rule is
+   ;; not a rule either -- HMAC pads its key to the block, so the two produce
+   ;; the same padded block. The object's contract asserts that with a vector.
+   ;;
+   ;; SHA-256 is inlined rather than required from `aiueos.sha256`: a namespace
+   ;; that declares `(:require ...)` is a multi-module project and
+   ;; `amu compile` will not package one for this target at all (measured
+   ;; 2026-09-02 against amu b1fdaad2), which is why `cid-v1-admit.kotoba` has
+   ;; no committed `.o` beside it.
+   'aiueos-hkdf-sha256 {:arity 3 :symbol "kotoba_aiueos_hkdf_sha256"}})
 
 (def ^:private admitted-entry-prefix
   "The prefix every `kernel-object-entries` key carries, checked against the
@@ -816,6 +837,25 @@
           ;; measured at 4,815,405 bounded-memory operations), not a shared
           ;; derivation.
           aead-fuel? (= 'aiueos-aes128-gcm object-entry)
+          ;; HMAC-SHA256 / HKDF-Expand-Label. COMPUTED, like the arm above and
+          ;; like `dhcp-fuel?`, and said so.
+          ;;
+          ;; Unlike `aiueos-sha256`, whose message may be 12,288 bytes, this
+          ;; object's message is bounded IN THE OBJECT at 192: HMAC only ever
+          ;; hashes a 64-byte padded key block plus an info string that RFC 8446
+          ;; 7.1 caps at 91 bytes here. That is at most four block
+          ;; compressions per hash and two hashes per call, and one compression
+          ;; is ~800 calls (a 17-call prepare, a 49-call extend, 64 rounds each
+          ;; carrying a 9-call register rotation, an 8-call add). Call it 7,000
+          ;; with the pad-block writes and the info construction.
+          ;;
+          ;; It takes SHA-256's own tier rather than something tighter. 65,536
+          ;; would be a 9x margin on an estimate, not a measurement, and the
+          ;; failure a tight bound produces is a prologue `ud2` -- an unexpected
+          ;; vector 6 that reads as a protocol bug rather than a fuel bug. The
+          ;; arm is separate from `sha-fuel?` so that measuring either one
+          ;; cannot silently move the other.
+          hkdf-fuel? (= 'aiueos-hkdf-sha256 object-entry)
           context-fuel? (contains? '#{aiueos-user-context-build
                                      aiueos-kernel-context-build}
                                    object-entry)
@@ -913,6 +953,7 @@
           replenish (cond
                       ecdsa-fuel? [0x49 0xc7 0x41 0x08 0xff 0xff 0xff 0x7f] ; 2,147,483,647
                       aead-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000
+                      hkdf-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
                       rsa-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000
                       sha-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
                       context-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x01 0x00] ; 65,536
