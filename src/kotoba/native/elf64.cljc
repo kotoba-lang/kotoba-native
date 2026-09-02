@@ -460,6 +460,33 @@
    ;; the answer, not in the spelling.
    'aiueos-qwen35-norm
    {:arity 5 :symbol "kotoba_aiueos_qwen35_norm"}
+   ;; The Qwen3.5 forward pass, third tranche: the two loops the matvecs sit
+   ;; between that are neither elementwise nor a whole-vector reduction.
+   ;;
+   ;; `[arena arena-bytes plan plan-bytes]` for both, because each needs six or
+   ;; more regions and a geometry against a five-argument ABI, and because
+   ;; `kernel-subregion` requires a BASE to be a parameter -- so regions arrive
+   ;; as OFFSETS into one arena, which a plan may compute. Zero is the success
+   ;; value; the negative codes name the refusing clause.
+   ;;
+   ;; `aiueos-qwen35-attention` is `full_attention`'s de-interleave, its FUSED
+   ;; SOFTMAX over the KV cache, and its position-zero reduction. The score
+   ;; widens each binary32 factor to binary64 and reduces in FOUR
+   ;; ACCUMULATORS -- `(sum0+sum1)+(sum2+sum3)`, `dot_scalar`'s tree and not
+   ;; `dot_avx2`'s -- while the softmax exponent and the denominator stay
+   ;; binary32. `rope_heads` is NOT in it and cannot be: on x86-64 the C's sine
+   ;; and cosine are the x87 `fsincos` instruction, Amu emits no x87, and there
+   ;; is no polynomial to transcribe because the C is not using one.
+   'aiueos-qwen35-attention
+   {:arity 4 :symbol "kotoba_aiueos_qwen35_attention"}
+   ;; `aiueos-qwen35-recurrent-step` is the gated DeltaNet step over ONE linear
+   ;; head's `d*d` state, whose slot in `decode->recurrent` is one of 2,304 in
+   ;; a 150,994,944-byte region -- which is why every offset in its plan is 64
+   ;; bits. Both of its inner products accumulate ONE ELEMENT AT A TIME, left
+   ;; to right, in binary32: the four-accumulator tree above would disagree
+   ;; with the C here.
+   'aiueos-qwen35-recurrent-step
+   {:arity 4 :symbol "kotoba_aiueos_qwen35_recurrent_step"}
    ;; The tokenizer beside them. The three admission objects above answer
    ;; "is this the file" without ever reading a token STRING; these three read
    ;; the two arrays those coordinates name -- 248,320 vocabulary entries and
@@ -1284,6 +1311,25 @@
           ;; Two arms, so that re-measuring one cannot silently move the other.
           qwen-activation-fuel? (= 'aiueos-qwen35-activation object-entry)
           qwen-norm-fuel? (= 'aiueos-qwen35-norm object-entry)
+          ;; The third Qwen tranche. MEASURED by bisection in the `kotoba.kir`
+          ;; interpreter at two geometries and extrapolated to the K16 one,
+          ;; the same method as the first two tranches -- and, like the second,
+          ;; with the earlier tranches' hardware returns behind it.
+          ;;
+          ;;   attention        mode 1 at 24 heads x 256 wide x 8 positions is
+          ;;                    the worst case: 24 x (8 scores of 256 binary64
+          ;;                    products + 8 x 256 weighted adds + 256
+          ;;                    sigmoids). ~2,800 per head-position and ~62,000
+          ;;                    per head -> ~1,500,000, against a tier chosen
+          ;;                    for the ceiling the object ADMITS (64 heads,
+          ;;                    256 wide, 8 positions), not the geometry K16
+          ;;                    passes.
+          ;;   recurrent-step   three passes over d*d cells at d <= 128:
+          ;;                    ~35 per cell x 3 x 16,384 -> ~1,800,000.
+          ;;
+          ;; Two arms, so that re-measuring one cannot silently move the other.
+          qwen-attention-fuel? (= 'aiueos-qwen35-attention object-entry)
+          qwen-recurrent-fuel? (= 'aiueos-qwen35-recurrent-step object-entry)
           ;; The GPT-2 BPE index build. COMPUTED, and the computation depends
           ;; on an argument, which is why the object refuses a model window
           ;; above 16 MiB: every token and every merge string is hashed and
@@ -1423,6 +1469,8 @@
                       qwen-matvec-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000 (3.8x)
                       qwen-activation-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x00 0x01] ; 16,777,216 (12x)
                       qwen-norm-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000 (9x)
+                      qwen-attention-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000
+                      qwen-recurrent-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x00 0x04] ; 67,108,864
                       qwen-index-fuel? [0x49 0xc7 0x41 0x08 0xff 0xff 0xff 0x7f] ; 2,147,483,647
                       qwen-tokenize-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000
                       qwen-detokenize-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000

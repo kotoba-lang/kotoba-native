@@ -157,7 +157,10 @@
            ['aiueos-qwen35-dequant-row 5 "kotoba_aiueos_qwen35_dequant_row" 16777216]
            ['aiueos-qwen35-matvec      4 "kotoba_aiueos_qwen35_matvec"      250000000]
            ['aiueos-qwen35-activation  5 "kotoba_aiueos_qwen35_activation"  16777216]
-           ['aiueos-qwen35-norm        5 "kotoba_aiueos_qwen35_norm"        250000000]]]
+           ['aiueos-qwen35-norm        5 "kotoba_aiueos_qwen35_norm"        250000000]
+           ['aiueos-qwen35-attention   4 "kotoba_aiueos_qwen35_attention"   250000000]
+           ['aiueos-qwen35-recurrent-step
+            4 "kotoba_aiueos_qwen35_recurrent_step" 67108864]]]
     (let [artifact (-> (sealed-kernel :x86_64-aiueos-kernel-v1 512)
                        (assoc :exports {entry {:offset 0 :arity arity}
                                         'main {:offset 1 :arity 0}}
