@@ -3330,3 +3330,202 @@
   (is (= :vex-opcode-map-unsupported
          (vex-rejection #(#'machine/vex3 {:map :0f0f :b 1}))))
   (is (= :vex-vvvv-out-of-range (vex-rejection #(#'machine/vex2 {:vvvv 16})))))
+
+;; ---------------------------------------------------------------------------
+;; memwidth: byte goldens for the two remaining MMIO widths, the alignment
+;; check, and the ADR 0285 slice family.
+;;
+;; Every encoding asserted below was disassembled with `llvm-mc --disassemble`
+;; (LLVM 22.1.7) before it was written here, and the disassembly is quoted
+;; beside it. A hand-derived encoding that decodes as something else is the one
+;; failure a byte golden cannot catch by itself: it pins whatever the encoder
+;; produced, correct or not.
+;;
+;; The assertions decode FIELDS rather than pinning whole words wherever the
+;; destination register is the allocator's choice. `ldrh w3, [x16]` and
+;; `ldrh w0, [x16]` are the same claim about this encoder; which register the
+;; value lands in is not what these tests are about, and pinning it would make
+;; them go red for a reason that has nothing to do with transfer width.
+;; ---------------------------------------------------------------------------
+
+(defn- memwidth-bytes [target params form]
+  (machine/compile-expression target params form))
+
+(defn- memwidth-contains? [bytes needle]
+  (boolean (some #(= (vec needle) %) (partition (count needle) 1 bytes))))
+
+(defn- memwidth-a64-words [bytes]
+  (map (fn [[a b c d]] (+ a (* 256 b) (* 65536 c) (* 16777216 d)))
+       (partition 4 4 bytes)))
+
+(defn- memwidth-x86-access?
+  "Is there an `opcode` at `[r11]` in BYTES -- REX with the given bits, then the
+  opcode bytes, then a ModRM whose mod is 00 and whose r/m is 011? The reg
+  field is the allocator's, so it is masked out."
+  [bytes {:keys [prefix rex-mask opcode]}]
+  (boolean
+   (some (fn [window]
+           (let [window (vec window)
+                 window (if prefix
+                          (when (= prefix (first window)) (subvec window 1))
+                          window)]
+             (when window
+               (let [rex (first window)
+                     rest-of (subvec window 1)]
+                 (and (= 0x40 (bit-and rex 0xf0))
+                      (= rex-mask (bit-and rex rex-mask))
+                      (= opcode (subvec rest-of 0 (count opcode)))
+                      (let [modrm (nth rest-of (count opcode))]
+                        (= 0x03 (bit-and modrm 0xc7))))))))
+         (partition 6 1 bytes))))
+
+(deftest memwidth-x86-transfer-widths-are-the-instructions-they-name
+  (let [load #(memwidth-bytes :x86-64 '[b l i] (list % 'b 'l 'i))
+        store #(memwidth-bytes :x86-64 '[b l i v] (list % 'b 'l 'i 'v))]
+    ;; movzwl (%r11), %r8d   -- 45 0f b7 03
+    (is (memwidth-x86-access? (load 'kernel-load-u16)
+                              {:rex-mask 0x01 :opcode [0x0f 0xb7]})
+        "u16 load is movzx r32, word ptr [r11] -- zero-extended into the i64")
+    ;; movq (%r11), %r8      -- 4d 8b 03
+    (is (memwidth-x86-access? (load 'kernel-load-u64)
+                              {:rex-mask 0x09 :opcode [0x8b]})
+        "u64 load is REX.W mov r64, qword ptr [r11]")
+    ;; movw %r8w, (%r11)     -- 66 45 89 03; the 0x66 operand-size prefix
+    ;; PRECEDES REX, which is the one thing easy to get backwards here.
+    (is (memwidth-x86-access? (store 'kernel-store-u16)
+                              {:prefix 0x66 :rex-mask 0x01 :opcode [0x89]})
+        "u16 store is 66 REX 89, in that order")
+    ;; movq %r8, (%r11)      -- 4d 89 03
+    (is (memwidth-x86-access? (store 'kernel-store-u64)
+                              {:rex-mask 0x09 :opcode [0x89]})
+        "u64 store is REX.W mov qword ptr [r11], r64")
+    (testing "and the widths that were already here have not moved"
+      (is (memwidth-x86-access? (load 'kernel-load-u8)
+                                {:rex-mask 0x01 :opcode [0x0f 0xb6]}))
+      (is (memwidth-x86-access? (load 'kernel-load-u32)
+                                {:rex-mask 0x01 :opcode [0x8b]}))
+      (is (memwidth-x86-access? (store 'kernel-store-u8)
+                                {:rex-mask 0x01 :opcode [0x88]})))))
+
+(deftest memwidth-x86-alignment-is-checked-and-two-operations-are-exempt
+  ;; andq $mask, %r10 -- 49 83 e2 <mask>, then test/ja. R10 is the same scratch
+  ;; the tail check uses and is dead afterwards.
+  (is (memwidth-contains? (memwidth-bytes :x86-64 '[b l i] '(kernel-load-u16 b l i))
+                          [0x49 0x83 0xe2 0x01])
+      "a u16 window access masks the index with 1")
+  (is (memwidth-contains? (memwidth-bytes :x86-64 '[b l i] '(kernel-load-u64 b l i))
+                          [0x49 0x83 0xe2 0x07])
+      "a u64 window access masks the index with 7")
+  (is (memwidth-contains? (memwidth-bytes :x86-64 '[b l i] '(kernel-load-u32-4k b l i))
+                          [0x49 0x83 0xe2 0x03])
+      "and so does a u32 access at a tier that did not exist before")
+  ;; `unaligned-accesses` is keyed on (operation, window) because the exemption
+  ;; is by DATE, not by shape: the same u32 load at a 4 KiB window DOES check,
+  ;; one assertion above. These three are the whole of the asymmetry.
+  (is (not (memwidth-contains?
+            (memwidth-bytes :x86-64 '[b l i] '(kernel-load-u32 b l i))
+            [0x49 0x83 0xe2 0x03]))
+      "the 512-byte u32 load keeps its historical unaligned contract")
+  (is (not (memwidth-contains?
+            (memwidth-bytes :x86-64 '[b l i v] '(kernel-store-u32 b l i v))
+            [0x49 0x83 0xe2 0x03]))
+      "and so does the 512-byte u32 store")
+  (is (not (memwidth-contains?
+            (memwidth-bytes :x86-64 '[b l i] '(kernel-try-lock-u32 b l i))
+            [0x49 0x83 0xe2 0x03]))
+      "and the lock pair, which never requests the check at all"))
+
+(deftest memwidth-x86-slice-is-one-scaled-mov-after-one-compare
+  (let [code (memwidth-bytes :x86-64 '[b l i] '(slice-load-u64 b l i))]
+    ;; movabsq $1099511627776, %r10 -- the ceiling does not fit an imm32, which
+    ;; is the visible sign that it is an address-space bound rather than a
+    ;; window profile.
+    (is (memwidth-contains? code [0x49 0xba 0x00 0x00 0x00 0x00 0x00 0x01 0x00 0x00])
+        "the slice ceiling is 2^40 and arrives by movabs")
+    (is (memwidth-x86-access? code {:rex-mask 0x09 :opcode [0x8b]})
+        "and the access is a plain REX.W mov off r11 -- no context callback")
+    (testing "nothing in the sequence is a host call"
+      ;; `call qword ptr [r9+disp]` is how every context callback leaves; the
+      ;; whole claim of ADR 0285 is that an element access is not one.
+      (is (not (memwidth-contains? code [0x41 0xff 0x51]))
+          "no disp8 context call")
+      (is (not (memwidth-contains? code [0x41 0xff 0x91]))
+          "no disp32 context call")))
+  (testing "the scale is the element width, and it is in the SIB byte"
+    (doseq [[op scale] [['slice-load-u8 0] ['slice-load-u16 1]
+                        ['slice-load-u32 2] ['slice-load-u64 3]]]
+      (let [code (memwidth-bytes :x86-64 '[b l i] (list op 'b 'l 'i))
+            ;; leaq (%base,%index,N), %r11 -- REX.W|R, 8d, ModRM mod=00
+            ;; reg=011 rm=100, then the SIB whose top two bits are the scale.
+            sib (some (fn [[rex opcode modrm sib]]
+                        (when (and (= 0x40 (bit-and rex 0xf0))
+                                   (= 0x08 (bit-and rex 0x08))
+                                   (= 0x04 (bit-and rex 0x04))
+                                   (= 0x8d opcode)
+                                   (= 0x1c modrm))
+                          sib))
+                      (partition 4 1 code))]
+        (is (some? sib) (str op " must compute its address with one lea"))
+        (is (= scale (bit-shift-right sib 6))
+            (str op " scales the index by " (bit-shift-left 1 scale)))))))
+
+(deftest memwidth-aarch64-transfer-widths-are-the-instructions-they-name
+  ;; ldrh w3,[x16] = 0x79400203, ldr x3,[x16] = 0xf9400203, and the stores.
+  ;; Rt is masked out; Rn must be x16, which is the address the bounds check
+  ;; computed.
+  (let [access? (fn [words opcode]
+                  (boolean (some #(and (= opcode (bit-and % 0xffc00000))
+                                       (= 16 (bit-and (bit-shift-right % 5) 0x1f))
+                                       (zero? (bit-and % 0x003ffc00)))
+                                 words)))
+        load #(memwidth-a64-words (memwidth-bytes :aarch64 '[b l i] (list % 'b 'l 'i)))
+        store #(memwidth-a64-words
+                (memwidth-bytes :aarch64 '[b l i v] (list % 'b 'l 'i 'v)))]
+    (is (access? (load 'kernel-load-u16) 0x79400000) "ldrh wN, [x16]")
+    (is (access? (load 'kernel-load-u64) 0xf9400000) "ldr xN, [x16]")
+    (is (access? (store 'kernel-store-u16) 0x79000000) "strh wN, [x16]")
+    (is (access? (store 'kernel-store-u64) 0xf9000000) "str xN, [x16]")
+    (testing "and the widths that were already here have not moved"
+      (is (access? (load 'kernel-load-u8) 0x39400000) "ldrb wN, [x16]")
+      (is (access? (load 'kernel-load-u32) 0xb9400000) "ldr wN, [x16]"))))
+
+(deftest memwidth-aarch64-alignment-is-tst-and-the-slice-scale-is-an-lsl
+  ;; tst xN, #7  =  ANDS XZR, xN, #imm  with N=1, immr=0, imms=2. Verified as
+  ;; 0xf240085f -> `tst x2, #0x7`; Rn is the allocator's, so it is masked out.
+  (let [tst? (fn [words imms]
+               (boolean (some #(and (= 0xf2400000 (bit-and % 0xfffc0000))
+                                    (= 31 (bit-and % 0x1f))
+                                    (zero? (bit-and (bit-shift-right % 16) 0x3f))
+                                    (= imms (bit-and (bit-shift-right % 10) 0x3f)))
+                              words)))]
+    (is (tst? (memwidth-a64-words
+               (memwidth-bytes :aarch64 '[b l i] '(kernel-load-u64 b l i))) 2)
+        "a u64 window access emits tst xN,#7")
+    (is (tst? (memwidth-a64-words
+               (memwidth-bytes :aarch64 '[b l i] '(kernel-load-u16 b l i))) 0)
+        "a u16 window access emits tst xN,#1")
+    (is (not (tst? (memwidth-a64-words
+                    (memwidth-bytes :aarch64 '[b l i] '(kernel-load-u32 b l i))) 1))
+        "the 512-byte u32 load keeps its historical unaligned contract here too")))
+
+(deftest memwidth-a-slice-scales-on-both-isas-and-a-window-does-not
+  ;; The one difference that matters: a window index is a byte offset, so its
+  ;; address is `base + index`; a slice index counts elements, so its address is
+  ;; `base + index * width`. On AArch64 both are the same ADD (shifted register)
+  ;; into x16 and only the LSL field differs, so reading that field is the
+  ;; sharpest form the claim can take.
+  (let [shift-of (fn [form]
+                   (some (fn [w]
+                           (when (and (= 0x8b000000 (bit-and w 0xff200000))
+                                      (= 16 (bit-and w 0x1f)))
+                             (bit-and (bit-shift-right w 10) 0x3f)))
+                         (memwidth-a64-words
+                          (memwidth-bytes :aarch64 '[b l i] form))))]
+    (is (= 0 (shift-of '(kernel-load-u64 b l i)))
+        "a window access adds the index unscaled")
+    (is (= 3 (shift-of '(slice-load-u64 b l i)))
+        "a slice access scales it by the element width")
+    (is (= 2 (shift-of '(slice-load-u32 b l i))))
+    (is (= 1 (shift-of '(slice-load-u16 b l i))))
+    (is (= 0 (shift-of '(slice-load-u8 b l i)))
+        "and a byte slice needs no scale at all")))
