@@ -41,7 +41,7 @@
         ;; own context pointer (kotoba-mir ADR-0017).
         io.github.kotoba-lang/kotoba-mir
         {:git/url "https://github.com/kotoba-lang/kotoba-mir.git"
-         :git/sha "30c421b3e53d72823932def9796e3f352b12e739"}
+         :git/sha "0bb174c8063178a6dd04f92359ef3ea8dff693e0"}
         io.github.kotoba-lang/kotoba-codegen
         {:git/url "https://github.com/kotoba-lang/kotoba-codegen.git"
          :git/sha "9b3fef38fb71dd6c2e63d167dafde6ee7a61dfe4"}
