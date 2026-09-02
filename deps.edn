@@ -35,10 +35,10 @@
         ;; the dead-quotient-save elision below it.
         io.github.kotoba-lang/kotoba-mir
         {:git/url "https://github.com/kotoba-lang/kotoba-mir.git"
-         :git/sha "be9944691f11f1d851c6993d773032a784256bec"}
+         :git/sha "f588a256dc0e11548b4eacdfa8c703d3d44cd9b8"}
         io.github.kotoba-lang/kotoba-codegen
         {:git/url "https://github.com/kotoba-lang/kotoba-codegen.git"
-         :git/sha "d450d460b2589899c5c8becb4e153cf8c4f2bc23"}
+         :git/sha "2887671d0b99daf9076e1acbd623f144313f8459"}
         io.github.kotoba-lang/kotoba-object
         {:git/url "https://github.com/kotoba-lang/kotoba-object.git"
          :git/sha "9b53a444cfe5550af6b76eef494b4190b5e4e461"}

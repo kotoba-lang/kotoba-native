@@ -341,6 +341,29 @@
    ;; narrowing checked -- the caller has already been told where it starts.
    'aiueos-qwen35-tensor-table-bind
    {:arity 5 :symbol "kotoba_aiueos_qwen35_tensor_table_bind"}
+   ;; The tokenizer beside them. The three admission objects above answer
+   ;; "is this the file" without ever reading a token STRING; these three read
+   ;; the two arrays those coordinates name -- 248,320 vocabulary entries and
+   ;; 247,587 merge rules -- and turn text into token ids and back.
+   ;;
+   ;; Three rather than one for the same reason as above: one exported symbol
+   ;; per object, no cross-object calls. The split follows the cost. The index
+   ;; is built ONCE per boot and costs a walk of both arrays; tokenize and
+   ;; detokenize then run per prompt and per emitted token against tables that
+   ;; are already there. Folding the build into the tokenizer would pay 4.7 MB
+   ;; of string walking on every prompt.
+   ;;
+   ;; None of the three copies the vocabulary. The index holds a 4-byte file
+   ;; offset per id and the strings stay in the model mapping, so an object
+   ;; that needs the bytes of token 173,092 reads them where the GGUF put them.
+   ;; Same reason-code convention: zero admits, negative refuses, and neither
+   ;; tokenize nor detokenize returns a count.
+   'aiueos-qwen35-vocab-index-build
+   {:arity 4 :symbol "kotoba_aiueos_qwen35_vocab_index_build"}
+   'aiueos-qwen35-tokenize
+   {:arity 4 :symbol "kotoba_aiueos_qwen35_tokenize"}
+   'aiueos-qwen35-detokenize
+   {:arity 4 :symbol "kotoba_aiueos_qwen35_detokenize"}
    ;; The TLS 1.3 record layer (RFC 8446 5.2), which is `aiueos-aes128-gcm`
    ;; plus the framing that decides what the AEAD is applied TO. It replaces
    ;; `protect` and `unprotect` in aiueos `kernel/tls13.c`. The framing is
@@ -911,6 +934,40 @@
           ;; starts. A separate arm, so that measuring either one cannot
           ;; silently move the other.
           qwen-tensor-fuel? (= 'aiueos-qwen35-tensor-table-bind object-entry)
+          ;; The GPT-2 BPE index build. COMPUTED, and the computation depends
+          ;; on an argument, which is why the object refuses a model window
+          ;; above 16 MiB: every token and every merge string is hashed and
+          ;; compared byte by byte, so this object's cost is LINEAR IN THE
+          ;; WINDOW IT IS GIVEN, not in the element counts. Handed the whole
+          ;; 10.9 GiB mapping instead of the 10,996,640-byte metadata prefix
+          ;; it needs, no finite bound would hold; the object refuses that
+          ;; instead of trapping partway through.
+          ;;
+          ;; Within a 16 MiB window and the ceilings the object enforces
+          ;; (1,048,576 tokens, 1,048,576 merges): clearing both tables is
+          ;; C1 + 3*C2 <= 8,388,608 stores; the token pass is ~16 charged
+          ;; calls per id plus one FNV step per byte of the array; the merge
+          ;; pass is ~55 per rule plus two hashes and up to two comparisons
+          ;; over the same bytes. That is ~120,000,000 at the ceiling and
+          ;; ~50,000,000 for the admitted artifact. 2,147,483,647 is ~18x the
+          ;; former; it shares the ECDSA arm's constant by coincidence of
+          ;; magnitude, and is a separate arm so that measuring either one
+          ;; cannot silently move the other.
+          qwen-index-fuel? (= 'aiueos-qwen35-vocab-index-build object-entry)
+          ;; Tokenize. COMPUTED. The merge loop is quadratic in the length of
+          ;; ONE pre-tokenizer chunk -- it rescans the chunk's symbol list to
+          ;; find the lowest-rank adjacent pair, and there are as many merges
+          ;; as symbols -- so the object refuses a chunk above 512 symbols and
+          ;; an input above 32,768 bytes. Worst case is then
+          ;; 512 * 98,304 = 50,331,648 scan steps (98,304 because normalising
+          ;; invalid UTF-8 to U+FFFD can triple the byte count), plus the
+          ;; encode and the per-symbol vocabulary lookups. ~60,000,000, so
+          ;; 250,000,000 is a 4x margin.
+          qwen-tokenize-fuel? (= 'aiueos-qwen35-tokenize object-entry)
+          ;; Detokenize. COMPUTED. Bounded by the ids it is given (at most
+          ;; 32,768) and by the output capacity it refuses to exceed (at most
+          ;; 65,536 bytes), at a handful of calls each: ~1,400,000.
+          qwen-detokenize-fuel? (= 'aiueos-qwen35-detokenize object-entry)
           context-fuel? (contains? '#{aiueos-user-context-build
                                      aiueos-kernel-context-build}
                                    object-entry)
@@ -1005,6 +1062,9 @@
                       hkdf-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
                       qwen-metadata-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000
                       qwen-tensor-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
+                      qwen-index-fuel? [0x49 0xc7 0x41 0x08 0xff 0xff 0xff 0x7f] ; 2,147,483,647
+                      qwen-tokenize-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000
+                      qwen-detokenize-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
                       rsa-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000
                       sha-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
                       context-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x01 0x00] ; 65,536

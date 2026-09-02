@@ -1,4 +1,4 @@
-# ADR 0043: The interrupt entry is generated, and its address is a context load
+# ADR 0045: The interrupt entry is generated, and its address is a context load
 
 ## Status
 
