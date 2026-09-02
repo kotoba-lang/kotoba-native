@@ -3813,8 +3813,8 @@
 ;; every false comparison -- including the two the oracle says the first should
 ;; win: either input NaN, and (-0.0, +0.0). Measured under the Rosetta loader
 ;; on 2026-09-02 (amu `isa_execution_test`), the single-instruction encoding got
-;; six of twelve NaN/zero rows wrong while AArch64's FMIN/FMAX got twelve of
-;; twelve right. Every byte below came from
+;; six of x86-64's eighteen NaN/zero rows wrong while AArch64's FMIN/FMAX were
+;; right on all twenty-four of theirs. Every byte below came from
 ;; `llvm-mc -arch=x86-64 -show-encoding`.
 
 (def ^:private f64-min-max-fixed-prefix

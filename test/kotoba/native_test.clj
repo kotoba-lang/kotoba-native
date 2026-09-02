@@ -177,8 +177,9 @@
 ;; on cljs), which propagates NaN and orders -0.0 below +0.0. A bare
 ;; `minsd xmm0,xmm1` computes `(a<b) ? a : b` and therefore returns the second
 ;; operand in exactly those cases. Measured through the Rosetta loader on
-;; 2026-09-02, that was six wrong answers out of twelve NaN/zero rows, with
-;; AArch64 right on all twelve. These goldens pin the corrected sequence; every
+;; 2026-09-02, that was six wrong answers out of x86-64's eighteen NaN/zero
+;; rows, with AArch64 right on all twenty-four of its observations (twelve
+;; operand pairs times two operations). These goldens pin the sequence; every
 ;; byte was assembled with `llvm-mc -arch=x86-64 -show-encoding`.
 
 (def ^:private x86-f64-min-bytes
