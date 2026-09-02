@@ -51,6 +51,40 @@
    'aiueos-user-object-journal-valid {:arity 3 :symbol "kotoba_aiueos_user_object_journal_valid"}
    'aiueos-user-object-journal-value {:arity 2 :symbol "kotoba_aiueos_user_object_journal_value"}
    'aiueos-sha256 {:arity 5 :symbol "kotoba_aiueos_sha256"}
+   ;; STREAMING SHA-256 (aiueos ADR-0139). The row above is a WHOLE-MESSAGE
+   ;; primitive capped at 12,288 bytes, and the shared module
+   ;; `aiueos/lib/sha256_core.kotoba` caps at 192. The Murakumo device-P256
+   ;; worker's `input-sha256` is taken over up to 131,080 bytes
+   ;; (`4*(32768+2)`), and the UEFI loader's over a whole kernel image.
+   ;; Neither is reachable by raising a constant: a whole-message object has
+   ;; to see its message through ONE region window, and the widest window this
+   ;; backend has is 65,536 bytes.
+   ;;
+   ;; THREE SYMBOLS, ONE IMPLEMENTATION. All three import
+   ;; `aiueos.lib.sha256-stream`, which amu#742 made possible, so the
+   ;; compression rounds exist once in source and these are three INSTANCES of
+   ;; it rather than three implementations.
+   ;;
+   ;; Three rather than one because the FUEL differs and a fuel tier is a
+   ;; per-CALL budget. Folding them into one symbol would hand the
+   ;; single-block call -- the one a driver makes 16,384 times -- the budget a
+   ;; whole-megabyte call needs, and a runaway single-block call could then
+   ;; spend a megabyte's worth of steps before the counter noticed. Same
+   ;; argument the `canonical`/`body` arms below make for keeping two
+   ;; measurements apart even where their constants agree.
+   ;;
+   ;; NOT BOOLEANS, and the two families keep their own conventions rather
+   ;; than being harmonised into one. The two `sha256` rows take
+   ;; `aiueos-hkdf-sha256`'s -- zero is done, positive is a reason -- because
+   ;; their useful output is bytes in a region and there is no length to
+   ;; return. `device-worker-digest` takes the `aiueos-device-worker-*` one it
+   ;; joins: a POSITIVE result is the canonical byte count it hashed, a
+   ;; NEGATIVE one is a reason, and zero is never returned because the
+   ;; smallest canonical form is four bytes.
+   'aiueos-sha256-stream {:arity 5 :symbol "kotoba_aiueos_sha256_stream"}
+   'aiueos-sha256-region {:arity 4 :symbol "kotoba_aiueos_sha256_region"}
+   'aiueos-device-worker-digest
+   {:arity 4 :symbol "kotoba_aiueos_device_worker_digest"}
    'aiueos-digest-equal {:arity 3 :symbol "kotoba_aiueos_digest_equal"}
    'aiueos-app-catalog-valid {:arity 5 :symbol "kotoba_aiueos_app_catalog_valid"}
    'aiueos-app-lookup-plan {:arity 5 :symbol "kotoba_aiueos_app_lookup_plan"}
@@ -1061,6 +1095,58 @@
                                             aiueos-device-worker-body}
                                          object-entry)
           device-parse-fuel? (= 'aiueos-device-worker-parse object-entry)
+          ;; Streaming SHA-256 (aiueos ADR-0139). MEASURED, by bisecting the
+          ;; fuel each call needs to return in the `kotoba.kir` interpreter,
+          ;; which charges one unit per Kotoba call -- the same accounting the
+          ;; emitted prologue does. Both directions each time: the minimum
+          ;; returns and the minimum minus one does not.
+          ;;
+          ;;   region  15,183 + 14,894 per 64-byte block, and 14,999 more when
+          ;;           the tail is 56..63 bytes and the padding needs a second
+          ;;           block. The per-block figure is cross-checked two ways
+          ;;           (f(128)-f(64) and f(64)-f(0) both give 14,894) and
+          ;;           confirmed at 640 bytes, where the predicted 164,123
+          ;;           returns and 164,122 does not.
+          ;;   stream  54 init, 14,895 one block, 15,130 final with a short
+          ;;           tail, 30,129 final with a 56..63-byte one.
+          ;;   digest  15,291 + 15,407 per block. 513 per block dearer than
+          ;;           `region` because every canonical byte goes through the
+          ;;           object's `cb` rather than being read straight out of the
+          ;;           token region.
+          ;;
+          ;; THREE ARMS, AND NONE OF THEM COPIES A CONSTANT. The `hkdf-fuel?`
+          ;; comment above records what copying cost last time: that object
+          ;; took SHA-256's tier because a tighter one "would be a 9x margin on
+          ;; an estimate, not a measurement", and then did not return on the
+          ;; machine. A borrowed tier is where that hid.
+          ;;
+          ;; The worst legitimate call each object admits:
+          ;;
+          ;;   region  its own ceiling, 1,048,576 bytes = 16,384 blocks
+          ;;           -> 244,038,584. 2,147,483,647 is 8.80x, AND IT IS THE
+          ;;           LARGEST TIER ANY OBJECT CAN HAVE -- the replenish is
+          ;;           `mov qword [r9+8], imm32` and the immediate is 32 bits.
+          ;;           At 14,894 per block that pays for ~144,181 blocks, 8.80
+          ;;           MiB, which is why the object's ceiling is 1 MiB and not
+          ;;           2^32: a ceiling above what the tier pays for is an
+          ;;           argument the object accepts and then `ud2`s partway
+          ;;           through, the size-dependent trap this file keeps naming.
+          ;;   stream  30,129, the dearest SINGLE call -> 262,144 is 8.7x.
+          ;;           Separate from `region` even though both run the same
+          ;;           rounds, because a fuel tier is a per-CALL budget and
+          ;;           these two calls differ by four orders of magnitude.
+          ;;           One symbol for both would hand the single-block call --
+          ;;           the one a driver makes 16,384 times -- a whole
+          ;;           megabyte's worth of steps before the counter noticed.
+          ;;   digest  32,768 tokens plus a max-tokens suffix = 131,080
+          ;;           canonical bytes = 2,048 blocks -> 31,568,827.
+          ;;           250,000,000 is 7.9x; it shares that constant with the
+          ;;           AEAD and RSA arms by coincidence of magnitude and is a
+          ;;           separate arm so that measuring one cannot silently move
+          ;;           the others.
+          sha-region-fuel? (= 'aiueos-sha256-region object-entry)
+          sha-stream-fuel? (= 'aiueos-sha256-stream object-entry)
+          device-digest-fuel? (= 'aiueos-device-worker-digest object-entry)
           ;; nic: the RTL8125 transmit-FIFO drain, and it is the one object in
           ;; that driver whose cost is not a handful of calls. COMPUTED.
           ;;
@@ -1278,6 +1364,9 @@
                       hkdf-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
                       device-client-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x01 0x00] ; 65,536
                       device-parse-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
+                      sha-region-fuel? [0x49 0xc7 0x41 0x08 0xff 0xff 0xff 0x7f] ; 2,147,483,647 (8.8x)
+                      sha-stream-fuel? [0x49 0xc7 0x41 0x08 0x00 0x00 0x04 0x00] ; 262,144 (8.7x)
+                      device-digest-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000 (7.9x)
                       rtl8125-program-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
                       qwen-metadata-fuel? [0x49 0xc7 0x41 0x08 0x80 0xb2 0xe6 0x0e] ; 250,000,000
                       qwen-tensor-fuel? [0x49 0xc7 0x41 0x08 0x80 0x96 0x98 0x00] ; 10,000,000
