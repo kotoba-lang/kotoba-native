@@ -2,10 +2,10 @@
  :deps {org.clojure/clojure {:mvn/version "1.12.0"}
         io.github.kotoba-lang/kotoba-kir
         {:git/url "https://github.com/kotoba-lang/kotoba-kir.git"
-         :git/sha "08bdab8b1084160dcb58ac291a002b140a5abf13"}
+         :git/sha "aa9f0f6af20491a87ead5c5a5bc6acbacd4806ba"}
         io.github.kotoba-lang/kotoba-gmir
         {:git/url "https://github.com/kotoba-lang/kotoba-gmir.git"
-         :git/sha "d5d004a584d10e4af0cbaaa31fd66996ae1f28a9"}
+         :git/sha "645bd21dea90f939b42cfcd1a0419a541ef9dfa3"}
         ;; kotoba-mir 4bf67c0: call+loop uses the scanner (:call-live), the
         ;; conservative fallback colors frame slots from CFG liveness, and
         ;; pure integer SSA segments are scheduled per basic block after physical
@@ -41,10 +41,10 @@
         ;; own context pointer (kotoba-mir ADR-0017).
         io.github.kotoba-lang/kotoba-mir
         {:git/url "https://github.com/kotoba-lang/kotoba-mir.git"
-         :git/sha "e266a862a4b3c83013e3bd3995080ac3230503fd"}
+         :git/sha "198f39d80d560cf47f1d5eb241cb0cd778df5fcc"}
         io.github.kotoba-lang/kotoba-codegen
         {:git/url "https://github.com/kotoba-lang/kotoba-codegen.git"
-         :git/sha "68d409fbc229a56add1d524c909c480373afdff8"}
+         :git/sha "6394327d358ad18fd05642949de4473bedee4fa7"}
         io.github.kotoba-lang/kotoba-object
         {:git/url "https://github.com/kotoba-lang/kotoba-object.git"
          :git/sha "9b53a444cfe5550af6b76eef494b4190b5e4e461"}

@@ -314,6 +314,21 @@
    ;; operation for every target but x86-64; pinned here so the asymmetry is
    ;; asserted rather than merely true.
    [['a 'al 'b 'bl 'n] '(kernel-dot-f32 a al b bl n)]
+   ;; dequant: the fused family, x86-only for the SAME reason and by the same
+   ;; measurement. Its two arms are AVX2 and legacy SSE, and the claim that
+   ;; binds them is that they agree BIT FOR BIT -- which is a claim about one
+   ;; accumulation tree, not about a dot product. A NEON arm would be a third
+   ;; answer nothing has compared with the other two. All three formats are
+   ;; listed rather than one standing for the family, so dropping a format
+   ;; from `kotoba.mir`'s refusal is a red test.
+   ;;
+   ;; Only Q8_0 is listed, because this table's other assertion is that x86-64
+   ;; EMITS every row in it. The two K-quants are refused on AArch64 for the
+   ;; same reason and are refused on x86-64 as well, for a different one
+   ;; (`:dequant-format-not-emitted`); both refusals are pinned in
+   ;; `kotoba.native.dequant-fusion-test`, which is where the asymmetry
+   ;; belongs.
+   [['w 'wl 'x 'xl 'n] '(kernel-dequant-dot-q8-0 w wl x xl n)]
    ;; boot-lit: the two wider firmware calls and the three literal address
    ;; heads. The calls are x86-only for the reason kernel-uefi-call2 is -- the
    ;; Microsoft x64 calling convention is not a thing AArch64 has.
@@ -386,7 +401,12 @@
     (let [thrown (try (arm/emit-program (program params body)) nil
                       (catch clojure.lang.ExceptionInfo e e))
           expected (cond
-                     (= 'kernel-dot-f32 (first body)) :x86-simd-target-mismatch
+                     (contains? '#{kernel-dot-f32
+                                   kernel-dequant-dot-q8-0
+                                   kernel-dequant-dot-q4-k
+                                   kernel-dequant-dot-q6-k}
+                                (first body))
+                     :x86-simd-target-mismatch
                      ;; boot-lit: a THIRD reason. The literal pool is refused
                      ;; because the rip-relative load-effective-address has no
                      ;; modelled AArch64 translation, which is a gap; the
@@ -401,7 +421,10 @@
       (is (= :mir (:phase (ex-data thrown))))
       (is (= expected (:problem (ex-data thrown))) (str body))))
   (testing "every reason is actually reached -- no branch is dead"
-    (is (= 1 (count (filter #(= 'kernel-dot-f32 (first (second %))) x86-only)))
+    (is (= 2 (count (filter #(contains? '#{kernel-dot-f32
+                                          kernel-dequant-dot-q8-0}
+                                       (first (second %)))
+                            x86-only)))
         "SCANNED simd rows")
     ;; boot-lit: three literal heads. The COUNT is asserted rather than the
     ;; presence, so dropping two of them is a red test.
@@ -409,7 +432,10 @@
                                         (first (second %)))
                             x86-only)))
         "SCANNED rodata rows")
-    (is (< 1 (count (remove #(contains? '#{kernel-dot-f32 ucs2 guid bytes-literal}
+    (is (< 1 (count (remove #(contains? '#{kernel-dot-f32 ucs2 guid bytes-literal
+                                          kernel-dequant-dot-q8-0
+                                          kernel-dequant-dot-q4-k
+                                          kernel-dequant-dot-q6-k}
                                         (first (second %)))
                             x86-only)))
         "SCANNED privileged rows")))

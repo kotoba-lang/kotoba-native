@@ -433,6 +433,24 @@
   {'kernel-dot-f32 [:gmir/kernel-dot-f32 65536 5]})
 ;; simd: end
 
+;; dequant: the fused dequantize-and-dot family. Same five operands and the
+;; same ceiling, so it lowers through the very same clause -- what differs is
+;; the arithmetic between the regions, which the GMIR op names and the
+;; backend emits. `:gmir/count` is BLOCKS here rather than elements; nothing
+;; in the lowering depends on which, because the ceiling check that does live
+;; in the emitter and in `kotoba.kir`.
+(def ^:private kir-kernel-dequant-dot-ops
+  {'kernel-dequant-dot-q8-0 [:gmir/kernel-dequant-dot-q8-0 65536 5]
+   'kernel-dequant-dot-q4-k [:gmir/kernel-dequant-dot-q4-k 65536 5]
+   'kernel-dequant-dot-q6-k [:gmir/kernel-dequant-dot-q6-k 65536 5]})
+
+(def ^:private kir-region-pair-ops
+  "Every head whose operands are `base length second-base second-length
+  count`. One table, so the pilot has one clause for the shape rather than
+  one per family -- and so adding a format cannot forget the `shape` arm."
+  (merge kir-kernel-dot-f32-ops kir-kernel-dequant-dot-ops))
+;; dequant: end
+
 (def ^:private kir-x86-privileged-ops
   {'kernel-boot-info :boot-info
    'kernel-read-cr0 :read-cr0
@@ -1764,8 +1782,8 @@
 
                 ;; simd: the f32 dot product. Five operands, none of them an
                 ;; index, so it does not fold into either shape above.
-                (and (seq? form) (contains? kir-kernel-dot-f32-ops (first form)))
-                (let [[op maximum arity] (get kir-kernel-dot-f32-ops (first form))
+                (and (seq? form) (contains? kir-region-pair-ops (first form)))
+                (let [[op maximum arity] (get kir-region-pair-ops (first form))
                       _ (when-not (= arity (count (rest form)))
                           (reject! :kir-to-gmir :kernel-dot-arity
                                    {:form form :expected arity}))
@@ -2180,8 +2198,8 @@
                 :scalar
 
                 ;; simd: the f32 dot product, with its own arity.
-                (and (seq? form) (contains? kir-kernel-dot-f32-ops (first form))
-                     (= (nth (get kir-kernel-dot-f32-ops (first form)) 2)
+                (and (seq? form) (contains? kir-region-pair-ops (first form))
+                     (= (nth (get kir-region-pair-ops (first form)) 2)
                         (count (rest form)))
                      (every? #(= :scalar (shape % env)) (rest form)))
                 :scalar
@@ -2819,7 +2837,28 @@
    ;; it inside the loop would pay that penalty per element.
    :vaddps-128     {:opcode 0x58 :map :0f   :pp :none :l 128 :w 0}
    :vmulss         {:opcode 0x59 :map :0f   :pp :f3   :l 128 :w 0}
-   :vaddss         {:opcode 0x58 :map :0f   :pp :f3   :l 128 :w 0}})
+   :vaddss         {:opcode 0x58 :map :0f   :pp :f3   :l 128 :w 0}
+   ;; dequant: the widening loads a packed weight row needs, and the two
+   ;; broadcasts and one subtract the K-quants need on top of them.
+   ;;
+   ;; `:vpmovsxbd` and `:vpmovzxbd` read EIGHT BYTES and write eight dwords.
+   ;; They are two entries and not one with a sign flag for the reason
+   ;; `:vhaddps-256` and `:vhaddps-128` are two: which one a format wants is
+   ;; part of what its codes MEAN. Q8_0's codes are signed and Q4_K's nibbles
+   ;; are not, and a caller that picked the wrong one would get a working
+   ;; instruction reading numbers it did not mean.
+   ;;
+   ;; `:vpbroadcastd` is the integer twin of `:vbroadcastss` -- the same
+   ;; four bytes to eight lanes, under a different opcode because the AVX2
+   ;; encoding separates the two domains. It carries the nibble masks, which
+   ;; are integers and never reach a floating-point unit.
+   :vpmovsxbd      {:opcode 0x21 :map :0f38 :pp :66   :l 256 :w 0}
+   :vpmovzxbd      {:opcode 0x31 :map :0f38 :pp :66   :l 256 :w 0}
+   :vpbroadcastd   {:opcode 0x58 :map :0f38 :pp :66   :l 256 :w 0}
+   :vpsubd         {:opcode 0xfa :map :0f   :pp :66   :l 256 :w 0}
+   ;; `/2` -- the destination travels in vvvv, exactly as `:vpsrlw-imm8`'s
+   ;; does, because the ModRM reg field carries the opcode extension.
+   :vpsrld-imm8    {:opcode 0x72 :map :0f   :pp :66   :l 256 :w 0 :extension 2}})
 
 (defn- x86-avx-form [instruction]
   (let [form (get x86-avx-forms instruction)]
@@ -2876,6 +2915,55 @@
                  bytes))))
 
 ;; ── simdprep: end ───────────────────────────────────────────────────────────
+
+;; ── dequant: the three integer encoders a packed weight row needs ───────────
+;;
+;; Everything above this point either moves a whole word or moves a float. A
+;; quantized block is neither: its scale is two bytes, its codes are one byte
+;; each and half of them are nibbles, so widening a sub-word load and shifting
+;; a mask into place are the operations the family is made of.
+
+(defn- x86-gpr-rm-0f
+  "A two-byte-opcode legacy instruction whose ModRM names memory and whose
+  register operand is a GENERAL register: [REX] 0F OPCODE <modrm+sib+disp>.
+  `movzx` and `movsx` are its only users.
+
+  The addressing half is `vex-memory-operand`'s, reused for the reason
+  `x86-sse-rm` reuses it: the three encodings that are not free choices
+  (RIP-relative mod 00 rm 101, the SIB escape, the forced displacement) are
+  already decided there, and a second copy of them is a second place to get
+  them wrong. What differs is only how X and B are spelled -- upright in a
+  REX byte, inverted in a VEX one.
+
+  WIDE? selects REX.W, which for `movsx` is the difference between writing 32
+  bits and writing 64. A sign-extended byte must reach the whole register:
+  `cvtsi2ss` reads 64 bits, and a 32-bit `movsx` of -1 leaves 0x00000000ffffffff
+  there, which converts to 4294967295.0f rather than to -1.0f."
+  [wide? opcode reg operand]
+  (let [r (vex-register reg)
+        {:keys [x b bytes]} (vex-memory-operand r operand)
+        rex (bit-or 0x40 (if wide? 8 0) (if (>= r 8) 4 0)
+                    (bit-shift-left x 1) b)]
+    (vec (concat (when (not= 0x40 rex) [rex]) [0x0f opcode] bytes))))
+
+(defn- x86-shift-imm
+  "`shl`/`shr` by an immediate -- REX.W C1 /SUBOP ib, where SUBOP is 4 for
+  left and 5 for logical right. Distinct from `x86-shift`, which is the
+  variable-count form and pays a `push rcx`/`pop rcx` for CL; nothing in a
+  fixed field extraction needs a variable count."
+  [subop register amount]
+  (let [code (get x86-register-code register)]
+    (when-not (some? code)
+      (reject! :mc-encode :unsupported-register {:register register}))
+    (when-not (and (integer? amount) (<= 0 amount 63))
+      (reject! :mc-encode :shift-amount-out-of-range {:amount amount}))
+    [(bit-or 0x48 (if (>= code 8) 1 0)) 0xc1
+     (bit-or (bit-shift-left subop 3) 0xc0 (bit-and code 7)) amount]))
+
+(defn- x86-movsx-byte-mem [dst operand] (x86-gpr-rm-0f true 0xbe dst operand))
+(defn- x86-movzx-word-mem [dst operand] (x86-gpr-rm-0f false 0xb7 dst operand))
+(defn- x86-movzx-byte-mem [dst operand] (x86-gpr-rm-0f false 0xb6 dst operand))
+;; ── dequant: end ────────────────────────────────────────────────────────────
 
 (defn- x86-lea-sum [dst base index]
   ;; lea dst, [base + index] -- REX.W 8D /r, SIB with scale 1, no displacement.
@@ -4276,6 +4364,319 @@
           [(layout/label done)]))))
 ;; simd: end
 
+;; ── dequant: the fused dequantize-and-dot family ────────────────────────────
+;;
+;; `kernel-dot-f32` folds two f32 regions. A transformer's weights are not f32
+;; -- 490 of the Qwen3.5 model's 866 tensors are Q8_0, Q4_K or Q6_K -- so
+;; using it means materialising a dequantized row somewhere first, which is a
+;; write of four bytes per weight into memory that is read once. The fusion
+;; removes that traffic: the codes are widened INSIDE the register file and
+;; multiplied by the activations without ever reaching memory as f32.
+;;
+;; ONE OPAQUE MC INSTRUCTION PER FORMAT, the way `kernel-dot-f32` is one. The
+;; guard, both arms, and the loop belong to the instruction, because what the
+;; instruction exists to select is a sequence and not an expression.
+;;
+;; THE OPERAND SHAPE IS BLOCK-SCALE. A quantized row is a vector of BLOCKS,
+;; and the byte stride and the element stride are different numbers, so
+;; `:mir/count` counts blocks and BOTH spans are derived from it. Nothing here
+;; assumes the two regions are the same length; they never are.
+;;
+;; THE ACCUMULATION TREE IS `kernel-dot-f32`'S, and there is no tail: every
+;; format's block is a whole number of eight-element groups (32, 256, 256), so
+;; a partial group cannot occur. Four accumulators; the lower half of each
+;; group before its upper half; `(s0+s1)+(s2+s3)` at the end. It is
+;; `dot_scalar` in `os/aiueos/kernel/qwen35_infer.c:234`, and it is the
+;; contract because the C has TWO trees and only this one is reproducible.
+;;
+;; NO FMA, DELIBERATELY. `y = q*d` then `sum += y*a` is two roundings, and
+;; `vfmadd231ps` would fuse the second one away -- giving a MORE accurate
+;; answer that differs from the oracle's, which is the one thing an arm of
+;; this pair may not do.
+
+(def ^:private x86-dequant-formats
+  "Mirrors `kotoba.gmir/kernel-dequant-dot-formats`. The strides are
+  `sizeof(block_*)` and QK from `os/aiueos/kernel/qwen35_quant.c`.
+
+  `:emitted?` says whether THIS backend has the two arms for that format. It
+  is false for the K-quants, and the refusal below names them rather than
+  letting the `case` fall through to `nil` -- a group emitter that returned
+  nothing would emit a loop with an empty body, which is a working
+  instruction that answers +0.0 for every row.
+
+  The K-quants are declared in `kotoba.gmir`, admitted by the frontend and
+  the verifier, and IMPLEMENTED IN THE ORACLE (`kotoba.kir`, checked element
+  by element against an independent port of the C). What is missing is only
+  the machine code, and it is missing for a measurable reason: a Q4_K or Q6_K
+  block's dequantization parameters change every 32 and every 16 elements
+  respectively, so its thirty-two eight-element groups are not a loop --
+  each one takes a different scale field, a different nibble half and a
+  different bit shift, and the sequence has to be unrolled thirty-two times
+  per arm. Q8_0's four groups are one loop. That is a real difference in the
+  formats and not an oversight; landing them is the next increment and the
+  oracle is already waiting for it."
+  {:x86-64/kernel-dequant-dot-q8-0 {:block-bytes 34  :block-elements 32
+                                    :emitted? true}
+   :x86-64/kernel-dequant-dot-q4-k {:block-bytes 144 :block-elements 256
+                                    :emitted? false}
+   :x86-64/kernel-dequant-dot-q6-k {:block-bytes 210 :block-elements 256
+                                    :emitted? false}})
+
+(def ^:private x86-dequant-magic
+  "2^112 as binary32: exponent field 112+127 = 239, mantissa zero.
+
+  It is the whole of the half-precision conversion. `(h & 0x7fff) << 13`
+  reinterpreted as binary32 is the right significand at an exponent 112 too
+  low -- for NORMAL halves because the fields line up after a 13-bit shift,
+  and for SUBNORMAL ones because the f32 subnormal it lands on has the same
+  significand at 2^-136 and the scaling by 2^112 is exact. One multiply
+  therefore covers both, with no normalising loop and no branch. Only
+  exponent 31 needs its own arm: 0x0F800000 scaled by 2^112 is 2^16, not an
+  infinity.
+
+  Asserted against a transcription of the C's `fp16_to_f32` over all 65536
+  patterns in `dequant_fp16_test`."
+  0x77800000)
+
+(defn- x86-dequant-fp16
+  "Two bytes at OPERAND as a binary16, leaving the binary32 pattern in RAX.
+  Clobbers RAX, RCX, RDX and WORK.
+
+  VEX? selects the encoding of the two floating-point instructions and
+  nothing else. An arm that has written a YMM register must not run legacy
+  SSE before `vzeroupper`, and `vmulss` is the VEX spelling of the same
+  operation on the same units: the two arms compute the identical pattern and
+  differ only in how the multiply is spelled."
+  [vex? operand work magic inf-nan done]
+  (vec (concat
+        (x86-movzx-word-mem :x86-64/rax operand)
+        ;; sign, moved from bit 15 to bit 31 and kept aside
+        (x86-rr 0x89 :x86-64/rcx :x86-64/rax)
+        (x86-alu-imm 4 :x86-64/rcx 0x8000)
+        (x86-shift-imm 4 :x86-64/rcx 16)
+        ;; the significand and exponent, shifted into binary32 position
+        (x86-rr 0x89 :x86-64/rdx :x86-64/rax)
+        (x86-alu-imm 4 :x86-64/rdx 0x7fff)
+        (x86-shift-imm 4 :x86-64/rdx 13)
+        ;; exponent 31 is the one case the scaling cannot express
+        (x86-alu-imm 4 :x86-64/rax 0x7c00)
+        (x86-cmp-imm32 :x86-64/rax 0x7c00)
+        [(layout/relative-branch :x86-64/jz-rel32 inf-nan)]
+        (if vex?
+          (concat
+           (x86-vex-rr (x86-avx-form :vmovd-from-gpr) {:reg work :rm :x86-64/rdx})
+           (x86-vex-rr (x86-avx-form :vmulss) {:reg work :vvvv work :rm magic})
+           (x86-vex-rr (x86-avx-form :vmovd-to-gpr) {:reg work :rm :x86-64/rax}))
+          (concat
+           (x86-gpr-to-xmm32 work :x86-64/rdx)
+           (x86-sse-rr 0xf3 0x59 work magic)
+           (x86-xmm-to-gpr32 :x86-64/rax work)))
+        [(layout/relative-branch :x86-64/jmp-rel32 done)
+         (layout/label inf-nan)]
+        (x86-rr 0x89 :x86-64/rax :x86-64/rdx)
+        (x86-alu-imm 4 :x86-64/rax 0x007fffff)
+        (x86-alu-imm 1 :x86-64/rax 0x7f800000)
+        [(layout/label done)]
+        (x86-rr 0x09 :x86-64/rax :x86-64/rcx))))
+
+(defn- x86-kernel-dequant-dot
+  [encoding instruction-index
+   {:mir/keys [dst base length second-base second-length maximum] :as instruction}]
+  (let [{:keys [block-bytes block-elements emitted?]} (get x86-dequant-formats encoding)
+        _ (when-not emitted?
+            (reject! :mc-encode :dequant-format-not-emitted
+                     {:encoding encoding
+                      :reason (str "this backend has no machine code for that "
+                                   "quantization format yet; the operation is "
+                                   "declared and its oracle exists")}))
+        blocks (:mir/count instruction)
+        ;; DERIVED from the ceiling and BOTH strides, and checked before
+        ;; either product is formed -- which is the whole point of having it.
+        ;; A block count of 2^60 scaled by 34 wraps to a small number, and a
+        ;; wrapped span passes every length check there is.
+        block-limit (min (quot maximum block-bytes)
+                         (quot maximum (* 4 block-elements)))
+        element-span (* 4 block-elements)
+        groups (quot block-elements 8)
+        label (fn [suffix]
+                (memory-label instruction-index
+                              (str "dq-" (name encoding) "-" suffix)))
+        trap (label "trap")
+        scalar (label "scalar")
+        join (label "join")
+        done (label "done")
+        pw :x86-64/r10
+        px :x86-64/r11
+        remaining :x86-64/rbx
+        group :x86-64/rsi
+        magic 7
+        work 6
+        counted-loop
+        (fn [register body-label check-label bound body]
+          (concat [(layout/relative-branch :x86-64/jmp-rel32 check-label)
+                   (layout/label body-label)]
+                  body
+                  [(layout/label check-label)]
+                  (x86-cmp-imm32 register bound)
+                  [(layout/relative-branch :x86-64/jae-rel32 body-label)]))
+        ;; One eight-element group of the scalar arm. Element e of the group
+        ;; lands in accumulator e mod 4, which is what "the lower half before
+        ;; the upper, lane by lane" means once it is written out.
+        scalar-group
+        (case encoding
+          :x86-64/kernel-dequant-dot-q8-0
+          (vec (mapcat
+                (fn [e]
+                  (concat
+                   ;; REX.W on the movsx: `cvtsi2ss` reads the whole 64-bit
+                   ;; register, so a 32-bit sign extension of -1 would convert
+                   ;; to 4294967295.0f.
+                   (x86-movsx-byte-mem :x86-64/rax {:base pw :disp e})
+                   (x86-cvtsi2 0xf3 4 :x86-64/rax)
+                   (x86-sse-rr 0xf3 0x59 4 work)
+                   (x86-sse-rm 0xf3 0x10 5 {:base px :disp (* 4 e)})
+                   (x86-sse-rr 0xf3 0x59 4 5)
+                   (x86-sse-rr 0xf3 0x58 (mod e 4) 4)))
+                (range 8))))
+        ;; The same eight elements, eight lanes wide. Lane j runs exactly the
+        ;; sequence element j runs above -- widen, convert, scale, multiply --
+        ;; so the two are bit-identical per lane, and the accumulation below
+        ;; adds the lower four before the upper four, per lane, as the scalar
+        ;; arm does by writing to accumulator e mod 4.
+        avx-group
+        (case encoding
+          :x86-64/kernel-dequant-dot-q8-0
+          (vec (concat
+                (x86-vex-rm (x86-avx-form :vpmovsxbd) {:reg 1 :operand {:base pw}})
+                (x86-vex-rr (x86-avx-form :vcvtdq2ps) {:reg 1 :rm 1})
+                (x86-vex-rr (x86-avx-form :vmulps) {:reg 1 :vvvv 1 :rm 3})
+                (x86-vex-rm (x86-avx-form :vmovups-load) {:reg 2 :operand {:base px}})
+                (x86-vex-rr (x86-avx-form :vmulps) {:reg 1 :vvvv 1 :rm 2})
+                (x86-vex-rr (x86-avx-form :vextractf128) {:reg 1 :rm 2 :imm8 1})
+                (x86-vex-rr (x86-avx-form :vaddps-128) {:reg 0 :vvvv 0 :rm 1})
+                (x86-vex-rr (x86-avx-form :vaddps-128) {:reg 0 :vvvv 0 :rm 2}))))
+        ;; How far each pointer moves per group, and what the block header
+        ;; costs before the groups run.
+        header-bytes (case encoding :x86-64/kernel-dequant-dot-q8-0 2)
+        group-weight-bytes (case encoding :x86-64/kernel-dequant-dot-q8-0 8)]
+    (vec (concat
+          ;; ── the checks, in the oracle's order ──────────────────────────
+          (x86-cmp-imm32 length maximum)
+          [(layout/relative-branch :x86-64/ja-rel32 trap)]
+          (x86-cmp-imm32 second-length maximum)
+          [(layout/relative-branch :x86-64/ja-rel32 trap)]
+          (x86-rr 0x85 base base)
+          [(layout/relative-branch :x86-64/jz-rel32 trap)]
+          (x86-rr 0x85 second-base second-base)
+          [(layout/relative-branch :x86-64/jz-rel32 trap)]
+          (x86-cmp-imm32 blocks block-limit)
+          [(layout/relative-branch :x86-64/ja-rel32 trap)]
+          ;; Both spans, each against its own region. `imul r64,r64,imm32`
+          ;; rather than the f32 dot product's two doublings, because 34 is
+          ;; not a power of two -- and the block count is already bounded, so
+          ;; neither product can wrap.
+          (x86-imul-imm pw blocks block-bytes)
+          (x86-rr 0x39 pw length)
+          [(layout/relative-branch :x86-64/ja-rel32 trap)]
+          (x86-imul-imm px blocks element-span)
+          (x86-rr 0x39 px second-length)
+          [(layout/relative-branch :x86-64/ja-rel32 trap)]
+
+          ;; ── rescue the operands, then ask the CPU ──────────────────────
+          ;; Everything this sequence writes that an allocator may own is
+          ;; saved here and restored at `join`: R10, R11 and the vector file
+          ;; are the only registers it may take for free. The three VALUES it
+          ;; needs are pushed ON TOP of the saves, so they pop off first --
+          ;; the saves have to outlive the arms, where the f32 dot product's
+          ;; could be restored immediately after the guard.
+          (x86-push remaining)
+          (x86-push group)
+          (x86-push :x86-64/rax)
+          (x86-push :x86-64/rcx)
+          (x86-push :x86-64/rdx)
+          (x86-push base)
+          (x86-push second-base)
+          (x86-push blocks)
+          (x86-dot-avx2-guard (label "guard-leaf1") (label "guard-xcr0")
+                              (label "guard-leaf7") (label "guard-fail")
+                              (label "guard-done"))
+          (x86-pop remaining)
+          (x86-pop px)
+          (x86-pop pw)
+          [(layout/relative-branch :x86-64/jz-rel32 scalar)]
+
+          ;; ── the AVX2 arm ──────────────────────────────────────────────
+          (x86-vex-rr (x86-avx-form :vxorps-128) {:reg 0 :vvvv 0 :rm 0})
+          (x86-mov-imm :x86-64/rax x86-dequant-magic)
+          (x86-vex-rr (x86-avx-form :vmovd-from-gpr) {:reg magic :rm :x86-64/rax})
+          (counted-loop
+           remaining (label "avx-block") (label "avx-block-check") 1
+           (concat
+            (x86-dequant-fp16 true {:base pw} work magic
+                              (label "avx-fp16-inf") (label "avx-fp16-done"))
+            (x86-vex-rr (x86-avx-form :vmovd-from-gpr) {:reg 3 :rm :x86-64/rax})
+            (x86-vex-rr (x86-avx-form :vbroadcastss) {:reg 3 :rm 3})
+            (x86-alu-imm 0 pw header-bytes)
+            (x86-mov-imm group groups)
+            (counted-loop
+             group (label "avx-group") (label "avx-group-check") 1
+             (concat avx-group
+                     (x86-alu-imm 0 pw group-weight-bytes)
+                     (x86-alu-imm 0 px 32)
+                     (x86-alu-imm 5 group 1)))
+            (x86-alu-imm 5 remaining 1)))
+          ;; [s0 s1 s2 s3] -> [s0+s1, s2+s3, ..] -> [(s0+s1)+(s2+s3), ..]
+          (x86-vex-rr (x86-avx-form :vhaddps-128) {:reg 0 :vvvv 0 :rm 0})
+          (x86-vex-rr (x86-avx-form :vhaddps-128) {:reg 0 :vvvv 0 :rm 0})
+          (x86-vex-rr (x86-avx-form :vmovd-to-gpr) {:reg 0 :rm pw})
+          x86-vzeroupper
+          [(layout/relative-branch :x86-64/jmp-rel32 join)]
+
+          ;; ── the scalar arm ────────────────────────────────────────────
+          [(layout/label scalar)]
+          (x86-sse-rr 0x57 0 0)
+          (x86-sse-rr 0x57 1 1)
+          (x86-sse-rr 0x57 2 2)
+          (x86-sse-rr 0x57 3 3)
+          (x86-mov-imm :x86-64/rax x86-dequant-magic)
+          (x86-gpr-to-xmm32 magic :x86-64/rax)
+          (counted-loop
+           remaining (label "sc-block") (label "sc-block-check") 1
+           (concat
+            (x86-dequant-fp16 false {:base pw} work magic
+                              (label "sc-fp16-inf") (label "sc-fp16-done"))
+            (x86-gpr-to-xmm32 work :x86-64/rax)
+            (x86-alu-imm 0 pw header-bytes)
+            (x86-mov-imm group groups)
+            (counted-loop
+             group (label "sc-group") (label "sc-group-check") 1
+             (concat scalar-group
+                     (x86-alu-imm 0 pw group-weight-bytes)
+                     (x86-alu-imm 0 px 32)
+                     (x86-alu-imm 5 group 1)))
+            (x86-alu-imm 5 remaining 1)))
+          (x86-sse-rr 0xf3 0x58 0 1)
+          (x86-sse-rr 0xf3 0x58 2 3)
+          (x86-sse-rr 0xf3 0x58 0 2)
+          (x86-xmm-to-gpr32 pw 0)
+
+          ;; ── the answer ────────────────────────────────────────────────
+          [(layout/label join)]
+          (x86-pop :x86-64/rdx)
+          (x86-pop :x86-64/rcx)
+          (x86-pop :x86-64/rax)
+          (x86-pop group)
+          (x86-pop remaining)
+          ;; MOVD wrote 32 bits and zeroed the rest; the canonical f32 word is
+          ;; sign-extended from bit 31, so it is re-established here.
+          (when-not (= dst pw) (x86-rr 0x89 dst pw))
+          (x86-movsxd dst)
+          [(layout/relative-branch :x86-64/jmp-rel32 done)
+           (layout/label trap)]
+          [0x0f 0x0b]
+          [(layout/label done)]))))
+;; dequant: end
+
 (defn- a64-kernel-bounds-check
   "AArch64's half of the shared window preamble. Same checks as the x86 side,
   in the same order, leaving x16 holding base+index. x16/x17 are the encoder
@@ -5428,6 +5829,12 @@
     ;; sysops: end
     ;; simd:
     :x86-64/kernel-dot-f32 (x86-kernel-dot-f32 instruction-index instruction)
+    ;; dequant: one arm per format, all through the one emitter -- the format
+    ;; decides the strides and the per-group arithmetic and nothing else.
+    (:x86-64/kernel-dequant-dot-q8-0
+     :x86-64/kernel-dequant-dot-q4-k
+     :x86-64/kernel-dequant-dot-q6-k)
+    (x86-kernel-dequant-dot encoding instruction-index instruction)
     :x86-64/kernel-subregion (x86-kernel-subregion instruction-index instruction)
     (:x86-64/equal :x86-64/less-than :x86-64/greater-than
      :x86-64/less-or-equal :x86-64/greater-or-equal)
