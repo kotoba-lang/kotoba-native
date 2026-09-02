@@ -118,6 +118,10 @@
            :mir/addend :mir/base :mir/length :mir/index :mir/stored
            ;; sysops: the compare-exchange comparand -- see `gmir-source-keys`.
            :mir/expected
+           ;; simd: the dot product's second region and element count. It
+           ;; never reaches an AArch64 emitter, but this list is not only
+           ;; read by one -- and a key that is present costs nothing.
+           :mir/second-base :mir/second-length :mir/count
            :mir/offset :mir/size :mir/arguments]))
 
 (defn- a64-used-before-definition?
@@ -1129,9 +1133,23 @@
   ;; only runs when the scanner has already given up, so the same program
   ;; under less register pressure would have reached an allocator with an
   ;; undefined operand.
+  ;;
+  ;; simd: `:gmir/second-base`, `:gmir/second-length` and `:gmir/count` are
+  ;; here for the reason `:gmir/expected` is, and they were left out first --
+  ;; the same defect, one stream later, found the same way. `(kernel-dot-f32 a
+  ;; 48 b 48 12)` is the shape a caller with fixed-size regions actually
+  ;; writes, and three of its five operands are literals; two of those three
+  ;; lost their `:gmir/constant` definitions here and the operation kept
+  ;; reading the vregs. The one that survived did so only because
+  ;; `:gmir/length` was already in this list.
+  ;;
+  ;; The comment above is still the whole explanation of why nothing upstream
+  ;; catches it. Adding a key to an operation's keyset does not add it here,
+  ;; and this list is the one place where that omission is silent.
   [:gmir/test :gmir/value :gmir/src :gmir/input :gmir/left :gmir/right
    :gmir/addend :gmir/base :gmir/length :gmir/index :gmir/stored
    :gmir/expected
+   :gmir/second-base :gmir/second-length :gmir/count
    :gmir/offset :gmir/size :gmir/arguments])
 
 (def ^:private gmir-block-boundary
@@ -5614,10 +5632,16 @@
     cache)))
 
 (def ^:private a64-source-keys
+  ;; Named for AArch64 and read by `x86-propagate-copies` as well, which is
+  ;; why a missing key here is not an AArch64-only problem: that pass counts
+  ;; the uses of a copied register before deciding a `mov` is dead, and a use
+  ;; it cannot see is a `mov` it removes while something still needs it.
   [:mir/test :mir/value :mir/src :mir/input :mir/left :mir/right :mir/addend
    :mir/base :mir/length :mir/index :mir/stored
    ;; sysops: the compare-exchange comparand -- see `gmir-source-keys`.
    :mir/expected
+   ;; simd: the dot product's second region and element count -- same reason.
+   :mir/second-base :mir/second-length :mir/count
    :mir/offset :mir/size
    :mir/arguments])
 
