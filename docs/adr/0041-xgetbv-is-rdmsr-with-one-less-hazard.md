@@ -1,4 +1,4 @@
-# ADR 0039: `xgetbv` is `rdmsr` with one less hazard
+# ADR 0041: `xgetbv` is `rdmsr` with one less hazard
 
 - Status: accepted
 - Date: 2026-09-02
@@ -103,3 +103,11 @@ arity 2, `(leaf, subleaf)`, in `kir-x86-privileged-ops`, in
 `emit-kernel-cpuid`'s own signature, in `x86-privileged-action-arities` and in
 `kernel-privileged-operations`. Leaf 7 subleaf 0 is spelled
 `(kernel-cpuid-ebx 7 0)` today.
+
+## Renumbering note
+
+Landed as `0039` and moved to `0041`: two streams working concurrently each
+numbered a new ADR `0039` on 2026-09-02 (`-uefi-firmware-boundary-encodings`
+and this one). This one moved because it can be; a numbered ADR whose number
+is shared is not a reference. Same day, the same thing happened three times
+over at `0229` in kotoba-kir, where two of the three still share the number.
