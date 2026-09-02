@@ -249,6 +249,25 @@
   `sub rsp,8` here: the object wrapper needs one because it pushes nothing,
   and adding one here would MIS-align by eight."
   [{:keys [vector fuel context-displacement call-displacement]}]
+  ;; fuel64: THIS ENTRY'S REPLENISH STAYS imm32, AND SAYS SO. The object
+  ;; wrapper widened (see `kotoba.native.elf64/replenish-bytes`); this sequence
+  ;; did not, because its size is load-bearing in a way the wrapper's is not --
+  ;; `entry-stride` is 128, and `context-displacement-offset` /
+  ;; `call-displacement-offset` / `entry-size` are hand-counted from the
+  ;; instruction widths below, including the literal `8 ; mov qword [r9+8],
+  ;; imm32`. A wide form here would move every gate in the entry region.
+  ;;
+  ;; What matters is that it now REFUSES rather than wraps. `le32` is
+  ;; `(mod n 4294967296)` -- deliberately, so a negative RIP displacement
+  ;; encodes -- so a fuel of exactly 2^32 would have written FOUR ZERO BYTES:
+  ;; the entry would replenish to zero, the callee's first charge would find
+  ;; zero and `ud2`, and every interrupt on the machine would take vector 6.
+  ;; A silent truncation in a value that means "how much work may happen"
+  ;; produces a fault that reads as a body bug, in a body that is correct.
+  (when-not (and (integer? fuel) (pos? fuel) (<= fuel 2147483647))
+    (throw (ex-info "interrupt entry fuel does not fit the entry's imm32 replenish"
+                    {:reason :isr-entry-fuel-exceeds-imm32
+                     :vector vector :fuel fuel :maximum 2147483647})))
   (vec (concat
         (when-not (contains? error-code-vectors vector) [0x6a 0x00])
         (apply concat gpr-pushes)

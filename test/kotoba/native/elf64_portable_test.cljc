@@ -82,3 +82,51 @@
                         (sealed-kernel :x86_64-aiueos-kernel-v1 4096)))]
     (is (= [0x7f 0x45 0x4c 0x46] (vec (take 4 object))))
     (is (every? #(<= 0 % 255) object))))
+
+;; fuel64: the WIDE replenish, emitted by the portable twin on the runtime that
+;; loads it.
+;;
+;; The JVM test for this (`kotoba.native.fuel64-test`) can only ever exercise
+;; `elf64.clj` -- Clojure prefers the `.clj` for a namespace that has both --
+;; so without this the widened encoder is proven on exactly one of the two
+;; files, and it is the file the JVM-free route does NOT use. That is the same
+;; asymmetry `elf64_twin_parity_test`'s docstring records as having already
+;; shipped a divergence once.
+;;
+;; The bytes are asserted rather than the count, because a wide form that
+;; wrote the right number of bytes with the wrong immediate is exactly the
+;; failure a cljs number/BigInt coercion would produce.
+(deftest the-wide-fuel-replenish-is-emitted-by-the-portable-twin
+  (let [object (:bytes (elf64/package-kernel-object
+                        (artifact/seal
+                         {:target :x86_64-aiueos-kernel-v1
+                          :target-profile {:runtime :none :ambient-syscalls false}
+                          :program {:entry 'main}
+                          :exports {'aiueos-fuel-wide-probe {:offset 0 :arity 1}
+                                    'main {:offset 1 :arity 0}}
+                          :limits {:fuel 512}
+                          :fuel-abi {:initial 512}
+                          :code [0xc3 0xc3]})))]
+    ;; 64 bytes of ELF header, then `lea r9,[rip+.data]` (7 bytes).
+    (is (= [0x49 0xba 0x00 0xcb 0x4c 0x00 0x01 0x00 0x00 0x00
+            0x4d 0x89 0x51 0x08]
+           (vec (subvec (vec object) 71 85)))
+        "movabs r10, 4300000000 then mov [r9+8], r10")))
+
+(deftest the-narrow-fuel-replenish-did-not-move
+  (let [object (:bytes (elf64/package-kernel-object
+                        (artifact/seal
+                         {:target :x86_64-aiueos-kernel-v1
+                          :target-profile {:runtime :none :ambient-syscalls false}
+                          :program {:entry 'main}
+                          :exports {'aiueos-sha256-region {:offset 0 :arity 4}
+                                    'main {:offset 1 :arity 0}}
+                          :limits {:fuel 512}
+                          :fuel-abi {:initial 512}
+                          :code [0xc3 0xc3]})))]
+    (is (= [0x49 0xc7 0x41 0x08 0xff 0xff 0xff 0x7f]
+           (vec (subvec (vec object) 71 79)))
+        "mov qword [r9+8], 2147483647 -- eight bytes, unchanged")))
+
+(deftest the-portable-twin-refuses-a-tier-it-cannot-count
+  (is (= 9007199254740991 elf64/max-object-fuel)))

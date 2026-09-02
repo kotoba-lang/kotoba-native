@@ -52,22 +52,35 @@
                       (re-seq entry-pattern (str/replace text #"\n\s+\{:arity" " {:arity")))]
     entries))
 
-;; `name-fuel? [0x49 0xc7 0x41 0x08 b b b b]`: the cond arm that writes the
-;; object's fuel immediate. Captured with its four bytes, so a tier that exists
-;; in both files under one name but with different fuel is still a difference.
-(def ^:private fuel-arm-pattern
-  #"([a-z0-9-]+)-fuel\?\s+\[0x49 0xc7 0x41 0x08((?:\s+0x[0-9a-f]{2}){4})\]")
+;; `<predicate>? <decimal>`: one arm of the `replenish` cond, which since
+;; fuel64 holds NUMBERS rather than hand-encoded `mov` bytes -- the encoding is
+;; `replenish-bytes`'s job, and it now has two forms.
+;;
+;; Scoped to the cond rather than matched across the whole file, because the
+;; arms are now bare integers and a file-wide pattern would collect every
+;; `something? <number>` in eleven hundred lines of commentary. The `:else`
+;; default is captured too: it is a tier like any other, and a twin whose
+;; default differs under-fuels every object neither table names.
+(def ^:private fuel-cond-start "replenish (replenish-bytes")
+(def ^:private fuel-arm-pattern #"\n\s+([a-z0-9-]+\?|:else)\s+(\d+)")
 
 (defn- fuel-tiers [path]
-  (into {} (map (fn [[_ n bytes]] [n (str/trim bytes)]))
-        (re-seq fuel-arm-pattern (slurp (io/file path)))))
+  (let [text (slurp (io/file path))
+        start (str/index-of text fuel-cond-start)
+        _ (assert start (str "the replenish cond moved in " path))
+        region (subs text start (+ start (or (str/index-of (subs text start) "))\n") 0) 3))]
+    (into {} (map (fn [[_ n v]] [n v])) (re-seq fuel-arm-pattern region))))
 
 (deftest the-two-elf64-fuel-tiers-are-the-same-tiers
   (let [clj (fuel-tiers "src/kotoba/native/elf64.clj")
         cljc (fuel-tiers "src/kotoba/native/elf64.cljc")]
     ;; Evidence floor: a pattern that matched nothing has not found agreement.
-    (is (< 3 (count clj)) "the .clj fuel tiers did not parse")
-    (is (< 3 (count cljc)) "the .cljc fuel tiers did not parse")
+    ;; Raised from 3 to 20 when the arms became numbers: the old byte pattern
+    ;; could only match the shape it was written for, so a format change made
+    ;; it match ZERO and the floor is the only thing that said so.
+    (is (< 20 (count clj)) "the .clj fuel tiers did not parse")
+    (is (< 20 (count cljc)) "the .cljc fuel tiers did not parse")
+    (is (= "1024" (get clj ":else")) "the default is a tier and is compared")
     (is (= (set (keys clj)) (set (keys cljc)))
         (str "fuel tier only in .clj: " (sort (remove (set (keys cljc)) (keys clj)))
              " | only in .cljc: " (sort (remove (set (keys clj)) (keys cljc)))))
