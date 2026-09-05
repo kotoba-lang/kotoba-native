@@ -1085,6 +1085,8 @@
          [[] '(kernel-read-cs) :read-cs [0x66 0x41 0x8c 0xca]]
          [[] '(kernel-page-fault-handler-address) :page-fault-handler-address
           [0x41 0x0f 0x20 0xd2 0x4c 0x8b 0x1c 0x24]]
+         [[] '(kernel-rt-timer-handler-address) :rt-timer-handler-address
+          [0xba 0xb0 0x00 0xe0 0xfe 0xc7 0x02]]
          [[] '(kernel-page-fault-recovery-handler-address) :page-fault-recovery-handler-address
           [0x48 0xcf]]
          [['a 'b] '(kernel-configure-page-fault-recovery a b)

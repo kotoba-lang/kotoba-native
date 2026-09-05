@@ -470,6 +470,7 @@
    'kernel-invlpg :invlpg
    'kernel-read-cs :read-cs
    'kernel-page-fault-handler-address :page-fault-handler-address
+   'kernel-rt-timer-handler-address :rt-timer-handler-address
    'kernel-page-fault-recovery-handler-address :page-fault-recovery-handler-address
    'kernel-configure-page-fault-recovery :configure-page-fault-recovery
    'kernel-double-fault-handler-address :double-fault-handler-address
@@ -5479,6 +5480,15 @@
    0x66 0xba 0xe9 0x00 0xee 0x44 0x89 0xc0
    0x66 0xba 0xf4 0x00 0xef 0xf4 0xeb 0xfd])
 
+(def ^:private x86-rt-timer-handler-bytes
+  ;; APIC vector 32. The interrupted register file is untouched; INC changes
+  ;; flags only and IRETQ restores the saved RFLAGS. The counter is part of
+  ;; the fixed kernel data page, and the EOI write completes this interrupt
+  ;; before returning to the preempted Kotoba instruction.
+  [0x48 0xff 0x04 0x25 0x00 0x02 0x11 0x00
+   0x52 0xba 0xb0 0x00 0xe0 0xfe 0xc7 0x02 0x00 0x00 0x00 0x00
+   0x5a 0x48 0xcf])
+
 (def ^:private x86-page-fault-recovery-handler-bytes
   [0xfa 0x48 0x89 0x04 0x25 0x10 0x01 0x11 0x00
    0x48 0x89 0x14 0x25 0x18 0x01 0x11 0x00
@@ -5575,6 +5585,14 @@
                  x86-page-fault-handler-bytes
                  ;; Handler starts immediately after the five-byte jump. RIP
                  ;; after this LEA is handler-start + n + 7.
+                 [0x4c 0x8d 0x15] (u32le (- (+ n 7)))
+                 (when-not (= dst :x86-64/r10)
+                   (x86-rr 0x89 dst :x86-64/r10))))))
+
+(defn- x86-rt-timer-handler-address [dst]
+  (let [n (count x86-rt-timer-handler-bytes)]
+    (vec (concat [0xe9] (u32le n)
+                 x86-rt-timer-handler-bytes
                  [0x4c 0x8d 0x15] (u32le (- (+ n 7)))
                  (when-not (= dst :x86-64/r10)
                    (x86-rr 0x89 dst :x86-64/r10))))))
@@ -5841,6 +5859,8 @@
       (finish [0x4d 0x31 0xd2 0x66 0x41 0x8c 0xca] :x86-64/r10)
       :page-fault-handler-address
       (x86-page-fault-handler-address dst)
+      :rt-timer-handler-address
+      (x86-rt-timer-handler-address dst)
       :page-fault-recovery-handler-address
       (x86-page-fault-recovery-handler-address dst)
       :configure-page-fault-recovery
