@@ -320,7 +320,22 @@
     (is (= 2 (count (filter #{:x86-64/multiply} (encodings x86))))
         "the AArch64 selection does not rewrite x86-64")
     (is (some #{[0x01 0x0c 0x01 0x9b]} words) "MADD x1,x0,x1,x3")
-    (is (some #{[0x00 0x84 0x02 0x9b]} words) "MSUB x0,x0,x2,x1")))
+    ;; The MSUB is fused (asserted above, on the pre-peephole encodings) and
+    ;; then strength-reduced, because 3 is 2^2-1 and a once-used Mersenne
+    ;; factor now reaches `a64-profitable-cached-mersenne-values`. The leaf is
+    ;; the same six instructions either way -- `MOVZ #3; MSUB` and
+    ;; `SUB xN,x0,x0,LSL #2; ADD` are both two words -- so this trades a
+    ;; multiply for a shifted subtract at no size cost.
+    ;;
+    ;; ⚠ Measured for 2147483647 in a division lowering (+2.49%, amu iteration
+    ;; 123); NOT measured for a small source-level factor like this one. The
+    ;; expectation below records what the compiler emits today, and the
+    ;; argument for it -- MSUB's 3-cycle multiply against a 2-cycle dependent
+    ;; SUB->ADD -- is reasoning, not evidence.
+    (is (some #{[0x11 0x08 0x00 0xcb]} words) "SUB x17,x0,x0,LSL #2")
+    (is (some #{[0x20 0x00 0x11 0x8b]} words) "ADD x0,x1,x17")
+    (is (not-any? #{[0x00 0x84 0x02 0x9b]} words)
+        "the MSUB is strength-reduced away, not merely reordered")))
 
 (defn- a64-le-words [code]
   (mapv (fn [[b0 b1 b2 b3]]
