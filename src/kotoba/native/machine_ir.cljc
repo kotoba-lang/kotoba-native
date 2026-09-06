@@ -7889,8 +7889,22 @@
             ;; clang's exact shape:
             ;;   stp x26,x25,[sp,#-0x50]! ... stp x29,x30,[sp,#0x40]
             ;;   add x29, sp, #0x40
-            ;; Measured 2026-09-06 (amu iteration 132): +1.32% on
-            ;; call-preservation, -1.69% -> -0.35% against clang.
+            ;;
+            ;; THIS BUYS NO MEASURABLE SPEED, and the earlier claim that it
+            ;; bought +1.32% on call-preservation was wrong. Measured properly
+            ;; 2026-09-06 (amu iteration 136) -- both sides on one quiet host,
+            ;; all 30 candidate/comparator/domain pairs, comparators identical
+            ;; to the byte-count with only Mach-O UUIDs differing -- the score
+            ;; is 19/30 either way and every pair moves by at most 0.35pp with
+            ;; mixed signs. The emitted code really does change (kexe is 3-4
+            ;; bytes smaller in four of the six domains), so this is a null
+            ;; result and not a measurement of the wrong binary.
+            ;;
+            ;; Kept because the shape is right, not because it is faster: two
+            ;; SP updates instead of four, and fp pointing where AAPCS64 says.
+            ;; The lesson is the ledger's existing one -- the removed SP
+            ;; updates were never on the dependency path, so counting them
+            ;; found a candidate that measuring rejected.
             call-frame? (call-frame-policy? frame-policy)
             {:keys [save restore]} (a64-saved-frame
                                     saved
