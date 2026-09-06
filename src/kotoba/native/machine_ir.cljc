@@ -7757,15 +7757,23 @@
      :restore (vec (concat (mapcat x86-pop (reverse saved))
                            (x86-adjust-stack 0xc4 pad)))}))
 
+(defn- a64-frame-reg-code
+  "Register code for a frame slot. `aarch64-register-code` covers only the
+   allocatable set -- x29 and x30 are deliberately absent from it, which is
+   why fp/lr used to carry a hardcoded word. A raw integer passes through so
+   the frame builder can name them."
+  [r]
+  (if (integer? r) r (get aarch64-register-code r)))
+
 (defn- a64-stack-pair
   "STP/LDP of two registers across one 16-byte stack step, or STR/LDP of one
    when the count is odd -- SP has to stay 16-byte aligned either way, so an
    odd save spends the same sixteen bytes as a pair."
   [opcode a b]
   (u32le (bit-or opcode
-                 (if b (bit-shift-left (get aarch64-register-code b) 10) 0)
+                 (if b (bit-shift-left (a64-frame-reg-code b) 10) 0)
                  (bit-shift-left 31 5)
-                 (get aarch64-register-code a))))
+                 (a64-frame-reg-code a))))
 
 (defn- a64-stack-pair-at
   "STP/LDP at a signed 16-byte-scaled offset from SP, or STR/LDR of one
@@ -7774,13 +7782,13 @@
   (if b
     (u32le (bit-or pair-op
                    (bit-shift-left (bit-and (quot offset 8) 0x7f) 15)
-                   (bit-shift-left (get aarch64-register-code b) 10)
+                   (bit-shift-left (a64-frame-reg-code b) 10)
                    (bit-shift-left 31 5)
-                   (get aarch64-register-code a)))
+                   (a64-frame-reg-code a)))
     (u32le (bit-or single-op
                    (bit-shift-left (quot offset 8) 10)
                    (bit-shift-left 31 5)
-                   (get aarch64-register-code a)))))
+                   (a64-frame-reg-code a)))))
 
 (defn- a64-saved-frame
   "Allocate the save area once and address the slots by offset.
@@ -7801,9 +7809,14 @@
 
    A single slot keeps the pre/post-indexed form: it is already one SP update
    and the offset form would need a separate allocation to pair with."
-  [saved]
-  (let [pairs (vec (partition-all 2 saved))
-        area (* 16 (count pairs))]
+  ([saved] (a64-saved-frame saved nil))
+  ([saved extra-pair]
+   ;; EXTRA-PAIR is appended as its own slot at the top of the area, never
+   ;; merged into SAVED's pairing. Concatenating it and re-pairing is wrong
+   ;; whenever SAVED has odd length: seven saved registers plus fp/lr pairs
+   ;; x25 with x29 and strands x30, which is 15 failures and 87 errors.
+   (let [pairs (cond-> (vec (partition-all 2 saved)) extra-pair (conj (vec extra-pair)))
+         area (* 16 (count pairs))]
     (if (<= (count pairs) 1)
       {:save (vec (mapcat (fn [[a b]]
                             (if b
@@ -7824,7 +7837,7 @@
                  (u32le (bit-or 0xf8000c00
                                 (bit-shift-left (bit-and (- area) 0x1ff) 12)
                                 (bit-shift-left 31 5)
-                                (get aarch64-register-code first-a))))
+                                (a64-frame-reg-code first-a))))
                (mapcat (fn [i [a b]]
                          (a64-stack-pair-at {:pair-op 0xa9000000 :single-op 0xf9000000}
                                             (* 16 i) a b))
@@ -7841,7 +7854,18 @@
                  (u32le (bit-or 0xf8400400
                                 (bit-shift-left (bit-and area 0x1ff) 12)
                                 (bit-shift-left 31 5)
-                                (get aarch64-register-code first-a))))))}))))
+                                (a64-frame-reg-code first-a))))))})))))
+
+(defn- a64-form-frame-pointer
+  "`add x29, sp, #offset` -- point fp at the {fp,lr} record.
+
+   This must NOT go through `a64-adjust-stack`, which emits nothing for a zero
+   amount. A call frame that saves no callee-saved registers has fp/lr at
+   offset 0, so routing it through there would drop the instruction and leave
+   x29 never formed. Nothing in the suite reads x29, so that omission is
+   green."
+  [offset]
+  (u32le (bit-or 0x910003fd (bit-shift-left (bit-and offset 0xfff) 10))))
 
 (defn- function-frame [target frame-slots frame-policy instructions]
   (let [storage-bytes (align16 (* 8 frame-slots))
@@ -7858,16 +7882,31 @@
                                      restore [0xc3]))})
 
       :aarch64
-      (let [{:keys [save restore]} (a64-saved-frame saved)]
-        (if (call-frame-policy? frame-policy)
+      (let [;; fp/lr joins the save area as its own top slot rather than taking
+            ;; a pre-indexed push of its own, so the whole frame costs two SP
+            ;; updates instead of four. AAPCS64 wants fp pointing AT the
+            ;; {fp,lr} record, so it is formed with `add x29, sp, #offset` --
+            ;; clang's exact shape:
+            ;;   stp x26,x25,[sp,#-0x50]! ... stp x29,x30,[sp,#0x40]
+            ;;   add x29, sp, #0x40
+            ;; Measured 2026-09-06 (amu iteration 132): +1.32% on
+            ;; call-preservation, -1.69% -> -0.35% against clang.
+            call-frame? (call-frame-policy? frame-policy)
+            {:keys [save restore]} (a64-saved-frame
+                                    saved
+                                    (when call-frame? [29 30]))
+            ;; fp/lr is the LAST slot, so its offset is the area below it.
+            fp-offset (* 16 (count (partition-all 2 saved)))]
+        (if call-frame?
           {:frame-bytes storage-bytes
            :saved-registers saved
-           :prologue (vec (concat save (u32le 0xa9bf7bfd) (u32le 0x910003fd)
+           :prologue (vec (concat save
+                                  (a64-form-frame-pointer fp-offset)
                                   (a64-adjust-stack 0xd10003ff storage-bytes)))
            :tail-suffix (vec (concat (a64-adjust-stack 0x910003ff storage-bytes)
-                                     (u32le 0xa8c17bfd) restore))
+                                     restore))
            :return-suffix (vec (concat (a64-adjust-stack 0x910003ff storage-bytes)
-                                       (u32le 0xa8c17bfd) restore
+                                       restore
                                        (u32le 0xd65f03c0)))}
           {:frame-bytes storage-bytes
            :saved-registers saved
