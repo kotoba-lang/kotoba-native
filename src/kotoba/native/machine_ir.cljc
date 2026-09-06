@@ -3652,6 +3652,22 @@
                 (a64-wide-move 0xf2800000 rd (nth chunks lane) lane))
               patch-lanes)))))
 
+(defn- a64-ldr-literal
+  "`LDR <Xt>, <label>` -- PC-relative load of a 64-bit word.
+
+   0x58000000 | imm19 << 5 | Rt, where imm19 counts WORDS from this
+   instruction's own address. Verified against clang's assembler rather than
+   derived: `ldr x0,+0x18` is 0x580000c0, `ldr x5,+0x14` is 0x580000a5,
+   `ldr x13,+0x18` is 0x580000cd."
+  [rd word-displacement]
+  (u32le (bit-or 0x58000000
+                 (bit-shift-left (bit-and word-displacement 0x7ffff) 5)
+                 rd)))
+
+(def ^:private a64-literal-pool-range
+  "LDR (literal) reaches +/-1MB: imm19 words, signed."
+  {:minimum (- (* 4 (bit-shift-left 1 18))) :maximum (dec (* 4 (bit-shift-left 1 18)))})
+
 (defn- a64-constant-fixed
   "The legacy four-word form. Keep it only where an enclosing sequence has a
   fixed local branch displacement or layout has reserved exactly 16 bytes."
@@ -3695,6 +3711,30 @@
     ;; Preserve the established wide-move spelling on ties. Apart from making
     ;; output deterministic, MOVZ/MOVN is the simpler dependency-breaking form.
     (if (and logical (< (count logical) (count selected))) logical selected)))
+
+
+(defn- a64-constant-pooled
+  "Materialise VALUE into DST, from a literal pool when the immediate form
+   would need more than one word.
+
+   MOVZ+MOVK is a two-long chain into whatever consumes the constant, because
+   MOVK read-modify-writes the register MOVZ just wrote. A pooled LDR is one
+   instruction with NO register input, so its latency is schedulable.
+
+   Measured 2026-09-06 on an M4 (amu iterations 139-140): a hand-written A/B
+   over the deep-spill lane shape, differing only in how the constant arrives,
+   puts the pooled load 4.1-4.6% ahead across ten runs; a fixture whose
+   constants need no MOVK agrees at ~4% from the other direction.
+
+   ONLY the `:aarch64/constant` encoder uses this. `a64-constant` stays as it
+   is: internal callers sit inside size-sensitive sequences, and the leaf
+   constant cache prices a constant by COUNTING the bytes `a64-constant`
+   returns -- handing it a token would silently rewrite that heuristic."
+  [dst value]
+  (let [immediate (a64-constant dst value)]
+    (if (<= (count immediate) 4)
+      immediate
+      [{:native/a64-pool-value value :native/a64-pool-dst (a64-register dst)}])))
 
 (defn- a64-compare [cset dst left right]
   (vec (concat
@@ -6340,7 +6380,7 @@
           src (keyword "aarch64" (str "x" index))]
       (when-not (<= 0 index 4) (reject! :mc-encode :argument-index-unsupported instruction))
       (if (= dst src) [] (a64-mov dst src)))
-    :aarch64/constant (a64-constant (:mir/dst instruction) (:mir/value instruction))
+    :aarch64/constant (a64-constant-pooled (:mir/dst instruction) (:mir/value instruction))
     :aarch64/data-address
     [{:native/data-content (:mir/content instruction)
       :native/data-dst (:mir/dst instruction) :native/data-target :aarch64}]
@@ -6634,6 +6674,7 @@
       ;; still suffices.
       (when (:native/rodata-content token)
         (case (:native/rodata-target token) :x86-64 7 nil))
+      (when (:native/a64-pool-value token) 4)
       (when (and (integer? token) (<= 0 token 255)) 1)))
 
 ;; boot-lit: `lea dst,[rip+disp32]`. ModRM mod=00 rm=101 is RIP-relative in
@@ -6648,6 +6689,36 @@
 
 (defn- align-to [value alignment]
   (* alignment (quot (+ value (dec alignment)) alignment)))
+
+(defn- append-a64-constant-pool
+  "Give TOKENS' pooled constants a home at the end of this function.
+
+   The pool goes INSIDE the function, after its last instruction. Function
+   extents are derived from the NEXT function's label offset, so anything
+   emitted here falls inside this function's reported length -- which is what
+   `extract-native` copies when the benchmark harness runs one function
+   standalone. A pool parked after all the code would sit outside that copy and
+   the loads would read whatever happened to follow it.
+
+   Nothing falls into the pool: every path out of the body has already taken
+   its return."
+  [tokens prefix]
+  (let [values (distinct (keep :native/a64-pool-value tokens))]
+    (if (empty? values)
+      tokens
+      (let [ids (into {} (map-indexed
+                          (fn [index value]
+                            [value (keyword "kotoba.native.a64-pool"
+                                            (str prefix "." index))])
+                          values))]
+        (into (mapv (fn [token]
+                      (if-let [value (:native/a64-pool-value token)]
+                        (assoc token :native/a64-pool-label (get ids value))
+                        token))
+                    tokens)
+              (mapcat (fn [value]
+                        (into [(layout/label (get ids value))] (le64 value)))
+                      values))))))
 
 (defn- resolve-program-layout [tokens]
   (let [labels (layout/label-offsets tokens size-of-token)
@@ -6708,6 +6779,18 @@
                     (case (:native/data-target token)
                       :x86-64 (x86-mov-imm-fixed (:native/data-dst token) offset)
                       :aarch64 (a64-constant-fixed (:native/data-dst token) offset)))
+
+                  (:native/a64-pool-value token)
+                  (let [target (get labels (:native/a64-pool-label token))]
+                    (when (nil? target)
+                      (reject! :mc-encode :a64-pool-label-unresolved token))
+                    (let [displacement (- target position)
+                          {:keys [minimum maximum]} a64-literal-pool-range]
+                      (when-not (<= minimum displacement maximum)
+                        (reject! :mc-encode :a64-pool-out-of-range
+                                 {:token token :displacement displacement}))
+                      (a64-ldr-literal (:native/a64-pool-dst token)
+                                       (quot displacement 4))))
 
                   (:native/rodata-content token)
                   (let [offset (get (:offsets literal-plan)
@@ -8069,8 +8152,10 @@
                                              fallback-exit
                                              instructions)))
                                #{fallback-label fallback-body fallback-exit}))]
-               (into [(layout/label (get callee-labels name))]
-                     (concat primary fallback))))
+               (append-a64-constant-pool
+                (into [(layout/label (get callee-labels name))]
+                      (concat primary fallback))
+                (str index))))
            (range) functions))
          {:keys [labels code code-size]} (resolve-program-layout tokens)
          function-offsets (mapv #(get labels (get callee-labels (:mc/name %))) functions)
@@ -8112,9 +8197,11 @@
                         (if host-call? :call-live :allocator)
                         instructions)]
     (resolve-layout
-     (vec (concat prologue
-                  (instruction-tokens target frame-bytes return-suffix tail-suffix {}
-                                      #{} [] nil nil instructions))))))
+     (append-a64-constant-pool
+      (vec (concat prologue
+                   (instruction-tokens target frame-bytes return-suffix tail-suffix {}
+                                       #{} [] nil nil instructions)))
+      "mc"))))
 
 (def ^:private guest-reentry-ops
   ;; A function that contains one of these can run unbounded guest or host
