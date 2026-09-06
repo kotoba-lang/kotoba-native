@@ -7926,9 +7926,25 @@
 
   A slot round trip is a store and a load through memory; an FMOV crossing to
   d16+slot is one register-file move each way. rustc's emission of the
-  qualified deep-spill fixture banks its overflow lanes exactly this way, and
-  hand-substituting amu's remaining fourteen spill instructions measured
-  +3.21% separated (amu docs/codegen-coscientist.md, iterations 23-24).
+  qualified deep-spill fixture banks its overflow lanes exactly this way.
+
+  ⚠ THE +3.21% THIS DOCSTRING USED TO CLAIM NO LONGER HOLDS. That figure came
+  from hand-substituting fourteen spill instructions (amu
+  docs/codegen-coscientist.md, iterations 23-24) on a compiler that has since
+  gained the Mersenne reduction (#142), single-allocation frames (#145) and
+  the fp/lr fold (#146). Re-measured 2026-09-07 by compiling both shapes and
+  running three interleaved quiet-host pairs of the competitive suite:
+  disabling this pass costs **+0.67%, sd 1.15, n=3** (drift-corrected against
+  the five domains whose bytes do not change) -- real in sign, but not
+  distinguishable from zero at this fleet's resolution.
+
+  The likely reason it shrank is #145: once the frame became a single
+  allocation with offset addressing, a stack slot round trip stopped being
+  expensive enough for a register-file move to beat by much.
+
+  Keep the pass -- nothing here argues for removing it -- but do not cite it
+  as a multi-percent win, and do not treat 24-lane spill traffic as a solved
+  cost when planning the next lever.
 
   Admission is fail-closed: AArch64 only, a frame of one through sixteen
   slots, no call-shaped instruction anywhere in the body (SIMD registers are
