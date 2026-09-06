@@ -7336,10 +7336,58 @@
                                       (update :indexes conj index)))))
                       out))
                   {} (map-indexed vector instructions))
+          ;; A constant used once saves nothing by being cached, which is why
+          ;; this filter is `> 1`. But `a64-profitable-cached-mersenne-values`
+          ;; reads the cache, and `a64-serial-msub-chain?` is written to accept
+          ;; `msub-count <= 1` -- so the single-MSUB case the chain test exists
+          ;; to admit could never reach it. Measured 2026-09-06 (amu iteration
+          ;; 123): every one of the six required fixtures emitted MSUB and none
+          ;; emitted the shifted form, and hand-patching the single site in
+          ;; `kernel_call`'s callee was worth +2.49% on that domain.
+          ;;
+          ;; A once-used Mersenne factor is admitted here so it can be *offered*
+          ;; to that decision. It is not a decision itself: the profitability
+          ;; test still runs, and for one use the two forms are the same size
+          ;; (materialize + MSUB = 2 words; shifted SUB + ADD = 2 words), so the
+          ;; size arm stays false and only the measured serial arm can accept it.
+          ;; Being Mersenne is not enough to admit one. Every 2^k-1 qualifies,
+          ;; including the 3 in `(i64-shift-left a 3)`, and admitting those
+          ;; reserves a cache register for a shift amount and moves allocation
+          ;; under unrelated code -- measured: 7 encoding-parity failures
+          ;; against a clean baseline, all of them shifts.
+          ;;
+          ;; The constant must also be read ONLY as an MSUB factor, which is
+          ;; the same condition `a64-profitable-cached-mersenne-values` applies
+          ;; to cached values. A shift amount has a non-MSUB reader and is out.
+          singleton-mersenne
+          (into #{}
+                (comp
+                 (filter (fn [[_ {:keys [value indexes]}]]
+                           (and (= 1 (count indexes))
+                                (positive-mersenne-shift value))))
+                 (keep (fn [[_ {:keys [value indexes]}]]
+                         (let [dst (:mir/dst (nth instructions (first indexes)))
+                               readers (filterv #(some #{dst} (a64-source-registers %))
+                                                instructions)
+                               msub-readers
+                               (filterv #(and (= :aarch64/multiply-subtract
+                                                 (:mc/encoding %))
+                                              (contains? #{(:mir/left %) (:mir/right %)}
+                                                         dst))
+                                        readers)]
+                           (when (and dst
+                                      (pos? (count msub-readers))
+                                      (= (count readers) (count msub-readers)))
+                             value)))))
+                occurrences)
           selected (->> occurrences
                         (keep (fn [[_ {:keys [value indexes]}]]
-                                (when (> (count indexes) 1)
+                                (when (or (> (count indexes) 1)
+                                          (contains? singleton-mersenne value))
                                   {:value value :first (first indexes)
+                                   ;; A singleton saves no materialization, so
+                                   ;; it sorts last and only takes a register
+                                   ;; once the genuinely repeated constants have.
                                    :saving (* (dec (count indexes))
                                               (count (a64-constant
                                                       :aarch64/x13 value)))})))
