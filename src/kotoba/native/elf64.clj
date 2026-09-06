@@ -168,7 +168,17 @@
    'aiueos-cpu-feature-syscall {:arity 0 :symbol "kotoba_aiueos_cpu_feature_syscall"}
    ;; NOT a feature test: leaf 1 EBX 31:24 is the initial APIC ID, which pci.c
    ;; uses as the MSI-X message destination.
-   'aiueos-cpu-apic-id {:arity 0 :symbol "kotoba_aiueos_cpu_apic_id"}})
+   'aiueos-cpu-apic-id {:arity 0 :symbol "kotoba_aiueos_cpu_apic_id"}
+   ;; Boot physical-page allocator record-table decision. The mechanism of
+   ;; allocation (advancing next_page over the best EFI_CONVENTIONAL_MEMORY
+   ;; run, writing the free-list head into the freed page, taking the
+   ;; allocator lock) stays in C, in kernel/memory.c. What this object owns is
+   ;; the record-table decision that guards it: which record to claim for a
+   ;; fresh page, and whether a page being freed is the one a live record
+   ;; names -- so a double free, an unknown page, or an already-inactive
+   ;; record is refused before C dereferences or re-links anything. Five
+   ;; parameters: table, length, count, stride, request.
+   'aiueos-allocator-plan {:arity 5 :symbol "kotoba_aiueos_allocator_plan"}})
 
 (defn- le [n width]
   (object-elf/little-endian n width))
