@@ -7767,18 +7767,81 @@
                  (bit-shift-left 31 5)
                  (get aarch64-register-code a))))
 
-(defn- a64-saved-frame [saved]
-  (let [pairs (partition-all 2 saved)]
-    {:save (vec (mapcat (fn [[a b]]
-                          (if b
-                            (a64-stack-pair 0xa9bf0000 a b)   ; stp a, b, [sp, #-16]!
-                            (a64-stack-pair 0xf81f0c00 a nil))) ; str a, [sp, #-16]!
-                        pairs))
-     :restore (vec (mapcat (fn [[a b]]
-                             (if b
-                               (a64-stack-pair 0xa8c10000 a b)   ; ldp a, b, [sp], #16
-                               (a64-stack-pair 0xf8410400 a nil))) ; ldr a, [sp], #16
-                           (reverse pairs)))}))
+(defn- a64-stack-pair-at
+  "STP/LDP at a signed 16-byte-scaled offset from SP, or STR/LDR of one
+   register at an unsigned offset when the slot holds a single save."
+  [{:keys [pair-op single-op]} offset a b]
+  (if b
+    (u32le (bit-or pair-op
+                   (bit-shift-left (bit-and (quot offset 8) 0x7f) 15)
+                   (bit-shift-left (get aarch64-register-code b) 10)
+                   (bit-shift-left 31 5)
+                   (get aarch64-register-code a)))
+    (u32le (bit-or single-op
+                   (bit-shift-left (quot offset 8) 10)
+                   (bit-shift-left 31 5)
+                   (get aarch64-register-code a)))))
+
+(defn- a64-saved-frame
+  "Allocate the save area once and address the slots by offset.
+
+   Each save used to carry its own pre-indexed 16-byte step, so N pairs meant
+   N dependent SP updates in the prologue and N more in the epilogue -- every
+   store waiting on the SP the previous store wrote. clang allocates the whole
+   area on the first store and offsets the rest, which is two SP updates for
+   any N.
+
+   Measured 2026-09-06 (amu iteration 131), instruction count unchanged and
+   every manifest input identical on both fixtures:
+
+     deep-spill-pressure  8 SP updates -> 2:  +4.35% -> +6.37% against clang,
+                                              separated -- the pair QUALIFIES
+     call-preservation   10 SP updates -> 2:  -4.22% -> -0.67%
+     branch-call         15 SP updates -> 3:  -11.27% -> -8.25%
+
+   A single slot keeps the pre/post-indexed form: it is already one SP update
+   and the offset form would need a separate allocation to pair with."
+  [saved]
+  (let [pairs (vec (partition-all 2 saved))
+        area (* 16 (count pairs))]
+    (if (<= (count pairs) 1)
+      {:save (vec (mapcat (fn [[a b]]
+                            (if b
+                              (a64-stack-pair 0xa9bf0000 a b)     ; stp a,b,[sp,#-16]!
+                              (a64-stack-pair 0xf81f0c00 a nil))) ; str a,[sp,#-16]!
+                          pairs))
+       :restore (vec (mapcat (fn [[a b]]
+                               (if b
+                                 (a64-stack-pair 0xa8c10000 a b)     ; ldp a,b,[sp],#16
+                                 (a64-stack-pair 0xf8410400 a nil))) ; ldr a,[sp],#16
+                             (reverse pairs)))}
+      (let [[first-a first-b] (first pairs)]
+        {:save
+         (vec (concat
+               ;; the one SP update: allocate the whole area
+               (if first-b
+                 (a64-stack-pair-at {:pair-op 0xa9800000} (- area) first-a first-b)
+                 (u32le (bit-or 0xf8000c00
+                                (bit-shift-left (bit-and (- area) 0x1ff) 12)
+                                (bit-shift-left 31 5)
+                                (get aarch64-register-code first-a))))
+               (mapcat (fn [i [a b]]
+                         (a64-stack-pair-at {:pair-op 0xa9000000 :single-op 0xf9000000}
+                                            (* 16 i) a b))
+                       (range 1 (count pairs)) (rest pairs))))
+         :restore
+         (vec (concat
+               (mapcat (fn [i [a b]]
+                         (a64-stack-pair-at {:pair-op 0xa9400000 :single-op 0xf9400000}
+                                            (* 16 i) a b))
+                       (reverse (range 1 (count pairs))) (reverse (rest pairs)))
+               ;; the one SP update: release the whole area
+               (if first-b
+                 (a64-stack-pair-at {:pair-op 0xa8c00000} area first-a first-b)
+                 (u32le (bit-or 0xf8400400
+                                (bit-shift-left (bit-and area 0x1ff) 12)
+                                (bit-shift-left 31 5)
+                                (get aarch64-register-code first-a))))))}))))
 
 (defn- function-frame [target frame-slots frame-policy instructions]
   (let [storage-bytes (align16 (* 8 frame-slots))

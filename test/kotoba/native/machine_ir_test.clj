@@ -2429,19 +2429,41 @@
         words (a64-words (machine/compile-expression :aarch64 '[n] body))
         ;; SP has to stay 16-byte aligned, so registers go down in pairs and an
         ;; odd one spends the same sixteen bytes on its own.
-        pairs (partition-all 2 saved)
-        save (mapv (fn [[a b]]
-                     (if b
-                       (bit-or 0xa9bf0000 (bit-shift-left (a64-code b) 10)
-                               (bit-shift-left 31 5) (a64-code a))
-                       (bit-or 0xf81f0c00 (bit-shift-left 31 5) (a64-code a))))
-                   pairs)
-        restore (mapv (fn [[a b]]
-                        (if b
-                          (bit-or 0xa8c10000 (bit-shift-left (a64-code b) 10)
-                                  (bit-shift-left 31 5) (a64-code a))
-                          (bit-or 0xf8410400 (bit-shift-left 31 5) (a64-code a))))
-                      (reverse pairs))]
+        pairs (vec (partition-all 2 saved))
+        area (* 16 (count pairs))
+        ;; The save area is allocated once and the slots addressed by offset:
+        ;; the first store carries the whole -area step and the rest are
+        ;; offsets, so N pairs cost one SP update rather than N. A single pair
+        ;; keeps the pre/post-indexed form, which is already one update.
+        one? (<= (count pairs) 1)
+        stp-at (fn [op off a b] (bit-or op (bit-shift-left (bit-and (quot off 8) 0x7f) 15)
+                                        (bit-shift-left (a64-code b) 10)
+                                        (bit-shift-left 31 5) (a64-code a)))
+        str-at (fn [op off a] (bit-or op (bit-shift-left (quot off 8) 10)
+                                      (bit-shift-left 31 5) (a64-code a)))
+        save (if one?
+               (mapv (fn [[a b]]
+                       (if b (bit-or 0xa9bf0000 (bit-shift-left (a64-code b) 10)
+                                     (bit-shift-left 31 5) (a64-code a))
+                           (bit-or 0xf81f0c00 (bit-shift-left 31 5) (a64-code a))))
+                     pairs)
+               (into [(let [[a b] (first pairs)] (stp-at 0xa9800000 (- area) a b))]
+                     (map-indexed (fn [i [a b]]
+                                    (if b (stp-at 0xa9000000 (* 16 (inc i)) a b)
+                                        (str-at 0xf9000000 (* 16 (inc i)) a)))
+                                  (rest pairs))))
+        restore (if one?
+                  (mapv (fn [[a b]]
+                          (if b (bit-or 0xa8c10000 (bit-shift-left (a64-code b) 10)
+                                        (bit-shift-left 31 5) (a64-code a))
+                              (bit-or 0xf8410400 (bit-shift-left 31 5) (a64-code a))))
+                        (reverse pairs))
+                  (conj (vec (map (fn [i [a b]]
+                                    (if b (stp-at 0xa9400000 (* 16 i) a b)
+                                        (str-at 0xf9400000 (* 16 i) a)))
+                                  (reverse (range 1 (count pairs)))
+                                  (reverse (rest pairs))))
+                        (let [[a b] (first pairs)] (stp-at 0xa8c00000 area a b))))]
     (is (seq saved) "this body has to reach the preserved tier for the rest to mean anything")
     (is (= save (subvec words 0 (count save)))
         "the prologue saves exactly the preserved registers the body names, in pool order")
