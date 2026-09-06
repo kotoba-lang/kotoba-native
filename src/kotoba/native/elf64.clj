@@ -601,7 +601,18 @@
    'aiueos-fuel-wide-probe
    {:arity 1 :symbol "kotoba_aiueos_fuel_wide_probe"}
    'aiueos-rtl8125-rx-poll
-   {:arity 2 :symbol "kotoba_aiueos_rtl8125_rx_poll"}})
+  {:arity 2 :symbol "kotoba_aiueos_rtl8125_rx_poll"}
+  ;; Boot physical-page allocator record-table decision. The mechanism of
+  ;; allocation (advancing next_page over the best EFI_CONVENTIONAL_MEMORY
+  ;; run, writing the free-list head into the freed page, taking the
+  ;; allocator lock) stays in C, in kernel/memory.c. What this object owns is
+  ;; the record-table decision that guards it: which record to claim for a
+  ;; fresh page, and whether a page being freed is the one a live record
+  ;; names -- so a double free, an unknown page, or an already-inactive
+  ;; record is refused before C dereferences or re-links anything. Five
+  ;; parameters: table, length, count, stride, request.
+  'aiueos-allocator-plan
+  {:arity 5 :symbol "kotoba_aiueos_allocator_plan"}})
 
 (def ^:private admitted-entry-prefix
   "The prefix every `kernel-object-entries` key carries, checked against the
