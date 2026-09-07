@@ -373,3 +373,331 @@
                [0x49 0xc1 0xe3 entry-stride-shift]  ; shl r11, 7
                [0x4d 0x03 0x99]                     ; add r11,[r9+disp32]
                (le32 context-entry-base-offset))))
+
+;; ── the context slots the canned handlers share with their configurators ───
+;;
+;; `kotoba.native.x86-64` and `kotoba.native.machine-ir` carry five fixed byte
+;; sequences that touch kernel memory outside any function's frame: the two
+;; configurators (`kernel-configure-page-fault-recovery`,
+;; `kernel-configure-double-fault-ist`) publish a frame page and a stack top,
+;; and the three canned handlers (recoverable #PF, #DF, the RT timer) read
+;; them back, spill registers, and count ticks. Until 2026-09-06 every one of
+;; those was an ABSOLUTE disp32 operand -- `mov [0x110100],r10` -- fixed on
+;; 2026-08-12 (3726aa8) on the assumption that the RW context page sits at
+;; image-base+0x10000. The packager stopped keeping that promise: it places
+;; the RW page at the first page past the text, and the aiueos kernel's text
+;; now ends at 0x11e000. The slots were inside RX text; with CR0.WP set the
+;; first configurator store page-faulted before the kernel's own #PF gate
+;; existed, and every QEMU boot of that kernel ended in a triple fault
+;; (CR2 = 0x110100, error 3). The failure moved with nothing: the IP moved as
+;; text grew, CR2 did not.
+;;
+;; The slots are now a BLOCK AT A FIXED OFFSET INTO THE CONTEXT PAGE, and the
+;; packagers reserve it (`kotoba.native.elf64`, both twins). Two different
+;; derivations reach the same block, and the difference is who may trust r9:
+;;
+;;   configurators   run INLINE in compiled Kotoba, where r9 IS the context
+;;                   (the boot shim, the syscall shim and every interrupt
+;;                   entry establish it). They address `[r9+slot]`.
+;;   handlers        are entered by the CPU from whatever was running. r9 is
+;;                   NOT inherited -- `entry-bytes` above says why, and the
+;;                   timer can arrive while CPL3 code holds r9 -- so a handler
+;;                   that wrote `[r9+slot]` would let user code choose where a
+;;                   supervisor store lands. They derive the context from
+;;                   `sgdt` instead: the boot shim's `lgdt` names the GDT the
+;;                   packager lays down at `context-gdt-offset`, so
+;;                   GDTR.base - context-gdt-offset is the context. That is
+;;                   CHECKED before it is used: the context's own GDTR copy at
+;;                   `context-gdtr-offset` must name this GDT, or the handler
+;;                   takes its fail-closed path. A kernel that loads its own
+;;                   GDT elsewhere (`kernel-load-gdt-tss`) therefore gets an
+;;                   'F' receipt and a halt on the first canned handler, not a
+;;                   write to GDT-0x60+slot.
+;;
+;; The block sits in the gap the packager's layout already had: above the
+;; interrupt entry base at 0x148 and below the request area at 0x200.
+;; `kotoba.native.elf64` asserts both bounds at load.
+
+(def context-gdt-offset
+  "Where the packager's GDT lives in the kernel context page; the boot shim's
+  `lgdt` names it, and the canned handlers derive the context from it."
+  96)
+
+(def context-gdtr-offset
+  "The 10-byte GDTR the boot shim loads: a 2-byte limit, then the 8-byte base
+  at +2. The handlers compare GDTR.base against this copy before trusting it."
+  152)
+
+(def context-slot-block-offset 0x160)
+(def context-slot-block-size 0x80)
+
+;; Recoverable #PF (aiueos ADR-0040). Frame base and 16-byte-aligned stack
+;; top published by the configurator; eight spill quadwords the handler
+;; saves the registers it touches into: rax rdx r10 r11 r12 r13 r14 r15.
+(def recovery-frame-slot (+ context-slot-block-offset 0x00))
+(def recovery-stack-top-slot (+ context-slot-block-offset 0x08))
+(def recovery-spill-slot (+ context-slot-block-offset 0x10))
+(def recovery-spill-count 8)
+
+;; #DF on TSS.IST1: frame page, stack page, stack top.
+(def double-fault-frame-slot (+ context-slot-block-offset 0x50))
+(def double-fault-stack-slot (+ context-slot-block-offset 0x58))
+(def double-fault-stack-top-slot (+ context-slot-block-offset 0x60))
+
+;; APIC vector 32 tick counter.
+(def rt-timer-tick-slot (+ context-slot-block-offset 0x68))
+
+(when-not (<= (+ context-entry-base-offset 8) context-slot-block-offset)
+  (throw (ex-info "the context slot block overlaps the interrupt entry base slot"
+                  {:entry-base context-entry-base-offset
+                   :block context-slot-block-offset})))
+(when-not (<= (+ rt-timer-tick-slot 8) (+ context-slot-block-offset context-slot-block-size))
+  (throw (ex-info "a context slot lies outside the slot block"
+                  {:last-slot rt-timer-tick-slot
+                   :block-end (+ context-slot-block-offset context-slot-block-size)})))
+
+;; ── a label-resolving assembler for the fixed sequences ─────────────────────
+;;
+;; The five sequences below used to be hand-counted byte vectors with literal
+;; rel8/rel32 displacements. Re-addressing every memory operand changes every
+;; instruction length, and a displacement counted once by hand is a
+;; displacement nobody recounts. ITEMS are byte vectors, `[:label k]`,
+;; `[:rel8 opcode-bytes k]` (a one-byte displacement follows the opcode) or
+;; `[:rel32 opcode-bytes k]`. Two passes: sizes are fixed, so labels resolve
+;; before any displacement is written, and a rel8 that does not fit refuses
+;; rather than wrapping.
+
+(defn- item-size [item]
+  (if (keyword? (first item))
+    (case (first item)
+      :label 0
+      :rel8 (inc (count (second item)))
+      :rel32 (+ 4 (count (second item))))
+    (count item)))
+
+(defn- assemble [items]
+  (let [labels (loop [items items pos 0 labels {}]
+                 (if-let [item (first items)]
+                   (recur (rest items) (+ pos (item-size item))
+                          (if (= :label (first item))
+                            (assoc labels (second item) pos)
+                            labels))
+                   labels))
+        target (fn [k]
+                 (or (get labels k)
+                     (throw (ex-info "assemble: undefined label" {:label k}))))]
+    (loop [items items pos 0 out []]
+      (if-let [item (first items)]
+        (let [size (item-size item)
+              after (+ pos size)]
+          (recur (rest items) after
+                 (if (keyword? (first item))
+                   (case (first item)
+                     :label out
+                     :rel8 (let [d (- (target (nth item 2)) after)]
+                             (when-not (<= -128 d 127)
+                               (throw (ex-info "assemble: rel8 displacement does not fit"
+                                               {:label (nth item 2) :displacement d})))
+                             (into out (conj (second item) (mod d 256))))
+                     :rel32 (into out (into (second item)
+                                            (le32 (- (target (nth item 2)) after)))))
+                   (into out item))))
+        out))))
+
+(defn- mem-disp32
+  "OPCODE with a `[base+disp32]` operand: REX.W, ModRM mod=10, REG in the reg
+  field, BASE in rm. REG and BASE are 0..15 (rax 0 .. r15 15). BASE may not
+  be rsp/r12, whose rm encoding means 'SIB follows' -- the two bases used
+  here are r9 (the context register) and r15 / rax (the derived context)."
+  [opcode reg base disp]
+  (when (= 4 (bit-and base 7))
+    (throw (ex-info "mem-disp32: rsp/r12 base needs a SIB" {:base base})))
+  (let [rex (bit-or 0x48 (if (>= reg 8) 4 0) (if (>= base 8) 1 0))
+        modrm (bit-or 0x80 (bit-shift-left (bit-and reg 7) 3) (bit-and base 7))]
+    (into [rex opcode modrm] (le32 disp))))
+
+(def ^:private rax 0) (def ^:private rdx 2)
+(def ^:private r9 9) (def ^:private r10 10) (def ^:private r11 11)
+(def ^:private r12 12) (def ^:private r13 13) (def ^:private r14 14)
+(def ^:private r15 15)
+
+(defn- store-slot [reg base slot] (mem-disp32 0x89 reg base slot))   ; mov [base+slot],reg
+(defn- load-slot  [reg base slot] (mem-disp32 0x8b reg base slot))   ; mov reg,[base+slot]
+(defn- cmp-slot   [reg base slot] (mem-disp32 0x3b reg base slot))   ; cmp reg,[base+slot]
+
+(def ^:private recovery-spill-registers [rax rdx r10 r11 r12 r13 r14 r15])
+
+(defn- spill-slot [i] (+ recovery-spill-slot (* 8 i)))
+
+(defn- context-from-gdtr
+  "Derive the kernel context into BASE (a register the caller owns) from the
+  GDTR: sub rsp,16; sgdt [rsp]; mov BASE,[rsp+2]; add rsp,16; then require
+  that the context's own GDTR copy names this GDT (`cmp BASE,[BASE+gdtr+2-gdt]`,
+  jne FAIL) and subtract `context-gdt-offset`. 16 bytes of the current stack
+  are used and released; the caller's frame is untouched."
+  [base fail]
+  [[0x48 0x83 0xec 0x10]                                ; sub rsp,16
+   [0x0f 0x01 0x04 0x24]                                ; sgdt [rsp]
+   (into [(if (>= base 8) 0x4c 0x48) 0x8b
+          (+ 0x44 (* 8 (bit-and base 7))) 0x24 0x02] []) ; mov base,[rsp+2]
+   [0x48 0x83 0xc4 0x10]                                ; add rsp,16
+   (cmp-slot base base (- (+ context-gdtr-offset 2) context-gdt-offset))
+   [:rel32 [0x0f 0x85] fail]                            ; jne fail
+   [(if (>= base 8) 0x49 0x48) 0x83 (+ 0xe8 (bit-and base 7)) context-gdt-offset]]) ; sub base,imm8
+
+;; 'F' on the debugcon port, 0x1f on isa-debug-exit, then a halt loop.
+(def ^:private fail-closed-tail
+  [[0xb0 0x46 0x66 0xba 0xe9 0x00 0xee]
+   [0xb8 0x1f 0x00 0x00 0x00 0x66 0xba 0xf4 0x00 0xef]
+   [:label :halt] [0xf4] [:rel8 [0xeb] :halt]])
+
+(def configure-page-fault-recovery-bytes
+  "r10 = frame page, r11 = stack page. Both must be distinct, nonzero and
+  4-KiB aligned. Publish the frame base and a 16-byte-aligned stack top into
+  the recovery slots of the context r9 names, read both back, and leave 1 in
+  r10 on success or 0 on refusal. Runs inline in compiled Kotoba."
+  (assemble
+   (concat
+    [[0x4c 0x89 0xd0]                          ; mov rax,r10
+     [0x4c 0x09 0xd8]                          ; or rax,r11
+     [0x48 0xa9 0xff 0x0f 0x00 0x00]           ; test rax,0xfff
+     [:rel8 [0x75] :fail]
+     [0x4d 0x85 0xd2] [:rel8 [0x74] :fail]     ; test r10,r10
+     [0x4d 0x85 0xdb] [:rel8 [0x74] :fail]     ; test r11,r11
+     [0x4d 0x39 0xd3] [:rel8 [0x74] :fail]     ; cmp r11,r10
+     (store-slot r10 r9 recovery-frame-slot)
+     [0x49 0x8d 0x83 0xf0 0x0f 0x00 0x00]      ; lea rax,[r11+0xff0]
+     (store-slot rax r9 recovery-stack-top-slot)
+     (cmp-slot r10 r9 recovery-frame-slot) [:rel8 [0x75] :fail]
+     (cmp-slot rax r9 recovery-stack-top-slot) [:rel8 [0x75] :fail]
+     [0x49 0xc7 0xc2 0x01 0x00 0x00 0x00]      ; mov r10,1
+     [:rel8 [0xeb] :end]
+     [:label :fail]
+     [0x4d 0x31 0xd2]                          ; xor r10,r10
+     [:label :end]])))
+
+(def configure-double-fault-ist-bytes
+  "r10 = frame page, r11 = IST1 stack page: distinct, nonzero, 4-KiB
+  aligned. Publish both and the 16-byte-aligned stack top into the
+  double-fault slots of the context r9 names, read all three back; 1 in r10
+  on success, 0 on refusal. Runs inline in compiled Kotoba."
+  (assemble
+   (concat
+    [[0x4c 0x89 0xd0] [0x4c 0x09 0xd8] [0x48 0xa9 0xff 0x0f 0x00 0x00]
+     [:rel8 [0x75] :fail]
+     [0x4d 0x85 0xd2] [:rel8 [0x74] :fail]
+     [0x4d 0x85 0xdb] [:rel8 [0x74] :fail]
+     [0x4d 0x39 0xda] [:rel8 [0x74] :fail]     ; cmp r10,r11
+     (store-slot r10 r9 double-fault-frame-slot)
+     (store-slot r11 r9 double-fault-stack-slot)
+     [0x49 0x8d 0x83 0xf0 0x0f 0x00 0x00]      ; lea rax,[r11+0xff0]
+     (store-slot rax r9 double-fault-stack-top-slot)
+     (cmp-slot r10 r9 double-fault-frame-slot) [:rel8 [0x75] :fail]
+     (cmp-slot r11 r9 double-fault-stack-slot) [:rel8 [0x75] :fail]
+     (cmp-slot rax r9 double-fault-stack-top-slot) [:rel8 [0x75] :fail]
+     [0x49 0xc7 0xc2 0x01 0x00 0x00 0x00]
+     [:rel8 [0xeb] :end]
+     [:label :fail]
+     [0x4d 0x31 0xd2]
+     [:label :end]])))
+
+(def page-fault-recovery-handler-bytes
+  "The recoverable #PF handler (aiueos ADR-0040). Derives the context from
+  the GDTR into r15 (the pushed r15 is spilled with the rest), saves the
+  register set it touches into the spill slots, requires CR2 == 0x100000 and
+  a supervisor write to a not-present page, publishes CR2 / error code / RIP
+  / the fault stack into the frame page, writes 'R', advances the saved RIP
+  past the 4-byte probe store, restores every register and `iretq`s through
+  the CPU frame. Any other fault is a fail-closed 'F' receipt and a halt."
+  (assemble
+   (concat
+    [[0xfa]                                    ; cli
+     [0x41 0x57]]                              ; push r15
+    (context-from-gdtr r15 :fail)
+    (map (fn [i reg] (store-slot reg r15 (spill-slot i)))
+         (range 7) recovery-spill-registers)   ; rax rdx r10 r11 r12 r13 r14
+    [[0x48 0x8b 0x04 0x24]                     ; mov rax,[rsp]  -- the pushed r15
+     (store-slot rax r15 (spill-slot 7))
+     [0x48 0x83 0xc4 0x08]                     ; add rsp,8 -- rsp is the CPU frame again
+     [0x49 0x89 0xe6]                          ; mov r14,rsp
+     [0x41 0x0f 0x20 0xd2]                     ; mov r10,cr2
+     [0x4d 0x8b 0x1e]                          ; mov r11,[r14]  -- error code
+     [0x49 0x81 0xfa 0x00 0x00 0x10 0x00]      ; cmp r10,0x100000
+     [:rel32 [0x0f 0x85] :fail]
+     [0x4c 0x89 0xd8 0x83 0xe0 0x03 0x83 0xf8 0x02] ; mov rax,r11; and eax,3; cmp eax,2
+     [:rel32 [0x0f 0x85] :fail]
+     (load-slot r12 r15 recovery-frame-slot)
+     (load-slot r13 r15 recovery-stack-top-slot)
+     [0x4d 0x85 0xe4] [:rel8 [0x74] :fail]     ; test r12,r12
+     [0x4d 0x85 0xed] [:rel8 [0x74] :fail]     ; test r13,r13
+     [0x4d 0x89 0x14 0x24]                     ; mov [r12],r10
+     [0x4d 0x89 0x5c 0x24 0x08]                ; mov [r12+8],r11
+     [0x49 0x8b 0x46 0x08]                     ; mov rax,[r14+8]  -- RIP
+     [0x49 0x89 0x44 0x24 0x10]                ; mov [r12+16],rax
+     [0x4c 0x89 0xec]                          ; mov rsp,r13
+     [0x49 0x89 0x64 0x24 0x18]                ; mov [r12+24],rsp
+     [0xb0 0x52 0x66 0xba 0xe9 0x00 0xee]      ; out 'R'
+     [0x49 0x83 0x46 0x08 0x04]                ; add qword [r14+8],4
+     [0x4c 0x89 0xf4]                          ; mov rsp,r14
+     [0x48 0x83 0xc4 0x08]]                    ; add rsp,8 -- drop the error code
+    (map (fn [i reg] (load-slot reg r15 (spill-slot i)))
+         (range 7) recovery-spill-registers)
+    [(load-slot r15 r15 (spill-slot 7))             ; r15 last: it was the base
+     [0x48 0xcf]                               ; iretq
+     [:label :fail]]
+    fail-closed-tail)))
+
+(def double-fault-handler-bytes
+  "The #DF handler. Entered on TSS.IST1 with a 48-byte same-CPL frame and
+  the architectural zero error code. Derives the context from the GDTR into
+  r15, reads the three double-fault slots, validates that RSP is exactly
+  stack-top - 48 inside the published stack page and that the error code is
+  zero, publishes the frame, writes 'D' and 0x1c, and halts. Terminal in
+  every path; 'F' and 0x1f on refusal."
+  (assemble
+   (concat
+    [[0xfa]                                    ; cli
+     [0x49 0x89 0xe2]                          ; mov r10,rsp
+     [0x4c 0x8b 0x1c 0x24]]                    ; mov r11,[rsp]  -- error code
+    (context-from-gdtr r15 :fail)
+    [(load-slot r12 r15 double-fault-frame-slot)
+     (load-slot r13 r15 double-fault-stack-slot)
+     (load-slot r14 r15 double-fault-stack-top-slot)
+     [0x4d 0x85 0xe4] [:rel8 [0x74] :fail]
+     [0x4d 0x85 0xed] [:rel8 [0x74] :fail]
+     [0x4d 0x85 0xf6] [:rel8 [0x74] :fail]
+     [0x4d 0x39 0xea] [:rel8 [0x72] :fail]     ; cmp r10,r13 ; jb
+     [0x4d 0x39 0xf2] [:rel8 [0x73] :fail]     ; cmp r10,r14 ; jae
+     [0x49 0x8d 0x46 0xd0]                     ; lea rax,[r14-48]
+     [0x49 0x39 0xc2] [:rel8 [0x75] :fail]     ; cmp r10,rax ; jne
+     [0x4d 0x85 0xdb] [:rel8 [0x75] :fail]     ; test r11,r11 ; jnz
+     [0x4d 0x89 0x14 0x24]                     ; mov [r12],r10
+     [0x4d 0x89 0x5c 0x24 0x08]                ; mov [r12+8],r11
+     [0x48 0x8b 0x44 0x24 0x20]                ; mov rax,[rsp+32]
+     [0x49 0x89 0x44 0x24 0x10]                ; mov [r12+16],rax
+     [0x48 0x8b 0x44 0x24 0x28]                ; mov rax,[rsp+40]
+     [0x49 0x89 0x44 0x24 0x18]                ; mov [r12+24],rax
+     [0x4d 0x89 0x74 0x24 0x20]                ; mov [r12+32],r14
+     [0xb0 0x44 0x66 0xba 0xe9 0x00 0xee]      ; out 'D'
+     [0xb8 0x1c 0x00 0x00 0x00 0x66 0xba 0xf4 0x00 0xef]
+     [:label :done] [0xf4] [:rel8 [0xeb] :done]
+     [:label :fail]]
+    fail-closed-tail)))
+
+(def rt-timer-handler-bytes
+  "APIC vector 32. Derives the context from the GDTR into rax, increments
+  the tick slot, acknowledges the local APIC (EOI at 0xfee000b0), restores
+  rax/rdx and `iretq`s; RFLAGS comes back from the frame. A GDTR that does
+  not name the context's GDT is the fail-closed 'F' receipt: a timer that
+  silently stopped counting would be the wrong kind of quiet."
+  (assemble
+   (concat
+    [[0x50] [0x52]]                            ; push rax; push rdx
+    (context-from-gdtr rax :fail)
+    [(mem-disp32 0xff 0 rax rt-timer-tick-slot) ; inc qword [rax+slot]
+     [0xba 0xb0 0x00 0xe0 0xfe]                ; mov edx,0xfee000b0
+     [0xc7 0x02 0x00 0x00 0x00 0x00]           ; mov dword [rdx],0
+     [0x5a] [0x58]                             ; pop rdx; pop rax
+     [0x48 0xcf]                               ; iretq
+     [:label :fail]]
+    fail-closed-tail)))
