@@ -800,11 +800,13 @@
 ;; vector-6 slot (`absent-entry-bytes-for` below), so a gate built from
 ;; `kernel-isr-entry-address 6` names it rather than a silent halt. A kernel
 ;; that lays no region -- the aiueos kernel today installs only vector 14 from
-;; `kernel-page-fault-handler-address` -- cannot reach it yet: a
-;; `kernel-undefined-opcode-handler-address` operation beside its siblings
-;; needs an arity in kotoba-gmir's `x86-privileged-action-arities` and
-;; admission in kotoba-kir, kotoba-sema and `guest-grammar.edn` before this
-;; repo can lower it through the pilot, which is why it is not here.
+;; `kernel-page-fault-handler-address` -- reaches it through
+;; `kernel-undefined-opcode-handler-address` instead: both lowering arms in
+;; `kotoba.native.x86-64` and `kotoba.native.machine-ir` embed THESE bytes and
+;; answer with their address, the way the three canned handler addresses do,
+;; so either route installs one handler. The operation pilots only once
+;; kotoba-gmir's `x86-privileged-action-arities`, kotoba-kir, kotoba-sema and
+;; `guest-grammar.edn` admit it as well (five repositories; this one last).
 
 (def undefined-opcode-vector 6)
 
