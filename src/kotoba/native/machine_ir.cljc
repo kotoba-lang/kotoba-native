@@ -440,9 +440,138 @@
             (fn [fs] (mapv #(update % :mir/instructions hoist-consumers-to-producers) fs)))
     (update program :mir/instructions hoist-consumers-to-producers)))
 
+;; ── post-allocation move coalescing (aarch64) ──────────────────────────────
+;;
+;; The allocator hands a call its arguments through copies. Two shapes of
+;; those copies are pure waste, and both sit on the dependency path INTO the
+;; call, so the callee waits on them:
+;;
+;;   move x19 <- x0 ; move x0 <- x19        x0 still holds n: the copy back is a no-op
+;;   add  x2 <- x19 + 1 ; move x0 <- x2     x2 has no other reader: write x0 directly
+;;
+;; clang writes `add x0, x19, #1`. On kernel_call and kernel_call_branch this
+;; is four instructions per call out of 52 and 51 (amu iteration 123 priced a
+;; NOP-patched removal at +1.28% on call-preservation; the real removal shortens
+;; the argument chain as well). aarch64 only for now: the x86-64 lowering of
+;; two-address ops has not been measured under a renamed destination.
+
+(def ^:private a64-caller-saved-registers
+  ;; x0-x17: clobbered by any call, so a value there is dead at a call unless
+  ;; the call itself reads it. x18 is platform-reserved and never allocated;
+  ;; x19+ survive calls and must be traced through them.
+  (into #{} (map #(keyword "aarch64" (str "x" %))) (range 0 18)))
+
+(def ^:private coalescable-ops
+  ;; Producers whose destination may be renamed to the copy's target. All
+  ;; lower to a single instruction that reads every source before it writes,
+  ;; so renaming is safe even when the target is one of the sources -- but the
+  ;; rewrite below refuses that case anyway, to stay out of the way of the
+  ;; multi-instruction lowerings (quotient, MADD fusion) it does not touch.
+  (into hoistable-ops #{:mir/constant :mir/move}))
+
+(def ^:private coalesce-transparent-ops
+  ;; Ops the liveness scan may walk through. Anything else -- labels, jumps,
+  ;; branches, recur/reentry, loads, stores, target-selected ops -- ends the
+  ;; scan with "live": the conservative answer, which keeps the copy.
+  (into crossable-ops #{:mir/move :mir/multiply-add :mir/multiply-subtract}))
+
+(defn- a64-register? [v]
+  (and (keyword? v) (= "aarch64" (namespace v))))
+
+(defn- a64-registers-read
+  "Every aarch64 register an instruction reads: any register-valued field
+   other than the destination, one level of vector (call arguments) and one
+   level of map-in-vector (phi incomings) deep. Over-approximating reads only
+   ever keeps a copy; it never removes one."
+  [instruction]
+  (->> (dissoc instruction :mir/op :mir/dst)
+       vals
+       (mapcat (fn [v] (cond (vector? v) (mapcat (fn [x] (if (map? x) (vals x) [x])) v)
+                             (map? v) (vals v)
+                             :else [v])))
+       (filter a64-register?)))
+
+(defn- a64-dead-after?
+  "Is REG dead at index FROM, i.e. written or unreachable before any read?
+   Walks only `coalesce-transparent-ops` plus calls and returns; a call kills a
+   caller-saved REG it does not read; a tail call kills everything; anything
+   the scan does not understand answers `false`."
+  [instructions from reg]
+  (loop [i from]
+    (if (>= i (count instructions))
+      true
+      (let [ins (nth instructions i) op (:mir/op ins)]
+        (cond
+          (some #{reg} (a64-registers-read ins)) false
+          (= reg (:mir/dst ins)) true
+          (= :mir/tail-call op) true
+          (= :mir/return op) true
+          (= :mir/call op) (if (contains? a64-caller-saved-registers reg) true (recur (inc i)))
+          (contains? coalesce-transparent-ops op) (recur (inc i))
+          :else false)))))
+
+(defn- a64-coalesce-moves
+  "One forward pass over an allocated instruction vector.
+
+   * `move d <- s` is dropped when d already holds s -- tracked as an alias
+     pair recorded by the previous move between them and forgotten the moment
+     either register is written, a call is made, or control flow appears.
+   * `<producer> t <- ...` immediately followed by `move d <- t`, with t dead
+     after the move and d not read by the producer, becomes `<producer> d <- ...`.
+
+   Later rewrites cannot invalidate an earlier scan: a scan that found t dead
+   stopped at t's next write, and a later rewrite removes that write only when
+   t is ALSO unread up to the write after it."
+  [instructions]
+  (let [v (vec instructions) n (count v)
+        forget (fn [alias & regs] (into {} (remove (fn [[a b]] (some #{a b} regs))) alias))]
+    (loop [i 0 out [] alias {}]
+      (if (>= i n)
+        out
+        (let [ins (nth v i) op (:mir/op ins) dst (:mir/dst ins) nxt (get v (inc i))]
+          (cond
+            ;; copy back to a register that still holds the value
+            (and (= :mir/move op) (a64-register? dst) (a64-register? (:mir/src ins))
+                 (or (= (:mir/src ins) (get alias dst)) (= dst (get alias (:mir/src ins)))))
+            (recur (inc i) out alias)
+
+            ;; producer + last-use copy: write the copy's target directly
+            (and (contains? coalescable-ops op) (a64-register? dst)
+                 nxt (= :mir/move (:mir/op nxt)) (= dst (:mir/src nxt))
+                 (a64-register? (:mir/dst nxt)) (not= dst (:mir/dst nxt))
+                 (not (some #{(:mir/dst nxt)} (a64-registers-read ins)))
+                 (a64-dead-after? v (+ i 2) dst))
+            (let [d (:mir/dst nxt)]
+              (recur (+ i 2) (conj out (assoc ins :mir/dst d)) (forget alias d)))
+
+            :else
+            (let [alias' (cond
+                           (= :mir/move op)
+                           (if (and (a64-register? dst) (a64-register? (:mir/src ins)))
+                             (assoc (forget alias dst) dst (:mir/src ins))
+                             (forget alias dst))
+                           (and (contains? coalesce-transparent-ops op) (a64-register? dst))
+                           (forget alias dst)
+                           :else {})]
+              (recur (inc i) (conj out ins) alias'))))))))
+
+(defn coalesce-program-moves
+  "Apply `a64-coalesce-moves` to every function of an allocated v3 MIR module,
+   or to a flat allocated program. Registers are physical here; run it after
+   `kotoba.mir/allocate-registers` and before lowering."
+  [program]
+  (if (= 3 (:mir/version program))
+    (update program :mir/functions
+            (fn [fs] (mapv #(update % :mir/instructions a64-coalesce-moves) fs)))
+    (update program :mir/instructions a64-coalesce-moves)))
+
 (defn compile-gmir [target program]
-  (->> program (mir/select-target target) hoist-program-consumers
-       mir/allocate-registers lower-mc))
+  (cond->> program
+    true (mir/select-target target)
+    true hoist-program-consumers
+    true mir/allocate-registers
+    (= :aarch64 target) coalesce-program-moves
+    true lower-mc))
 
 ;; ── closed KIR expression -> GMIR pilot ─────────────────────────────────────
 

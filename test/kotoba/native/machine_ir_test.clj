@@ -2674,7 +2674,10 @@
         "the optimization retains the real helper call in MIR/MC")
     (is (pos? (subvector-count x86-code [0x0f 0x84]))
         "x86 retains its canonical TEST/JZ branch path")
-    (is (= 53 (count words))
+    ;; 53 until post-allocation move coalescing: the helper's constant argument
+    ;; was `MOV x2,#1; MOV x0,x2` in both the bulk and the cold copy and is now
+    ;; `MOV x0,#1` in each (kotoba-native #154).
+    (is (= 51 (count words))
         "rotation moves each shared exit without growing the bulk/fallback copies")))
 
 (deftest aarch64-bottom-test-rotation-fails-closed-outside-the-exact-form
@@ -4028,3 +4031,82 @@
                                {:format :kotoba.kir/v4 :exports ['main]
                                 :functions [{:name 'main :params '[a b]
                                              :body '(kernel-dot-f32 a 48 b 48 12)}]}))))))))
+
+;; ── post-allocation move coalescing ─────────────────────────────────────────
+
+(def ^:private call-argument-kir
+  ;; kernel_call's shape: four arguments derived from n, four from earlier
+  ;; results. Before coalescing the caller spent one instruction per call on a
+  ;; copy that either wrote back a value x0 still held, or moved a fresh
+  ;; add result into x0 that nothing else read.
+  {:format :kotoba.kir/v4 :exports ['kernel]
+   :functions [{:name 'step :params ['x] :result :i64
+                :body '(+ (* x 48271) 1)}
+               {:name 'kernel :params ['n] :result :i64
+                :body '(let [a (step n) b (step (+ n 1)) c (step (+ n 2)) d (step (+ n 3))
+                             e (step a) f (step b) g (step c) h (step d)]
+                         (+ (+ (+ a b) (+ c d)) (+ (+ e f) (+ g h))))}]})
+
+(defn- kernel-mc [module]
+  (->> (:mc/functions module) (filter #(= 'kernel (:mc/name %))) first :mc/instructions))
+
+(deftest aarch64-call-arguments-are-written-directly-not-copied
+  ;; MC instructions name their operation in `:mc/encoding` (`:aarch64/add`),
+  ;; not `:mir/op`; a filter on the latter matches nothing and passes vacuously.
+  (let [instructions (kernel-mc (machine/compile-gmir :aarch64
+                                                      (machine/lower-kir-module call-argument-kir)))
+        op #(or (:mc/encoding %) (:mc/op %))
+        moves (filter #(= :aarch64/move (op %)) instructions)
+        adjacent (partition 2 1 instructions)]
+    (is (= 8 (count (filter #(= :aarch64/call (op %)) instructions)))
+        "the eight calls are all present: this is the kernel_call shape")
+    (is (not-any? (fn [[a b]]
+                    (and (= :aarch64/move (op a)) (= :aarch64/move (op b))
+                         (= (:mir/dst a) (:mir/src b)) (= (:mir/src a) (:mir/dst b))))
+                  adjacent)
+        "a copy is never immediately followed by its inverse")
+    (is (not-any? (fn [[a b]]
+                    (and (= :aarch64/add (op a)) (= :aarch64/move (op b))
+                         (= (:mir/dst a) (:mir/src b))))
+                  adjacent)
+        "an add feeding only a call argument writes the argument register itself")
+    (let [n+k (filter #(and (= :aarch64/add (op %)) (= :aarch64/x19 (:mir/left %))) instructions)]
+      (is (= 3 (count n+k)))
+      (is (every? #(= :aarch64/x0 (:mir/dst %)) n+k)
+          "the three n+k arguments are formed in x0 directly, as clang does"))
+    ;; Seven results still need a home across later calls; the copies that
+    ;; save them are the ones that carry information and all remain.
+    (is (= 7 (count (filter #(and (= :aarch64/x0 (:mir/src %))
+                                  (not= :aarch64/x0 (:mir/dst %))) moves))))))
+
+(deftest aarch64-move-coalescing-refuses-when-the-source-is-still-read
+  (let [coalesce #'kotoba.native.machine-ir/a64-coalesce-moves
+        add (fn [dst l r] {:mir/op :mir/add :mir/dst dst :mir/left l :mir/right r})
+        mov (fn [dst src] {:mir/op :mir/move :mir/dst dst :mir/src src})
+        call {:mir/op :mir/call :mir/dst :aarch64/x0 :mir/callee 'step :mir/arguments [:aarch64/x0]}]
+    (testing "a read before the call keeps the copy"
+      (let [v [(add :aarch64/x2 :aarch64/x19 :aarch64/x1) (mov :aarch64/x0 :aarch64/x2)
+               (add :aarch64/x3 :aarch64/x2 :aarch64/x0) call]]
+        (is (= v (coalesce v)))))
+    (testing "a callee-saved source read after the call keeps the copy"
+      (let [v [(add :aarch64/x20 :aarch64/x19 :aarch64/x1) (mov :aarch64/x0 :aarch64/x20)
+               call (add :aarch64/x1 :aarch64/x20 :aarch64/x0)]]
+        (is (= v (coalesce v)))))
+    (testing "a caller-saved source is dead at the call, so the copy folds"
+      (let [v [(add :aarch64/x2 :aarch64/x19 :aarch64/x1) (mov :aarch64/x0 :aarch64/x2) call]]
+        (is (= [(add :aarch64/x0 :aarch64/x19 :aarch64/x1) call] (coalesce v)))))
+    (testing "an op the scan does not understand answers live"
+      (let [v [(add :aarch64/x2 :aarch64/x19 :aarch64/x1) (mov :aarch64/x0 :aarch64/x2)
+               {:mir/op :mir/label :mir/id :l} (add :aarch64/x3 :aarch64/x2 :aarch64/x2)]]
+        (is (= v (coalesce v)))))
+    (testing "a producer that reads the copy's target is left alone"
+      (let [v [(add :aarch64/x2 :aarch64/x0 :aarch64/x1) (mov :aarch64/x0 :aarch64/x2) call]]
+        (is (= v (coalesce v)))))
+    (testing "the copy back is dropped only while the alias holds"
+      (is (= [(mov :aarch64/x19 :aarch64/x0) call]
+             (coalesce [(mov :aarch64/x19 :aarch64/x0) (mov :aarch64/x0 :aarch64/x19) call])))
+      (let [v [(mov :aarch64/x19 :aarch64/x0) (add :aarch64/x0 :aarch64/x0 :aarch64/x1)
+               (mov :aarch64/x0 :aarch64/x19) call]]
+        (is (= v (coalesce v)) "x0 was rewritten in between; the copy carries information"))
+      (let [v [(mov :aarch64/x19 :aarch64/x0) call (mov :aarch64/x0 :aarch64/x19) call]]
+        (is (= v (coalesce v)) "a call clobbers x0; the alias does not survive it")))))
