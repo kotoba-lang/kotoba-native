@@ -557,15 +557,17 @@
                             (map :mc/encoding (:mc/instructions program))))))))
 
 (def spill-program
-  ;; Six leaves reduced by TWO trees, so every leaf has two uses and all six
-  ;; stay live until the second tree. One tree is no longer enough: the
-  ;; pre-allocation hoist (`hoist-consumers-to-producers`) moves a single-use
-  ;; add up beside its operands, and a lone tree over independent leaves
-  ;; then allocates in three registers with no spill at all -- which is
-  ;; better code, and also no longer a test of bounded spilling. Second uses
-  ;; are what real pressure looks like; the hoist cannot and should not
-  ;; remove them.
-  (let [registers (mapv gmir/vreg (range 17))
+  ;; Six leaves whose only consumers need `k`, and `k` is defined LAST. That is
+  ;; pressure no reordering can remove: the pre-allocation hoist anchors a
+  ;; consumer after the later of its operands' definitions and other uses, and
+  ;; `k`'s definition is the last instruction before the adds -- so every leaf
+  ;; stays live until then. Two earlier shapes were defused by the hoist and
+  ;; stopped testing bounded spilling: a single tree (each add hoisted beside
+  ;; its leaves) and leaves consumed by two trees (the second folded in beside
+  ;; the first once "every operand dies here" replaced "some operand is
+  ;; single-use"). A late shared operand is what real irreducible pressure
+  ;; looks like.
+  (let [registers (mapv gmir/vreg (range 19))
         add (fn [dst left right]
               {:gmir/op :gmir/add :gmir/dst (registers dst)
                :gmir/left (registers left) :gmir/right (registers right)})]
@@ -576,10 +578,10 @@
                           {:gmir/op :gmir/constant :gmir/dst register
                            :gmir/value index})
                         (subvec registers 0 6))
-           [(add 6 0 1) (add 7 2 3) (add 8 4 5) (add 9 6 7) (add 10 9 8)
-            (add 11 0 1) (add 12 2 3) (add 13 4 5) (add 14 11 12) (add 15 14 13)
-            (add 16 10 15)
-            {:gmir/op :gmir/return :gmir/value (registers 16)}]))}))
+           [{:gmir/op :gmir/constant :gmir/dst (registers 6) :gmir/value 7}   ; k, defined last
+            (add 7 0 6) (add 8 1 6) (add 9 2 6) (add 10 3 6) (add 11 4 6) (add 12 5 6)
+            (add 13 7 8) (add 14 9 10) (add 15 11 12) (add 16 13 14) (add 17 16 15)
+            {:gmir/op :gmir/return :gmir/value (registers 17)}]))}))
 
 (def program
   {:gmir/version 1
@@ -1008,25 +1010,26 @@
           arm-mc (machine/compile-gmir :aarch64 spill-program)
           x86 (machine/encode-mc x86-mc)
           arm (machine/encode-mc arm-mc)]
-      ;; Seventeen values in a four-register profile take seven slots, not
-      ;; seventeen: the allocator spills what it cannot keep and leaves the
-      ;; rest in registers. A 64-byte frame rather than 144.
-      (is (= 7 (:mc/frame-slots x86-mc)))
-      (is (= 7 (:mc/frame-slots arm-mc)))
+      ;; Seven simultaneously-live values (six leaves and `k`) in a
+      ;; four-register profile take three slots, not seven: the allocator
+      ;; spills what it cannot keep and leaves the rest in registers. A 32-byte
+      ;; frame rather than 64.
+      (is (= 3 (:mc/frame-slots x86-mc)))
+      (is (= 3 (:mc/frame-slots arm-mc)))
       (doseq [mc [x86-mc arm-mc]]
         (is (some #(= "spill-store" (some-> % :mc/encoding name))
                   (:mc/instructions mc)))
         (is (some #(= "spill-load" (some-> % :mc/encoding name))
                   (:mc/instructions mc))))
-      (is (= [0x48 0x81 0xec 0x40 0x00 0x00 0x00]      ; sub rsp,0x40
+      (is (= [0x48 0x81 0xec 0x20 0x00 0x00 0x00]      ; sub rsp,0x20
              (subvec x86 0 7)))
-      (is (= [0x48 0x81 0xc4 0x40 0x00 0x00 0x00 0xc3]  ; add rsp,0x40; ret
+      (is (= [0x48 0x81 0xc4 0x20 0x00 0x00 0x00 0xc3]  ; add rsp,0x20; ret
              (subvec x86 (- (count x86) 8))))
       (is (= [0xc0 0x03 0x5f 0xd6]
              (subvec arm (- (count arm) 4))))
-      (is (= [0xff 0x03 0x01 0xd1]                       ; sub sp,sp,#0x40
+      (is (= [0xff 0x83 0x00 0xd1]                       ; sub sp,sp,#0x20
              (subvec arm 0 4)))
-      (is (= [0xff 0x03 0x01 0x91 0xc0 0x03 0x5f 0xd6]   ; add sp,sp,#0x40; ret
+      (is (= [0xff 0x83 0x00 0x91 0xc0 0x03 0x5f 0xd6]   ; add sp,sp,#0x20; ret
              (subvec arm (- (count arm) 8)))))))
 
 (deftest kir-expression-slice-encodes-final-bytes-for-both-isas
@@ -2863,15 +2866,19 @@
         bindings (vec (mapcat (fn [symbol index]
                                 [symbol (list '+ 'acc index)])
                               values (range 30)))
-        fold (fn [seed] (reduce (fn [accumulator symbol]
-                                  (list '+ accumulator symbol))
-                                seed values))
-        ;; Two folds over the same thirty values. With one, the pre-allocation
-        ;; hoist consumes each value the moment it exists and the pressure this
-        ;; test is named for never arises; the fallback path it exercises would
-        ;; then be exercised by nothing. A second use per value is real
-        ;; pressure the hoist cannot remove.
-        sum (list '+ (fold 'acc) (fold 'acc))
+        ;; Every value's only consumer needs `k`, and `k` is bound LAST -- after
+        ;; all thirty. That is pressure no reordering can remove: the
+        ;; pre-allocation hoist anchors a consumer after the later of its
+        ;; operands' definitions and other uses, and `k` is defined at the end,
+        ;; so all thirty values stay live until then. Two earlier shapes were
+        ;; defused by the hoist and left the fallback path this test is named
+        ;; for exercised by nothing: a single fold (each add hoisted beside its
+        ;; value) and two folds (the second folded in beside the first once
+        ;; "every operand dies here" replaced "some operand is single-use").
+        bindings (conj bindings 'k (list '+ 'acc 31))
+        sum (reduce (fn [accumulator symbol]
+                      (list '+ accumulator (list '+ symbol 'k)))
+                    'acc values)
         body (list 'if (list '= 'i 0) 'acc
                    (list 'let bindings
                          (list 'kernel (list '- 'i 1) 'b 'c 'd sum)))

@@ -284,10 +284,20 @@
     :mir/bit-and :mir/bit-or :mir/bit-xor
     :mir/shift-left :mir/shift-right-signed :mir/shift-right-unsigned})
 
+(def ^:private call-ops
+  ;; Crossable ONLY under the last-other-use anchor below. A pure add whose
+  ;; operands were both live across a call folds two live-across values into
+  ;; one when it moves above that call; the allocator then keeps one register
+  ;; (or one lazy-reload slot) instead of two. Measured 2026-09-07 on the
+  ;; kernel_call fixture (amu iteration 148): peak live-across-call values 7 ->
+  ;; 4, callee-saved registers 7 -> 5, 51 -> 46 instructions.
+  #{:mir/call :mir/tail-call})
+
 (def ^:private crossable-ops
   ;; What a hoisted instruction may pass over on its way up. Everything else
-  ;; -- labels, branches, calls, loads, stores, returns, phi transport, and
-  ;; every target-selected op -- is a barrier the hoist stops beneath.
+  ;; -- labels, branches, loads, stores, returns, phi transport, and every
+  ;; target-selected op -- is a barrier the hoist stops beneath. Calls are in
+  ;; `call-ops`, crossable under the anchor rule, not here.
   ;; `:mir/argument` is deliberately ABSENT. Arguments materialise the entry
   ;; convention, and an instruction hoisted above a later argument makes the
   ;; allocator store the remaining incoming parameters: on the five-argument
@@ -300,6 +310,21 @@
 (defn- hoist-register-operands [instruction]
   (filter gmir/vreg? (keep instruction hoist-source-keys)))
 
+(defn- hoist-all-register-reads
+  "EVERY vreg an instruction reads, including a call's `:mir/arguments` and a
+   phi's `:mir/incomings`. Use counts and last-use positions must come from
+   this, not from `hoist-register-operands`: the latter lists only the operand
+   kinds a hoistable instruction itself carries, and computing liveness from
+   it made a call's reads invisible -- `a` looked single-use with `step a`
+   still ahead, `a+b` was hoisted above two calls, and one MORE value rode
+   across them. Found by reading the MIR after the hoist, not by the suite."
+  [instruction]
+  (concat (filter gmir/vreg? (keep instruction hoist-source-keys))
+          (when (vector? (:mir/arguments instruction))
+            (filter gmir/vreg? (:mir/arguments instruction)))
+          (when (vector? (:mir/incomings instruction))
+            (filter gmir/vreg? (map :mir/value (:mir/incomings instruction))))))
+
 (defn- hoist-register-only?
   "Every operand and the destination is a vreg or a plain literal. A physical
    register anywhere means select-target already pinned this instruction to a
@@ -309,8 +334,13 @@
           (cons (:mir/dst instruction) (keep instruction hoist-source-keys))))
 
 (defn- hoist-crossable? [instruction]
-  (and (contains? crossable-ops (:mir/op instruction))
-       (hoist-register-only? instruction)))
+  (or (and (contains? crossable-ops (:mir/op instruction))
+           (hoist-register-only? instruction))
+      ;; A call's operands are vregs (arguments) and its dst a vreg; it is
+      ;; crossable because the anchor never places anything above an
+      ;; operand's last OTHER use, so nothing a call reads or writes is
+      ;; disturbed and no lifetime grows -- one shrinks.
+      (contains? call-ops (:mir/op instruction))))
 
 (defn- hoist-splits-fusion-pair?
   "Would inserting at POSITION separate a multiply from the add/subtract that
@@ -335,25 +365,53 @@
   "One function's instruction vector, with pressure-killing pure instructions
    moved up beside their producers. See the header comment above."
   [instructions]
-  (let [use-counts (frequencies (mapcat hoist-register-operands instructions))]
-    (loop [remaining (seq instructions)
+  (let [use-counts (frequencies (mapcat hoist-all-register-reads instructions))
+        ;; For each vreg, the ORIGINAL index of its last use by any instruction
+        ;; other than the one being hoisted -- counting call arguments. Anchoring
+        ;; below that is what makes crossing a call sound: an operand is never
+        ;; asked to live longer than it already did, so folding it early only
+        ;; shortens.
+        ;; vreg -> every ORIGINAL index that reads it. A single "last use" was
+        ;; not enough: when the last use IS the instruction being hoisted, the
+        ;; use before it is the one that anchors, and a map holding only the
+        ;; final index had already forgotten it -- `a+b` climbed above `step a`.
+        uses (reduce (fn [m [i ins]]
+                       (reduce #(update %1 %2 (fnil conj []) i) m (hoist-all-register-reads ins)))
+                     {} (map-indexed vector instructions))
+        last-use (into {} (map (fn [[v is]] [v (peek is)]) uses))
+        ;; original index -> index in OUT, maintained as we insert
+        ]
+    (loop [remaining (seq (map-indexed vector instructions))
            out []
            def-pos {}          ; vreg -> index in OUT
+           orig->out {}        ; original index -> index in OUT
            last-barrier -1]    ; index in OUT of the most recent non-crossable
       (if-not remaining
         out
-        (let [ins (first remaining)
+        (let [[orig-i ins] (first remaining)
               srcs (hoist-register-operands ins)
-              kills? (some #(= 1 (get use-counts % 0)) srcs)
+              ;; Every vreg operand dies HERE: all of them are born earlier and
+              ;; this is each one's last read. Then the move retires n values and
+              ;; births one, so pressure over the moved interval falls by n-1 and
+              ;; never rises. "Some operand is single-use" was the earlier rule;
+              ;; it missed `a+b` when `a` also fed `step a` -- this add is still
+              ;; a's last use, and that is what the anchor needs, not use-count 1.
+              kills? (every? #(= orig-i (get last-use %)) srcs)
               hoistable? (and (contains? hoistable-ops (:mir/op ins))
                               (hoist-register-only? ins)
                               (seq srcs)
                               (every? def-pos srcs)
                               kills?)
+              ;; the operands' last OTHER uses, in OUT coordinates (they all
+              ;; precede this instruction in original order, so they are placed)
+              other-uses (when hoistable?
+                           (keep (fn [v] (some->> (get uses v) (remove #{orig-i}) seq (apply max) (get orig->out)))
+                                 srcs))
               target-pos (when hoistable?
                            (let [after-producers (inc (reduce max (map def-pos srcs)))
+                                 after-other-uses (inc (reduce max -1 other-uses))
                                  after-barrier (inc last-barrier)
-                                 pos (max after-producers after-barrier)]
+                                 pos (max after-producers after-other-uses after-barrier)]
                              (if (hoist-splits-fusion-pair? out pos use-counts)
                                (inc pos)
                                pos)))
@@ -362,13 +420,15 @@
             (recur (next remaining)
                    (conj out ins)
                    (cond-> def-pos (gmir/vreg? (:mir/dst ins)) (assoc (:mir/dst ins) (count out)))
+                   (assoc orig->out orig-i (count out))
                    (if (hoist-crossable? ins) last-barrier (count out)))
-            (let [out' (into (conj (subvec out 0 target-pos) ins) (subvec out target-pos))
-                  ;; every definition at or after the insertion point slid down one
-                  def-pos' (into {} (map (fn [[v i]] [v (if (>= i target-pos) (inc i) i)]) def-pos))
+            (let [slide (fn [i] (if (>= i target-pos) (inc i) i))
+                  out' (into (conj (subvec out 0 target-pos) ins) (subvec out target-pos))
+                  def-pos' (into {} (map (fn [[v i]] [v (slide i)]) def-pos))
                   def-pos' (cond-> def-pos' (gmir/vreg? (:mir/dst ins)) (assoc (:mir/dst ins) target-pos))
+                  orig->out' (assoc (into {} (map (fn [[o i]] [o (slide i)]) orig->out)) orig-i target-pos)
                   last-barrier' (if (>= last-barrier target-pos) (inc last-barrier) last-barrier)]
-              (recur (next remaining) out' def-pos' last-barrier'))))))))
+              (recur (next remaining) out' def-pos' orig->out' last-barrier'))))))))
 
 (defn hoist-program-consumers
   "Apply `hoist-consumers-to-producers` to every function of a v3 MIR module,
