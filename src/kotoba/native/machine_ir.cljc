@@ -238,8 +238,151 @@
       :mc/frame-slots (or frame-slots 0)
       :mc/instructions (lower-mc-instructions target instructions)})))
 
+;; ── pre-allocation liveness: hoist consumers to their producers ─────────────
+;;
+;; The allocator sees instructions in lowering order, and the scheduler that
+;; could reorder them runs AFTER allocation (kotoba.mir/allocate-registers:
+;; "Pure integer scheduling runs after allocation on physical MIR"). So a
+;; source like
+;;
+;;   (let [a (lane 0) b (lane 1) ... x (lane 23)] (+ (+ (+ a b) c) ... x))
+;;
+;; reaches the allocator with all 24 lane values live at once and the 23
+;; adds parked at the end -- the maximum-pressure order. On deep-spill that is
+;; 14 SIMD parks, 8 stack ops, four callee-saved pairs and a frame.
+;;
+;; Measured 2026-09-07 (amu docs/codegen-coscientist.md, iteration 146): the
+;; same lanes with each add placed right after the lane it consumes compile to
+;; ZERO parks, ZERO stack ops, no callee-saved registers and no frame, and run
+;; +3.17% (median) / +2.64% (min) faster on the fleet's quiet host. That was a
+;; hand-written fixture; this pass produces that order from the original.
+;;
+;; The rule is small and target-independent. A pure instruction whose operands
+;; are all vregs, and for which at least one operand's LAST use is this
+;; instruction, moves up to sit immediately after the later of its operand
+;; definitions. Hoisting such an instruction shortens a lifetime and never
+;; lengthens one it does not already own. It never crosses a barrier (a label,
+;; branch, call, memory operation, terminator, or anything touching a
+;; physical register), and it never splits an adjacent multiply -> add /
+;; subtract pair that the AArch64 selector would otherwise fuse into MADD/MSUB.
+;;
+;; Iteration 145 is the caution on the other side: chaining the lane INPUTS
+;; serially cost 5%. This pass does not do that. The producers keep their
+;; independence; only the consumers move, and only next to something they
+;; already had to wait for.
+
+(def ^:private hoist-source-keys
+  ;; Mirrors kotoba.mir's instruction-sources for the operand kinds pure
+  ;; integer instructions carry. Anything with other operand kinds is not
+  ;; hoistable and is a barrier, so the wider list is unnecessary here.
+  [:mir/src :mir/input :mir/left :mir/right :mir/addend :mir/test :mir/value])
+
+(def ^:private hoistable-ops
+  ;; Pure, non-trapping, register-only. Constants are crossable (below) but
+  ;; not hoisted: they have no operands to be adjacent to.
+  #{:mir/add :mir/subtract :mir/multiply
+    :mir/bit-and :mir/bit-or :mir/bit-xor
+    :mir/shift-left :mir/shift-right-signed :mir/shift-right-unsigned})
+
+(def ^:private crossable-ops
+  ;; What a hoisted instruction may pass over on its way up. Everything else
+  ;; -- labels, branches, calls, loads, stores, returns, phi transport, and
+  ;; every target-selected op -- is a barrier the hoist stops beneath.
+  ;; `:mir/argument` is deliberately ABSENT. Arguments materialise the entry
+  ;; convention, and an instruction hoisted above a later argument makes the
+  ;; allocator store the remaining incoming parameters: on the five-argument
+  ;; `sum-five` fixture that turned a frameless leaf into three spill slots.
+  ;; Nothing may rise above the last argument; it is a barrier.
+  (into hoistable-ops #{:mir/constant :mir/quotient-constant
+                        :mir/equal :mir/less-than :mir/greater-than
+                        :mir/less-or-equal :mir/greater-or-equal}))
+
+(defn- hoist-register-operands [instruction]
+  (filter gmir/vreg? (keep instruction hoist-source-keys)))
+
+(defn- hoist-register-only?
+  "Every operand and the destination is a vreg or a plain literal. A physical
+   register anywhere means select-target already pinned this instruction to a
+   machine convention; leave it exactly where it is."
+  [instruction]
+  (every? (fn [v] (or (not (keyword? v)) (gmir/vreg? v)))
+          (cons (:mir/dst instruction) (keep instruction hoist-source-keys))))
+
+(defn- hoist-crossable? [instruction]
+  (and (contains? crossable-ops (:mir/op instruction))
+       (hoist-register-only? instruction)))
+
+(defn- hoist-splits-fusion-pair?
+  "Would inserting at POSITION separate a multiply from the add/subtract that
+   consumes its (single-use) product on the next line? The AArch64 selector
+   fuses that pair into MADD/MSUB; kotoba.mir's post-allocation scheduler
+   protects it too (aarch64-fusion-pair?), and we should not undo it here."
+  [out position use-counts]
+  (let [above (nth out (dec position) nil)
+        below (nth out position nil)
+        product (:mir/dst above)]
+    (boolean
+     (and above below
+          (= :mir/multiply (:mir/op above))
+          (gmir/vreg? product)
+          (= 1 (get use-counts product 0))
+          (or (and (= :mir/add (:mir/op below))
+                   (or (= product (:mir/left below)) (= product (:mir/right below))))
+              (and (= :mir/subtract (:mir/op below))
+                   (= product (:mir/right below))))))))
+
+(defn- hoist-consumers-to-producers
+  "One function's instruction vector, with pressure-killing pure instructions
+   moved up beside their producers. See the header comment above."
+  [instructions]
+  (let [use-counts (frequencies (mapcat hoist-register-operands instructions))]
+    (loop [remaining (seq instructions)
+           out []
+           def-pos {}          ; vreg -> index in OUT
+           last-barrier -1]    ; index in OUT of the most recent non-crossable
+      (if-not remaining
+        out
+        (let [ins (first remaining)
+              srcs (hoist-register-operands ins)
+              kills? (some #(= 1 (get use-counts % 0)) srcs)
+              hoistable? (and (contains? hoistable-ops (:mir/op ins))
+                              (hoist-register-only? ins)
+                              (seq srcs)
+                              (every? def-pos srcs)
+                              kills?)
+              target-pos (when hoistable?
+                           (let [after-producers (inc (reduce max (map def-pos srcs)))
+                                 after-barrier (inc last-barrier)
+                                 pos (max after-producers after-barrier)]
+                             (if (hoist-splits-fusion-pair? out pos use-counts)
+                               (inc pos)
+                               pos)))
+              append? (or (nil? target-pos) (>= target-pos (count out)))]
+          (if append?
+            (recur (next remaining)
+                   (conj out ins)
+                   (cond-> def-pos (gmir/vreg? (:mir/dst ins)) (assoc (:mir/dst ins) (count out)))
+                   (if (hoist-crossable? ins) last-barrier (count out)))
+            (let [out' (into (conj (subvec out 0 target-pos) ins) (subvec out target-pos))
+                  ;; every definition at or after the insertion point slid down one
+                  def-pos' (into {} (map (fn [[v i]] [v (if (>= i target-pos) (inc i) i)]) def-pos))
+                  def-pos' (cond-> def-pos' (gmir/vreg? (:mir/dst ins)) (assoc (:mir/dst ins) target-pos))
+                  last-barrier' (if (>= last-barrier target-pos) (inc last-barrier) last-barrier)]
+              (recur (next remaining) out' def-pos' last-barrier'))))))))
+
+(defn hoist-program-consumers
+  "Apply `hoist-consumers-to-producers` to every function of a v3 MIR module,
+   or to a flat program's instruction vector. Pure; safe to call before
+   `kotoba.mir/allocate-registers`."
+  [program]
+  (if (= 3 (:mir/version program))
+    (update program :mir/functions
+            (fn [fs] (mapv #(update % :mir/instructions hoist-consumers-to-producers) fs)))
+    (update program :mir/instructions hoist-consumers-to-producers)))
+
 (defn compile-gmir [target program]
-  (->> program (mir/select-target target) mir/allocate-registers lower-mc))
+  (->> program (mir/select-target target) hoist-program-consumers
+       mir/allocate-registers lower-mc))
 
 ;; ── closed KIR expression -> GMIR pilot ─────────────────────────────────────
 
