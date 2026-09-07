@@ -701,3 +701,75 @@
      [0x48 0xcf]                               ; iretq
      [:label :fail]]
     fail-closed-tail)))
+
+;; ── the non-returning #PF classifier ───────────────────────────────────────
+;;
+;; `kernel-page-fault-handler-address` -- the handler aiueos's
+;; `install-page-fault-idt` puts on vector 14. Three probes exist to be caught
+;; by it: a write to the guard page (`kernel-probe-guard-write`), a write to
+;; the first text page (`kernel-probe-text-write`) and an instruction fetch
+;; from the data page (`kernel-probe-nx-execute`). It names which one fired --
+;; 'G' / 'W' / 'X' on the debug port, 0x19 / 0x1a / 0x1b on isa-debug-exit --
+;; and halts; anything else is 'F' / 0x1f. It never returns, so the CPU frame
+;; is read for evidence only and no register is preserved.
+;;
+;; Until 2026-09-07 its third test was `cmp r10,0x110000` and the probe that
+;; provokes it was `movabs r10,0x110000; call r10`: both assumed the RW
+;; context page at image-base+0x10000, the same assumption the slot block
+;; above carried until #153 (cr3-h1). The JVM packager places that page at the
+;; first page past the text, and in the aiueos kernel 0x110000 is INSIDE RX
+;; text -- so the probe would have executed text, and the classifier could
+;; never say 'X' for a fetch from the page it was written to name. Both now
+;; DERIVE the page. The probe calls r9: the context register IS the page, and
+;; the probe runs inline in compiled Kotoba where r9 is established. The
+;; classifier is entered by the CPU, so it finds the context from the GDTR the
+;; way the three handlers above do, and takes the same fail-closed path when
+;; the GDTR does not name the packager's GDT.
+;;
+;; 0x100000 and 0x101000 stay literal. They are the two addresses the packager
+;; PINS (`kotoba.native.elf64/pinned-image-addresses`): the ELF header page it
+;; leaves unmapped as the guard, and the first text page. Neither moves when
+;; the text grows -- the property the data page lacked.
+
+(def probe-nx-execute-bytes
+  "`mov r10,r9; call r10`: an instruction fetch from the first byte of the
+  context page, which is RW and NX under the kernel's own map. The value the
+  probe leaves is undefined -- if the call returned, the probe has already
+  failed -- and the direct arm zeroes eax after it for the KIR oracle's sake."
+  [0x4d 0x89 0xca 0x41 0xff 0xd2])
+
+(def page-fault-classifier-handler-bytes
+  (assemble
+   (concat
+    [[0xfa]                                    ; cli
+     [0x41 0x0f 0x20 0xd2]                     ; mov r10,cr2
+     [0x4c 0x8b 0x1c 0x24]                     ; mov r11,[rsp]  -- error code
+     [0x49 0x81 0xfa 0x00 0x00 0x10 0x00]      ; cmp r10,0x100000  -- the guard page
+     [:rel8 [0x74] :guard]
+     [0x49 0x81 0xfa 0x00 0x10 0x10 0x00]      ; cmp r10,0x101000  -- the first text page
+     [:rel8 [0x74] :text]]
+    ;; the data page is the context: derive it from the GDTR into r13
+    (context-from-gdtr r13 :fail)
+    [[0x4d 0x39 0xea]                          ; cmp r10,r13
+     [:rel8 [0x75] :fail]
+     [0x4c 0x89 0xd8 0x83 0xe0 0x11 0x83 0xf8 0x11] ; mov rax,r11; and eax,0x11; cmp eax,0x11
+     [:rel8 [0x75] :fail]                      ;   -- present, instruction fetch
+     [0xb0 0x58 0x41 0xb8 0x1b 0x00 0x00 0x00] ; 'X', 0x1b
+     [:rel8 [0xeb] :report]
+     [:label :guard]
+     [0x4c 0x89 0xd8 0x83 0xe0 0x03 0x83 0xf8 0x02] ; and eax,3; cmp eax,2 -- supervisor write, not present
+     [:rel8 [0x75] :fail]
+     [0xb0 0x47 0x41 0xb8 0x19 0x00 0x00 0x00] ; 'G', 0x19
+     [:rel8 [0xeb] :report]
+     [:label :text]
+     [0x4c 0x89 0xd8 0x83 0xe0 0x03 0x83 0xf8 0x03] ; and eax,3; cmp eax,3 -- supervisor write, present
+     [:rel8 [0x75] :fail]
+     [0xb0 0x57 0x41 0xb8 0x1a 0x00 0x00 0x00] ; 'W', 0x1a
+     [:rel8 [0xeb] :report]
+     [:label :fail]
+     [0xb0 0x46 0x41 0xb8 0x1f 0x00 0x00 0x00] ; 'F', 0x1f
+     [:label :report]
+     [0x66 0xba 0xe9 0x00 0xee]                ; out 0xe9,al
+     [0x44 0x89 0xc0]                          ; mov eax,r8d
+     [0x66 0xba 0xf4 0x00 0xef]                ; out 0xf4,eax
+     [:label :halt] [0xf4] [:rel8 [0xeb] :halt]])))

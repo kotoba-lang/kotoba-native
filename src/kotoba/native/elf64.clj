@@ -57,6 +57,16 @@
 
 (defn- align16 [n] (* 16 (quot (+ n 15) 16)))
 
+(def pinned-image-addresses
+  "The two addresses this packager PINS, whatever the text's size: the ELF
+  header page at `image-base`, which the kernel leaves unmapped as its guard
+  page, and the first text page at `image-base + text-offset`. A probe or a
+  canned handler may name these as immediates. The RW context page is NOT
+  pinned -- it is the first page past the text (`kernel-data-offset-for`) --
+  which is why nothing in emitted text may name it by number (cr3-h1, cr3-h2);
+  `context_slots_test` scans for exactly that."
+  #{image-base (+ image-base text-offset)})
+
 ;; isr: the toolchain-generated interrupt entries an image carries.
 ;;
 ;; `interrupt-entry-exports` answers vector -> export for every `aiueos-isr-*`
