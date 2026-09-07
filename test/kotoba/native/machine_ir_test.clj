@@ -557,7 +557,18 @@
                             (map :mc/encoding (:mc/instructions program))))))))
 
 (def spill-program
-  (let [registers (mapv gmir/vreg (range 11))]
+  ;; Six leaves reduced by TWO trees, so every leaf has two uses and all six
+  ;; stay live until the second tree. One tree is no longer enough: the
+  ;; pre-allocation hoist (`hoist-consumers-to-producers`) moves a single-use
+  ;; add up beside its operands, and a lone tree over independent leaves
+  ;; then allocates in three registers with no spill at all -- which is
+  ;; better code, and also no longer a test of bounded spilling. Second uses
+  ;; are what real pressure looks like; the hoist cannot and should not
+  ;; remove them.
+  (let [registers (mapv gmir/vreg (range 17))
+        add (fn [dst left right]
+              {:gmir/op :gmir/add :gmir/dst (registers dst)
+               :gmir/left (registers left) :gmir/right (registers right)})]
     {:gmir/version 1
      :gmir/instructions
      (vec (concat
@@ -565,17 +576,10 @@
                           {:gmir/op :gmir/constant :gmir/dst register
                            :gmir/value index})
                         (subvec registers 0 6))
-           [{:gmir/op :gmir/add :gmir/dst (registers 6)
-             :gmir/left (registers 0) :gmir/right (registers 1)}
-            {:gmir/op :gmir/add :gmir/dst (registers 7)
-             :gmir/left (registers 2) :gmir/right (registers 3)}
-            {:gmir/op :gmir/add :gmir/dst (registers 8)
-             :gmir/left (registers 4) :gmir/right (registers 5)}
-            {:gmir/op :gmir/add :gmir/dst (registers 9)
-             :gmir/left (registers 6) :gmir/right (registers 7)}
-            {:gmir/op :gmir/add :gmir/dst (registers 10)
-             :gmir/left (registers 9) :gmir/right (registers 8)}
-            {:gmir/op :gmir/return :gmir/value (registers 10)}]))}))
+           [(add 6 0 1) (add 7 2 3) (add 8 4 5) (add 9 6 7) (add 10 9 8)
+            (add 11 0 1) (add 12 2 3) (add 13 4 5) (add 14 11 12) (add 15 14 13)
+            (add 16 10 15)
+            {:gmir/op :gmir/return :gmir/value (registers 16)}]))}))
 
 (def program
   {:gmir/version 1
@@ -1004,25 +1008,25 @@
           arm-mc (machine/compile-gmir :aarch64 spill-program)
           x86 (machine/encode-mc x86-mc)
           arm (machine/encode-mc arm-mc)]
-      ;; Eleven values in a four-register profile take two slots, not
-      ;; eleven: the allocator spills the two it cannot keep and leaves the
-      ;; rest in registers. A 16-byte frame rather than 96.
-      (is (= 2 (:mc/frame-slots x86-mc)))
-      (is (= 2 (:mc/frame-slots arm-mc)))
+      ;; Seventeen values in a four-register profile take seven slots, not
+      ;; seventeen: the allocator spills what it cannot keep and leaves the
+      ;; rest in registers. A 64-byte frame rather than 144.
+      (is (= 7 (:mc/frame-slots x86-mc)))
+      (is (= 7 (:mc/frame-slots arm-mc)))
       (doseq [mc [x86-mc arm-mc]]
         (is (some #(= "spill-store" (some-> % :mc/encoding name))
                   (:mc/instructions mc)))
         (is (some #(= "spill-load" (some-> % :mc/encoding name))
                   (:mc/instructions mc))))
-      (is (= [0x48 0x81 0xec 0x10 0x00 0x00 0x00]
+      (is (= [0x48 0x81 0xec 0x40 0x00 0x00 0x00]      ; sub rsp,0x40
              (subvec x86 0 7)))
-      (is (= [0x48 0x81 0xc4 0x10 0x00 0x00 0x00 0xc3]
+      (is (= [0x48 0x81 0xc4 0x40 0x00 0x00 0x00 0xc3]  ; add rsp,0x40; ret
              (subvec x86 (- (count x86) 8))))
       (is (= [0xc0 0x03 0x5f 0xd6]
              (subvec arm (- (count arm) 4))))
-      (is (= [0xff 0x43 0x00 0xd1]
+      (is (= [0xff 0x03 0x01 0xd1]                       ; sub sp,sp,#0x40
              (subvec arm 0 4)))
-      (is (= [0xff 0x43 0x00 0x91 0xc0 0x03 0x5f 0xd6]
+      (is (= [0xff 0x03 0x01 0x91 0xc0 0x03 0x5f 0xd6]   ; add sp,sp,#0x40; ret
              (subvec arm (- (count arm) 8)))))))
 
 (deftest kir-expression-slice-encodes-final-bytes-for-both-isas
@@ -2249,7 +2253,13 @@
         ;; The AArch64 leaf's one spill slot parks in a SIMD register, so
         ;; its SP adjustment disappears (68 -> 60); the call-live caller
         ;; keeps its stack slot.
-        (is (= (if (= :x86-64 target) 114 60)
+        ;;
+        ;; x86-64 is 117, not 114, since the pre-allocation hoist: the
+        ;; caller's reduction adds now sit beside their operands, the
+        ;; allocator lands the running sum in r8 instead of rax, and one
+        ;; REX-prefixed `mov rax,r8` (3 bytes) precedes the ret. One move on
+        ;; this fixture; AArch64 is unchanged at 60.
+        (is (= (if (= :x86-64 target) 117 60)
                (count (:code compiled))) target)))))
 
 (deftest aarch64-leaf-spill-slots-park-in-simd-registers
@@ -2352,15 +2362,23 @@
 ;; not overlap, and a single body cannot exercise both.
 
 (def ^:private preserved-tier-body
+  ;; Each lane is consumed by the tree TWICE. A single tree over independent
+  ;; lanes no longer reaches the preserved tier: the pre-allocation hoist
+  ;; folds each lane into the tree as it is produced and the whole body fits
+  ;; the scratch registers. The second use is what keeps every lane live to
+  ;; the end, which is the pressure these frame tests are about.
   {:x86-64 '(let [a (+ (* n 3) 1) b (+ (* n 5) 2) c (+ (* n 7) 3) d (+ (* n 11) 4)
                   e (+ (* n 13) 5) f (+ (* n 17) 6) g (+ (* n 19) 7) h (+ (* n 23) 8)]
-              (+ (+ (+ a b) (+ c d)) (+ (+ e f) (+ g h))))
+              (+ (+ (+ (+ a b) (+ c d)) (+ (+ e f) (+ g h)))
+                 (+ (+ (+ a b) (+ c d)) (+ (+ e f) (+ g h)))))
    :aarch64 '(let [a (+ (* n 3) 1) b (+ (* n 5) 2) c (+ (* n 7) 3) d (+ (* n 11) 4)
                    e (+ (* n 13) 5) f (+ (* n 17) 6) g (+ (* n 19) 7) h (+ (* n 23) 8)
                    i (+ (* n 29) 9) j (+ (* n 31) 10) k (+ (* n 37) 11)
                    l (+ (* n 41) 12) m (+ (* n 43) 13) o (+ (* n 47) 14)]
-               (+ (+ (+ (+ a b) (+ c d)) (+ (+ e f) (+ g h)))
-                  (+ (+ (+ i j) (+ k l)) (+ m o))))})
+               (+ (+ (+ (+ (+ a b) (+ c d)) (+ (+ e f) (+ g h)))
+                     (+ (+ (+ i j) (+ k l)) (+ m o)))
+                  (+ (+ (+ (+ a b) (+ c d)) (+ (+ e f) (+ g h)))
+                     (+ (+ (+ i j) (+ k l)) (+ m o)))))})
 
 (def ^:private scratch-tier-body '(+ (* n 3) 1))
 
@@ -2373,9 +2391,14 @@
    :x86-64/r14 [0x41 0x5e] :x86-64/r15 [0x41 0x5f]})
 
 (defn- allocated-instructions [target body]
+  ;; Same pre-allocation pipeline as `compile-gmir`: select, hoist consumers to
+  ;; their producers, allocate. Skipping the hoist here made `saved` describe
+  ;; one program and `words` another -- the frame tests then compared a
+  ;; prologue against registers a different instruction order had needed.
   (:mir/instructions
    (mir/allocate-registers
-    (mir/select-target target (machine/lower-kir-expression '[n] body)))))
+    (machine/hoist-program-consumers
+     (mir/select-target target (machine/lower-kir-expression '[n] body))))))
 
 (deftest x86-64-frame-saves-and-restores-exactly-the-preserved-registers-it-uses
   (let [body (get preserved-tier-body :x86-64)
@@ -2836,9 +2859,15 @@
         bindings (vec (mapcat (fn [symbol index]
                                 [symbol (list '+ 'acc index)])
                               values (range 30)))
-        sum (reduce (fn [accumulator symbol]
-                      (list '+ accumulator symbol))
-                    'acc values)
+        fold (fn [seed] (reduce (fn [accumulator symbol]
+                                  (list '+ accumulator symbol))
+                                seed values))
+        ;; Two folds over the same thirty values. With one, the pre-allocation
+        ;; hoist consumes each value the moment it exists and the pressure this
+        ;; test is named for never arises; the fallback path it exercises would
+        ;; then be exercised by nothing. A second use per value is real
+        ;; pressure the hoist cannot remove.
+        sum (list '+ (fold 'acc) (fold 'acc))
         body (list 'if (list '= 'i 0) 'acc
                    (list 'let bindings
                          (list 'kernel (list '- 'i 1) 'b 'c 'd sum)))
@@ -2852,7 +2881,7 @@
                              'kernel)]
     (is (contains? (machine/counted-self-recur-plans :aarch64 kir) 'kernel)
         "the source recurrence alone is eligible")
-    (is (= 24 (:mc/frame-slots function)))
+    (is (= 25 (:mc/frame-slots function)))
     (is (= :aarch64/tail-call (:mc/encoding (last instructions))))
     (is (some #(= :aarch64/spill-load (:mc/encoding %)) instructions))
     (is (not-any? #(= :mc/recur (:mc/op %)) instructions))
