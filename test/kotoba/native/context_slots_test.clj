@@ -2,7 +2,9 @@
   "cr3-h1 / cr3-h4 (aiueos ADR-0156): the kernel context slots the canned
   handlers and their configurators share are r9-/GDTR-relative and live in
   the RW context page, and no memory operand in emitted text names an
-  absolute address inside the text itself.
+  absolute address inside the text itself. cr3-h2 (k16 rank-02) extends the
+  same question to register immediates: `kernel-probe-nx-execute` and the
+  non-returning #PF classifier used to name the data page as 0x110000.
 
   WHY THESE TESTS EXIST. Until 2026-09-06 `kernel-configure-page-fault-recovery`
   stored to the ABSOLUTE addresses 0x110100 / 0x110108, fixed on 2026-08-12
@@ -102,14 +104,98 @@
              :when (and (<= lo address) (< address hi))]
          {:offset (+ base i) :address address})))
 
+(defn absolute-immediate-operands
+  "Every register-immediate in TEXT whose value falls in [LO, HI): the four
+  ways a compiler-emitted probe or handler spells an address it will jump to,
+  call or compare against without touching memory --
+
+    REX.W B8+r imm64      movabs r64,imm64     (the NX probe's call target)
+    REX.W 81 /7 imm32     cmp r64,imm32        (a #PF handler's CR2 test)
+    REX.W C7 /0 imm32     mov r64,simm32       (the recoverable-guard probe)
+    [REX.B] B8+r imm32    mov r32,imm32        (the double-fault probe)
+
+  The memory-operand scan above cannot see these: `movabs r10,0x110000; call
+  r10` has no ModRM operand at all, and it is exactly the drift cr3-h1 fixed
+  for the slot stores -- an address assumed at emit time that the packager no
+  longer keeps. Same byte-scan caveats as `absolute-text-operands`: forms are
+  consumed greedily so an immediate's own bytes are not re-read as an opcode,
+  and the address filter is what makes a coincidence unlikely to matter."
+  [text base lo hi]
+  (let [n (count text)
+        b (fn [i] (nth text i))
+        rex-w? (fn [x] (= 0x48 (bit-and x 0xfe)))   ; 48 (REX.W) or 49 (REX.W+B)
+        form-at (fn [i]
+                  (cond
+                    (and (< (+ i 9) n) (rex-w? (b i)) (= 0xb8 (bit-and (b (inc i)) 0xf8)))
+                    [:mov-imm64 10 (le text (+ i 2) 8)]
+                    (and (< (+ i 6) n) (rex-w? (b i)) (= 0x81 (b (inc i)))
+                         (= 0xf8 (bit-and (b (+ i 2)) 0xf8)))
+                    [:cmp-imm32 7 (le text (+ i 3) 4)]
+                    (and (< (+ i 6) n) (rex-w? (b i)) (= 0xc7 (b (inc i)))
+                         (= 0xc0 (bit-and (b (+ i 2)) 0xf8)))
+                    [:mov-simm32 7 (le text (+ i 3) 4)]
+                    (and (< (+ i 5) n) (= 0x41 (b i)) (= 0xb8 (bit-and (b (inc i)) 0xf8)))
+                    [:mov-imm32 6 (le text (+ i 2) 4)]
+                    (and (< (+ i 4) n) (= 0xb8 (bit-and (b i) 0xf8)))
+                    [:mov-imm32 5 (le text (+ i 1) 4)]))]
+    (loop [i 0 out []]
+      (if (>= i n)
+        out
+        (if-let [[form size value] (form-at i)]
+          (recur (+ i size)
+                 (if (and (<= lo value) (< value hi))
+                   (conj out {:offset (+ base i) :address value :form form})
+                   out))
+          (recur (inc i) out))))))
+
 (defn- scan-image
-  "Scan the RX segment of a packaged kernel for absolute operands into itself."
+  "Scan the RX segment of a packaged kernel: memory operands into itself, and
+  register immediates naming any address in the image -- from the ELF header
+  page (the RX segment's vaddr minus its file offset, which is where the
+  header page the packager leaves unmapped as the guard sits) to the end of
+  the RW page."
   [packaged]
   (let [image (:bytes packaged)
         {:keys [offset vaddr filesz]} (segment image pf-rx)
-        text (subvec image offset (+ offset filesz))]
+        rw (segment image pf-rw)
+        text (subvec image offset (+ offset filesz))
+        image-lo (- vaddr offset)
+        image-hi (+ (:vaddr rw) (:memsz rw))]
     {:rx [vaddr (+ vaddr filesz)]
-     :hits (absolute-text-operands text vaddr vaddr (+ vaddr filesz))}))
+     :image [image-lo image-hi]
+     :hits (absolute-text-operands text vaddr vaddr (+ vaddr filesz))
+     :immediates (absolute-immediate-operands text vaddr image-lo image-hi)}))
+
+;; The two data-page assumptions cr3-h2 names, VERBATIM as emitted before this
+;; series: `movabs r10,0x110000; call r10` and the non-returning #PF
+;; classifier whose third test was `cmp r10,0x110000`.
+(def ^:private pre-fix-probe-nx-execute
+  [0x49 0xba 0x00 0x00 0x11 0x00 0x00 0x00 0x00 0x00 0x41 0xff 0xd2])
+
+(def ^:private pre-fix-page-fault-classifier
+  [0xfa 0x41 0x0f 0x20 0xd2 0x4c 0x8b 0x1c 0x24
+   0x49 0x81 0xfa 0x00 0x00 0x10 0x00 0x74 0x14
+   0x49 0x81 0xfa 0x00 0x10 0x10 0x00 0x74 0x20
+   0x49 0x81 0xfa 0x00 0x00 0x11 0x00 0x74 0x2c 0xeb 0x3f
+   0x4c 0x89 0xd8 0x83 0xe0 0x03 0x83 0xf8 0x02 0x75 0x34
+   0xb0 0x47 0x41 0xb8 0x19 0x00 0x00 0x00 0xeb 0x32
+   0x4c 0x89 0xd8 0x83 0xe0 0x03 0x83 0xf8 0x03 0x75 0x1f
+   0xb0 0x57 0x41 0xb8 0x1a 0x00 0x00 0x00 0xeb 0x1d
+   0x4c 0x89 0xd8 0x83 0xe0 0x11 0x83 0xf8 0x11 0x75 0x0a
+   0xb0 0x58 0x41 0xb8 0x1b 0x00 0x00 0x00 0xeb 0x08
+   0xb0 0x46 0x41 0xb8 0x1f 0x00 0x00 0x00
+   0x66 0xba 0xe9 0x00 0xee 0x44 0x89 0xc0
+   0x66 0xba 0xf4 0x00 0xef 0xf4 0xeb 0xfd])
+
+;; The addresses the packager PINS: the ELF header page it leaves unmapped as
+;; the guard, and the first text page. A probe may name these because they do
+;; not move when the text grows; the data page is not among them.
+(def ^:private pinned-image-addresses elf64/pinned-image-addresses)
+
+(deftest the-packager-pins-exactly-the-guard-and-first-text-pages
+  ;; The allowlist the immediate scan uses is the packager's, and it is two
+  ;; addresses. A third would widen what emitted text may hardcode.
+  (is (= #{0x100000 0x101000} pinned-image-addresses)))
 
 ;; The bytes `configure-page-fault-recovery-bytes` had before this series --
 ;; the four absolute operands at 0x110100 / 0x110108 -- kept here VERBATIM
@@ -174,21 +260,49 @@
                           (+ (kernel-configure-double-fault-ist 12288 16384)
                              (+ (kernel-page-fault-recovery-handler-address)
                                 (+ (kernel-double-fault-handler-address)
-                                   (kernel-rt-timer-handler-address)))))}]})
+                                   (+ (kernel-rt-timer-handler-address)
+                                      ;; cr3-h2: the two data-page consumers
+                                      (+ (kernel-probe-nx-execute)
+                                         (kernel-page-fault-handler-address)))))))}]})
 
 (deftest emitted-text-has-no-absolute-operand-into-itself
   (let [code (:code (x86-64/emit-program all-slot-operations))
         contains? (fn [needle] (boolean (some #{needle} (partition (count needle) 1 code))))
         packaged (elf64/package-kernel (sealed-kernel (padded-to code aiueos-sized)))
-        {:keys [rx hits]} (scan-image packaged)]
+        {:keys [rx image hits immediates]} (scan-image packaged)]
     ;; evidence floor: the five sequences really are in the text we scan
     (is (contains? (vec isr/configure-page-fault-recovery-bytes)))
     (is (contains? (vec isr/configure-double-fault-ist-bytes)))
     (is (contains? (vec isr/page-fault-recovery-handler-bytes)))
     (is (contains? (vec isr/double-fault-handler-bytes)))
     (is (contains? (vec isr/rt-timer-handler-bytes)))
+    (is (contains? (vec isr/page-fault-classifier-handler-bytes)))
+    (is (contains? (vec isr/probe-nx-execute-bytes)))
     (is (< 0x110100 (second rx)) "the scanned text spans the old slot addresses")
-    (is (= [] hits) (str "absolute operands into RX " rx))))
+    (is (= [] hits) (str "absolute operands into RX " rx))
+    ;; cr3-h2: the same question for register immediates. The two pinned
+    ;; addresses are allowed to appear -- and MUST appear, or the scanner
+    ;; has not seen an immediate at all -- and nothing else in the image may.
+    (is (= pinned-image-addresses (set (map :address immediates)))
+        (str "register immediates naming the image " image ": "
+             (pr-str (remove #(pinned-image-addresses (:address %)) immediates))))))
+
+(deftest the-immediate-scan-goes-red-on-the-re-hardcoded-data-page
+  ;; The control: the pre-fix probe and classifier in the same aiueos-sized
+  ;; geometry. 0x110000 is inside RX text there, so an immediate naming it is
+  ;; an immediate naming text -- once as the probe's call target and once as
+  ;; the classifier's CR2 test.
+  (let [old (padded-to (into pre-fix-probe-nx-execute pre-fix-page-fault-classifier)
+                       aiueos-sized)
+        red (scan-image (elf64/package-kernel (sealed-kernel old)))
+        drifted (remove #(pinned-image-addresses (:address %)) (:immediates red))]
+    (is (= 2 (count drifted)) (pr-str drifted))
+    (is (= #{0x110000} (set (map :address drifted))))
+    (is (= #{:mov-imm64 :cmp-imm32} (set (map :form drifted)))
+        "the movabs of the probe and the cmp of the classifier")
+    (is (= #{0x100000 0x101000} (set (map :address (filter #(pinned-image-addresses (:address %))
+                                                             (:immediates red)))))
+        "and the pinned guard/text pages are seen beside them")))
 
 (deftest the-scan-goes-red-on-a-re-hardcoded-slot
   ;; Same text, same geometry, the one configurator swapped for its pre-fix
@@ -215,7 +329,7 @@
 (deftest configurators-and-handlers-address-the-same-slots
   (let [has? (fn [bytes needle]
                (boolean (some #{needle} (partition (count needle) 1 bytes))))
-        r9 9 r15 15 rax 0 r10 10 r12 12 r13 13 r14 14]
+        r9 9 r13 13 r15 15 rax 0 r10 10 r12 12 r14 14]
     (testing "recoverable #PF: configurator writes [r9+slot], handler reads [r15+slot]"
       (is (has? isr/configure-page-fault-recovery-bytes
                 (mem-disp32 0x89 r10 r9 isr/recovery-frame-slot)))
@@ -256,12 +370,27 @@
         (is (has? bytes (mem-disp32 0x3b base base
                                     (- (+ isr/context-gdtr-offset 2) isr/context-gdt-offset)))
             (str name " compares GDTR.base with the context's own GDTR copy"))))
+    (testing "the classifier derives the context from the GDTR too, and compares CR2 with it"
+      (is (has? isr/page-fault-classifier-handler-bytes [0x0f 0x01 0x04 0x24]) "sgdt [rsp]")
+      (is (has? isr/page-fault-classifier-handler-bytes
+                (mem-disp32 0x3b r13 r13
+                            (- (+ isr/context-gdtr-offset 2) isr/context-gdt-offset)))
+          "compares GDTR.base with the context's own GDTR copy")
+      (is (has? isr/page-fault-classifier-handler-bytes [0x4d 0x39 0xea]) "cmp r10,r13")
+      (is (not (has? isr/page-fault-classifier-handler-bytes
+                     [0x49 0x81 0xfa 0x00 0x00 0x11 0x00]))
+          "and no longer asks whether CR2 is 0x110000"))
+    (testing "the NX probe executes the context register, not a number"
+      (is (= [0x4d 0x89 0xca 0x41 0xff 0xd2] isr/probe-nx-execute-bytes)
+          "mov r10,r9; call r10"))
     (testing "no handler or configurator carries an absolute disp32 operand at all"
       (doseq [bytes [isr/configure-page-fault-recovery-bytes
                      isr/configure-double-fault-ist-bytes
                      isr/page-fault-recovery-handler-bytes
                      isr/double-fault-handler-bytes
-                     isr/rt-timer-handler-bytes]]
+                     isr/rt-timer-handler-bytes
+                     isr/page-fault-classifier-handler-bytes
+                     isr/undefined-opcode-handler-bytes]]
         (is (= [] (absolute-text-operands bytes 0 0 0x100000000)))))))
 
 (deftest the-machine-ir-arm-emits-the-same-sequences
@@ -278,6 +407,10 @@
                          ['(kernel-double-fault-handler-address)
                           isr/double-fault-handler-bytes]
                          ['(kernel-rt-timer-handler-address)
-                          isr/rt-timer-handler-bytes]]]
+                          isr/rt-timer-handler-bytes]
+                         ['(kernel-page-fault-handler-address)
+                          isr/page-fault-classifier-handler-bytes]
+                         ['(kernel-probe-nx-execute)
+                          isr/probe-nx-execute-bytes]]]
     (let [bytes (machine/compile-expression :x86-64 [] form)]
       (is (some #{(vec needle)} (partition (count needle) 1 bytes)) (str form)))))

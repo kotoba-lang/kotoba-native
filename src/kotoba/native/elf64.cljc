@@ -18,6 +18,13 @@
 (def ^:private page-size 0x1000)
 (def ^:private image-base 0x100000)
 (def ^:private text-offset page-size)
+
+(def pinned-image-addresses
+  "The two addresses this packager PINS, whatever the text's size: the ELF
+  header page at `image-base` (the kernel's guard page) and the first text
+  page at `image-base + text-offset`. Same set as the JVM twin's."
+  #{image-base (+ image-base text-offset)})
+
 (def ^:private data-offset (* 2 page-size))
 (def ^:private kernel-data-offset (* 8 page-size))
 (def ^:private x86-kernel-data-offset (* 16 page-size))

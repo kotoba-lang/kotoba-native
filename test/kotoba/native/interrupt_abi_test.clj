@@ -215,7 +215,18 @@
   (is (= [0xfa 0xf4 0xeb 0xfd] (subvec isr/absent-entry-bytes 0 4))
       "cli; hlt; jmp $-1")
   (is (every? #(= 0xcc %) (subvec isr/absent-entry-bytes 4))
-      "and a jump into the middle of the slot stops too"))
+      "and a jump into the middle of the slot stops too")
+  ;; amu-h7: the one exception is vector 6, the trap this compiler emits.
+  (is (= 6 isr/undefined-opcode-vector))
+  (doseq [v (remove #{6} (range isr/vector-limit))]
+    (is (identical? isr/absent-entry-bytes (isr/absent-entry-bytes-for v))
+        (str "vector " v " is the silent halt")))
+  (let [slot (isr/absent-entry-bytes-for 6)
+        n (count isr/undefined-opcode-handler-bytes)]
+    (is (= isr/entry-stride (count slot)))
+    (is (= isr/undefined-opcode-handler-bytes (subvec slot 0 n))
+        "vector 6 is the canned #UD handler")
+    (is (every? #(= 0xcc %) (subvec slot n)))))
 
 ;; ---------------------------------------------------------------------------
 ;; the address
@@ -465,8 +476,14 @@
         file-of (fn [address] (+ 0x1000 (- address 0x101000)))]
     (doseq [v (range isr/vector-limit)]
       (let [start (file-of (+ base (* v isr/entry-stride)))]
-        (if (= v 3)
+        (cond
+          (= v 3)
           (is (= 0x6a (nth image start)) "vector 3 is the installed entry")
+          (= v isr/undefined-opcode-vector)
+          (is (= isr/undefined-opcode-handler-bytes
+                 (subvec image start (+ start (count isr/undefined-opcode-handler-bytes))))
+              "vector 6 names itself (amu-h7)")
+          :else
           (is (= [0xfa 0xf4 0xeb 0xfd]
                  (subvec image start (+ start 4)))
               (str "vector " v " halts")))))
@@ -518,3 +535,28 @@
     (is (= 3 (:vector data)))
     (is (= 2 (:arity data)))
     (is (= 4 (:expected data)))))
+
+;; ---------------------------------------------------------------------------
+;; amu-h7: vector 6 names itself
+;; ---------------------------------------------------------------------------
+
+(deftest the-undefined-opcode-slot-names-itself
+  ;; Vector 6 is the trap this compiler itself emits -- every bounds check and
+  ;; every fuel charge ends in `ud2` -- so an image whose kernel installed no
+  ;; body for it must not go silent there. The slot writes 'U' to the debug
+  ;; port, 0x1d to isa-debug-exit, and halts.
+  (let [packaged (elf64/package-kernel (image-artifact))
+        image (:bytes packaged)
+        base (:interrupt-entry-base packaged)
+        file-of (fn [address] (+ 0x1000 (- address 0x101000)))
+        start (file-of (+ base (* 6 isr/entry-stride)))]
+    (is (= [0xfa 0xb0 0x55 0x66 0xba 0xe9 0x00 0xee]
+           (subvec image start (+ start 8)))
+        "cli; mov al,'U'; mov dx,0xe9; out dx,al")
+    (is (= [0xb8 0x1d 0x00 0x00 0x00 0x66 0xba 0xf4 0x00 0xef 0xf4 0xeb 0xfd]
+           (subvec image (+ start 8) (+ start 21)))
+        "mov eax,0x1d; mov dx,0xf4; out dx,eax; hlt; jmp $-1")
+    (is (every? #(= 0xcc %) (subvec image (+ start 21) (+ start isr/entry-stride)))
+        "and a jump into the middle of the slot stops too")
+    (is (= isr/undefined-opcode-handler-bytes (subvec image start (+ start 21)))
+        "and those 21 bytes are the one definition both routes share")))
