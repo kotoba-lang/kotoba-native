@@ -773,3 +773,54 @@
      [0x44 0x89 0xc0]                          ; mov eax,r8d
      [0x66 0xba 0xf4 0x00 0xef]                ; out 0xf4,eax
      [:label :halt] [0xf4] [:rel8 [0xeb] :halt]])))
+
+;; ── #UD names itself ───────────────────────────────────────────────────────
+;;
+;; Vector 6 is the trap THIS COMPILER emits. Every bounded load and store ends
+;; its range check in `ud2`, and so does every fuel charge: a kernel whose
+;; per-boot budget runs out executes `ud2` in the next prologue. Until
+;; 2026-09-07 a kernel that installed no vector 6 gate went silent there --
+;; an empty gate is #GP, an empty #GP gate is #DF, an empty #DF gate is a
+;; triple fault and a reset. Measured twice on real hardware (aiueos k16
+;; rank-02, amu-h7): the only evidence was a missing run-end byte.
+;;
+;; This is the canned answer: 'U' on the debug port, 0x1d on isa-debug-exit,
+;; halt. Terminal, like the classifier -- #UD is a fault, the saved RIP is
+;; the `ud2` itself, and advancing it would mean deciding how long the
+;; faulting instruction was. It contains no decision and needs no context, so
+;; it does not derive one: the letter IS the vector's name.
+;;
+;; 'U' because it is unused. The aiueos kernel writes E M P R C D N F, the
+;; classifier G W X F, the recovery handler R, the double-fault handler D, and
+;; the ISR fixture I S R P. 0x1d is the next free isa-debug-exit code after the
+;; double-fault handler's 0x1c; 0x1f is 'F'.
+;;
+;; It is reached through the entry region: an image that lays one (any
+;; `aiueos-isr-N` body) and declares no body for vector 6 gets this in the
+;; vector-6 slot (`absent-entry-bytes-for` below), so a gate built from
+;; `kernel-isr-entry-address 6` names it rather than a silent halt. A kernel
+;; that lays no region -- the aiueos kernel today installs only vector 14 from
+;; `kernel-page-fault-handler-address` -- cannot reach it yet: a
+;; `kernel-undefined-opcode-handler-address` operation beside its siblings
+;; needs an arity in kotoba-gmir's `x86-privileged-action-arities` and
+;; admission in kotoba-kir, kotoba-sema and `guest-grammar.edn` before this
+;; repo can lower it through the pilot, which is why it is not here.
+
+(def undefined-opcode-vector 6)
+
+(def undefined-opcode-handler-bytes
+  (assemble
+   [[0xfa]                                     ; cli
+    [0xb0 0x55 0x66 0xba 0xe9 0x00 0xee]       ; out 0xe9,'U'
+    [0xb8 0x1d 0x00 0x00 0x00 0x66 0xba 0xf4 0x00 0xef] ; out 0xf4,0x1d
+    [:label :halt] [0xf4] [:rel8 [0xeb] :halt]]))
+
+(defn absent-entry-bytes-for
+  "The slot an image lays for VECTOR when no body is declared for it. Vector
+  6 is the canned #UD handler padded with `int3`; every other vector is
+  `absent-entry-bytes`, the silent fail-closed halt."
+  [vector]
+  (if (= vector undefined-opcode-vector)
+    (into undefined-opcode-handler-bytes
+          (repeat (- entry-stride (count undefined-opcode-handler-bytes)) 0xcc))
+    absent-entry-bytes))

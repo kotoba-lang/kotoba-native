@@ -389,7 +389,8 @@
                      isr/page-fault-recovery-handler-bytes
                      isr/double-fault-handler-bytes
                      isr/rt-timer-handler-bytes
-                     isr/page-fault-classifier-handler-bytes]]
+                     isr/page-fault-classifier-handler-bytes
+                     isr/undefined-opcode-handler-bytes]]
         (is (= [] (absolute-text-operands bytes 0 0 0x100000000)))))))
 
 (deftest the-machine-ir-arm-emits-the-same-sequences

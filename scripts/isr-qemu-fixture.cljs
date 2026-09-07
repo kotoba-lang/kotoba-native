@@ -27,6 +27,10 @@
 ;; isa-debug-exit at 0xf4 answers with (value << 1) | 1, and the fixture's
 ;; body writes 16.
 (def expected-status 33)
+(def default-fuel "32768")
+;; amu-h7: the same boot with `--source test/fixtures/fuel-exhaustion-qemu.kotoba
+;; --expect-console DU --expect-status 59` is the execution proof that an
+;; exhausted fuel budget names itself through the vector-6 slot.
 
 (defn- die! [& parts]
   (.error js/console (str/join " " parts))
@@ -65,6 +69,9 @@
         out (or (arg argv "--out")
                 (fs/mkdtempSync (path/join (os/tmpdir) "kotoba-isr-")))
         qemu (or (arg argv "--qemu") "qemu-system-x86_64")
+        fuel (or (arg argv "--fuel") default-fuel)
+        want-console (or (arg argv "--expect-console") expected-console)
+        want-status (if-let [s (arg argv "--expect-status")] (js/parseInt s 10) expected-status)
         ovmf (or (arg argv "--ovmf") (first (filter #(fs/existsSync %) ovmf-candidates)))
         amu-bin (path/join amu "bin" "amu")
         kernel (path/join out "KERNEL.ELF")
@@ -78,7 +85,7 @@
     (println "compiling" source)
     (run! "amu compile" amu-bin
           [ "compile" source "--target" "x86_64-aiueos-kernel-v1"
-           "--artifact" "image" "--fuel" "32768" "--output" kernel])
+           "--artifact" "image" "--fuel" fuel "--output" kernel])
     (println "packaging the UEFI boot chain")
     (run! "amu package-aiueos-boot" amu-bin
           ["package-aiueos-boot" kernel "--output" efi])
@@ -99,13 +106,13 @@
           console (if (fs/existsSync log) (fs/readFileSync log "utf8") "")]
       (println "console  =" (pr-str console))
       (println "exit     =" status)
-      (println "expected =" (pr-str expected-console) expected-status)
-      (if (and (= console expected-console) (= status expected-status))
+      (println "expected =" (pr-str want-console) want-status)
+      (if (and (= console want-console) (= status want-status))
         (do (println "AIUEOS_KOTOBA_ISR_QEMU_OK"
-                     "vector=6 entry=toolchain-generated"
-                     "argument=vector,error-code,rip,rsp"
+                     "vector=6" (str "source=" (path/basename source))
+                     (str "console=" (pr-str console)) (str "status=" status)
                      "image=" kernel)
             (.exit js/process 0))
-        (die! "REFUSED: the interrupt entry did not run as specified")))))
+        (die! "REFUSED: the boot did not write the console and status specified")))))
 
 (apply -main (drop 2 (js->clj js/process.argv)))

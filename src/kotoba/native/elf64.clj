@@ -850,7 +850,9 @@
                                  :vector vector :arity (:arity export)
                                  :expected interrupt-abi/body-arity})))
               (into bytes (repeat (- interrupt-abi/entry-stride (count bytes)) 0xcc)))
-            interrupt-abi/absent-entry-bytes))
+            ;; amu-h7: vector 6 with no body is the canned #UD handler; every
+            ;; other absent vector is the silent fail-closed halt.
+            (interrupt-abi/absent-entry-bytes-for vector)))
         (range interrupt-abi/vector-limit))))
 
 (defn- entry-shim [main-address context-address syscall-address]
