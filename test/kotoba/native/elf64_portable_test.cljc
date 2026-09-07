@@ -10,6 +10,7 @@
      nbb --classpath \"src:test:<deps>\" run-tests.cljs"
   (:require [clojure.test :refer [deftest is]]
             [kotoba.artifact.core :as artifact]
+            [kotoba.native.interrupt-abi :as interrupt-abi]
             [kotoba.native.elf64 :as elf64]
             [kotoba.native.machine-ir :as machine]))
 
@@ -130,3 +131,30 @@
 
 (deftest the-portable-twin-refuses-a-tier-it-cannot-count
   (is (= 9007199254740991 elf64/max-object-fuel)))
+
+(deftest the-x86-kernel-rw-segment-covers-the-context-slot-block
+  ;; cr3-h1: the canned handlers' slot block (`interrupt-abi/context-slot-block-offset`)
+  ;; must lie inside the RW PT_LOAD of the x86-64 kernel image. Twin-neutral:
+  ;; the JVM packager's RW page is the whole runtime data area, this twin's
+  ;; is the bare context extended to the block's end -- both must cover it.
+  (let [image (:bytes (elf64/package-kernel
+                       (sealed-kernel :x86_64-aiueos-kernel-v1 4096)))
+        le (fn [offset width]
+             (reduce (fn [v i] (+ v (* (nth image (+ offset i))
+                                       (reduce * (repeat i 256)))))
+                     0 (range width)))
+        phoff (le 0x20 8) phentsize (le 0x36 2) phnum (le 0x38 2)
+        headers (mapv (fn [i]
+                        (let [o (+ phoff (* i phentsize))]
+                          {:flags (le (+ o 4) 4) :vaddr (le (+ o 16) 8)
+                           :filesz (le (+ o 32) 8) :memsz (le (+ o 40) 8)}))
+                      (range phnum))
+        rw (first (filter #(= 6 (:flags %)) headers))
+        rx (first (filter #(= 5 (:flags %)) headers))
+        block-end (+ interrupt-abi/context-slot-block-offset
+                     interrupt-abi/context-slot-block-size)]
+    (is (some? rw) "an RW PT_LOAD exists")
+    (is (<= block-end (:memsz rw)) "the slot block ends inside the RW segment")
+    (is (<= block-end (:filesz rw)) "and is zero-initialised from the file")
+    (is (<= (+ (:vaddr rx) (:memsz rx)) (:vaddr rw))
+        "the RW page starts at or after the end of the text")))
