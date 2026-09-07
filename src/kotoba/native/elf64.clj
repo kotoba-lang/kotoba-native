@@ -13,8 +13,8 @@
 (def ^:private minimum-kernel-data-offset (* 8 page-size))
 (def ^:private context-size 80)
 (def ^:private kernel-image-context-size 88)
-(def ^:private kernel-gdt-offset 96)
-(def ^:private kernel-gdtr-offset 152)
+(def ^:private kernel-gdt-offset interrupt-abi/context-gdt-offset)
+(def ^:private kernel-gdtr-offset interrupt-abi/context-gdtr-offset)
 (def ^:private kernel-tss-offset 168)
 (def ^:private kernel-current-domain-offset 0x110)
 (def ^:private kernel-saved-rsp-offset 0x118)
@@ -27,6 +27,29 @@
 (def ^:private kernel-stack-offset 0x3000)
 (def ^:private kernel-stack-bytes 65536)
 (def ^:private kernel-runtime-data-size (+ kernel-stack-offset kernel-stack-bytes))
+
+;; The canned handlers' slot block (`interrupt-abi/context-slot-block-offset`,
+;; 0x160..0x1e0) lives in THIS page, in the gap between the request pointer
+;; (0x130) and the request area (0x200). The configurators write it
+;; r9-relative and the handlers find it from the GDTR, which the boot shim
+;; loads from `kernel-gdtr-offset` -- both of those offsets are now read from
+;; `interrupt-abi` so the derivation and the layout cannot disagree. Until
+;; 2026-09-06 the slots were absolute addresses assuming this page at
+;; image-base+0x10000; `kernel-data-offset-for` had stopped keeping that
+;; promise and the aiueos kernel triple-faulted on its first configurator
+;; store (CR2=0x110100 inside RX text).
+(let [block-start interrupt-abi/context-slot-block-offset
+      block-end (+ block-start interrupt-abi/context-slot-block-size)]
+  (when-not (<= (+ kernel-request-pointer-offset 8) block-start)
+    (throw (ex-info "kernel context slot block overlaps the request pointer"
+                    {:block-start block-start
+                     :request-pointer-end (+ kernel-request-pointer-offset 8)})))
+  (when-not (<= block-end kernel-request-offset)
+    (throw (ex-info "kernel context slot block overlaps the request area"
+                    {:block-end block-end :request-offset kernel-request-offset})))
+  (when-not (<= block-end kernel-runtime-data-size)
+    (throw (ex-info "kernel context slot block lies outside the RW context page"
+                    {:block-end block-end :runtime-data-size kernel-runtime-data-size}))))
 (def ^:private live-boot-shim-size 144)
 (def ^:private live-syscall-shim-size 192)
 (def ^:private user-context-size 88)
@@ -1037,6 +1060,13 @@
        :entry :aiueos_kernel_entry
        :source-entry source-entry
        :entry-address entry-address
+       ;; The RW context page and the canned handlers' slot block inside it,
+       ;; so a caller can check both landed in the RW segment rather than
+       ;; recomputing the layout.
+       :context-address context-address
+       :context-slot-block [(+ context-address interrupt-abi/context-slot-block-offset)
+                            (+ context-address interrupt-abi/context-slot-block-offset
+                               interrupt-abi/context-slot-block-size)]
        :syscall-entry-address syscall-address
        :value-runtime-live? live?
        ;; isr: the manifest half. A caller that wants to check what the image

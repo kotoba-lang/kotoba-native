@@ -23,6 +23,17 @@
 (def ^:private x86-kernel-data-offset (* 16 page-size))
 (def ^:private context-size 80)
 (def ^:private kernel-image-context-size 88)
+;; The x86-64 kernel image's RW segment in this twin: the bare 88-byte
+;; context, extended to cover the canned handlers' slot block
+;; (`interrupt-abi/context-slot-block-offset` .. +size). The configurators
+;; emitted by both x86-64 twins store r9-relative into that block, so a
+;; segment that stopped at 88 bytes would leave the stores landing past the
+;; RW segment the loader mapped. NOTE: this twin lays no GDT at
+;; `context-gdt-offset`, so the canned HANDLERS (which derive the context
+;; from the GDTR) take their fail-closed path in an image it packs; the JVM
+;; packager (`elf64.clj`) is the one that lays the GDT/TSS/stack.
+(def ^:private x86-kernel-data-size
+  (+ interrupt-abi/context-slot-block-offset interrupt-abi/context-slot-block-size))
 (def ^:private user-context-size 88)
 (def ^:private user-image-base 0x1e0000)
 
@@ -850,21 +861,30 @@
           context-address (+ image-base x86-kernel-data-offset)
           shim (entry-shim (+ entry-address 23 (:offset export)) context-address)
           text (into shim (:code artifact))
+          ;; This twin's data offset is FIXED. A text that reaches it would put
+          ;; the RW context inside RX text -- the defect the slot block was
+          ;; introduced to end -- so refuse rather than pack it.
+          _ (when (> (+ text-offset (count text)) x86-kernel-data-offset)
+              (throw (ex-info "the portable elf64 twin's text reaches its fixed kernel data offset"
+                              {:reason :text-reaches-kernel-data
+                               :text-end (+ text-offset (count text))
+                               :data-offset x86-kernel-data-offset
+                               :use :the-jvm-packager})))
           context (into (vec (repeat 8 0))
                         (concat (le (artifact-fuel artifact) 8)
-                                (repeat (- kernel-image-context-size 16) 0)))
+                                (repeat (- x86-kernel-data-size 16) 0)))
           names (mapv int (utf8-bytes "\u0000.text\u0000.data\u0000.shstrtab\u0000"))
-          names-offset (+ x86-kernel-data-offset kernel-image-context-size)
+          names-offset (+ x86-kernel-data-offset x86-kernel-data-size)
           section-offset (+ names-offset (count names)
                             (mod (- 8 (mod (+ names-offset (count names)) 8)) 8))
           sections [(vec (repeat 64 0))
                     (section-header 1 1 0x6 entry-address text-offset (count text) 16)
-                    (section-header 7 1 0x3 context-address x86-kernel-data-offset kernel-image-context-size 8)
+                    (section-header 7 1 0x3 context-address x86-kernel-data-offset x86-kernel-data-size 8)
                     (section-header 13 3 0 0 names-offset (count names) 1)]
           header (elf-header entry-address 2 section-offset (count sections))
           phdrs (concat (program-header 0x5 text-offset entry-address (count text) (count text))
                         (program-header 0x6 x86-kernel-data-offset context-address
-                                        kernel-image-context-size kernel-image-context-size))
+                                        x86-kernel-data-size x86-kernel-data-size))
           before-text (padded (concat header phdrs) text-offset)
           before-data (padded (concat before-text text) x86-kernel-data-offset)
           before-sections (padded (concat before-data context names) section-offset)
