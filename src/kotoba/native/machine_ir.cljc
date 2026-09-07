@@ -806,6 +806,7 @@
    'kernel-page-fault-recovery-handler-address :page-fault-recovery-handler-address
    'kernel-configure-page-fault-recovery :configure-page-fault-recovery
    'kernel-double-fault-handler-address :double-fault-handler-address
+   'kernel-undefined-opcode-handler-address :undefined-opcode-handler-address
    'kernel-configure-double-fault-ist :configure-double-fault-ist
    'kernel-load-gdt-tss :load-gdt-tss
    'kernel-load-idt :load-idt
@@ -5849,6 +5850,18 @@
                  (when-not (= dst :x86-64/r10)
                    (x86-rr 0x89 dst :x86-64/r10))))))
 
+;; amu-h7: the canned #UD handler. Same shape as the three above; the bytes
+;; are `kotoba.native.interrupt-abi`'s and are the ones the image lays in the
+;; vector-6 entry slot, so a kernel that lays no region installs the same
+;; handler a kernel with a region reaches through `(kernel-isr-entry-address 6)`.
+(defn- x86-undefined-opcode-handler-address [dst]
+  (let [n (count interrupt-abi/undefined-opcode-handler-bytes)]
+    (vec (concat [0xe9] (u32le n)
+                 interrupt-abi/undefined-opcode-handler-bytes
+                 [0x4c 0x8d 0x15] (u32le (- (+ n 7)))
+                 (when-not (= dst :x86-64/r10)
+                   (x86-rr 0x89 dst :x86-64/r10))))))
+
 (def ^:private x86-load-idt-and-readback
   ;; r10 = pointer to the 10-byte pseudo-descriptor, r11 = declared length.
   ;; LIDT is immediately followed by SIDT and exact limit/base comparison.
@@ -6106,6 +6119,8 @@
               :x86-64/r10)
       :double-fault-handler-address
       (x86-double-fault-handler-address dst)
+      :undefined-opcode-handler-address
+      (x86-undefined-opcode-handler-address dst)
       :configure-double-fault-ist
       (finish (concat (copy-to :x86-64/r10 a)
                       (copy-to :x86-64/r11 b)

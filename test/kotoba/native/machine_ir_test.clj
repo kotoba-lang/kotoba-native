@@ -1117,6 +1117,8 @@
           [0x4d 0x89 0x91 0x60 0x01 0x00 0x00]]
          [[] '(kernel-double-fault-handler-address) :double-fault-handler-address
           [0x49 0x8d 0x46 0xd0 0x49 0x39 0xc2]]  ; lea rax,[r14-48]; cmp r10,rax
+         [[] '(kernel-undefined-opcode-handler-address) :undefined-opcode-handler-address
+          [0xb0 0x55 0x66 0xba 0xe9 0x00 0xee]]  ; mov al,'U'; out 0xe9,al
          [['a 'b] '(kernel-configure-double-fault-ist a b)
           :configure-double-fault-ist
           ;; mov [r9+0x1b0],r10 -- the double-fault frame slot, r9-relative

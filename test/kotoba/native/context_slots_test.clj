@@ -406,6 +406,8 @@
                           isr/page-fault-recovery-handler-bytes]
                          ['(kernel-double-fault-handler-address)
                           isr/double-fault-handler-bytes]
+                         ['(kernel-undefined-opcode-handler-address)
+                          isr/undefined-opcode-handler-bytes]
                          ['(kernel-rt-timer-handler-address)
                           isr/rt-timer-handler-bytes]
                          ['(kernel-page-fault-handler-address)

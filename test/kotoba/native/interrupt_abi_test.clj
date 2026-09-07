@@ -17,6 +17,7 @@
             [kotoba.artifact.core :as artifact]
             [kotoba.native.elf64 :as elf64]
             [kotoba.native.interrupt-abi :as isr]
+            [kotoba.native.machine-ir :as machine]
             [kotoba.native.x86-64 :as x86-64]))
 
 ;; ---------------------------------------------------------------------------
@@ -268,6 +269,46 @@
         "the bound check, the shift and the context load reach machine code")
     (is (some #(= [0x0f 0x0b] %) (partition 2 1 code))
         "including the trap: a vector outside the table is not an address")))
+
+(defn- le32 [n]
+  (let [v (mod n 4294967296)]
+    (mapv #(mod (quot v (bit-shift-left 1 (* 8 %))) 256) (range 4))))
+
+(deftest the-undefined-opcode-handler-address-names-the-vector-6-slot-s-bytes
+  ;; amu-h7: what a kernel that lays NO entry region installs for vector 6.
+  ;; Both arms embed the canned bytes and answer with their address, the way
+  ;; the three canned handler addresses do, and the bytes are the ones the
+  ;; image lays in the vector-6 slot -- so a gate built from this operation
+  ;; and one built from `(kernel-isr-entry-address 6)` name ONE handler.
+  ;;
+  ;; RED with kotoba-gmir pinned before `:undefined-opcode-handler-address`
+  ;; entered `x86-privileged-action-arities` (`x86-privileged-arity`); GREEN
+  ;; once that pin advances. The op is inert for a guest until kotoba-kir,
+  ;; kotoba-sema and `guest-grammar.edn` admit it too.
+  (let [bytes isr/undefined-opcode-handler-bytes
+        n (count bytes)
+        has? (fn [code needle]
+               (boolean (some #(= (vec needle) (vec %))
+                              (partition (count needle) 1 code))))]
+    (is (= bytes (subvec (isr/absent-entry-bytes-for isr/undefined-opcode-vector) 0 n))
+        "the operation and the entry slot are the same bytes")
+    (testing "the machine-IR arm, which is what the pilot emits"
+      (let [code (machine/compile-expression :x86-64 [] '(kernel-undefined-opcode-handler-address))]
+        (is (has? code (concat [0xe9] (le32 n) bytes [0x4c 0x8d 0x15] (le32 (- (+ n 7)))))
+            "jmp over the handler; lea r10,[rip-(n+7)] -- the answer is the byte after the jmp")))
+    (testing "the direct arm, kept for parity"
+      (let [code (#'kotoba.native.x86-64/emit-expr '(kernel-undefined-opcode-handler-address)
+                  {} {:temp-depth 0 :tail? false})]
+        (is (has? code (concat [0xe9] (le32 n) bytes [0x48 0x8d 0x05] (le32 (- (+ n 7))))))))
+    (testing "and through the pilot, as a guest compiles it"
+      (let [code (:code (x86-64/emit-program
+                         {:format :kotoba.kir/v3 :entry 'main :exports ['main]
+                          :effects #{} :signature {:params [] :result :i64}
+                          :functions [{:name 'main :params [] :result :i64
+                                       :effects #{}
+                                       :body '(kernel-undefined-opcode-handler-address)}]}))]
+        (is (has? code bytes) "the canned #UD handler reaches machine code")
+        (is (has? code [0xb0 0x55 0x66 0xba 0xe9 0x00 0xee]) "including the letter: out 0xe9,'U'")))))
 
 ;; ---------------------------------------------------------------------------
 ;; the object route

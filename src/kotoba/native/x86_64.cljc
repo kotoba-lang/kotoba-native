@@ -1930,6 +1930,16 @@
         (let [n (count interrupt-abi/double-fault-handler-bytes)]
           (vec (concat [0xe9] (le32 n) interrupt-abi/double-fault-handler-bytes
                        [0x48 0x8d 0x05] (le32 (- (+ n 7))))))
+        ;; amu-h7: the canned #UD handler, the same shape as the three canned
+        ;; addresses above it -- jump over the bytes, `lea` back to them -- so a
+        ;; kernel that lays NO entry region can still install a vector 6 gate.
+        ;; The bytes are the ones the image lays in the vector-6 slot
+        ;; (`interrupt-abi/absent-entry-bytes-for 6`), so a gate built from this
+        ;; and one built from `(kernel-isr-entry-address 6)` name one handler.
+        (= op 'kernel-undefined-opcode-handler-address)
+        (let [n (count interrupt-abi/undefined-opcode-handler-bytes)]
+          (vec (concat [0xe9] (le32 n) interrupt-abi/undefined-opcode-handler-bytes
+                       [0x48 0x8d 0x05] (le32 (- (+ n 7))))))
         (= op 'kernel-configure-page-fault-recovery)
         (vec (concat (emit-expr (first args) env (assoc ctx :tail? false)) [0x50]
                      (emit-expr (second args) env (assoc ctx :tail? false))
