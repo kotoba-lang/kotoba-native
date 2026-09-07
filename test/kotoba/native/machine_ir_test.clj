@@ -1105,11 +1105,15 @@
          [[] '(kernel-page-fault-recovery-handler-address) :page-fault-recovery-handler-address
           [0x48 0xcf]]
          [['a 'b] '(kernel-configure-page-fault-recovery a b)
-          :configure-page-fault-recovery [0x4c 0x89 0x14 0x25 0x00 0x01 0x11 0x00]]
+          :configure-page-fault-recovery
+          ;; mov [r9+0x160],r10 -- the recovery frame slot, r9-relative
+          [0x4d 0x89 0x91 0x60 0x01 0x00 0x00]]
          [[] '(kernel-double-fault-handler-address) :double-fault-handler-address
-          [0x4d 0x8d 0x7e 0xd0 0x4d 0x39 0xfa]]
+          [0x49 0x8d 0x46 0xd0 0x49 0x39 0xc2]]  ; lea rax,[r14-48]; cmp r10,rax
          [['a 'b] '(kernel-configure-double-fault-ist a b)
-          :configure-double-fault-ist [0x4c 0x89 0x14 0x25 0x80 0x01 0x11 0x00]]
+          :configure-double-fault-ist
+          ;; mov [r9+0x1b0],r10 -- the double-fault frame slot, r9-relative
+          [0x4d 0x89 0x91 0xb0 0x01 0x00 0x00]]
          [['a 'b] '(kernel-load-gdt-tss a b) :load-gdt-tss
           [0x41 0x0f 0x01 0x12]]
          [['a 'b] '(kernel-load-idt a b) :load-idt [0x41 0x0f 0x01 0x1a]]
