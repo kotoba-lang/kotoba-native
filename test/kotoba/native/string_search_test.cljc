@@ -25,7 +25,8 @@
   (`tools/kexe_loader.c` belongs to kotoba-lang/compiler), as
   `kotoba.native.isa-parity-test` also records. The rows executed as real
   processes on both ISAs are reproduced in `docs/adr/0002-*`."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require #?(:clj  [clojure.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
             [kotoba.kir :as ir]
             [kotoba.native.aarch64 :as arm]
             [kotoba.native.string-search :as search]
@@ -184,9 +185,9 @@
            ["replace-all" '(string-replace-all "abc" "" "x")
             (search/lower-replace-all ["abc" "" "x"]) :string]]]
     (testing why
-      (is (thrown? clojure.lang.ExceptionInfo (run (program result op)))
+      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) (run (program result op)))
           "the oracle traps")
-      (is (thrown? clojure.lang.ExceptionInfo (run (rewritten result op lowered)))
+      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) (run (rewritten result op lowered)))
           "so the rewrite must trap")))
   ;; And it still reaches machine code on both backends: the trap is a runtime
   ;; outcome, not an emission-time refusal.
@@ -251,7 +252,7 @@
 
 (deftest a-helper-name-collision-is-refused
   (is (thrown-with-msg?
-       clojure.lang.ExceptionInfo #"collides with a native string-search helper"
+       #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) #"collides with a native string-search helper"
        (search/augment-functions
         [{:name 'main :params [] :body '(string-contains? "a" "a")}
          {:name search/find-name :params '[a b c d] :body 'a}]))))
@@ -267,7 +268,7 @@
                     '(string-contains? "a" "b" "c")
                     '(string-replace-all "a" "b")
                     '(string-replace-all "a" "b" "c" "d")]]
-        (is (thrown? clojure.lang.ExceptionInfo
+        (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
                      (emit {:format :kotoba.kir/v4 :exports ['main]
                             :functions [{:name 'main :params [] :body body}]}))
             (pr-str body))))))

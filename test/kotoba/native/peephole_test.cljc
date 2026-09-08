@@ -1,5 +1,6 @@
 (ns kotoba.native.peephole-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require #?(:clj  [clojure.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
             [kotoba.native.peephole :as peephole]))
 
 (deftest constant-operand-recognizes-exactly-the-safe-forms

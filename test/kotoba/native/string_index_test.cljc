@@ -1,5 +1,6 @@
 (ns kotoba.native.string-index-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require #?(:clj  [clojure.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
             [kotoba.native.aarch64 :as arm]
             [kotoba.native.string-index :as string-index]
             [kotoba.native.x86-64 :as x86]))
@@ -51,7 +52,7 @@
            (mapv :name indexed)))
     (is (= indexed (string-index/augment-functions indexed))))
   (is (thrown-with-msg?
-       clojure.lang.ExceptionInfo
+       #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
        #"collides with a native string-index helper"
        (string-index/augment-functions
         [{:name 'main :params [] :body '(string-index-new)}
