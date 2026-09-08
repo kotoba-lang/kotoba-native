@@ -41,7 +41,25 @@
         ;; own context pointer (kotoba-mir ADR-0017).
         io.github.kotoba-lang/kotoba-mir
         {:git/url "https://github.com/kotoba-lang/kotoba-mir.git"
-         :git/sha "0bb174c8063178a6dd04f92359ef3ea8dff693e0"}
+         ;;
+         ;; Advanced 2026-09-08, 0bb174c8 -> ac690136 (kotoba-mir main, ahead
+         ;; 2, forward only), and this one is a CORRECTNESS advance, not a
+         ;; feature one. `aarch64-fuse-zero-equality-branches` tested its
+         ;; constant with `zero?`, which is false for a JavaScript BigInt, so
+         ;; on the JVM-free front the fusion never fired for a literal that
+         ;; came from the reader -- every literal in real source. Measured
+         ;; through amu: `(if (= a 0) a a)` was 24 bytes here and 12 on the
+         ;; JVM, for the same program.
+         ;;
+         ;; That made emission a function of the HOST'S SPELLING of a value
+         ;; rather than of the value, which `kotoba-verifier` -- it re-derives
+         ;; the instruction stream from sealed KIR and refuses drift --
+         ;; correctly reports as "native instruction stream rejected" the
+         ;; moment an artifact is read back with a reader that preserves i64
+         ;; exactly. `peephole.cljc`'s own docstring names this hazard for
+         ;; iteration order; representation is the same hazard by another
+         ;; route.
+         :git/sha "ac69013644fdd74f10ae770b0360a84004297c4a"}
         io.github.kotoba-lang/kotoba-codegen
         {:git/url "https://github.com/kotoba-lang/kotoba-codegen.git"
          :git/sha "3a7d7fc216408d7de53daaec6012aca1db4360b2"}
