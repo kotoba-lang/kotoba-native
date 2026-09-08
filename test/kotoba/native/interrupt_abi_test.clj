@@ -594,10 +594,97 @@
     (is (= [0xfa 0xb0 0x55 0x66 0xba 0xe9 0x00 0xee]
            (subvec image start (+ start 8)))
         "cli; mov al,'U'; mov dx,0xe9; out dx,al")
-    (is (= [0xb8 0x1d 0x00 0x00 0x00 0x66 0xba 0xf4 0x00 0xef 0xf4 0xeb 0xfd]
-           (subvec image (+ start 8) (+ start 21)))
-        "mov eax,0x1d; mov dx,0xf4; out dx,eax; hlt; jmp $-1")
-    (is (every? #(= 0xcc %) (subvec image (+ start 21) (+ start isr/entry-stride)))
+    (is (= [0xb8 0x1d 0x00 0x00 0x00 0x66 0xba 0xf4 0x00 0xef]
+           (subvec image (+ start 8) (+ start 18)))
+        "mov eax,0x1d; mov dx,0xf4; out dx,eax")
+    ;; k16 2026-09-08: after the receipts, the shared fatal tail -- reset the
+    ;; platform through 0xcf9, say 'H' if the chipset ignored it, then halt.
+    (is (= isr/fatal-tail-bytes (subvec image (+ start 18) (+ start 35)))
+        "mov al,6; mov dx,0xcf9; out dx,al; out 0xe9,'H'; hlt; jmp $-1")
+    (is (every? #(= 0xcc %) (subvec image (+ start 35) (+ start isr/entry-stride)))
         "and a jump into the middle of the slot stops too")
-    (is (= isr/undefined-opcode-handler-bytes (subvec image start (+ start 21)))
-        "and those 21 bytes are the one definition both routes share")))
+    (is (= isr/undefined-opcode-handler-bytes (subvec image start (+ start 35)))
+        "and those 35 bytes are the one definition both routes share")))
+
+;; ---------------------------------------------------------------------------
+;; k16 2026-09-08: a fatal handler resets the platform before it halts
+;; ---------------------------------------------------------------------------
+
+(def ^:private fatal-tail
+  ;; mov al,6; mov dx,0xcf9; out dx,al   Reset Control Register: SYS_RST|RST_CPU
+  ;; mov al,'H'; mov dx,0xe9; out dx,al  reached only if the chipset ignored it
+  ;; hlt; jmp $-1                        the fallback, and only the fallback
+  [0xb0 0x06 0x66 0xba 0xf9 0x0c 0xee
+   0xb0 0x48 0x66 0xba 0xe9 0x00 0xee
+   0xf4 0xeb 0xfd])
+
+(def ^:private halt-loop [0xf4 0xeb 0xfd])
+(def ^:private reset-write [0x66 0xba 0xf9 0x0c 0xee])           ; mov dx,0xcf9; out dx,al
+(def ^:private debug-exit-write [0x66 0xba 0xf4 0x00 0xef])      ; mov dx,0xf4; out dx,eax
+(def ^:private f-receipt                                          ; 'F', 0x1f
+  (into [0xb0 0x46 0x66 0xba 0xe9 0x00 0xee 0xb8 0x1f 0x00 0x00 0x00] debug-exit-write))
+
+(defn- occurrences [bytes needle]
+  (count (filter #(= (vec needle) (vec %)) (partition (count needle) 1 bytes))))
+
+(defn- ends-with? [bytes tail]
+  (let [bytes (vec bytes) tail (vec tail)]
+    (and (<= (count tail) (count bytes))
+         (= tail (subvec bytes (- (count bytes) (count tail)))))))
+
+(deftest every-fatal-handler-resets-the-platform-before-it-halts
+  ;; 2026-09-08, aiueos k16: the board's kernel ran out of fuel at 11:03 and
+  ;; took vector 6. The canned handler wrote 'U', wrote the debug-exit port
+  ;; that only QEMU listens to, and executed `hlt; jmp $-1` -- for nine hours,
+  ;; until a human reached the power button. A fleet node that can only be
+  ;; recovered by hand is not a fleet node. The aiueos kernel already ends its
+  ;; deliberate run with `(kernel-out-u8 3321 6)` -- 0xcf9 <- SYS_RST|RST_CPU
+  ;; -- and firmware comes back through PXE; a fatal handler must end the same
+  ;; way, so that a crash is one lost iteration and not a lost day.
+  ;;
+  ;; Ordering is the point: letter first (the evidence), debug-exit second (so
+  ;; every QEMU fixture still exits with its code before the reset is
+  ;; reached), reset third, and the halt loop LAST -- reached only when the
+  ;; chipset ignored the write, which is what the second letter 'H' says, the
+  ;; way the aiueos kernel returns 223 (STATUS DF) in the same case. 'H' and
+  ;; not 'X': the classifier already says 'X' for an NX fetch.
+  (is (= fatal-tail isr/fatal-tail-bytes) "the tail is the bytes it is named for")
+  (is (= 0xcf9 isr/reset-control-port))
+  (is (= 0x06 isr/reset-control-value) "SYS_RST | RST_CPU, the write the aiueos kernel makes at its run end")
+  (is (= 0x48 isr/reset-refused-letter) "'H'")
+  (doseq [[name bytes] [["#UD" isr/undefined-opcode-handler-bytes]
+                        ["#DF" isr/double-fault-handler-bytes]
+                        ["#PF classifier" isr/page-fault-classifier-handler-bytes]]]
+    (testing name
+      (is (ends-with? bytes fatal-tail) "ends in the shared tail")
+      (is (ends-with? bytes (concat debug-exit-write fatal-tail))
+          "the isa-debug-exit write is the instruction before the reset")
+      (is (= 1 (occurrences bytes halt-loop)) "exactly one halt loop, and it is after the reset")
+      (is (= 1 (occurrences bytes reset-write)) "exactly one reset write")
+      (is (< (.indexOf (vec bytes) 0xef) (count bytes)) "and a debug-exit write exists to be first")))
+  (testing "#UD: cli, 'U', 0x1d, tail -- nothing else"
+    (is (= (concat [0xfa 0xb0 0x55 0x66 0xba 0xe9 0x00 0xee
+                    0xb8 0x1d 0x00 0x00 0x00] debug-exit-write fatal-tail)
+           isr/undefined-opcode-handler-bytes)))
+  (testing "#DF: both receipts reach the one tail"
+    (let [bytes isr/double-fault-handler-bytes
+          d-receipt (into [0xb0 0x44 0x66 0xba 0xe9 0x00 0xee 0xb8 0x1c 0x00 0x00 0x00] debug-exit-write)]
+      (is (= 1 (occurrences bytes (concat d-receipt [0xeb (count f-receipt)])))
+          "'D', 0x1c, then a jump over the 'F' receipt into the tail")
+      (is (ends-with? bytes (concat f-receipt fatal-tail))
+          "'F', 0x1f falls straight into the tail")))
+  (testing "the classifier: one report path, so G/W/X/F all reach the tail"
+    (is (ends-with? isr/page-fault-classifier-handler-bytes
+                    (concat [0x66 0xba 0xe9 0x00 0xee 0x44 0x89 0xc0] debug-exit-write fatal-tail))
+        "out 0xe9,al; mov eax,r8d; out 0xf4,eax; tail"))
+  (testing "the recoverable #PF and timer handlers are unchanged: out of this change's scope"
+    ;; Their fail-closed 'F' arm still ends in the halt loop with no reset.
+    ;; Deliberate and narrow -- they have an `iretq` path and this change was
+    ;; scoped to the three handlers that never return. Extending the reset to
+    ;; them is a separate decision; this assertion is here so that doing it
+    ;; by accident (editing `fail-closed-tail`) is loud.
+    (doseq [[name bytes] [["#PF recovery" isr/page-fault-recovery-handler-bytes]
+                          ["timer" isr/rt-timer-handler-bytes]]]
+      (testing name
+        (is (ends-with? bytes (concat f-receipt halt-loop)))
+        (is (= 0 (occurrences bytes reset-write)))))))
