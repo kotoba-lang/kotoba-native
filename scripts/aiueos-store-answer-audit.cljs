@@ -35,7 +35,7 @@
 (ns aiueos-store-answer-audit
   (:require ["fs" :as fs]
             ["path" :as path]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [cljs.reader :as reader]))
 
 (defn- store-op? [x]

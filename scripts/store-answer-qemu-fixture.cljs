@@ -25,7 +25,7 @@
             ["fs" :as fs]
             ["os" :as os]
             ["path" :as path]
-            [clojure.string :as str]))
+            [kotoba.lang.text :as str]))
 
 (def fixed-console
   "One digit per question, in the order the fixture asks them: store answer and

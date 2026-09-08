@@ -21,7 +21,7 @@
             ["fs" :as fs]
             ["os" :as os]
             ["path" :as path]
-            [clojure.string :as str]))
+            [kotoba.lang.text :as str]))
 
 (def expected-console "DISRP")
 ;; isa-debug-exit at 0xf4 answers with (value << 1) | 1, and the fixture's
