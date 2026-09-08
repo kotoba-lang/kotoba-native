@@ -480,7 +480,14 @@
                  (if-let [item (first items)]
                    (recur (rest items) (+ pos (item-size item))
                           (if (= :label (first item))
-                            (assoc labels (second item) pos)
+                            (do (when (contains? labels (second item))
+                                  ;; Two tails concatenated into one sequence
+                                  ;; would each bring a `:halt`; the second
+                                  ;; would silently win and the first would
+                                  ;; jump into the wrong loop.
+                                  (throw (ex-info "assemble: label defined twice"
+                                                  {:label (second item)})))
+                                (assoc labels (second item) pos))
                             labels))
                    labels))
         target (fn [k]
@@ -545,11 +552,66 @@
    [:rel32 [0x0f 0x85] fail]                            ; jne fail
    [(if (>= base 8) 0x49 0x48) 0x83 (+ 0xe8 (bit-and base 7)) context-gdt-offset]]) ; sub base,imm8
 
-;; 'F' on the debugcon port, 0x1f on isa-debug-exit, then a halt loop.
-(def ^:private fail-closed-tail
+;; 'F' on the debugcon port, 0x1f on isa-debug-exit.
+(def ^:private fail-closed-receipt
   [[0xb0 0x46 0x66 0xba 0xe9 0x00 0xee]
-   [0xb8 0x1f 0x00 0x00 0x00 0x66 0xba 0xf4 0x00 0xef]
-   [:label :halt] [0xf4] [:rel8 [0xeb] :halt]])
+   [0xb8 0x1f 0x00 0x00 0x00 0x66 0xba 0xf4 0x00 0xef]])
+
+;; The receipt, then a halt loop. The fail arm of the two handlers that CAN
+;; return (recoverable #PF, timer). Unchanged on 2026-09-08 when the three
+;; non-returning handlers below moved to `fatal-tail`: they were out of that
+;; change's scope, and `interrupt_abi_test` pins that they still end here so
+;; that extending the reset to them is a decision and not a side effect.
+(def ^:private fail-closed-tail
+  (conj fail-closed-receipt
+        [:label :halt] [0xf4] [:rel8 [0xeb] :halt]))
+
+;; ── the fatal tail: reset the platform, THEN halt ─────────────────────────
+;;
+;; Every canned handler that does not return used to end in `hlt; jmp $-1`.
+;; On 2026-09-08 the aiueos k16 board's kernel ran out of fuel at 11:03, took
+;; vector 6, wrote 'U', wrote the isa-debug-exit port that only QEMU listens
+;; to, and halted -- for nine hours, until a human reached the power button.
+;; The aiueos kernel already ends its DELIBERATE run by writing 0x06 to the
+;; Reset Control Register (`(kernel-out-u8 3321 6)`, 0xcf9 <- SYS_RST|RST_CPU)
+;; and firmware comes back through PXE, so a deploy is a whole iteration. A
+;; fatal handler ends the same way: a crash is then one lost iteration, not a
+;; lost day.
+;;
+;; Order, and why it is load-bearing:
+;;
+;;   out 0xe9,<letter>     the evidence -- written by the handler, before this
+;;   out 0xf4,<code>       isa-debug-exit: QEMU exits HERE with (code<<1)|1,
+;;                         so every QEMU fixture keeps its console and status
+;;                         and never reaches the reset. Real hardware has no
+;;                         device on 0xf4 and the write is a no-op
+;;   mov al,6 ; out 0xcf9  the reset. ONE write of SYS_RST|RST_CPU, exactly
+;;                         the write the k16 kernel is measured to reset on
+;;   out 0xe9,'H'          reached ONLY if the chipset ignored the reset. The
+;;                         aiueos kernel returns 223 (STATUS DF) in that case
+;;                         for the same reason: a reset that did not happen
+;;                         must not look like one that did. 'H' and not 'X'
+;;                         because the classifier already says 'X' (NX fetch)
+;;   hlt ; jmp $-1         the fallback, and only the fallback
+;;
+;; The three non-returning handlers -- #UD, #DF, the #PF classifier -- share
+;; this ONE sequence (`fatal-tail-bytes` is what a test compares against), so
+;; the reset cannot be present in one and forgotten in another.
+
+(def reset-control-port 0xcf9)
+(def reset-control-value 0x06)      ; SYS_RST | RST_CPU
+(def reset-refused-letter 0x48)     ; 'H'
+
+(def ^:private fatal-tail
+  [[0xb0 reset-control-value 0x66 0xba 0xf9 0x0c 0xee]   ; mov al,6; mov dx,0xcf9; out dx,al
+   [0xb0 reset-refused-letter 0x66 0xba 0xe9 0x00 0xee]  ; mov al,'H'; mov dx,0xe9; out dx,al
+   [:label :reset-refused] [0xf4] [:rel8 [0xeb] :reset-refused]])
+
+(def fatal-tail-bytes
+  "The assembled tail, for a consumer or test that wants to recognise it at
+  the end of a handler. Its one displacement is internal, so it assembles to
+  the same bytes alone as inside a sequence."
+  (assemble fatal-tail))
 
 (def configure-page-fault-recovery-bytes
   "r10 = frame page, r11 = stack page. Both must be distinct, nonzero and
@@ -652,8 +714,9 @@
   the architectural zero error code. Derives the context from the GDTR into
   r15, reads the three double-fault slots, validates that RSP is exactly
   stack-top - 48 inside the published stack page and that the error code is
-  zero, publishes the frame, writes 'D' and 0x1c, and halts. Terminal in
-  every path; 'F' and 0x1f on refusal."
+  zero, publishes the frame, writes 'D' and 0x1c, and resets the platform
+  (`fatal-tail`; a halt loop only if the chipset refused). Terminal in every
+  path; 'F' and 0x1f on refusal, then the same tail."
   (assemble
    (concat
     [[0xfa]                                    ; cli
@@ -680,9 +743,11 @@
      [0x4d 0x89 0x74 0x24 0x20]                ; mov [r12+32],r14
      [0xb0 0x44 0x66 0xba 0xe9 0x00 0xee]      ; out 'D'
      [0xb8 0x1c 0x00 0x00 0x00 0x66 0xba 0xf4 0x00 0xef]
-     [:label :done] [0xf4] [:rel8 [0xeb] :done]
+     [:rel8 [0xeb] :reset]                     ; over the 'F' receipt, into the tail
      [:label :fail]]
-    fail-closed-tail)))
+    fail-closed-receipt
+    [[:label :reset]]
+    fatal-tail)))
 
 (def rt-timer-handler-bytes
   "APIC vector 32. Derives the context from the GDTR into rax, increments
@@ -710,8 +775,9 @@
 ;; the first text page (`kernel-probe-text-write`) and an instruction fetch
 ;; from the data page (`kernel-probe-nx-execute`). It names which one fired --
 ;; 'G' / 'W' / 'X' on the debug port, 0x19 / 0x1a / 0x1b on isa-debug-exit --
-;; and halts; anything else is 'F' / 0x1f. It never returns, so the CPU frame
-;; is read for evidence only and no register is preserved.
+;; and ends in `fatal-tail` (reset, then halt only if refused); anything else
+;; is 'F' / 0x1f. It never returns, so the CPU frame is read for evidence only
+;; and no register is preserved.
 ;;
 ;; Until 2026-09-07 its third test was `cmp r10,0x110000` and the probe that
 ;; provokes it was `movabs r10,0x110000; call r10`: both assumed the RW
@@ -771,8 +837,8 @@
      [:label :report]
      [0x66 0xba 0xe9 0x00 0xee]                ; out 0xe9,al
      [0x44 0x89 0xc0]                          ; mov eax,r8d
-     [0x66 0xba 0xf4 0x00 0xef]                ; out 0xf4,eax
-     [:label :halt] [0xf4] [:rel8 [0xeb] :halt]])))
+     [0x66 0xba 0xf4 0x00 0xef]]               ; out 0xf4,eax
+    fatal-tail)))
 
 ;; ── #UD names itself ───────────────────────────────────────────────────────
 ;;
@@ -785,8 +851,10 @@
 ;; rank-02, amu-h7): the only evidence was a missing run-end byte.
 ;;
 ;; This is the canned answer: 'U' on the debug port, 0x1d on isa-debug-exit,
-;; halt. Terminal, like the classifier -- #UD is a fault, the saved RIP is
-;; the `ud2` itself, and advancing it would mean deciding how long the
+;; then `fatal-tail` -- reset the platform, and halt only if the chipset
+;; refused (the k16 board sat halted for nine hours on 2026-09-08 when this
+;; ended in `hlt`). Terminal, like the classifier -- #UD is a fault, the saved
+;; RIP is the `ud2` itself, and advancing it would mean deciding how long the
 ;; faulting instruction was. It contains no decision and needs no context, so
 ;; it does not derive one: the letter IS the vector's name.
 ;;
@@ -812,10 +880,11 @@
 
 (def undefined-opcode-handler-bytes
   (assemble
-   [[0xfa]                                     ; cli
-    [0xb0 0x55 0x66 0xba 0xe9 0x00 0xee]       ; out 0xe9,'U'
-    [0xb8 0x1d 0x00 0x00 0x00 0x66 0xba 0xf4 0x00 0xef] ; out 0xf4,0x1d
-    [:label :halt] [0xf4] [:rel8 [0xeb] :halt]]))
+   (concat
+    [[0xfa]                                    ; cli
+     [0xb0 0x55 0x66 0xba 0xe9 0x00 0xee]      ; out 0xe9,'U'
+     [0xb8 0x1d 0x00 0x00 0x00 0x66 0xba 0xf4 0x00 0xef]] ; out 0xf4,0x1d
+    fatal-tail)))
 
 (defn absent-entry-bytes-for
   "The slot an image lays for VECTOR when no body is declared for it. Vector
