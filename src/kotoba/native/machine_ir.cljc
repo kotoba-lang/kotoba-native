@@ -5,7 +5,7 @@
   lowers through closed GMIR/MIR/MC data; unknown operations, unsupported value
   shapes, use-before-definition, register exhaustion, and malformed labels fail
   closed before either ISA encoder."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [clojure.walk :as walk]
             [kotoba.gmir :as gmir]
             [kotoba.mir :as mir]

@@ -3,7 +3,7 @@
   ;; conditional that used to wrap the whole `:require` (see
   ;; `kotoba.wasm.core`'s ns form for that original reasoning -- the `:clj`
   ;; branch needed no requires at all) now wraps only the cljs-only item.
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [kotoba.codegen.layout :as layout]
             [kotoba.native.interrupt-abi :as interrupt-abi]
             [kotoba.native.machine-ir :as machine-ir]

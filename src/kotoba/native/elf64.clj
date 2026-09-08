@@ -1,5 +1,5 @@
 (ns kotoba.native.elf64
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [kotoba.artifact.core :as artifact]
             [kotoba.native.interrupt-abi :as interrupt-abi]
             [kotoba.object.elf64 :as object-elf]))

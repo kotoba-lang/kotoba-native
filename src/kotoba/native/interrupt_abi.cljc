@@ -34,7 +34,7 @@
             `kotoba_aiueos_isr_<vector>` directly. There is no entry table in
             an object -- objects cannot reference each other -- so
             `kernel-isr-entry-address` has no answer there and is refused."
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 ;; ── the name ───────────────────────────────────────────────────────────────
 ;;
