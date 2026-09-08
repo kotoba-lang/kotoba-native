@@ -25,7 +25,7 @@
   (`tools/kexe_loader.c` belongs to kotoba-lang/compiler), as
   `kotoba.native.isa-parity-test` also records. The rows executed as real
   processes on both ISAs are reproduced in `docs/adr/0002-*`."
-  (:require #?(:clj  [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.lang.text] #?(:clj  [clojure.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing] :include-macros true])
             [kotoba.kir :as ir]
             [kotoba.native.aarch64 :as arm]
@@ -129,7 +129,7 @@
    ["empty haystack" "" "a" "b"]
    ["needle is the whole haystack" "abc" "abc" "z"]
    ;; A rewrite that rescanned its own output would either loop until it ran
-   ;; out of fuel or return "xaaax"; `clojure.string/replace` returns "xaax".
+   ;; out of fuel or return "xaaax"; `kotoba.lang.text/replace` returns "xaax".
    ["the replacement contains the needle" "xax" "a" "aa"]
    ["the replacement is the needle doubled" "a.b" "." ".."]
    ["the replacement is the needle" "a-b" "-" "-"]

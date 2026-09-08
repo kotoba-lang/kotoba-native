@@ -38,7 +38,7 @@
   aiueos's `verify-jvm-free-object-parity.cljs` does. This test is the cheap
   source-level guard that catches the drift earlier."
   (:require [clojure.java.io :as io]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is]]))
 
 (def ^:private entry-pattern

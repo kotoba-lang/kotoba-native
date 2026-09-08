@@ -78,7 +78,8 @@
   when `n` is empty. The trap's identity differs from the interpreter's
   keyword -- native traps carry no keyword at all, the loader reports
   `KEXE_TRAP` -- but the observable behaviour (no value is produced) agrees,
-  and it needs no new trap encoding in either backend.")
+  and it needs no new trap encoding in either backend."
+  (:require [kotoba.lang.text]))
 
 ;; Bound to the two operands so each is evaluated exactly once, matching the
 ;; reference interpreter, which evaluates every argument once before applying.
@@ -164,7 +165,7 @@
 ;; next occurrence in S, or -1 -- the caller finds the first one, and each
 ;; iteration finds the next in the SUFFIX it hands on, so the replacement is
 ;; never rescanned. That is what makes a replacement containing the needle
-;; terminate and match `clojure.string/replace`'s non-overlapping,
+;; terminate and match `kotoba.lang.text/replace`'s non-overlapping,
 ;; left-to-right result.
 ;;
 ;; The suffix expression appears three times rather than being `let`-bound:
