@@ -1,7 +1,8 @@
 (ns kotoba.native.affine-test
   "A wrong `true` here silently mutates a value somebody still holds, so most
   of these assert refusals."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require #?(:clj  [clojure.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
             [kotoba.native.affine :as aff]))
 
 ;; ── the shape a struct of arrays writes ─────────────────────────────────────
