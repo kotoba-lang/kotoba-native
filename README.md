@@ -44,6 +44,32 @@ emission parity here does not qualify Amu or aiueos maturity: qualification
 requires the exact-pinned consumer chain, empty foreign-code receipts, and
 positive plus negative machine execution. See ADR-0029.
 
+### What that looks like from the guest side, measured 2026-09-08
+
+Against amu `origin/main` `a169d7bf`, `--jvm-free`, each artifact **executed**
+through `tools/kexe_loader.c` rather than merely built — because building is
+not running, and `:ok true` means the first, not the second:
+
+| guest form | `--target aarch64-macos` | answer |
+|---|---|---|
+| arithmetic, lambda, application, definition reference | compiles | correct value |
+| `kgraph-assert!` / `kgraph-get` (the `rel` / `query` spellings) | compiles | reads back what was stored |
+| a capability call (`cap-call` / `perform`) | compiles | **`KEXE_TRAP :SIGTRAP`** |
+| `try` / `catch`, with or without the `handle` spelling | **refused** `:verify` | — |
+
+The third row is this section's title, observed rather than asserted: the
+guest compiles, and traps at the call because **there is no native effect
+provider in the bare loader**. That is the documented boundary, not a defect
+here. A native host that grants capabilities is `kototama` plus `aiueos`.
+
+The fourth row is a real gap in this backend and is named as one: the `:abort`
+ability has no native lowering, so `native artifact contains an unsupported
+effect`. The control is what makes it a backend gap rather than a surface
+one — the refusal is identical with and without the `handle` spelling, so it
+is the ability that is missing, not a source form. Recorded upstream as
+`:native-gap` in kotoba-lang `lang/surface-status.edn`; guests targeting
+native keep returning `[:result T E]` at boundaries.
+
 ## String search
 
 `string-contains?` and `string-replace-all` are the one operator family whose
