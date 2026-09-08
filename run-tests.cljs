@@ -7,6 +7,15 @@
             ;; it is portable by construction -- and its test was `.cljc` too, and
             ;; still ran on one host, because this runner is an explicit list and
             ;; did not name it. `scripts/verify-cljs-runner-completeness.cljs` did.
+            ;; 2026-09-08: five more `.cljc` tests of `.cljc` sources that ran on
+            ;; the JVM only. None contains a single java interop form -- they were
+            ;; `.clj` by habit, not by need. The superproject's
+            ;; `verify-portable-source-tested-on-one-host.cljs` names the class.
+            [kotoba.native.peephole-test]
+            [kotoba.native.boot-scratch-test]
+            [kotoba.native.vector-region-test]
+            [kotoba.native.string-index-test]
+            [kotoba.native.string-search-test]
             [kotoba.native.affine-test]
             [kotoba.native.elf64-portable-test]))
 
@@ -16,5 +25,6 @@
   (when (pos? (+ (or (:fail m) 0) (or (:error m) 0)))
     (set! (.-exitCode js/process) 1)))
 
-(t/run-tests 'kotoba.native.affine-test
+(t/run-tests 'kotoba.native.peephole-test 'kotoba.native.boot-scratch-test 'kotoba.native.vector-region-test 'kotoba.native.string-index-test 'kotoba.native.string-search-test
+             'kotoba.native.affine-test
              'kotoba.native.elf64-portable-test)

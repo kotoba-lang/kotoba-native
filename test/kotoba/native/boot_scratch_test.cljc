@@ -5,7 +5,8 @@
   Both are four and seven bytes respectively, and both were read back with
   `llvm-mc` rather than assembled from the intent -- the ModRM byte is where
   this kind of encoding goes wrong, and a wrong one still validates."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require #?(:clj  [clojure.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
             [kotoba.native.image-scratch :as image-scratch]
             [kotoba.native.machine-ir]
             [kotoba.native.x86-64 :as x86]))
@@ -126,7 +127,7 @@
   ;; be reached by a hand-built MC module, which is why it is asserted
   ;; separately below rather than through the compiler.
   (is (thrown-with-msg?
-       clojure.lang.ExceptionInfo #"unresolved-function-address"
+       #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) #"unresolved-function-address"
        (code [{:name 'main :params []
                :body '(kernel-function-address absent)}]))))
 
@@ -137,7 +138,7 @@
   ;; reaching: it is the check that stops a backend emitting a `lea` at a
   ;; label it would have to invent.
   (is (thrown-with-msg?
-       clojure.lang.ExceptionInfo #"unknown-function-address-target"
+       #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) #"unknown-function-address-target"
        (#'kotoba.native.machine-ir/encode-mc
         {:mc/version 2 :mc/target :x86-64 :mc/frame-slots 0
          :mc/instructions

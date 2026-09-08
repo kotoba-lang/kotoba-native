@@ -1,5 +1,6 @@
 (ns kotoba.native.vector-region-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require #?(:clj  [clojure.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
             [kotoba.native.aarch64 :as aarch64]
             [kotoba.native.machine-ir :as machine]
             [kotoba.native.vector-region :as region]
