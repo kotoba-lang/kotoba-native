@@ -339,17 +339,27 @@
    ;; number. An AArch64 arm must emit FMUL and FADD separately and must not
    ;; let any peephole contract them.
    ;;
-   ;; Until that arm exists, `kotoba.mir` refuses the operation for every
-   ;; target but x86-64; pinned here so the asymmetry is asserted rather than
-   ;; merely true. When it lands, this row moves and the bit-identity claim
-   ;; becomes an executable comparison rather than a construction argument.
-   [['a 'al 'b 'bl 'n] '(kernel-dot-f32 a al b bl n)]
-   ;; dequant: the fused family, x86-only for the SAME reason and by the same
-   ;; measurement. Its two arms are AVX2 and legacy SSE, and the claim that
-   ;; binds them is that they agree BIT FOR BIT -- which is a claim about one
-   ;; accumulation tree, not about a dot product. A NEON arm would be a third
-   ;; answer nothing has compared with the other two. All three formats are
-   ;; listed rather than one standing for the family, so dropping a format
+   ;; ── THAT ARM LANDED THE SAME DAY, AND THIS ROW MOVED ──
+   ;;
+   ;; The paragraph above used to end "until that arm exists, `kotoba.mir`
+   ;; refuses the operation for every target but x86-64", and promised that
+   ;; when it landed the bit-identity claim would become an executable
+   ;; comparison rather than a construction argument. It did:
+   ;; `a64-kernel-dot-f32` emits, `kotoba.mir` no longer refuses it, and the
+   ;; emitted bytes were assembled into an object and CALLED on this machine
+   ;; against `dot-f32-probe.kotoba`'s fixture -- see
+   ;; `a64-dot-f32-emits-the-x86-scalar-tree` for the digits and the control.
+   ;;
+   ;; So `kernel-dot-f32` is no longer in this table, and the positive test
+   ;; below is what replaces it: removing a row from a refusal list is
+   ;; otherwise a silently-passing deletion.
+   ;;
+   ;; dequant: the fused family IS still in this table, and its reason is now
+   ;; NARROWER than the one above. It is no longer the tree -- the tree has an
+   ;; AArch64 spelling. It is that each format's per-block decode (an fp16
+   ;; scale, a nibble split, a six-bit regroup) has no second arm yet, which
+   ;; is a gap and not a difference between the machines. All three formats
+   ;; are listed rather than one standing for the family, so dropping a format
    ;; from `kotoba.mir`'s refusal is a red test.
    ;;
    ;; Only Q8_0 is listed, because this table's other assertion is that x86-64
@@ -431,8 +441,10 @@
     (let [thrown (try (arm/emit-program (program params body)) nil
                       (catch clojure.lang.ExceptionInfo e e))
           expected (cond
-                     (contains? '#{kernel-dot-f32
-                                   kernel-dequant-dot-q8-0
+                     ;; simd: `kernel-dot-f32` is NOT in this set any more --
+                     ;; it emits on AArch64. The keyword and the branch stay,
+                     ;; because the fused family still reaches them.
+                     (contains? '#{kernel-dequant-dot-q8-0
                                    kernel-dequant-dot-q4-k
                                    kernel-dequant-dot-q6-k}
                                 (first body))
@@ -451,8 +463,10 @@
       (is (= :mir (:phase (ex-data thrown))))
       (is (= expected (:problem (ex-data thrown))) (str body))))
   (testing "every reason is actually reached -- no branch is dead"
-    (is (= 2 (count (filter #(contains? '#{kernel-dot-f32
-                                          kernel-dequant-dot-q8-0}
+    ;; simd: ONE row, not two -- `kernel-dot-f32` left this table. The count
+    ;; is asserted rather than the presence so that losing the remaining row
+    ;; is red rather than quiet.
+    (is (= 1 (count (filter #(contains? '#{kernel-dequant-dot-q8-0}
                                        (first (second %)))
                             x86-only)))
         "SCANNED simd rows")
@@ -462,13 +476,107 @@
                                         (first (second %)))
                             x86-only)))
         "SCANNED rodata rows")
-    (is (< 1 (count (remove #(contains? '#{kernel-dot-f32 ucs2 guid bytes-literal
+    (is (< 1 (count (remove #(contains? '#{ucs2 guid bytes-literal
                                           kernel-dequant-dot-q8-0
                                           kernel-dequant-dot-q4-k
                                           kernel-dequant-dot-q6-k}
                                         (first (second %)))
                             x86-only)))
         "SCANNED privileged rows")))
+;; ---------------------------------------------------------------------------
+;; simd: the AArch64 arm of the f32 dot product
+;; ---------------------------------------------------------------------------
+
+(def ^:private a64-dot-words
+  "The emitted instruction stream as 32-bit words, which is the unit an
+  AArch64 reader thinks in."
+  (delay
+    (let [code (vec (:code (arm/emit-program
+                            (program '[a al b bl n]
+                                     '(kernel-dot-f32 a al b bl n)))))]
+      (mapv (fn [i] (bit-or (nth code i)
+                            (bit-shift-left (nth code (+ i 1)) 8)
+                            (bit-shift-left (nth code (+ i 2)) 16)
+                            (bit-shift-left (nth code (+ i 3)) 24)))
+            (range 0 (count code) 4)))))
+
+(defn- word-run-count [words needle]
+  (count (filter #(= needle (subvec words % (+ % (count needle))))
+                 (range (inc (- (count words) (count needle)))))))
+
+(deftest a64-dot-f32-emits-the-x86-scalar-tree
+  ;; This test replaces the `x86-only` row `kernel-dot-f32` used to occupy.
+  ;; Deleting a row from a refusal list is a silently-passing change: the list
+  ;; asserts that the operation is REFUSED, so removing it asserts nothing.
+  ;;
+  ;; ⚠ WHAT THIS NAMESPACE CAN AND CANNOT SAY. It can say these are the words
+  ;; intended. It cannot say they compute the right number -- this repository
+  ;; does not execute compiled programs, which its own deps.edn says in so
+  ;; many words. That measurement was taken OUTSIDE it, on 2026-09-09, and is
+  ;; reproducible: emit this program, write the bytes as `.byte` directives
+  ;; under a `_f` label, `clang -c -target arm64-apple-macos`, and call it
+  ;; from C as `int64_t f(int64_t,int64_t,int64_t,int64_t,int64_t)` -- the
+  ;; sequence takes its five operands in x0..x4 and returns in x0, which is
+  ;; AAPCS64's own argument order, so no shim is needed.
+  ;;
+  ;;   A = [2^24, 1 x 11], B = [1 x 12]     (`dot-f32-probe.kotoba`'s fixture)
+  ;;   0x4B800004   <- measured. four lanes, lower before upper,
+  ;;                   (s0+s1)+(s2+s3), then the four-element scalar tail
+  ;;   0x4B800000      a straight left-to-right sum -- every 1 lost into the
+  ;;                   gap above 2^24
+  ;;
+  ;; The control was run too, and it is the reason the fixture is this one:
+  ;; with `step`'s lane argument forced to 0 -- a left-to-right chain -- the
+  ;; same harness printed 0x4B800000, AND an ordinary fixture (dot of
+  ;; [1..9] with [0.5..4.5]) still printed 142.5 in that broken build. A
+  ;; plausible dot product agrees with a wrong tree.
+  (let [words @a64-dot-words]
+    (testing "four accumulators, all +0.0 and not an arithmetic identity"
+      ;; FMOV S0..S3, WZR. `fsub s0,s0,s0` would answer -0.0 for a NaN-free
+      ;; start and +0.0 otherwise, which is a different first addend.
+      (is (= [0x1e2703e0 0x1e2703e1 0x1e2703e2 0x1e2703e3]
+             (subvec words 18 22))))
+    (testing "element e of each eight-element group goes into accumulator e mod 4"
+      ;; The block body, from the first LDR. Lane order is the whole contract:
+      ;; 0 1 2 3 for the lower half, then 0 1 2 3 again for the upper.
+      (let [block (subvec words 23 55)
+            lanes (mapv (fn [i] (bit-and (nth block (+ (* 4 i) 3)) 0x1f))
+                        (range 8))
+            offsets (mapv (fn [i] (* 4 (bit-and (bit-shift-right
+                                                 (nth block (* 4 i)) 10)
+                                                0xfff)))
+                          (range 8))]
+        (is (= [0 1 2 3 0 1 2 3] lanes) "SCANNED 8 lanes")
+        (is (= [0 4 8 12 16 20 24 28] offsets) "SCANNED 8 offsets")))
+    (testing "two roundings per element, never one"
+      ;; FMUL then FADD. A fused multiply-add rounds once and answers a
+      ;; DIFFERENT, more accurate number -- the one thing an arm of this pair
+      ;; may not do. FMADD/FMSUB/FNMADD/FNMSUB are the 0x1F00.... encoding
+      ;; space; nothing in this sequence may land in it.
+      (is (= 9 (word-run-count words [0x1e250884]))
+          "SCANNED fmul s4,s4,s5 -- eight in the block and one in the tail")
+      (is (empty? (filter #(= 0x1f000000 (bit-and % 0xff000000)) words))
+          "SCANNED zero fused multiply-adds"))
+    (testing "the reduction is (s0+s1)+(s2+s3) and not a left-to-right chain"
+      ;; fadd s0,s0,s1 ; fadd s2,s2,s3 ; fadd s0,s0,s2 -- the tree the x86
+      ;; arm's two `vhaddps` compute. A chain would be s0+=s1; s0+=s2; s0+=s3.
+      (is (= [0x1e212800 0x1e232842 0x1e222800]
+             (subvec words 60 63))))
+    (testing "no feature guard, because there is nothing to choose between"
+      ;; The x86 sequence asks `cpuid` which of two arms to run. There is one
+      ;; arm here, and FMUL/FADD/SCVTF/LDR-S are AArch64 base -- so a runtime
+      ;; check would be a branch that is always taken, and a second arm would
+      ;; be a second answer.
+      (is (empty? (filter #(= 0xd5300000 (bit-and % 0xfff00000)) words))
+          "SCANNED zero MRS reads of a feature register"))
+    (testing "the answer is sign-extended from bit 31"
+      ;; FMOV W then SXTW. Without the extension every negative result is a
+      ;; word `f32-from-bits` refuses.
+      (is (= 0x1e260000 (bit-and (nth words 73) 0xfffffc00)))
+      (is (= 0x93407c00 (bit-and (nth words 74) 0xfffffc00))))
+    (testing "an out-of-bounds request traps rather than reading"
+      (is (some #(= 0xd4200000 %) words) "SCANNED the BRK"))))
+
 
 ;; ---------------------------------------------------------------------------
 ;; The u32 bound is four bytes wider than the u8 bound
