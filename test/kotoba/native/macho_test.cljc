@@ -1,5 +1,6 @@
 (ns kotoba.native.macho-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require #?(:clj  [clojure.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
             [kotoba.native.macho :as native-macho]))
 
 (defn request [target type bytes offset]
@@ -23,13 +24,13 @@
 
 (deftest relocation-integration-fails-closed
   (testing "request target must match the object target"
-    (is (thrown? clojure.lang.ExceptionInfo
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
                  (native-macho/encode-text-object
                   (assoc-in (request :aarch64 :aarch64/branch26
                                      [0 0 0 0x94] 0)
                             [:relocations 0 :reloc/target] :x86-64)))))
   (testing "only the owned text section is admitted"
-    (is (thrown? clojure.lang.ExceptionInfo
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
                  (native-macho/encode-text-object
                   (assoc-in (request :x86-64 :x86-64/branch
                                      [0xe8 0 0 0 0] 1)
