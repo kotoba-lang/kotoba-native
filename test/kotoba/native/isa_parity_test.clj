@@ -309,10 +309,40 @@
    ;; sequence can imitate a vector while a vector cannot imitate an
    ;; arbitrary scalar order. An AArch64 spelling would have to decide
    ;; whether to keep that tree, at whatever it costs in NEON instructions,
-   ;; or to answer a different number. That is a decision for whoever needs
-   ;; one and it is not a translation of this. `kotoba.mir` refuses the
-   ;; operation for every target but x86-64; pinned here so the asymmetry is
-   ;; asserted rather than merely true.
+   ;; or to answer a different number.
+   ;;
+   ;; ── that decision was taken on 2026-09-09: KEEP THE TREE ──
+   ;;
+   ;; Owner decision, on this measurement: cross-ISA bit-identity is already
+   ;; load-bearing in the fleet, not a preference. `local-murakumo.device-p256`
+   ;; qualifies an AIUEOS node by comparing its GREEDY first and second token
+   ;; against expected values, exactly; and the community-provider lane
+   ;; (com-junkawasaki adr-2609091200) is designed to verify a claimed result
+   ;; by re-running a sampled job on another node and comparing outputs. Both
+   ;; break if a Mac mini and the K16 disagree in the last bit of a logit,
+   ;; because greedy token choice is a comparison and a comparison has no
+   ;; tolerance. An AArch64 arm that answered a different number would not be
+   ;; a faster kernel; it would be a second fleet.
+   ;;
+   ;; The tree is reachable scalar-ly, which is what makes keeping it
+   ;; tractable rather than heroic. `x86-kernel-dequant-dot`'s own scalar arm
+   ;; is the specification: for each eight-element group, element e is
+   ;; sign-extended from a byte through a 64-bit register, converted, scaled,
+   ;; multiplied by the activation at [px + 4e], and added into accumulator
+   ;; `e mod 4` -- four accumulators, elements in order, lower half before
+   ;; upper. Every step is one IEEE operation with one rounding, so the same
+   ;; sequence written with SCVTF / FMUL / FADD on AArch64 is bit-identical by
+   ;; construction rather than by measurement.
+   ;;
+   ;; ⚠ The one way to lose it silently is FMADD. `mulss` then `addss` rounds
+   ;; twice; a fused multiply-add rounds once and answers a different, better
+   ;; number. An AArch64 arm must emit FMUL and FADD separately and must not
+   ;; let any peephole contract them.
+   ;;
+   ;; Until that arm exists, `kotoba.mir` refuses the operation for every
+   ;; target but x86-64; pinned here so the asymmetry is asserted rather than
+   ;; merely true. When it lands, this row moves and the bit-identity claim
+   ;; becomes an executable comparison rather than a construction argument.
    [['a 'al 'b 'bl 'n] '(kernel-dot-f32 a al b bl n)]
    ;; dequant: the fused family, x86-only for the SAME reason and by the same
    ;; measurement. Its two arms are AVX2 and legacy SSE, and the claim that
