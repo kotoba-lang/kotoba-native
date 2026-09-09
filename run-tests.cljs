@@ -18,7 +18,8 @@
             [kotoba.native.string-search-test]
             [kotoba.native.macho-test]
             [kotoba.native.affine-test]
-            [kotoba.native.elf64-portable-test]))
+            [kotoba.native.elf64-portable-test]
+            [kotoba.native.aggregate-abi-portable-test]))
 
 (defmethod t/report [:cljs.test/default :end-run-tests] [m]
   (println (str "\nnbb: " (:test m) " tests, " (:pass m) " passed, "
@@ -29,4 +30,5 @@
 (t/run-tests 'kotoba.native.macho-test
              'kotoba.native.peephole-test 'kotoba.native.boot-scratch-test 'kotoba.native.vector-region-test 'kotoba.native.string-index-test 'kotoba.native.string-search-test
              'kotoba.native.affine-test
-             'kotoba.native.elf64-portable-test)
+             'kotoba.native.elf64-portable-test
+             'kotoba.native.aggregate-abi-portable-test)
