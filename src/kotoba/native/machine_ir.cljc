@@ -6834,6 +6834,16 @@
     :aarch64/data-address
     [{:native/data-content (:mir/content instruction)
       :native/data-dst (:mir/dst instruction) :native/data-target :aarch64}]
+    ;; boot-lit/adr: the literal's ADDRESS on AArch64. The x86 arm's docstring
+    ;; explains why an address rather than an offset is needed at all; the
+    ;; token is the same shape and only the target differs, because the pool
+    ;; and its placement are ISA-independent and just the instruction that
+    ;; reaches it is not.
+    :aarch64/rodata-address
+    [{:native/rodata-content (:mir/content instruction)
+      :native/rodata-encoding (:mir/rodata-encoding instruction)
+      :native/rodata-dst (:mir/dst instruction)
+      :native/rodata-target :aarch64}]
     :aarch64/add
     (if-let [immediate (:native/a64-immediate instruction)]
       (u32le (bit-or (if (= :subtract (:native/a64-immediate-op instruction))
@@ -7353,7 +7363,9 @@
       ;; ModRM and four displacement bytes. Fixed width, so one layout pass
       ;; still suffices.
       (when (:native/rodata-content token)
-        (case (:native/rodata-target token) :x86-64 7 nil))
+        ;; boot-lit/adr: seven for `lea r64,[rip+disp32]`, four for `adr Xd`.
+        ;; Both are fixed width, so one layout pass still suffices on both.
+        (case (:native/rodata-target token) :x86-64 7 :aarch64 4 nil))
       (when (and (integer? token) (<= 0 token 255)) 1)))
 
 ;; boot-lit: `lea dst,[rip+disp32]`. ModRM mod=00 rm=101 is RIP-relative in
@@ -7365,6 +7377,43 @@
     (when-not (some? code)
       (reject! :mc-encode :unsupported-register {:register dst}))
     (x86-lea-rip-code code displacement)))
+
+(defn- a64-adr
+  "`adr Xd, label` -- ADR, not ADRP.
+
+  This is the AArch64 answer to `lea dst,[rip+disp32]`, and it is ONE
+  instruction rather than the two the refusal in `kotoba.mir` predicted.
+  ADRP+ADD exists because a 21-bit byte displacement reaches only +/-1 MiB and
+  a linker cannot know that a symbol is near; splitting into a 4 KiB page
+  number and a 12-bit offset buys +/-4 GiB at the cost of modelling the page
+  boundary, which is the split the layout pass does not have.
+
+  ⚠ THIS BACKEND KNOWS WHAT A LINKER DOES NOT. The literal pool is placed by
+  `resolve-program-layout` at the end of the SAME buffer as the code, so the
+  distance from any instruction to any entry is bounded by the size of one
+  emitted program. 1 MiB of Kotoba code is enormous; and if a program ever did
+  exceed it, the guard below refuses rather than truncating -- silently
+  wrapping a 21-bit field is how this class of bug reaches a running machine.
+
+  The encoding, verified against `clang -arch arm64` + `otool -t` on five
+  cases including a negative displacement and all three non-zero `immlo`
+  values (2026-09-09): bit 31 clear selects ADR over ADRP, bits 30-29 carry
+  the low two bits of the byte displacement, bits 23-5 carry the rest, and the
+  displacement is measured from the address of the ADR ITSELF -- not from the
+  end of it, which is where the x86 arm's seven comes from and is the one
+  difference a reader is most likely to carry over wrongly."
+  [dst displacement]
+  (when-not (<= -1048576 displacement 1048575)
+    (reject! :mc-encode :rodata-literal-out-of-range
+             {:register dst :displacement displacement
+              :limit "adr reaches +/-1 MiB"}))
+  (let [imm (bit-and displacement 0x1fffff)
+        immlo (bit-and imm 3)
+        immhi (bit-and (bit-shift-right displacement 2) 0x7ffff)]
+    (u32le (bit-or 0x10000000
+                   (bit-shift-left immlo 29)
+                   (bit-shift-left immhi 5)
+                   (a64-register dst)))))
 
 (defn- align-to [value alignment]
   (* alignment (quot (+ value (dec alignment)) alignment)))
@@ -7433,8 +7482,15 @@
                   (let [offset (get (:offsets literal-plan)
                                     [(:native/rodata-encoding token)
                                      (:native/rodata-content token)])]
-                    (x86-lea-rip (:native/rodata-dst token)
-                                 (- offset (+ position 7))))
+                    ;; The two ISAs measure from different points and that is
+                    ;; the whole of the difference: x86's disp32 counts from
+                    ;; the END of the seven-byte instruction, AArch64's ADR
+                    ;; counts from the address of the instruction itself.
+                    (case (:native/rodata-target token)
+                      :x86-64 (x86-lea-rip (:native/rodata-dst token)
+                                           (- offset (+ position 7)))
+                      :aarch64 (a64-adr (:native/rodata-dst token)
+                                        (- offset position))))
 
                   :else [token])))]
     {:code (vec (concat code data (repeat literal-pad 0)
