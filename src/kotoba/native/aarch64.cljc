@@ -1261,11 +1261,16 @@
              (ascii-literal? (first args)))
         (emit-string-substring-of-ascii-literal (first args) (second args) (nth args 2) env depth)
 
-        ;; The two string SEARCH operations. See `kotoba.native.string-search`;
+        ;; The three string SEARCH operations. See `kotoba.native.string-search`;
         ;; the rewrite is shared with the x86-64 backend rather than restated
         ;; here, so the two ISAs cannot drift in their search semantics.
         (and (= op 'string-contains?) (= 2 (count args)))
         (emit-expr (string-search/lower-contains args) env depth)
+
+        ;; `string-index-of` is the same scan without the 0/1 fold on top, so
+        ;; it appends no helper `string-contains?` did not already need.
+        (and (= op 'string-index-of) (= 2 (count args)))
+        (emit-expr (string-search/lower-index-of args) env depth)
 
         (and (= op 'string-replace-all) (= 3 (count args)))
         (emit-expr (string-search/lower-replace-all args) env depth)

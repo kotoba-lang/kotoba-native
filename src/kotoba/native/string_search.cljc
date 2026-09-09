@@ -1,6 +1,6 @@
 (ns kotoba.native.string-search
-  "`string-contains?` and `string-replace-all`, lowered for BOTH native ISAs
-  out of operations the backends already emit.
+  "`string-contains?`, `string-index-of` and `string-replace-all`, lowered for
+  BOTH native ISAs out of operations the backends already emit.
 
   ## Why this is a source rewrite and not a new context callback
 
@@ -211,6 +211,33 @@
                                 0)
                       0 1)))))
 
+(defn lower-index-of
+  "`(string-index-of h n)` over the operations both backends already emit.
+
+  The same scan `lower-contains` performs, stopped one step earlier.
+  `string-find` already ANSWERS the first matching haystack offset, or -1 --
+  which is `string-index-of`'s entire contract (`lang/guest-grammar.edn`:
+  \"first UTF-8 byte offset of needle in haystack, -1 when absent\";
+  `lang/surface-status.edn` `:string-index-of {:indexes :utf8-byte-offsets
+  :not-found -1}`). `lower-contains` throws that offset away down to 0/1;
+  this hands it back. So the operation costs no helper `lower-contains` did
+  not already append, and a program that searches both ways emits ONE copy of
+  the scan.
+
+  The empty needle is refused exactly as it is for `string-contains?`, by the
+  same leading `string-code-point-at`, and that is load-bearing HERE in a way
+  it is not there: an empty needle occurs at offset 0 in every string, so a
+  lowering that answered instead of trapping would return a plausible 0 and
+  the caller could not tell it from a real match at the start."
+  [args]
+  (let [[h n] args]
+    (list 'let [haystack h needle n]
+          (list 'do
+                ;; Traps iff the needle is empty; see the namespace docstring.
+                (list 'string-code-point-at needle 0)
+                (list find-name haystack needle 0
+                      (list span-name haystack needle 0 0))))))
+
 (defn lower-replace-all
   "`(string-replace-all s n r)` over the operations both backends already emit."
   [args]
@@ -246,7 +273,7 @@
   because the calls this lowering emits would silently go there instead."
   [functions]
   (let [bodies (map :body functions)
-        searches? (some #(uses? '#{string-contains?} %) bodies)
+        searches? (some #(uses? '#{string-contains? string-index-of} %) bodies)
         replaces? (some #(uses? '#{string-replace-all} %) bodies)]
     (if-not (or searches? replaces?)
       functions

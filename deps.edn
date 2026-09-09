@@ -7,7 +7,27 @@
        org.clojure/clojure {:mvn/version "1.12.0"}
         io.github.kotoba-lang/osaho
         {:git/url "https://github.com/kotoba-lang/osaho.git"
-         :git/sha "d809f284c40cc6b4b4de037baf5f9c7a9607e9c3"}
+         ;; Advanced 2026-09-09, d809f284 -> 1a81e2d (osaho main, forward only,
+         ;; 46 commits). The reason is the ORACLE, not a feature here: this
+         ;; repo's string-search tests never write an expected value down, they
+         ;; run `kotoba.kir/execute` on both the operation and the rewrite and
+         ;; compare. `string-index-of` had no evaluator at d809f284, so the
+         ;; rows added for it below would have compared two refusals and passed
+         ;; while proving nothing -- the exact shape of "a test that could not
+         ;; run returns what a test that ran and found nothing returns". osaho
+         ;; 375cb65 added the evaluator (first UTF-8 byte offset, -1 absent,
+         ;; empty-needle trap) and ee850cb fixed its ClojureScript
+         ;; representation to a BigInt i64, which is what makes the oracle
+         ;; agree on both hosts.
+         ;;
+         ;; The tip commit is the one that makes the astral rows below pass.
+         ;; `utf8-index-of!` charged a surrogate pair 4 bytes at the high
+         ;; surrogate and 3 more at the low one, so it answered 7 where this
+         ;; repo's lowering, kotoba-script's JS emitter and CPython all answer
+         ;; 4. That disagreement is what the oracle comparison here surfaced,
+         ;; and osaho ADR 0271 is the fix. Pinning a37577c instead would leave
+         ;; one row red for a defect that is not in this repository.
+         :git/sha "1a81e2d7df947a719b75db1e6e5616a900f3ebb7"}
         io.github.kotoba-lang/kotoba-gmir
         {:git/url "https://github.com/kotoba-lang/kotoba-gmir.git"
          :git/sha "a3f0597cc8fdbd104235996441673af94f6db621"}

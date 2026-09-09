@@ -1,5 +1,6 @@
 (ns kotoba.native.string-search-test
-  "`string-contains?` / `string-replace-all` on both native ISAs.
+  "`string-contains?` / `string-index-of` / `string-replace-all` on both native
+  ISAs.
 
   Two things have to be true and they are proved separately.
 
@@ -115,6 +116,77 @@
               (str why " must emit exactly the written-out rewrite")))))))
 
 ;; ---------------------------------------------------------------------------
+;; string-index-of
+;; ---------------------------------------------------------------------------
+
+;; The same haystack/needle pairs `string-contains?` is proved on, because the
+;; two lowerings share their whole scan: any row that separates a right scan
+;; from a wrong one for the predicate separates them for the offset too. What
+;; the offset ADDS is that a wrong answer is no longer one of two values -- a
+;; scan that lands one code point early or late is caught here and is invisible
+;; to `contains?`, which only ever reports that it landed somewhere.
+;;
+;; The rows below extend `contains-rows` with the cases where the OFFSET is the
+;; only thing in question: a needle that occurs twice (the answer is the FIRST,
+;; not the last), and multi-byte haystacks where the byte offset and the code
+;; point index differ -- "日本語" / "語" is 6, not 2, and a lowering that
+;; counted code points would answer 2 and pass every `contains?` row.
+(def ^:private index-of-rows
+  (into contains-rows
+        [["two occurrences, the answer is the first" "abcabc" "abc"]
+         ["two occurrences one byte apart" "xaxab" "xa"]
+         ["multi-byte haystack: byte offset exceeds the code-point index" "日本語" "語"]
+         ["multi-byte haystack, needle in the middle" "日本語" "本"]
+         ["mixed widths before the match" "aé日b" "b"]
+         ["astral-plane code point before the match" "𝄞ab" "ab"]
+         ;; The boundary case for the -1 answer: the needle is present but
+         ;; ONE byte too long to fit, so the last window is refused by width
+         ;; rather than by content.
+         ["needle one byte longer than the only window" "abc" "abcd"]
+         ;; And the boundary case for a 0 answer: a real match at offset 0,
+         ;; which is the value an empty needle would also produce if the
+         ;; empty-needle trap below were ever removed.
+         ["a real match at offset 0" "abc" "a"]]))
+
+(deftest string-index-of-agrees-with-the-reference-interpreter
+  (doseq [[why haystack needle] index-of-rows]
+    (testing why
+      (let [op (list 'string-index-of haystack needle)]
+        (is (= (run (program :i64 op))
+               (run (rewritten :i64 op (search/lower-index-of [haystack needle]))))
+            (str "the rewrite must answer what `string-index-of` answers: "
+                 (pr-str haystack) " / " (pr-str needle)))))))
+
+(deftest string-index-of-is-emitted-as-the-written-out-rewrite-on-both-isas
+  (doseq [[label emit] backends]
+    (testing label
+      (doseq [[why haystack needle] index-of-rows]
+        (let [op (list 'string-index-of haystack needle)
+              emitted (:code (emit (program :i64 op)))]
+          (is (seq emitted) why)
+          (is (= emitted
+                 (:code (emit (rewritten :i64 op (search/lower-index-of [haystack needle])))))
+              (str why " must emit exactly the written-out rewrite")))))))
+
+(deftest string-index-of-shares-one-copy-of-the-scan-with-string-contains
+  ;; The docstring of `lower-index-of` claims the operation appends no helper
+  ;; `string-contains?` did not already need, and that a program searching both
+  ;; ways emits ONE scan. Both halves are asserted, because a second copy would
+  ;; not fail any row above -- it would only make every call displacement past
+  ;; the first copy wrong, which is a bug that shows up somewhere else entirely.
+  (let [names (fn [body]
+                (mapv :name (search/augment-functions
+                             [{:name 'main :params [] :result :i64 :body body}])))]
+    (is (= (names '(string-contains? "abc" "b"))
+           (names '(string-index-of "abc" "b")))
+        "the same helper set, in the same order")
+    (is (= (names '(string-index-of "abc" "b"))
+           (names '(+ (string-index-of "abc" "b") (string-contains? "abc" "b"))))
+        "using both operations appends the helpers once, not twice")
+    (is (apply distinct? (names '(string-index-of "abc" "b")))
+        "and no name is declared twice")))
+
+;; ---------------------------------------------------------------------------
 ;; string-replace-all
 ;; ---------------------------------------------------------------------------
 
@@ -182,6 +254,15 @@
             (search/lower-contains ["abc" ""]) :i64]
            ["contains?, empty haystack too" '(string-contains? "" "")
             (search/lower-contains ["" ""]) :i64]
+           ;; An empty needle occurs at offset 0 in every string, so a
+           ;; lowering that answered here would return a plausible 0 -- the
+           ;; one wrong answer indistinguishable from a real match at the
+           ;; start. This row is why the trap is load-bearing for the offset
+           ;; in a way it is not for the predicate.
+           ["index-of" '(string-index-of "abc" "")
+            (search/lower-index-of ["abc" ""]) :i64]
+           ["index-of, empty haystack too" '(string-index-of "" "")
+            (search/lower-index-of ["" ""]) :i64]
            ["replace-all" '(string-replace-all "abc" "" "x")
             (search/lower-replace-all ["abc" "" "x"]) :string]]]
     (testing why
