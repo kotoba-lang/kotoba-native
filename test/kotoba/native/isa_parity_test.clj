@@ -371,25 +371,21 @@
    ;; x86 refusals are a DIFFERENT keyword and belong in
    ;; `kotoba.native.dequant-fusion-test`.
    [['w 'wl 'x 'xl 'n] '(kernel-dequant-dot-q4-k w wl x xl n)]
-   ;; boot-lit: the two wider firmware calls and the three literal address
-   ;; heads. The calls are x86-only for the reason kernel-uefi-call2 is -- the
-   ;; Microsoft x64 calling convention is not a thing AArch64 has.
+   ;; boot-lit: the two wider firmware calls. x86-only for the reason
+   ;; kernel-uefi-call2 is -- the Microsoft x64 calling convention is not a
+   ;; thing AArch64 has.
    ;;
-   ;; The literals are x86-only for a DIFFERENT and weaker reason, and saying
-   ;; so is the point of listing them here rather than absorbing them into the
-   ;; heading above: the rip-relative load-effective-address HAS an AArch64
-   ;; answer -- ADRP plus ADD -- whose 4 KiB page split the layout pass does
-   ;; not model. That is a gap, not a difference between the machines, and it
-   ;; is pinned here so closing it is a deliberate act rather than something
-   ;; that quietly never happens. It is also why the refusal below is checked
-   ;; against a SET of two problem keywords: the literals are refused as
-   ;; :rodata-address-target-mismatch, which is a different sentence from the
-   ;; privileged family's and should stay one.
+   ;; ⚠ THE THREE LITERAL ADDRESS HEADS LEFT THIS TABLE ON 2026-09-09. They
+   ;; were listed here as a GAP rather than as a difference between the
+   ;; machines -- the note said the rip-relative load-effective-address has an
+   ;; AArch64 answer, ADRP plus ADD, whose 4 KiB page split the layout pass
+   ;; does not model -- and it said so precisely so that closing it would be a
+   ;; deliberate act. Closing it found that the named blocker was the wrong
+   ;; instruction: `adr` reaches +/-1 MiB in one, and the pool is in the same
+   ;; buffer as the code. `a64-rodata-literals-emit-the-adr-encoding` below is
+   ;; what replaces these three rows.
    [['b 'o 'x 'y] '(kernel-uefi-call4 b o x y 3 4)]
-   [['b 'o 'x 'y] '(kernel-uefi-call6 b o x y 3 4 5 6)]
-   [[] '(ucs2 "AIUEOS")]
-   [[] '(guid "5B1B31A1-9562-11D2-8E3F-00A0C969723B")]
-   [[] '(bytes-literal "deadbeef")]])
+   [['b 'o 'x 'y] '(kernel-uefi-call6 b o x y 3 4 5 6)]])
 
 (deftest privileged-x86-operators-are-x86-only-by-design
   (doseq [[params body] x86-only]
@@ -450,15 +446,11 @@
                                    kernel-dequant-dot-q6-k}
                                 (first body))
                      :x86-simd-target-mismatch
-                     ;; boot-lit: a THIRD reason. The literal pool is refused
-                     ;; because the rip-relative load-effective-address has no
-                     ;; modelled AArch64 translation, which is a gap; the
-                     ;; privileged channel is
-                     ;; refused because the instructions do not exist there,
-                     ;; which is not. Collapsing them would let a gap start
-                     ;; being reported as a difference between the machines.
-                     (contains? '#{ucs2 guid bytes-literal} (first body))
-                     :rodata-address-target-mismatch
+                     ;; boot-lit: the third reason -- the literal pool's
+                     ;; :rodata-address-target-mismatch -- is GONE, along with
+                     ;; the three rows that reached it. It said the AArch64
+                     ;; translation was unmodelled, and it was right until it
+                     ;; was measured.
                      :else :x86-privileged-target-mismatch)]
       (is (some? thrown) (str body " must be rejected on AArch64"))
       (is (= :mir (:phase (ex-data thrown))))
@@ -471,18 +463,115 @@
                                        (first (second %)))
                             x86-only)))
         "SCANNED simd rows")
-    ;; boot-lit: three literal heads. The COUNT is asserted rather than the
-    ;; presence, so dropping two of them is a red test.
-    (is (= 3 (count (filter #(contains? '#{ucs2 guid bytes-literal}
+    ;; boot-lit: ZERO literal heads, asserted rather than left implicit. The
+    ;; count used to be three and the assertion said dropping two of them
+    ;; should be red; now the assertion says putting one BACK should be red,
+    ;; because a row here claims a refusal that no longer exists and would
+    ;; fail for a reason no branch above names.
+    (is (= 0 (count (filter #(contains? '#{ucs2 guid bytes-literal}
                                         (first (second %)))
                             x86-only)))
         "SCANNED rodata rows")
-    (is (< 1 (count (remove #(contains? '#{ucs2 guid bytes-literal
-                                          kernel-dequant-dot-q4-k
+    (is (< 1 (count (remove #(contains? '#{kernel-dequant-dot-q4-k
                                           kernel-dequant-dot-q6-k}
                                         (first (second %)))
                             x86-only)))
         "SCANNED privileged rows")))
+;; ---------------------------------------------------------------------------
+;; boot-lit/adr: the AArch64 arm of the literal pool
+;; ---------------------------------------------------------------------------
+
+(defn- program-words
+  "An emitted program as 32-bit little-endian words, the unit an AArch64
+  reader thinks in. Unlike `a64-dot-words` this one takes the program, because
+  three literal heads are pinned here and each needs its own."
+  [params body]
+  (let [code (vec (:code (arm/emit-program (program params body))))]
+    (mapv (fn [i] (bit-or (nth code i)
+                          (bit-shift-left (nth code (+ i 1)) 8)
+                          (bit-shift-left (nth code (+ i 2)) 16)
+                          (bit-shift-left (nth code (+ i 3)) 24)))
+          (range 0 (- (count code) 3) 4))))
+
+(defn- adr-word?
+  "True when WORD is `adr Xd, #imm`: bit 31 clear (ADR, not ADRP) and bits
+  28-24 exactly 10000. Spelled as a predicate rather than as an equality
+  because the displacement varies with where in the stream the instruction
+  landed, and pinning a displacement would pin the size of the prologue."
+  [word]
+  (and (zero? (bit-and word 0x80000000))
+       (= 0x10000000 (bit-and word 0x1f000000))))
+
+(defn- adr-displacement
+  "The signed 21-bit byte displacement ADR carries, decoded back out."
+  [word]
+  (let [imm (bit-or (bit-shift-left (bit-and (bit-shift-right word 5) 0x7ffff) 2)
+                    (bit-and (bit-shift-right word 29) 3))]
+    (if (>= imm 0x100000) (- imm 0x200000) imm)))
+
+(deftest a64-rodata-literals-emit-the-adr-encoding
+  ;; ⚠ THIS TEST REPLACES THREE ROWS OF `x86-only`. Deleting rows from a
+  ;; refusal list is a silently-passing change -- the list asserts the
+  ;; operation is REFUSED, so removing a row asserts nothing.
+  ;;
+  ;; The encoding was verified against `clang -arch arm64` + `otool -t` on
+  ;; 2026-09-09, five cases, and those five are re-asserted below directly so
+  ;; the arithmetic is pinned and not merely remembered. They cover a negative
+  ;; displacement and all three non-zero `immlo` values, which is the field a
+  ;; reader is most likely to get wrong: ADR's displacement is in BYTES and
+  ;; unaligned targets are legal, so the low two bits live at 30-29.
+  ;;
+  ;;   adr x0, #20   -> 0x100000a0        adr x0, #17  -> 0x30000080
+  ;;   adr x1, #16   -> 0x10000081        adr x2, #14  -> 0x50000062
+  ;;   adr x9, #12   -> 0x10000069        adr x3, #11  -> 0x70000043
+  ;;   adr x0, #-12  -> 0x10ffffa0
+  (testing "the encoder agrees with clang"
+    (let [encode @#'kotoba.native.machine-ir/a64-adr
+          word (fn [reg disp] (let [b (encode reg disp)]
+                                (bit-or (nth b 0) (bit-shift-left (nth b 1) 8)
+                                        (bit-shift-left (nth b 2) 16)
+                                        (bit-shift-left (nth b 3) 24))))]
+      (is (= 0x100000a0 (word :aarch64/x0 20)))
+      (is (= 0x10000081 (word :aarch64/x1 16)))
+      (is (= 0x10000069 (word :aarch64/x9 12)))
+      (is (= 0x10ffffa0 (word :aarch64/x0 -12)))
+      (is (= 0x30000080 (word :aarch64/x0 17)))
+      (is (= 0x50000062 (word :aarch64/x2 14)))
+      (is (= 0x70000043 (word :aarch64/x3 11)))))
+  (testing "the range guard refuses rather than truncating"
+    ;; A 21-bit field silently wraps. Wrapping produces a valid instruction
+    ;; that reaches the wrong address, which is the worst of the three
+    ;; possible outcomes -- worse than refusing and worse than crashing.
+    (let [encode @#'kotoba.native.machine-ir/a64-adr]
+      (is (thrown? clojure.lang.ExceptionInfo (encode :aarch64/x0 1048576)))
+      (is (thrown? clojure.lang.ExceptionInfo (encode :aarch64/x0 -1048577)))
+      (is (some? (encode :aarch64/x0 1048575)))
+      (is (some? (encode :aarch64/x0 -1048576)))))
+  (testing "all three literal heads reach real AArch64 code"
+    (doseq [body ['(ucs2 "AIUEOS")
+                  '(guid "5B1B31A1-9562-11D2-8E3F-00A0C969723B")
+                  '(bytes-literal "deadbeef")]]
+      (testing (str body)
+        (let [words (program-words [] body)
+              adrs (filter adr-word? words)]
+          (is (= 1 (count adrs))
+              "exactly one ADR -- one literal, one address")
+          (is (pos? (adr-displacement (first adrs)))
+              (str "the pool follows the code, so the displacement is "
+                   "forwards; a negative one means the layout pass put the "
+                   "pool somewhere this test does not know about")))))))
+
+(deftest a64-two-literals-take-two-pool-entries-and-two-addresses
+  ;; The pool is keyed on [encoding content], so the same string under two
+  ;; encodings is two entries. This is the AArch64 side of a property the x86
+  ;; arm already has, and it is what would break first if the layout pass
+  ;; started sharing entries across encodings.
+  (let [words (program-words [] '(+ (ucs2 "AB") (bytes-literal "4142")))
+        adrs (filter adr-word? words)]
+    (is (= 2 (count adrs)))
+    (is (apply not= (map adr-displacement adrs))
+        "two entries, so two different displacements")))
+
 ;; ---------------------------------------------------------------------------
 ;; simd: the AArch64 arm of the f32 dot product
 ;; ---------------------------------------------------------------------------

@@ -102,7 +102,17 @@
          ;; `a64-dequant-formats` -- both refusals exist and are asserted, and
          ;; that is deliberate: one is a target decision and the other is an
          ;; encoder's admission that it has no bytes.
-         :git/sha "b70a567a9a2e8ba20e6dbb6257ed0eddd9d0c8d5"}
+         ;;
+         ;; Advanced 2026-09-09, b70a567a -> 4a049cc9 (kotoba-mir main, ahead
+         ;; 1, forward only). `select-target` no longer refuses
+         ;; `:gmir/rodata-address` on AArch64 -- the refusal is deleted rather
+         ;; than narrowed, since `targets` holds exactly two.
+         ;;
+         ;; REQUIRED WITH THIS COMMIT, not optional. `a64-rodata-literals-
+         ;; emit-the-adr-encoding` compiles a literal for AArch64, so against
+         ;; the older pin it errors out in `kotoba.mir` before this backend's
+         ;; new arm is ever reached.
+         :git/sha "4a049cc9404aab554aed429aefcc994cecbc3ae2"}
         io.github.kotoba-lang/kotoba-codegen
         {:git/url "https://github.com/kotoba-lang/kotoba-codegen.git"
          :git/sha "8f2726c7621930ea3c53957e8a510f57d2a35f58"}
