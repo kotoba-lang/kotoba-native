@@ -65,10 +65,18 @@ are the ones that booted (amu ADR-0291), so it was left alone.
 
 ## Consequences
 
-- The literals are x86-only and `kotoba.mir` says so with its own keyword,
-  `:rodata-address-target-mismatch`. `isa-parity` now pins THREE refusal
-  reasons rather than two, and asserts the row count for each so a branch
-  cannot go dead.
+- ~~The literals are x86-only and `kotoba.mir` says so with its own keyword,
+  `:rodata-address-target-mismatch`.~~ **Superseded 2026-09-09.** They emit on
+  both ISAs. The refusal claimed the blocker was ADRP+ADD's 4 KiB page split;
+  the blocker was the wrong instruction. `adr Xd, label` reaches ±1 MiB in one
+  instruction with no page arithmetic, and the pool this ADR places sits at the
+  end of the same emitted buffer as the code — so the distance is bounded by
+  the size of one program, which is the fact a *linker* cannot know and this
+  backend can. `a64-adr` refuses with `:rodata-literal-out-of-range` rather
+  than truncating if a program ever exceeds it. The refusal keyword is gone
+  rather than narrowed (`targets` holds exactly two), and `isa-parity` is back
+  to TWO refusal reasons, with `a64-rodata-literals-emit-the-adr-encoding`
+  replacing the three rows that left `x86-only`.
 - `bytes-literal-length` never reaches the pool: it lowers to a
   `:gmir/constant`, derived from the same text the address is derived from.
 - The non-word-typed fallback emitter does not implement the literal heads,
