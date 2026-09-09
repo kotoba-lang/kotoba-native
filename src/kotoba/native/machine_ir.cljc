@@ -7292,6 +7292,24 @@
                         (unsigned-bit-shift-right displacement 16)
                         (unsigned-bit-shift-right displacement 24)])))
 
+(defn- a64-adr-code
+  "The four bytes, given the destination's register CODE rather than its
+  keyword. Split out for the same reason `x86-lea-rip-code` is: the layout
+  table's operands are codes (kotoba-codegen ADR-0011), and the two callers
+  must not grow two encodings of one instruction.
+
+  ⚠ THE RANGE IS NOT CHECKED HERE. `resolve-tokens` checks it for the layout
+  caller against `:aarch64/adr-label`'s own row, and `a64-adr` checks it for
+  the pool caller; a third check would be a third place to disagree. What
+  matters is that NEITHER path can truncate silently."
+  [code displacement]
+  (let [immlo (bit-and displacement 3)
+        immhi (bit-and (bit-shift-right displacement 2) 0x7ffff)]
+    (u32le (bit-or 0x10000000
+                   (bit-shift-left immlo 29)
+                   (bit-shift-left immhi 5)
+                   code))))
+
 (defn- x86-lea-rip-code
   "The seven bytes, given the destination's register CODE. Split out from
   `x86-lea-rip` because the layout table's operands are codes, not register
@@ -7316,6 +7334,13 @@
     ;; label rather than a literal pool offset. Same seven bytes and the same
     ;; ModRM as the pool's `lea`, which is why they share `x86-lea-rip-code`.
     :x86-64/lea-rip-label (x86-lea-rip-code (first operands) displacement)
+    ;; boot-scratch/adr: the AArch64 arm of the line above, and it is one
+    ;; instruction. The register arrives as a CODE rather than a keyword --
+    ;; the layout table's operands are codes (kotoba-codegen ADR-0011) -- so
+    ;; this cannot call `a64-adr`, which takes a keyword. The word is built
+    ;; the same way and `a64-adr-code` is what both go through, so the two
+    ;; callers cannot grow two encodings of one instruction.
+    :aarch64/adr-label (a64-adr-code (first operands) displacement)
     :aarch64/cbz-imm19
     (u32le (bit-or 0xb4000000
                    (bit-shift-left (bit-and (quot displacement 4) 0x7ffff) 5)
@@ -7407,13 +7432,7 @@
     (reject! :mc-encode :rodata-literal-out-of-range
              {:register dst :displacement displacement
               :limit "adr reaches +/-1 MiB"}))
-  (let [imm (bit-and displacement 0x1fffff)
-        immlo (bit-and imm 3)
-        immhi (bit-and (bit-shift-right displacement 2) 0x7ffff)]
-    (u32le (bit-or 0x10000000
-                   (bit-shift-left immlo 29)
-                   (bit-shift-left immhi 5)
-                   (a64-register dst)))))
+  (a64-adr-code (a64-register dst) displacement))
 
 (defn- align-to [value alignment]
   (* alignment (quot (+ value (dec alignment)) alignment)))
@@ -8425,12 +8444,21 @@
               ;; this is the floor under it.
               (let [callee (:mir/function instruction)
                     label (get callee-labels callee)
-                    code (get x86-register-code (:mir/dst instruction))]
+                    code (if (= :x86-64 isa)
+                           (get x86-register-code (:mir/dst instruction))
+                           (a64-register (:mir/dst instruction)))]
                 (when-not label
                   (reject! :mc-encode :unknown-function-address-target instruction))
                 (when-not (some? code)
                   (reject! :mc-encode :unsupported-register instruction))
-                [(layout/relative-branch :x86-64/lea-rip-label label [code])])
+                ;; boot-scratch/adr: seven bytes measured from the end on
+                ;; x86-64, four measured from the instruction itself on
+                ;; AArch64. Both resolve against the SAME label table a call
+                ;; resolves against, which is why this lives here rather than
+                ;; in `encode-selected`.
+                [(layout/relative-branch
+                  (if (= :x86-64 isa) :x86-64/lea-rip-label :aarch64/adr-label)
+                  label [code])])
             (if (contains? #{"call" "tail-call"}
                          (name (:mc/encoding instruction)))
               (let [callee (:mir/callee instruction)

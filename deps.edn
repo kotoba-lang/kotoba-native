@@ -112,10 +112,28 @@
          ;; emit-the-adr-encoding` compiles a literal for AArch64, so against
          ;; the older pin it errors out in `kotoba.mir` before this backend's
          ;; new arm is ever reached.
-         :git/sha "4a049cc9404aab554aed429aefcc994cecbc3ae2"}
+         ;;
+         ;; Advanced again 2026-09-09 to the AArch64 function-address
+         ;; selection. The refusal it removes said a function's address is
+         ;; x86-only "for exactly the reason the literal is" -- and the
+         ;; literal's reason had stopped holding a few hours earlier.
+         :git/sha "1a1c4358dc52c1c293f04c1bb21e7b1dfc5bd5da"}
         io.github.kotoba-lang/kotoba-codegen
         {:git/url "https://github.com/kotoba-lang/kotoba-codegen.git"
-         :git/sha "8f2726c7621930ea3c53957e8a510f57d2a35f58"}
+         ;;
+         ;; Advanced 2026-09-09 to 3e6c815a, which adds `:aarch64/adr-label`'s
+         ;; FIVE layout rows -- size, range, pc-bias, alignment and operand
+         ;; shape. The first commit added three and the two it missed
+         ;; announced themselves in opposite ways: the operand row as an
+         ;; immediate refusal naming the token, the alignment row as
+         ;; `(mod displacement nil)` four frames below the caller. An absent
+         ;; row in a lookup table does not refuse; it returns nil. Required WITH this repository's encoder: the
+         ;; size, pc-bias and range live there, and two of the three differ
+         ;; from the x86 row in ways that would be silent -- pc-bias 0 rather
+         ;; than 7 (ADR measures from the instruction itself), and a maximum
+         ;; of 0xfffff rather than a branch's 0xffffc (ADR's displacement is
+         ;; in BYTES).
+         :git/sha "3e6c815a83e0c9b92c8b05d3f2eb3a1ed80c6f92"}
         io.github.kotoba-lang/kotoba-object
         {:git/url "https://github.com/kotoba-lang/kotoba-object.git"
          :git/sha "9b53a444cfe5550af6b76eef494b4190b5e4e461"}
