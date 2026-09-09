@@ -9,6 +9,7 @@
                :cljs [cljs.test :refer [deftest is testing] :include-macros true])
             [kotoba.native.image-scratch :as image-scratch]
             [kotoba.native.machine-ir]
+            [kotoba.native.aarch64 :as arm]
             [kotoba.native.x86-64 :as x86]))
 
 (defn- module [functions]
@@ -18,6 +19,37 @@
 (defn- code [functions]
   (vec (map #(bit-and (long %) 0xff)
             (:code (x86/emit-program (module functions))))))
+
+(defn- a64-words
+  "The AArch64 stream as 32-bit little-endian words."
+  [functions]
+  (let [bytes (vec (map #(bit-and (long %) 0xff)
+                        (:code (arm/emit-program (module functions)))))]
+    (mapv (fn [i] (bit-or (nth bytes i)
+                          (bit-shift-left (nth bytes (+ i 1)) 8)
+                          (bit-shift-left (nth bytes (+ i 2)) 16)
+                          (bit-shift-left (nth bytes (+ i 3)) 24)))
+          (range 0 (- (count bytes) 3) 4))))
+
+(defn- a64-adr-indexes
+  "Word indexes of every `adr Xd, #imm`: bit 31 clear (ADR, not ADRP) and
+  bits 28-24 exactly 10000."
+  [words]
+  (filterv #(let [w (nth words %)]
+              (and (zero? (bit-and w 0x80000000))
+                   (= 0x10000000 (bit-and w 0x1f000000))))
+           (range (count words))))
+
+(defn- a64-adr-target
+  "The byte offset the ADR at word INDEX names. ADR measures from the address
+  of the instruction itself, so the base is the word index times four -- not
+  the following instruction, which is where the x86 arm's seven comes from."
+  [words index]
+  (let [w (nth words index)
+        imm (bit-or (bit-shift-left (bit-and (bit-shift-right w 5) 0x7ffff) 2)
+                    (bit-and (bit-shift-right w 29) 3))
+        signed (if (>= imm 0x100000) (- imm 0x200000) imm)]
+    (+ (* 4 index) signed)))
 
 (defn- index-of-bytes [haystack needle]
   (let [n (count needle)]
@@ -104,6 +136,46 @@
                                (assoc (module two-functions)
                                       :exports ['main 'target])))]
         (is (= (:offset (get exports 'target)) (lea-target bytes lea)))))))
+
+(deftest a-function-address-is-an-adr-at-that-functions-label-on-aarch64
+  ;; ⚠ THE AARCH64 ARM OF THE TEST ABOVE, and it replaces a refusal rather
+  ;; than adding a case: `kotoba.mir` used to answer
+  ;; `:function-address-target-mismatch` here, saying a function's address is
+  ;; x86-only "for exactly the reason the literal is". The literal's reason
+  ;; stopped holding hours earlier -- `adr` reaches +/-1 MiB in one
+  ;; instruction -- and a function's label is in the same emitted buffer as
+  ;; the code exactly as the pool is.
+  ;;
+  ;; The target offset is read out of the module's own EXPORT TABLE rather
+  ;; than compared against a golden number, so this stays true when the entry
+  ;; prologue changes -- the same discipline as the x86 arm.
+  (let [words (a64-words two-functions)
+        adrs (a64-adr-indexes words)]
+    (is (= 1 (count adrs)) "exactly one ADR, so it is unambiguous")
+    (let [exports (:exports (arm/emit-program
+                             (assoc (module two-functions)
+                                    :exports ['main 'target])))]
+      (is (= (:offset (get exports 'target))
+             (a64-adr-target words (first adrs)))))))
+
+(deftest the-two-isas-name-the-same-function-entry
+  ;; Not a parity claim about BYTES -- the two encodings differ in width and
+  ;; in what they measure from. It is a claim about the ANSWER: whatever each
+  ;; instruction computes at run time, it is the offset its own module's
+  ;; export table gives `target`. A backend that resolved against a different
+  ;; table would still emit a plausible instruction.
+  (let [x86-exports (:exports (x86/emit-program
+                               (assoc (module two-functions)
+                                      :exports ['main 'target])))
+        a64-exports (:exports (arm/emit-program
+                               (assoc (module two-functions)
+                                      :exports ['main 'target])))
+        bytes (code two-functions)
+        words (a64-words two-functions)]
+    (is (= (:offset (get x86-exports 'target))
+           (lea-target bytes (first (rip-lea-indexes bytes)))))
+    (is (= (:offset (get a64-exports 'target))
+           (a64-adr-target words (first (a64-adr-indexes words)))))))
 
 (deftest the-address-and-a-call-resolve-against-the-same-table
   ;; A program that both CALLS `target` and takes its address must name one
