@@ -72,7 +72,17 @@
          ;; this pin the operation is selected here and rejected there. The
          ;; fused dequantize-and-dot family is still refused, for a reason
          ;; that is now narrower and is stated at the refusal.
-         :git/sha "55d78851e7548236f37e99c8c99d5e42e6336853"}
+         ;;
+         ;; Advanced 2026-09-09, 55d78851 -> b70a567a (kotoba-mir main, ahead
+         ;; 2, forward only). `select-target` now admits
+         ;; `:gmir/kernel-dequant-dot-q8-0` on AArch64 as well, which is what
+         ;; `a64-kernel-dequant-dot` here is the arm for. The refusal is
+         ;; spelled by subtraction upstream, so the six formats this backend
+         ;; still has no arms for are refused BEFORE selection rather than at
+         ;; `a64-dequant-formats` -- both refusals exist and are asserted, and
+         ;; that is deliberate: one is a target decision and the other is an
+         ;; encoder's admission that it has no bytes.
+         :git/sha "b70a567a9a2e8ba20e6dbb6257ed0eddd9d0c8d5"}
         io.github.kotoba-lang/kotoba-codegen
         {:git/url "https://github.com/kotoba-lang/kotoba-codegen.git"
          :git/sha "8f2726c7621930ea3c53957e8a510f57d2a35f58"}

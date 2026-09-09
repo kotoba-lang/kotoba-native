@@ -354,21 +354,23 @@
    ;; below is what replaces it: removing a row from a refusal list is
    ;; otherwise a silently-passing deletion.
    ;;
-   ;; dequant: the fused family IS still in this table, and its reason is now
-   ;; NARROWER than the one above. It is no longer the tree -- the tree has an
-   ;; AArch64 spelling. It is that each format's per-block decode (an fp16
-   ;; scale, a nibble split, a six-bit regroup) has no second arm yet, which
-   ;; is a gap and not a difference between the machines. All three formats
-   ;; are listed rather than one standing for the family, so dropping a format
-   ;; from `kotoba.mir`'s refusal is a red test.
+   ;; dequant: THE ROW HERE IS NOW Q4_K, NOT Q8_0. Q8_0 followed the f32 dot
+   ;; product out of this table on the same day (2026-09-09): its per-block
+   ;; decode is one fp16 scale and eight sign-extended bytes per group, which
+   ;; transliterates from the x86 scalar arm directly, and
+   ;; `a64-dequant-q8-0-emits-the-x86-scalar-arm` below is the positive
+   ;; assertion that replaces it.
    ;;
-   ;; Only Q8_0 is listed, because this table's other assertion is that x86-64
-   ;; EMITS every row in it. The two K-quants are refused on AArch64 for the
-   ;; same reason and are refused on x86-64 as well, for a different one
-   ;; (`:dequant-format-not-emitted`); both refusals are pinned in
-   ;; `kotoba.native.dequant-fusion-test`, which is where the asymmetry
-   ;; belongs.
-   [['w 'wl 'x 'xl 'n] '(kernel-dequant-dot-q8-0 w wl x xl n)]
+   ;; Q4_K is the right successor rather than a placeholder, because this
+   ;; table asserts TWO things about every row -- x86-64 emits it, AArch64
+   ;; refuses it -- and Q4_K satisfies both. Its reason is a gap and is named
+   ;; as one: a Q4_K block's (scale, min) pair and its nibble half change on
+   ;; different periods, so the thirty-two groups are unrolled with per-group
+   ;; geometry rather than looped, and none of that is written for AArch64.
+   ;; Q6_K is the same and is refused for the same reason; the two K-quants'
+   ;; x86 refusals are a DIFFERENT keyword and belong in
+   ;; `kotoba.native.dequant-fusion-test`.
+   [['w 'wl 'x 'xl 'n] '(kernel-dequant-dot-q4-k w wl x xl n)]
    ;; boot-lit: the two wider firmware calls and the three literal address
    ;; heads. The calls are x86-only for the reason kernel-uefi-call2 is -- the
    ;; Microsoft x64 calling convention is not a thing AArch64 has.
@@ -444,8 +446,7 @@
                      ;; simd: `kernel-dot-f32` is NOT in this set any more --
                      ;; it emits on AArch64. The keyword and the branch stay,
                      ;; because the fused family still reaches them.
-                     (contains? '#{kernel-dequant-dot-q8-0
-                                   kernel-dequant-dot-q4-k
+                     (contains? '#{kernel-dequant-dot-q4-k
                                    kernel-dequant-dot-q6-k}
                                 (first body))
                      :x86-simd-target-mismatch
@@ -466,7 +467,7 @@
     ;; simd: ONE row, not two -- `kernel-dot-f32` left this table. The count
     ;; is asserted rather than the presence so that losing the remaining row
     ;; is red rather than quiet.
-    (is (= 1 (count (filter #(contains? '#{kernel-dequant-dot-q8-0}
+    (is (= 1 (count (filter #(contains? '#{kernel-dequant-dot-q4-k}
                                        (first (second %)))
                             x86-only)))
         "SCANNED simd rows")
@@ -477,7 +478,6 @@
                             x86-only)))
         "SCANNED rodata rows")
     (is (< 1 (count (remove #(contains? '#{ucs2 guid bytes-literal
-                                          kernel-dequant-dot-q8-0
                                           kernel-dequant-dot-q4-k
                                           kernel-dequant-dot-q6-k}
                                         (first (second %)))
@@ -576,6 +576,137 @@
       (is (= 0x93407c00 (bit-and (nth words 74) 0xfffffc00))))
     (testing "an out-of-bounds request traps rather than reading"
       (is (some #(= 0xd4200000 %) words) "SCANNED the BRK"))))
+(def ^:private a64-q8-words
+  (delay
+    (let [code (vec (:code (arm/emit-program
+                            (program '[w wl x xl n]
+                                     '(kernel-dequant-dot-q8-0 w wl x xl n)))))]
+      (mapv (fn [i] (bit-or (nth code i)
+                            (bit-shift-left (nth code (+ i 1)) 8)
+                            (bit-shift-left (nth code (+ i 2)) 16)
+                            (bit-shift-left (nth code (+ i 3)) 24)))
+            (range 0 (count code) 4)))))
+
+(deftest a64-dequant-q8-0-emits-the-x86-scalar-arm
+  ;; Replaces the `x86-only` row Q8_0 used to occupy. The fused family folds a
+  ;; QUANTIZED weight row against f32 activations without materialising the
+  ;; dequantized row in memory -- which is the whole reason it exists, since
+  ;; 490 of the Qwen3.5 model's 866 tensors are Q8_0, Q4_K or Q6_K.
+  ;;
+  ;; ⚠ Same caveat as `a64-dot-f32-emits-the-x86-scalar-tree`: this namespace
+  ;; can say these are the words intended and cannot say they compute the
+  ;; right number. That was measured outside the repository on 2026-09-09 by
+  ;; the same route (emit, `.byte` under a label, `clang -c -target
+  ;; arm64-apple-macos`, call as a five-argument C function). Seven fixtures
+  ;; and three controls:
+  ;;
+  ;;   tree            d=1, codes 1, a=[2^24, 1 x 31]  -> 0x4B80000C
+  ;;                   (four lanes; lane0 = 2^24, the others 8 each,
+  ;;                    (2^24+8)+(8+8) = 2^24+24). One accumulator left to
+  ;;                    right answers 0x4B800000, and the control confirmed it.
+  ;;   negative codes  code = -1                        -> -32.0f
+  ;;                   The control replaced LDRSB with LDRB and got 8160,
+  ;;                   which is 255 x 32 -- exactly "read as unsigned".
+  ;;   fp16 normal     d = 0.5, codes 1..32             -> 264.0f
+  ;;   fp16 subnormal  d = 0x0001 = 2^-24               -> 32 x 2^-24
+  ;;                   The case the multiply by 2^112 exists for.
+  ;;   fp16 infinity   d = 0x7C00                       -> 0x7F800000
+  ;;                   The control moved the compare off 0x7c00 and got
+  ;;                   2^21 = 32 x 2^16 -- which is the number
+  ;;                   `x86-dequant-magic`'s own docstring predicts for that
+  ;;                   mistake ("0x0F800000 scaled by 2^112 is 2^16, not an
+  ;;                   infinity").
+  ;;   fp16 negative   d = -1.0                         -> -32.0f
+  ;;   two blocks      so both strides advance twice    -> 592.0f
+  (let [words @a64-q8-words]
+    (testing "both spans are derived from the BLOCK COUNT by their own stride"
+      ;; 34 bytes carry one block of codes and 128 bytes carry its
+      ;; activations. Two different numbers, neither a power of two, each
+      ;; compared with its OWN region -- this is where the family differs from
+      ;; `kernel-dot-f32`, which scales one count by four for both.
+      (is (some #(= 34 %) (map #(bit-and (bit-shift-right % 5) 0xffff)
+                               (filter #(= 0xd2800000 (bit-and % 0xffe00000))
+                                       words)))
+          "SCANNED the 34-byte packed stride")
+      (is (some #(= 128 %) (map #(bit-and (bit-shift-right % 5) 0xffff)
+                                (filter #(= 0xd2800000 (bit-and % 0xffe00000))
+                                        words)))
+          "SCANNED the 128-byte element stride"))
+    (testing "the codes are SIGN-extended on the way into the converter"
+      ;; LDRSB Xt (0x39800000), not LDRB Wt (0x39400000). A code of -1 read as
+      ;; 255 converts to 255.0f, and the row is then wrong by a factor of -255
+      ;; wherever a weight is negative -- which is half of them.
+      (is (= 8 (count (filter #(= 0x39800000 (bit-and % 0xffc00000)) words)))
+          "SCANNED 8 LDRSB, one per element of the group")
+      (is (empty? (filter #(= 0x39400000 (bit-and % 0xffc00000)) words))
+          "SCANNED zero unsigned byte loads"))
+    (testing "SCVTF reads the whole 64-bit register"
+      ;; The x86 arm's REX.W. A 32-bit conversion of -1 answers 4294967295.0f.
+      (is (= 8 (count (filter #(= 0x9e220000 (bit-and % 0xfffffc00)) words)))
+          "SCANNED 8 SCVTF S,X"))
+    (testing "three roundings per element, never fewer"
+      ;; q*d, then *a, then +=. A fused multiply-add would remove one and
+      ;; answer a different, more accurate number.
+      ;; SEVENTEEN, not sixteen: two per element across the eight-element
+      ;; group, plus the one that scales the half-precision significand by
+      ;; 2^112. Counting sixteen here was the author's first guess and it was
+      ;; wrong, which is the argument for asserting the count rather than the
+      ;; presence.
+      (is (= 17 (count (filter #(= 0x1e200800 (bit-and % 0xffe0fc00)) words)))
+          "SCANNED 17 FMUL")
+      (is (empty? (filter #(= 0x1f000000 (bit-and % 0xff000000)) words))
+          "SCANNED zero fused multiply-adds"))
+    (testing "element e of the group goes into accumulator e mod 4"
+      (let [adds (filterv #(= 0x1e202800 (bit-and % 0xffe0fc00)) words)
+            ;; The last three are the reduction; the first eight are the group.
+            lanes (mapv #(bit-and % 0x1f) (subvec adds 0 8))]
+        (is (= [0 1 2 3 0 1 2 3] lanes) "SCANNED 8 lanes")))
+    (testing "the reduction is (s0+s1)+(s2+s3)"
+      ;; Nine from the end, because the epilogue below them is FMOV W, SXTW,
+      ;; B, BRK, MOV and RET.
+      (is (= [0x1e212800 0x1e232842 0x1e222800]
+             (subvec words (- (count words) 9) (- (count words) 6)))))
+    (testing "the half-precision scale takes the x86 EQUATION, not FCVT"
+      ;; AArch64 has `FCVT S,H` and it is exact for every finite half. It is
+      ;; still the wrong instruction: the two arms have to agree on the
+      ;; exponent-31 case, whose x86 answer is hand-written, and on NaN
+      ;; payloads. Reproducing the equation reproduces those; reproducing the
+      ;; intent would not.
+      (is (empty? (filter #(= 0x1ee24000 (bit-and % 0xfffffc00)) words))
+          "SCANNED zero FCVT S,H")
+      ;; 2^112 is 0x77800000, whose LOW sixteen bits are zero -- so
+      ;; `a64-constant` emits it as a single wide move of 0x7780 into lane 1
+      ;; and there is no low-half word to find. Looking for one was the
+      ;; author's first guess and found nothing, which would have read as "the
+      ;; magic is missing" if the assertion had been written the other way up.
+      (is (some (fn [w]
+                  (and (contains? #{0xd2800000 0xf2800000}
+                                  (bit-and w 0xff800000))
+                       (= 1 (bit-and (bit-shift-right w 21) 3))
+                       (= 0x7780 (bit-and (bit-shift-right w 5) 0xffff))))
+                words)
+          "SCANNED 2^112 as a wide move into lane 1"))
+    (testing "an out-of-bounds request traps rather than reading"
+      (is (some #(= 0xd4200000 %) words) "SCANNED the BRK"))))
+
+(deftest a64-refuses-the-formats-it-has-no-arms-for
+  ;; A `case` with a missing arm would emit a loop with an EMPTY BODY, which
+  ;; is a working instruction that answers +0.0 for every row on every machine
+  ;; while agreeing with itself. So the format table carries a row per format
+  ;; and the refusal is explicit. Six of seven are refused HERE; two of those
+  ;; (the K-quants) are emitted on x86-64, which is what makes this an
+  ;; asymmetry worth asserting rather than a shared gap.
+  (doseq [op '[kernel-dequant-dot-q4-k kernel-dequant-dot-q6-k
+               kernel-dequant-dot-iq4-xs kernel-dequant-dot-iq2-s
+               kernel-dequant-dot-iq3-xxs kernel-dequant-dot-iq3-s]]
+    (testing (str op)
+      (is (not (emits? arm/emit-program '[w wl x xl n]
+                       (list op 'w 'wl 'x 'xl 'n)))
+          (str op " reached the AArch64 backend without an arm"))))
+  (testing "and the one that IS emitted is not refused by the same table"
+    (is (emits? arm/emit-program '[w wl x xl n]
+                '(kernel-dequant-dot-q8-0 w wl x xl n)))))
+
 
 
 ;; ---------------------------------------------------------------------------

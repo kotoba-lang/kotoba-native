@@ -5556,6 +5556,240 @@
           [(layout/label done)]))))
 ;; dequant: end
 
+;; ── dequant: the AArch64 arm of the fused dequantize-and-dot ────────────────
+;;
+;; Q8_0 ONLY, and the other six formats stay refused. That is not tidiness: a
+;; `case` with a missing arm would emit a loop with an EMPTY BODY, which is a
+;; working instruction that answers +0.0 for every row on every machine while
+;; agreeing with itself. `a64-dequant-formats` is the guard, and it carries a
+;; row per format with `:emitted?` so a new format has to say `false` before it
+;; can say anything.
+;;
+;; The tree is `a64-kernel-dot-f32`'s and therefore the x86 scalar arm's: four
+;; accumulators, element e of each eight-element group into lane e mod 4, then
+;; `(s0+s1)+(s2+s3)`. There is no tail -- a Q8_0 block is thirty-two elements,
+;; four whole groups -- so the tail loop the f32 dot product needs is absent
+;; here on both ISAs.
+;;
+;; The half-precision scale is decoded by the SAME EQUATION the x86 arm uses,
+;; not by AArch64's own `FCVT S,H`. FCVT would be one instruction and would be
+;; exact for every finite half -- and it would still be the wrong choice: the
+;; two arms must agree on NaN payloads and on the inf/nan case, and the x86
+;; equation has a hand-written arm for exponent 31 whose output is
+;; `(significand << 13 & 0x007fffff) | 0x7f800000 | sign`. Reproducing the
+;; equation reproduces that too; reproducing the intent would not.
+;;
+;; NO FMADD, for the reason `a64-kernel-dot-f32` states: `q*d` then `*a` then
+;; `+=` is three roundings, and any fusion answers a different, better number.
+
+(def ^:private a64-dequant-formats
+  "Mirrors `x86-dequant-formats`, and the strides are the same numbers because
+  they are the formats' and not a backend's.
+
+  `:emitted?` is false for six of the seven. Two of those are false HERE for a
+  reason x86 does not have -- Q4_K and Q6_K are emitted there -- and the other
+  four are false on both backends because their codes index a table that has
+  to reach the machine as read-only data first."
+  {:aarch64/kernel-dequant-dot-q8-0 {:block-bytes 34 :block-elements 32
+                                     :emitted? true}
+   :aarch64/kernel-dequant-dot-q4-k {:block-bytes 144 :block-elements 256
+                                     :emitted? false}
+   :aarch64/kernel-dequant-dot-q6-k {:block-bytes 210 :block-elements 256
+                                     :emitted? false}
+   :aarch64/kernel-dequant-dot-iq4-xs {:block-bytes 136 :block-elements 256
+                                       :emitted? false}
+   :aarch64/kernel-dequant-dot-iq2-s {:block-bytes 82 :block-elements 256
+                                      :emitted? false}
+   :aarch64/kernel-dequant-dot-iq3-xxs {:block-bytes 98 :block-elements 256
+                                        :emitted? false}
+   :aarch64/kernel-dequant-dot-iq3-s {:block-bytes 110 :block-elements 256
+                                      :emitted? false}})
+
+;; MUL Xd, Xn, Xm -- MADD with XZR as the addend. The block count is already
+;; bounded by `block-limit` before either product is formed, so neither can
+;; wrap; that check is the whole reason the limit is derived from BOTH strides.
+(defn- a64-mul-rr [dst left right]
+  (u32le (bit-or 0x9b007c00 (bit-shift-left (a64-register right) 16)
+                 (bit-shift-left (a64-register left) 5)
+                 (a64-register dst))))
+
+(defn- a64-and-rr [dst left right]
+  (u32le (bit-or 0x8a000000 (bit-shift-left (a64-register right) 16)
+                 (bit-shift-left (a64-register left) 5)
+                 (a64-register dst))))
+
+(defn- a64-orr-rr [dst left right]
+  (u32le (bit-or 0xaa000000 (bit-shift-left (a64-register right) 16)
+                 (bit-shift-left (a64-register left) 5)
+                 (a64-register dst))))
+
+;; LSL Xd, Xn, #k -- UBFM Xd, Xn, #(-k mod 64), #(63-k). The alias, spelled
+;; out, because this file has no shift-by-immediate encoder and the aliasing
+;; rule is the kind of thing that is easy to get one off.
+(defn- a64-lsl-imm [dst src amount]
+  (u32le (bit-or 0xd3400000
+                 (bit-shift-left (mod (- 64 amount) 64) 16)
+                 (bit-shift-left (- 63 amount) 10)
+                 (bit-shift-left (a64-register src) 5)
+                 (a64-register dst))))
+
+(defn- a64-fmov-s-w [vd register]
+  (u32le (bit-or 0x1e270000 (bit-shift-left (a64-register register) 5) vd)))
+
+(defn- a64-fmov-w-s [register vn]
+  (u32le (bit-or 0x1e260000 (bit-shift-left vn 5) (a64-register register))))
+
+(defn- a64-dequant-fp16
+  "Two bytes at [PACKED + DISP] as a binary16, leaving the binary32 pattern in
+  x16. Clobbers x16, x17, SIGN, SIGNIFICAND and vector register WORK.
+
+  This is `x86-dequant-fp16` transliterated, and the masks are loaded into x17
+  rather than encoded as AArch64 logical immediates: 0x8000, 0x7fff, 0x7c00
+  and 0x007fffff are all encodable as bitmask immediates, but the N/immr/imms
+  derivation is exactly the sort of thing that is wrong in one of four cases,
+  and this runs once per thirty-two elements."
+  [packed disp sign significand work magic inf-nan done]
+  (vec (concat
+        (a64-ldrh-w :aarch64/x16 packed disp)
+        ;; sign, moved from bit 15 to bit 31 and kept aside
+        (a64-constant :aarch64/x17 0x8000)
+        (a64-and-rr sign :aarch64/x16 :aarch64/x17)
+        (a64-lsl-imm sign sign 16)
+        ;; the significand and exponent, shifted into binary32 position
+        (a64-constant :aarch64/x17 0x7fff)
+        (a64-and-rr significand :aarch64/x16 :aarch64/x17)
+        (a64-lsl-imm significand significand 13)
+        ;; exponent 31 is the one case the scaling by 2^112 cannot express
+        (a64-constant :aarch64/x17 0x7c00)
+        (a64-and-rr :aarch64/x16 :aarch64/x16 :aarch64/x17)
+        (a64-cmp-rr :aarch64/x16 :aarch64/x17)
+        [(layout/relative-branch :aarch64/b-eq-imm19 inf-nan)]
+        (a64-fmov-s-w work significand)
+        (a64-f32-rrr a64-fmul-s work work magic)
+        (a64-fmov-w-s :aarch64/x16 work)
+        [(layout/relative-branch :aarch64/b-imm26 done)
+         (layout/label inf-nan)]
+        (a64-constant :aarch64/x17 0x007fffff)
+        (a64-and-rr :aarch64/x16 significand :aarch64/x17)
+        (a64-constant :aarch64/x17 0x7f800000)
+        (a64-orr-rr :aarch64/x16 :aarch64/x16 :aarch64/x17)
+        [(layout/label done)]
+        (a64-orr-rr :aarch64/x16 :aarch64/x16 sign))))
+
+(defn- a64-kernel-dequant-dot
+  [encoding instruction-index
+   {:mir/keys [dst base length second-base second-length maximum] :as instruction}]
+  (let [{:keys [block-bytes block-elements emitted?]}
+        (get a64-dequant-formats encoding)
+        _ (when-not emitted?
+            (reject! :mc-encode :dequant-format-not-emitted
+                     {:encoding encoding
+                      :reason (str "this backend has no machine code for that "
+                                   "quantization format yet; the operation is "
+                                   "declared and its oracle exists")}))
+        blocks (:mir/count instruction)
+        block-limit (min (quot maximum block-bytes)
+                         (quot maximum (* 4 block-elements)))
+        element-span (* 4 block-elements)
+        groups (quot block-elements 8)
+        label (fn [suffix]
+                (memory-label instruction-index
+                              (str "a64-dq-" (name encoding) "-" suffix)))
+        trap (label "trap")
+        done (label "done")
+        ;; The five operands arrive on the call-argument tier with nothing live
+        ;; across the instruction, so all five are scratch here. `length` and
+        ;; `second-length` are dead the moment the checks finish, which is what
+        ;; makes the group counter and the fp16 temporaries free.
+        pw base
+        px second-base
+        remaining blocks
+        group length
+        sign second-length
+        work 6
+        magic 7
+        ;; One element: sign-extend the code through a 64-bit register, convert,
+        ;; scale by the block's `d`, multiply by the activation, add into lane
+        ;; `e mod 4`. The x86 scalar arm's movsx/cvtsi2ss/mulss/movss/mulss/
+        ;; addss in that order, and the REX.W is the LDRSB's `x` here for the
+        ;; same reason: a 32-bit widening of -1 converts to 4294967295.0f.
+        element
+        (fn [e]
+          (concat (a64-ldrsb-x :aarch64/x16 pw e)
+                  (a64-scvtf-s-x 4 :aarch64/x16)
+                  (a64-f32-rrr a64-fmul-s 4 4 work)
+                  (a64-f32-load 5 px (* 4 e))
+                  (a64-f32-rrr a64-fmul-s 4 4 5)
+                  (a64-f32-rrr a64-fadd-s (mod e 4) (mod e 4) 4)))
+        counted-loop
+        (fn [register body-label check-label bound body]
+          (concat [(layout/relative-branch :aarch64/b-imm26 check-label)
+                   (layout/label body-label)]
+                  body
+                  [(layout/label check-label)]
+                  (a64-cmp-imm register bound)
+                  [(layout/relative-branch :aarch64/b-hs-imm19 body-label)]))]
+    (vec (concat
+          ;; ── the checks, in the oracle's order ──────────────────────────
+          (a64-constant :aarch64/x16 maximum)
+          (a64-cmp-rr length :aarch64/x16)
+          [(layout/relative-branch :aarch64/b-hi-imm19 trap)]
+          (a64-cmp-rr second-length :aarch64/x16)
+          [(layout/relative-branch :aarch64/b-hi-imm19 trap)
+           (layout/relative-branch :aarch64/cbz-imm19 trap
+                                   [(a64-register base)])
+           (layout/relative-branch :aarch64/cbz-imm19 trap
+                                   [(a64-register second-base)])]
+          (a64-constant :aarch64/x16 block-limit)
+          (a64-cmp-rr blocks :aarch64/x16)
+          [(layout/relative-branch :aarch64/b-hi-imm19 trap)]
+          ;; Both spans, each derived from the BLOCK COUNT by its own stride
+          ;; and each compared with its own region. The two strides are
+          ;; different numbers and neither is a power of two, which is why this
+          ;; multiplies where the f32 dot product doubles twice.
+          (a64-constant :aarch64/x16 block-bytes)
+          (a64-mul-rr :aarch64/x16 blocks :aarch64/x16)
+          (a64-cmp-rr :aarch64/x16 length)
+          [(layout/relative-branch :aarch64/b-hi-imm19 trap)]
+          (a64-constant :aarch64/x16 element-span)
+          (a64-mul-rr :aarch64/x16 blocks :aarch64/x16)
+          (a64-cmp-rr :aarch64/x16 second-length)
+          [(layout/relative-branch :aarch64/b-hi-imm19 trap)]
+
+          ;; ── the one arm ───────────────────────────────────────────────
+          (a64-f32-zero 0) (a64-f32-zero 1)
+          (a64-f32-zero 2) (a64-f32-zero 3)
+          (a64-constant :aarch64/x16 x86-dequant-magic)
+          (a64-fmov-s-w magic :aarch64/x16)
+          (counted-loop
+           remaining (label "block") (label "block-check") 1
+           (concat
+            (a64-dequant-fp16 pw 0 sign group work magic
+                              (label "fp16-inf") (label "fp16-done"))
+            (a64-fmov-s-w work :aarch64/x16)
+            (a64-add-imm pw pw 2)
+            (a64-constant group groups)
+            (counted-loop
+             group (label "group") (label "group-check") 1
+             (concat (vec (mapcat element (range 8)))
+                     (a64-add-imm pw pw 8)
+                     (a64-add-imm px px 32)
+                     (a64-sub-imm group group 1)))
+            (a64-sub-imm remaining remaining 1)))
+          ;; (s0+s1) + (s2+s3)
+          (a64-f32-rrr a64-fadd-s 0 0 1)
+          (a64-f32-rrr a64-fadd-s 2 2 3)
+          (a64-f32-rrr a64-fadd-s 0 0 2)
+
+          ;; ── the answer ────────────────────────────────────────────────
+          (a64-fmov-w-s dst 0)
+          (a64-sxtw dst)
+          [(layout/relative-branch :aarch64/b-imm26 done)
+           (layout/label trap)]
+          (u32le 0xd4200000)
+          [(layout/label done)]))))
+;; dequant: end
+
 (defn- a64-kernel-bounds-check
   "AArch64's half of the shared window preamble. Same checks as the x86 side,
   in the same order, leaving x16 holding base+index. x16/x17 are the encoder
@@ -6780,6 +7014,17 @@
     :aarch64/kernel-subregion (a64-kernel-subregion instruction-index instruction)
     ;; simd: one arm, scalar, reproducing the x86 accumulation tree exactly.
     :aarch64/kernel-dot-f32 (a64-kernel-dot-f32 instruction-index instruction)
+    ;; dequant: the same tree with the codes widened on the way in. Every
+    ;; format is listed so a missing arm is a REFUSAL and not an empty loop
+    ;; body -- `a64-dequant-formats` owns which of them this backend has.
+    (:aarch64/kernel-dequant-dot-q8-0
+     :aarch64/kernel-dequant-dot-q4-k
+     :aarch64/kernel-dequant-dot-q6-k
+     :aarch64/kernel-dequant-dot-iq4-xs
+     :aarch64/kernel-dequant-dot-iq2-s
+     :aarch64/kernel-dequant-dot-iq3-xxs
+     :aarch64/kernel-dequant-dot-iq3-s)
+    (a64-kernel-dequant-dot encoding instruction-index instruction)
     (:aarch64/equal :aarch64/less-than :aarch64/greater-than
      :aarch64/less-or-equal :aarch64/greater-or-equal)
     (a64-compare (case encoding
@@ -7081,6 +7326,14 @@
                    (bit-shift-left (bit-and (quot displacement 4) 0x7ffff) 5)))
     :aarch64/b-lt-imm19
     (u32le (bit-or 0x5400000b
+                   (bit-shift-left (bit-and (quot displacement 4) 0x7ffff) 5)))
+    ;; dequant: B.EQ, cond 0000. `kotoba.mir` has admitted this encoding for a
+    ;; long time and the legacy emitter carries it; this table had never needed
+    ;; it, because nothing in production MIR branched on EQUALITY until the
+    ;; half-precision decode did -- exponent 31 is the one case the scaling by
+    ;; 2^112 cannot express, and finding it is a comparison against 0x7c00.
+    :aarch64/b-eq-imm19
+    (u32le (bit-or 0x54000000
                    (bit-shift-left (bit-and (quot displacement 4) 0x7ffff) 5)))
     :aarch64/b-imm26
     (u32le (bit-or 0x14000000 (bit-and (quot displacement 4) 0x03ffffff)))
