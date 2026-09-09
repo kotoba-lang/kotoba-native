@@ -421,8 +421,26 @@
    ;; F32, Q8_0, Q4_K and Q6_K only. The four IQ types that dominate the
    ;; shipping model (IQ3_XXS, IQ3_S, IQ4_XS, IQ2_S -- 306 of 866 tensors)
    ;; decode through codebook grids that `qwen35_quant_tables.inc` holds as
-   ;; static const data, and this dialect has no rodata and no bytes literal to
-   ;; put one in. Those types stay in the C.
+   ;; static const data.
+   ;;
+   ;; ⚠ THE REASON THEY STAYED IN THE C IS GONE. This comment said "this
+   ;; dialect has no rodata and no bytes literal to put one in. Those types
+   ;; stay in the C." Both halves stopped being true on 2026-09-09: the four
+   ;; literal heads are admitted on every `:native` target on both ISAs, and
+   ;; AArch64 reaches the pool with `adr` -- one instruction, not the ADRP+ADD
+   ;; whose page split `kotoba.mir` had named as the blocker.
+   ;;
+   ;; All four decode in Kotoba and are executed as real processes on both
+   ;; ISAs by amu's `isa-execution` fixtures, bit-exact against osaho's
+   ;; oracle, with the codebooks carried in the program's own pool and
+   ;; compared against `kotoba.kir.iq-codebook`'s vendored images by their
+   ;; FNV-1a/32 digests.
+   ;;
+   ;; ⚠ WHAT IS STILL TRUE IS THIS LIST. The kernel objects below are still
+   ;; F32, Q8_0, Q4_K and Q6_K only, because DECODING A FORMAT AND ROUTING A
+   ;; TENSOR THROUGH IT ARE DIFFERENT THINGS. The capability exists; the
+   ;; matvec here does not use it yet. Do not read the paragraph above as a
+   ;; coverage claim -- that is the next act, and it is not this one.
    ;;
    ;; THE ONE OBJECT HERE WHOSE ANSWER IS A WORD rather than a verdict. It
    ;; returns the binary32 bit pattern of the dot product, sign-extended from
