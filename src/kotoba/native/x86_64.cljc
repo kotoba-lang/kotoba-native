@@ -1771,7 +1771,7 @@
              (ascii-literal? (first args)))
         (emit-string-substring-of-ascii-literal (first args) (second args) (nth args 2) env ctx)
 
-        ;; The two string SEARCH operations. `kotoba.native.string-search`
+        ;; The three string SEARCH operations. `kotoba.native.string-search`
         ;; explains why they are a source rewrite over the four string
         ;; callbacks this backend already has rather than a fifth one at a new
         ;; context offset, and why the scan walks code points instead of
@@ -1780,6 +1780,11 @@
         ;; operations underneath, not in the search itself.
         (and (= op 'string-contains?) (= 2 (count args)))
         (emit-expr (string-search/lower-contains args) env ctx)
+
+        ;; `string-index-of` is the same scan without the 0/1 fold on top, so
+        ;; it appends no helper `string-contains?` did not already need.
+        (and (= op 'string-index-of) (= 2 (count args)))
+        (emit-expr (string-search/lower-index-of args) env ctx)
 
         (and (= op 'string-replace-all) (= 3 (count args)))
         (emit-expr (string-search/lower-replace-all args) env ctx)

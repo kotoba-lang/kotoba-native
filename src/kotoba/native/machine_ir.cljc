@@ -1245,6 +1245,8 @@
            (list 'string-concat ":" (first args))
            (and (= op 'string-contains?) (= 2 (count args)))
            (normalize-surface-operations (string-search/lower-contains args))
+           (and (= op 'string-index-of) (= 2 (count args)))
+           (normalize-surface-operations (string-search/lower-index-of args))
            (and (= op 'string-replace-all) (= 3 (count args)))
            (normalize-surface-operations (string-search/lower-replace-all args))
            (and (contains? '#{string-index-new string-index-count
