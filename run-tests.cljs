@@ -16,6 +16,7 @@
             [kotoba.native.vector-region-test]
             [kotoba.native.string-index-test]
             [kotoba.native.string-search-test]
+            [kotoba.native.macho-test]
             [kotoba.native.affine-test]
             [kotoba.native.elf64-portable-test]))
 
@@ -25,6 +26,7 @@
   (when (pos? (+ (or (:fail m) 0) (or (:error m) 0)))
     (set! (.-exitCode js/process) 1)))
 
-(t/run-tests 'kotoba.native.peephole-test 'kotoba.native.boot-scratch-test 'kotoba.native.vector-region-test 'kotoba.native.string-index-test 'kotoba.native.string-search-test
+(t/run-tests 'kotoba.native.macho-test
+             'kotoba.native.peephole-test 'kotoba.native.boot-scratch-test 'kotoba.native.vector-region-test 'kotoba.native.string-index-test 'kotoba.native.string-search-test
              'kotoba.native.affine-test
              'kotoba.native.elf64-portable-test)
