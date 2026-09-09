@@ -4761,6 +4761,196 @@
            (layout/label trap)]
           [0x0f 0x0b]
           [(layout/label done)]))))
+
+;; ── simd: the AArch64 arm of the same accumulation tree ─────────────────────
+;;
+;; ONE ARM, AND IT IS SCALAR. That is the decision (2026-09-09) and not a gap:
+;; the contract of `kernel-dot-f32` is an ORDER OF SUMMATION, not a dot
+;; product, so the only AArch64 answer that may be called the same operation is
+;; the one that reproduces the x86 arms' order exactly. NEON can hold four
+;; lanes as well as SSE can, but the cheap NEON reduction (`faddp`) computes a
+;; DIFFERENT tree, and the expensive one that computes this tree costs the
+;; lane extractions the scalar sequence does not pay. Speed was weighed against
+;; bit-identity and bit-identity won, because a provider network prices work by
+;; agreeing on the answer.
+;;
+;; So this is `x86-kernel-dot-f32`'s SCALAR arm, instruction for instruction:
+;; four accumulators, elements 0..3 of each eight-element block into lanes
+;; 0..3, then elements 4..7 into the same four lanes in the same order, then
+;; `(s0+s1)+(s2+s3)`, then the ≤7-element tail onto lane 0. AArch64 scalar
+;; single-precision FMUL and FADD are IEEE-754 round-to-nearest-even on exactly
+;; the operands SSE's `mulss`/`addss` are, so the two agree by construction.
+;;
+;; NO FMADD. `FMADD S,S,S,S` rounds once where FMUL+FADD round twice, which is
+;; a MORE accurate answer and therefore the wrong one. Nothing in this sequence
+;; may be peephole-fused into it -- the two words are emitted here as bytes and
+;; never pass the MIR peephole, which is why the hazard is stated rather than
+;; guarded.
+;;
+;; NO FEATURE GUARD, because there is nothing to guard: FMUL/FADD/SCVTF/LDR-S
+;; are AArch64 base, present on every implementation of the architecture. The
+;; x86 side needs `cpuid` to choose between two arms; one arm needs no choice.
+;;
+;; CLOBBER DISCIPLINE. `kotoba.mir` hands this operation the call-argument tier
+;; (x0..x4) with nothing live across it, so those five and the encoder scratch
+;; pair x16/x17 are all this sequence writes. x7 is the context register and is
+;; untouched. V0..V5 are scratch: no allocator in this repository allocates a
+;; vector register, and `a64-simd-park-spills` parks into d16+ only.
+
+(defn- a64-add-rr [dst left right]
+  (u32le (bit-or 0x8b000000 (bit-shift-left (a64-register right) 16)
+                 (bit-shift-left (a64-register left) 5)
+                 (a64-register dst))))
+
+(defn- a64-add-imm [dst src amount]
+  (u32le (bit-or 0x91000000 (bit-shift-left amount 10)
+                 (bit-shift-left (a64-register src) 5)
+                 (a64-register dst))))
+
+(defn- a64-sub-imm [dst src amount]
+  (u32le (bit-or 0xd1000000 (bit-shift-left amount 10)
+                 (bit-shift-left (a64-register src) 5)
+                 (a64-register dst))))
+
+;; CMP Xn, #imm12 -- SUBS XZR, Xn, #imm.
+(defn- a64-cmp-imm [register amount]
+  (u32le (bit-or 0xf100001f (bit-shift-left amount 10)
+                 (bit-shift-left (a64-register register) 5))))
+
+;; CMP Xn, Xm -- SUBS XZR, Xn, Xm. `b.hi` after it is "n above m", unsigned,
+;; which is what `ja` is after the x86 `cmp`.
+(defn- a64-cmp-rr [left right]
+  (u32le (bit-or 0xeb00001f (bit-shift-left (a64-register right) 16)
+                 (bit-shift-left (a64-register left) 5))))
+
+;; LDR St, [Xn, #disp] -- the unsigned-offset form, so DISP is a byte offset
+;; and a multiple of four. Every use here is a block offset of 0..28.
+(defn- a64-f32-load [vt base disp]
+  (u32le (bit-or 0xbd400000 (bit-shift-left (quot disp 4) 10)
+                 (bit-shift-left (a64-register base) 5) vt)))
+
+;; The three-register scalar-single words, derived the way this file's other
+;; f32 encoders are: FADD is `0001 1110 ftype=00 1 Rm 001010 Rn Rd` and FMUL is
+;; the same with opcode 000010. Both bases were checked against the existing
+;; fixed-register words -- `(bit-or a64-fadd-s (bit-shift-left 1 16))` is
+;; 0x1E212800, which is exactly the `:aarch64/f32-add` word above.
+(def ^:private a64-fadd-s 0x1e202800)
+(def ^:private a64-fmul-s 0x1e200800)
+
+(defn- a64-f32-rrr [base d n m]
+  (u32le (bit-or base (bit-shift-left m 16) (bit-shift-left n 5) d)))
+
+;; FMOV St, WZR -- +0.0, and the pattern rather than an arithmetic identity, so
+;; the accumulator starts at positive zero and nowhere else.
+(defn- a64-f32-zero [vt]
+  (u32le (bit-or 0x1e270000 (bit-shift-left 31 5) vt)))
+
+;; SCVTF Sd, Xn -- the whole 64-bit register, as the x86 arm's REX.W
+;; `cvtsi2ss` reads it. A 32-bit conversion of -1 would answer 4294967295.0f.
+(defn- a64-scvtf-s-x [vd register]
+  (u32le (bit-or 0x9e220000 (bit-shift-left (a64-register register) 5) vd)))
+
+;; LDRSB Xt, [Xn, #disp] -- sign-extending byte load into the 64-bit register,
+;; which is the missing half of the pair above: SCVTF has to see -1 and not
+;; 255. `10 111 0 01 10 imm12 Rn Rt`.
+(defn- a64-ldrsb-x [dst base disp]
+  (u32le (bit-or 0x39800000 (bit-shift-left disp 10)
+                 (bit-shift-left (a64-register base) 5)
+                 (a64-register dst))))
+
+;; LDRH Wt, [Xn, #disp] -- zero-extending halfword, for the fp16 scale.
+(defn- a64-ldrh-w [dst base disp]
+  (u32le (bit-or 0x79400000 (bit-shift-left (quot disp 2) 10)
+                 (bit-shift-left (a64-register base) 5)
+                 (a64-register dst))))
+
+(defn- a64-kernel-dot-f32
+  [instruction-index
+   {:mir/keys [dst base length second-base second-length maximum] :as instruction}]
+  (let [elements (:mir/count instruction)
+        element-limit (quot maximum 4)
+        label (fn [suffix] (memory-label instruction-index (str "a64-dot-" suffix)))
+        trap (label "trap")
+        done (label "done")
+        pa base
+        pb second-base
+        remaining elements
+        ;; One element: load both, multiply, add into the lane it belongs to.
+        ;; The x86 scalar arm's `movss/movss/mulss/addss`, word for word.
+        step (fn [disp lane]
+               (concat (a64-f32-load 4 pa disp)
+                       (a64-f32-load 5 pb disp)
+                       (a64-f32-rrr a64-fmul-s 4 4 5)
+                       (a64-f32-rrr a64-fadd-s lane lane 4)))
+        ;; `b check; body: ...; check: cmp reg,#k; b.hs body` -- bottom-tested,
+        ;; the shape the x86 side uses and for the same reason: the layout pass
+        ;; has the "at or above" branch and not its complement.
+        counted-loop
+        (fn [body-label check-label bound body]
+          (concat [(layout/relative-branch :aarch64/b-imm26 check-label)
+                   (layout/label body-label)]
+                  body
+                  [(layout/label check-label)]
+                  (a64-cmp-imm remaining bound)
+                  [(layout/relative-branch :aarch64/b-hs-imm19 body-label)]))]
+    (vec (concat
+          ;; ── the checks, in the oracle's order ──────────────────────────
+          (a64-constant :aarch64/x16 maximum)
+          (a64-cmp-rr length :aarch64/x16)
+          [(layout/relative-branch :aarch64/b-hi-imm19 trap)]
+          (a64-cmp-rr second-length :aarch64/x16)
+          [(layout/relative-branch :aarch64/b-hi-imm19 trap)
+           (layout/relative-branch :aarch64/cbz-imm19 trap
+                                   [(a64-register base)])
+           (layout/relative-branch :aarch64/cbz-imm19 trap
+                                   [(a64-register second-base)])]
+          (a64-constant :aarch64/x16 element-limit)
+          (a64-cmp-rr elements :aarch64/x16)
+          [(layout/relative-branch :aarch64/b-hi-imm19 trap)]
+          ;; span = count * 4, as two doublings -- the count is already bounded
+          ;; by the line above, so neither can wrap.
+          (a64-mov :aarch64/x16 elements)
+          (a64-add-rr :aarch64/x16 :aarch64/x16 :aarch64/x16)
+          (a64-add-rr :aarch64/x16 :aarch64/x16 :aarch64/x16)
+          (a64-cmp-rr :aarch64/x16 length)
+          [(layout/relative-branch :aarch64/b-hi-imm19 trap)]
+          (a64-cmp-rr :aarch64/x16 second-length)
+          [(layout/relative-branch :aarch64/b-hi-imm19 trap)]
+
+          ;; ── the one arm ───────────────────────────────────────────────
+          (a64-f32-zero 0) (a64-f32-zero 1)
+          (a64-f32-zero 2) (a64-f32-zero 3)
+          (counted-loop
+           (label "block") (label "block-check") 8
+           (concat
+            ;; lower half, elements 0..3 into lanes 0..3
+            (step 0 0) (step 4 1) (step 8 2) (step 12 3)
+            ;; upper half, the same four lanes in the same order
+            (step 16 0) (step 20 1) (step 24 2) (step 28 3)
+            (a64-add-imm pa pa 32)
+            (a64-add-imm pb pb 32)
+            (a64-sub-imm remaining remaining 8)))
+          ;; (s0+s1) + (s2+s3), the tree the x86 arm's two `vhaddps` compute.
+          (a64-f32-rrr a64-fadd-s 0 0 1)
+          (a64-f32-rrr a64-fadd-s 2 2 3)
+          (a64-f32-rrr a64-fadd-s 0 0 2)
+          (counted-loop
+           (label "tail") (label "tail-check") 1
+           (concat (step 0 0)
+                   (a64-add-imm pa pa 4)
+                   (a64-add-imm pb pb 4)
+                   (a64-sub-imm remaining remaining 1)))
+
+          ;; ── the answer ────────────────────────────────────────────────
+          ;; FMOV W writes 32 bits and zeroes the upper half; the canonical f32
+          ;; word is sign-extended from bit 31, so SXTW re-establishes it. The
+          ;; x86 arm's `movd`+`movsxd`, for the same reason.
+          (a64-fmov-w-s0 dst)
+          (a64-sxtw dst)
+          [(layout/relative-branch :aarch64/b-imm26 done)
+           (layout/label trap)]
+          (u32le 0xd4200000)
+          [(layout/label done)]))))
 ;; simd: end
 
 ;; ── dequant: the fused dequantize-and-dot family ────────────────────────────
@@ -6381,6 +6571,254 @@
        :x86-64/r10)
       (reject! :mc-encode :unknown-x86-privileged-action instruction))))
 
+(defn- encode-selected-a64
+  "The AArch64 half of the selection.
+
+  Split out of `encode-selected` on 2026-09-09 because the combined `case`
+  exceeded the JVM's 64 KiB method limit -- one more arm and the namespace
+  stopped compiling with `Method code too large!`. The seam is the ISA, which
+  is the only place a `case` over `:<isa>/<op>` keywords can be cut without
+  splitting a family: `encode-selected` answers every `:x86-64/` encoding and
+  hands everything else here, and this one owns the refusal so an unknown
+  encoding still reports `:unknown-encoding` with its ISA attached.
+
+  The limit is a real ceiling and it will be reached again: the x86 half is
+  now the larger of the two. When it is, cut it the same way -- by family,
+  not by count -- and say in the new function what its boundary is."
+  [isa frame-bytes return-suffix instruction-index load-a64-multiplier?
+   {:mc/keys [encoding] :as instruction}]
+  (case encoding
+    :aarch64/argument
+    (let [dst (:mir/dst instruction)
+          index (:mir/index instruction)
+          src (keyword "aarch64" (str "x" index))]
+      (when-not (<= 0 index 4) (reject! :mc-encode :argument-index-unsupported instruction))
+      (if (= dst src) [] (a64-mov dst src)))
+    :aarch64/constant (a64-constant (:mir/dst instruction) (:mir/value instruction))
+    :aarch64/data-address
+    [{:native/data-content (:mir/content instruction)
+      :native/data-dst (:mir/dst instruction) :native/data-target :aarch64}]
+    :aarch64/add
+    (if-let [immediate (:native/a64-immediate instruction)]
+      (u32le (bit-or (if (= :subtract (:native/a64-immediate-op instruction))
+                       0xd1000000 0x91000000)
+                     (bit-shift-left (:native/a64-immediate-shift instruction) 22)
+                     (bit-shift-left immediate 10)
+                     (bit-shift-left (a64-register (:mir/left instruction)) 5)
+                     (a64-register (:mir/dst instruction))))
+      (u32le (bit-or 0x8b000000
+                     (bit-shift-left (a64-register (:mir/right instruction)) 16)
+                     (bit-shift-left (a64-register (:mir/left instruction)) 5)
+                     (a64-register (:mir/dst instruction)))))
+    (:aarch64/multiply-add :aarch64/multiply-subtract)
+    ;; Two independent features meet on this case. The Mersenne reduction
+    ;; changes what a multiply-add/subtract emits when the multiplier is
+    ;; 2^shift-1; the corpus immediate folding gave `:aarch64/subtract` a case
+    ;; of its own. They compose: the Mersenne test is on the fused encodings,
+    ;; the immediate test is on the plain subtract, and neither reads the
+    ;; other's instruction key.
+    (if-let [shift (:native/a64-mersenne-shift instruction)]
+      (let [factor (a64-register (:native/a64-mersenne-factor instruction))
+            addend (a64-register (:mir/addend instruction))
+            dst (a64-register (:mir/dst instruction))]
+        (vec
+         (concat
+          ;; x17 = factor - (factor << shift) = -factor*(2^shift-1)
+          (u32le (bit-or 0xcb000000 (bit-shift-left factor 16)
+                         (bit-shift-left shift 10)
+                         (bit-shift-left factor 5) 17))
+          ;; dst = addend - factor*(2^shift-1)
+          (u32le (bit-or 0x8b000000 (bit-shift-left 17 16)
+                         (bit-shift-left addend 5) dst)))))
+      (u32le (bit-or (if (= :aarch64/multiply-add encoding)
+                       0x9b000000 0x9b008000)
+                     (bit-shift-left (a64-register (:mir/right instruction)) 16)
+                     (bit-shift-left (a64-register (:mir/addend instruction)) 10)
+                     (bit-shift-left (a64-register (:mir/left instruction)) 5)
+                     (a64-register (:mir/dst instruction)))))
+    :aarch64/subtract
+    (if-let [immediate (:native/a64-immediate instruction)]
+      (u32le (bit-or (if (= :add (:native/a64-immediate-op instruction))
+                       0x91000000 0xd1000000)
+                     (bit-shift-left (:native/a64-immediate-shift instruction) 22)
+                     (bit-shift-left immediate 10)
+                     (bit-shift-left (a64-register (:mir/left instruction)) 5)
+                     (a64-register (:mir/dst instruction))))
+      (u32le (bit-or 0xcb000000
+                     (bit-shift-left (a64-register (:mir/right instruction)) 16)
+                     (bit-shift-left (a64-register (:mir/left instruction)) 5)
+                     (a64-register (:mir/dst instruction)))))
+    (:aarch64/multiply
+     :aarch64/bit-and :aarch64/bit-or :aarch64/bit-xor
+     :aarch64/shift-left :aarch64/shift-right-signed
+     :aarch64/shift-right-unsigned)
+    (let [base (case encoding
+                 :aarch64/multiply 0x9b007c00
+                 :aarch64/bit-and 0x8a000000
+                 :aarch64/bit-or 0xaa000000
+                 :aarch64/bit-xor 0xca000000
+                 :aarch64/shift-left 0x9ac02000
+                 :aarch64/shift-right-signed 0x9ac02800
+                 :aarch64/shift-right-unsigned 0x9ac02400)]
+      (u32le (bit-or base
+                     (bit-shift-left (a64-register (:mir/right instruction)) 16)
+                     (bit-shift-left (a64-register (:mir/left instruction)) 5)
+                     (a64-register (:mir/dst instruction)))))
+    :aarch64/quotient
+    (a64-quotient (:mir/dst instruction) (:mir/left instruction)
+                  (:mir/right instruction))
+    :aarch64/quotient-constant
+    (a64-quotient-constant (:mir/dst instruction) (:mir/left instruction)
+                           (:mir/divisor instruction)
+                           load-a64-multiplier?)
+    (:aarch64/f64-add :aarch64/f64-subtract :aarch64/f64-multiply
+     :aarch64/f64-divide :aarch64/f64-min :aarch64/f64-max)
+    (a64-f64-binary (case encoding
+                      :aarch64/f64-add 0x1e612800
+                      :aarch64/f64-subtract 0x1e613800
+                      :aarch64/f64-multiply 0x1e610800
+                      :aarch64/f64-divide 0x1e611800
+                      :aarch64/f64-min 0x1e615800
+                      :aarch64/f64-max 0x1e614800)
+                    (:mir/dst instruction) (:mir/left instruction)
+                    (:mir/right instruction))
+    :aarch64/f64-sqrt
+    (vec (concat
+          (u32le (bit-or 0x9e670000
+                         (bit-shift-left (a64-register (:mir/input instruction)) 5)))
+          (u32le 0x1e61c000)
+          (u32le (bit-or 0x9e660000 (a64-register (:mir/dst instruction))))))
+    (:aarch64/f64-equal :aarch64/f64-less-than
+     :aarch64/f64-less-or-equal :aarch64/f64-greater-than
+     :aarch64/f64-greater-or-equal :aarch64/f64-unordered)
+    (a64-f64-compare (case encoding
+                       :aarch64/f64-equal 0x9a9f17e0
+                       :aarch64/f64-less-than 0x9a9f57e0
+                       :aarch64/f64-less-or-equal 0x9a9f87e0
+                       :aarch64/f64-greater-than 0x9a9fd7e0
+                       :aarch64/f64-greater-or-equal 0x9a9fb7e0
+                       :aarch64/f64-unordered 0x9a9f77e0)
+                     (:mir/dst instruction) (:mir/left instruction)
+                     (:mir/right instruction))
+    ;; f32. Each word is the f64 one with ftype (bit 22) cleared.
+    (:aarch64/f32-add :aarch64/f32-subtract :aarch64/f32-multiply
+     :aarch64/f32-divide)
+    (a64-f32-binary (case encoding
+                      :aarch64/f32-add 0x1e212800
+                      :aarch64/f32-subtract 0x1e213800
+                      :aarch64/f32-multiply 0x1e210800
+                      :aarch64/f32-divide 0x1e211800)
+                    (:mir/dst instruction) (:mir/left instruction)
+                    (:mir/right instruction))
+    :aarch64/f32-sqrt
+    (vec (concat (a64-fmov-s0-w (:mir/input instruction))
+                 (u32le 0x1e21c000)
+                 (a64-fmov-w-s0 (:mir/dst instruction))
+                 (a64-sxtw (:mir/dst instruction))))
+    (:aarch64/f32-equal :aarch64/f32-less-than
+     :aarch64/f32-less-or-equal :aarch64/f32-greater-than
+     :aarch64/f32-greater-or-equal :aarch64/f32-unordered)
+    (a64-f32-compare (case encoding
+                       :aarch64/f32-equal 0x9a9f17e0
+                       :aarch64/f32-less-than 0x9a9f57e0
+                       :aarch64/f32-less-or-equal 0x9a9f87e0
+                       :aarch64/f32-greater-than 0x9a9fd7e0
+                       :aarch64/f32-greater-or-equal 0x9a9fb7e0
+                       :aarch64/f32-unordered 0x9a9f77e0)
+                     (:mir/dst instruction) (:mir/left instruction)
+                     (:mir/right instruction))
+    ;; Width conversions. Which FMOV comes back is decided by the RESULT's
+    ;; width: an f64 or i64 result fills the whole X register and gets no SXTW.
+    :aarch64/f32-to-f64
+    (vec (concat (a64-fmov-s0-w (:mir/input instruction))
+                 (u32le 0x1e22c000)
+                 (u32le (bit-or 0x9e660000 (a64-register (:mir/dst instruction))))))
+    :aarch64/f64-to-f32
+    (vec (concat (u32le (bit-or 0x9e670000
+                                (bit-shift-left (a64-register (:mir/input instruction)) 5)))
+                 (u32le 0x1e624000)
+                 (a64-fmov-w-s0 (:mir/dst instruction))
+                 (a64-sxtw (:mir/dst instruction))))
+    ;; SCVTF reads the 64-bit general register directly, so there is no FMOV in.
+    :aarch64/i64-to-f32
+    (vec (concat (u32le (bit-or 0x9e220000
+                                (bit-shift-left (a64-register (:mir/input instruction)) 5)))
+                 (a64-fmov-w-s0 (:mir/dst instruction))
+                 (a64-sxtw (:mir/dst instruction))))
+    :aarch64/i64-to-f64
+    (vec (concat (u32le (bit-or 0x9e620000
+                                (bit-shift-left (a64-register (:mir/input instruction)) 5)))
+                 (u32le (bit-or 0x9e660000 (a64-register (:mir/dst instruction))))))
+    (:aarch64/kernel-load-u8 :aarch64/kernel-load-u16
+     :aarch64/kernel-load-u32 :aarch64/kernel-load-u64
+     :aarch64/kernel-store-u8 :aarch64/kernel-store-u16
+     :aarch64/kernel-store-u32 :aarch64/kernel-store-u64)
+    (let [op (keyword "gmir" (name encoding))
+          store? (str/includes? (name encoding) "store")
+          bits (* 8 (kernel-access-bytes encoding))]
+      (a64-kernel-memory instruction-index bits store?
+                         (and (> bits 8)
+                              (not (contains? unaligned-accesses
+                                              [op (:mir/maximum instruction)])))
+                         instruction))
+    (:aarch64/slice-load-u8 :aarch64/slice-load-u16
+     :aarch64/slice-load-u32 :aarch64/slice-load-u64
+     :aarch64/slice-store-u8 :aarch64/slice-store-u16
+     :aarch64/slice-store-u32 :aarch64/slice-store-u64)
+    (a64-slice-memory instruction-index (* 8 (kernel-access-bytes encoding))
+                      (str/includes? (name encoding) "store") instruction)
+    :aarch64/kernel-try-lock-u32 (a64-kernel-lock instruction-index 0 1 instruction)
+    :aarch64/kernel-unlock-u32 (a64-kernel-lock instruction-index 1 0 instruction)
+    ;; sysops:
+    :aarch64/kernel-atomic-add-u32 (a64-kernel-atomic instruction-index :add 32 instruction)
+    :aarch64/kernel-atomic-add-u64 (a64-kernel-atomic instruction-index :add 64 instruction)
+    :aarch64/kernel-xchg-u32 (a64-kernel-atomic instruction-index :xchg 32 instruction)
+    :aarch64/kernel-xchg-u64 (a64-kernel-atomic instruction-index :xchg 64 instruction)
+    :aarch64/kernel-cmpxchg-u32 (a64-kernel-atomic instruction-index :cmpxchg 32 instruction)
+    :aarch64/kernel-cmpxchg-u64 (a64-kernel-atomic instruction-index :cmpxchg 64 instruction)
+    ;; sysops: end
+    :aarch64/kernel-subregion (a64-kernel-subregion instruction-index instruction)
+    ;; simd: one arm, scalar, reproducing the x86 accumulation tree exactly.
+    :aarch64/kernel-dot-f32 (a64-kernel-dot-f32 instruction-index instruction)
+    (:aarch64/equal :aarch64/less-than :aarch64/greater-than
+     :aarch64/less-or-equal :aarch64/greater-or-equal)
+    (a64-compare (case encoding
+                   :aarch64/equal 0x9a9f17e0
+                   :aarch64/less-than 0x9a9fa7e0
+                   :aarch64/greater-than 0x9a9fd7e0
+                   :aarch64/less-or-equal 0x9a9fc7e0
+                   :aarch64/greater-or-equal 0x9a9fb7e0)
+                 (:mir/dst instruction) (:mir/left instruction)
+                 (:mir/right instruction))
+    :aarch64/spill-load
+    (a64-stack-memory 0xf9400000 (:mir/dst instruction) (:mir/slot instruction))
+    :aarch64/spill-store
+    (a64-stack-memory 0xf9000000 (:mir/src instruction) (:mir/slot instruction))
+    ;; A leaf's spill slot parked in a caller-saved SIMD register: FMOV is a
+    ;; one-instruction register-file crossing, where the stack round trip the
+    ;; slot form takes is a store-load through memory (measured +3.21% on the
+    ;; qualified deep-spill fixture -- amu docs/codegen-coscientist.md,
+    ;; iterations 23-24; rustc parks its overflow lanes the same way).
+    :aarch64/simd-park-store
+    (u32le (bit-or 0x9e670000
+                   (bit-shift-left (a64-register (:mir/src instruction)) 5)
+                   (+ 16 (:mir/slot instruction))))
+    :aarch64/simd-park-load
+    (u32le (bit-or 0x9e660000
+                   (bit-shift-left (+ 16 (:mir/slot instruction)) 5)
+                   (a64-register (:mir/dst instruction))))
+    :aarch64/move
+    (if (= (:mir/dst instruction) (:mir/src instruction))
+      []
+      (a64-mov (:mir/dst instruction) (:mir/src instruction)))
+    :aarch64/runtime-call (a64-runtime-call instruction)
+    :aarch64/capability-call (a64-capability-call instruction)
+    :aarch64/return
+    (vec (concat (when-not (= :aarch64/x0 (:mir/value instruction))
+                   (a64-mov :aarch64/x0 (:mir/value instruction)))
+                 return-suffix))
+    (reject! :mc-encode :unknown-encoding (assoc instruction :isa isa))))
+
 (defn- encode-selected
   [isa frame-bytes return-suffix instruction-index load-a64-multiplier?
    {:mc/keys [encoding] :as instruction}]
@@ -6586,234 +7024,9 @@
                    (x86-rr 0x89 :x86-64/rax (:mir/value instruction)))
                  return-suffix))
 
-    :aarch64/argument
-    (let [dst (:mir/dst instruction)
-          index (:mir/index instruction)
-          src (keyword "aarch64" (str "x" index))]
-      (when-not (<= 0 index 4) (reject! :mc-encode :argument-index-unsupported instruction))
-      (if (= dst src) [] (a64-mov dst src)))
-    :aarch64/constant (a64-constant (:mir/dst instruction) (:mir/value instruction))
-    :aarch64/data-address
-    [{:native/data-content (:mir/content instruction)
-      :native/data-dst (:mir/dst instruction) :native/data-target :aarch64}]
-    :aarch64/add
-    (if-let [immediate (:native/a64-immediate instruction)]
-      (u32le (bit-or (if (= :subtract (:native/a64-immediate-op instruction))
-                       0xd1000000 0x91000000)
-                     (bit-shift-left (:native/a64-immediate-shift instruction) 22)
-                     (bit-shift-left immediate 10)
-                     (bit-shift-left (a64-register (:mir/left instruction)) 5)
-                     (a64-register (:mir/dst instruction))))
-      (u32le (bit-or 0x8b000000
-                     (bit-shift-left (a64-register (:mir/right instruction)) 16)
-                     (bit-shift-left (a64-register (:mir/left instruction)) 5)
-                     (a64-register (:mir/dst instruction)))))
-    (:aarch64/multiply-add :aarch64/multiply-subtract)
-    ;; Two independent features meet on this case. The Mersenne reduction
-    ;; changes what a multiply-add/subtract emits when the multiplier is
-    ;; 2^shift-1; the corpus immediate folding gave `:aarch64/subtract` a case
-    ;; of its own. They compose: the Mersenne test is on the fused encodings,
-    ;; the immediate test is on the plain subtract, and neither reads the
-    ;; other's instruction key.
-    (if-let [shift (:native/a64-mersenne-shift instruction)]
-      (let [factor (a64-register (:native/a64-mersenne-factor instruction))
-            addend (a64-register (:mir/addend instruction))
-            dst (a64-register (:mir/dst instruction))]
-        (vec
-         (concat
-          ;; x17 = factor - (factor << shift) = -factor*(2^shift-1)
-          (u32le (bit-or 0xcb000000 (bit-shift-left factor 16)
-                         (bit-shift-left shift 10)
-                         (bit-shift-left factor 5) 17))
-          ;; dst = addend - factor*(2^shift-1)
-          (u32le (bit-or 0x8b000000 (bit-shift-left 17 16)
-                         (bit-shift-left addend 5) dst)))))
-      (u32le (bit-or (if (= :aarch64/multiply-add encoding)
-                       0x9b000000 0x9b008000)
-                     (bit-shift-left (a64-register (:mir/right instruction)) 16)
-                     (bit-shift-left (a64-register (:mir/addend instruction)) 10)
-                     (bit-shift-left (a64-register (:mir/left instruction)) 5)
-                     (a64-register (:mir/dst instruction)))))
-    :aarch64/subtract
-    (if-let [immediate (:native/a64-immediate instruction)]
-      (u32le (bit-or (if (= :add (:native/a64-immediate-op instruction))
-                       0x91000000 0xd1000000)
-                     (bit-shift-left (:native/a64-immediate-shift instruction) 22)
-                     (bit-shift-left immediate 10)
-                     (bit-shift-left (a64-register (:mir/left instruction)) 5)
-                     (a64-register (:mir/dst instruction))))
-      (u32le (bit-or 0xcb000000
-                     (bit-shift-left (a64-register (:mir/right instruction)) 16)
-                     (bit-shift-left (a64-register (:mir/left instruction)) 5)
-                     (a64-register (:mir/dst instruction)))))
-    (:aarch64/multiply
-     :aarch64/bit-and :aarch64/bit-or :aarch64/bit-xor
-     :aarch64/shift-left :aarch64/shift-right-signed
-     :aarch64/shift-right-unsigned)
-    (let [base (case encoding
-                 :aarch64/multiply 0x9b007c00
-                 :aarch64/bit-and 0x8a000000
-                 :aarch64/bit-or 0xaa000000
-                 :aarch64/bit-xor 0xca000000
-                 :aarch64/shift-left 0x9ac02000
-                 :aarch64/shift-right-signed 0x9ac02800
-                 :aarch64/shift-right-unsigned 0x9ac02400)]
-      (u32le (bit-or base
-                     (bit-shift-left (a64-register (:mir/right instruction)) 16)
-                     (bit-shift-left (a64-register (:mir/left instruction)) 5)
-                     (a64-register (:mir/dst instruction)))))
-    :aarch64/quotient
-    (a64-quotient (:mir/dst instruction) (:mir/left instruction)
-                  (:mir/right instruction))
-    :aarch64/quotient-constant
-    (a64-quotient-constant (:mir/dst instruction) (:mir/left instruction)
-                           (:mir/divisor instruction)
-                           load-a64-multiplier?)
-    (:aarch64/f64-add :aarch64/f64-subtract :aarch64/f64-multiply
-     :aarch64/f64-divide :aarch64/f64-min :aarch64/f64-max)
-    (a64-f64-binary (case encoding
-                      :aarch64/f64-add 0x1e612800
-                      :aarch64/f64-subtract 0x1e613800
-                      :aarch64/f64-multiply 0x1e610800
-                      :aarch64/f64-divide 0x1e611800
-                      :aarch64/f64-min 0x1e615800
-                      :aarch64/f64-max 0x1e614800)
-                    (:mir/dst instruction) (:mir/left instruction)
-                    (:mir/right instruction))
-    :aarch64/f64-sqrt
-    (vec (concat
-          (u32le (bit-or 0x9e670000
-                         (bit-shift-left (a64-register (:mir/input instruction)) 5)))
-          (u32le 0x1e61c000)
-          (u32le (bit-or 0x9e660000 (a64-register (:mir/dst instruction))))))
-    (:aarch64/f64-equal :aarch64/f64-less-than
-     :aarch64/f64-less-or-equal :aarch64/f64-greater-than
-     :aarch64/f64-greater-or-equal :aarch64/f64-unordered)
-    (a64-f64-compare (case encoding
-                       :aarch64/f64-equal 0x9a9f17e0
-                       :aarch64/f64-less-than 0x9a9f57e0
-                       :aarch64/f64-less-or-equal 0x9a9f87e0
-                       :aarch64/f64-greater-than 0x9a9fd7e0
-                       :aarch64/f64-greater-or-equal 0x9a9fb7e0
-                       :aarch64/f64-unordered 0x9a9f77e0)
-                     (:mir/dst instruction) (:mir/left instruction)
-                     (:mir/right instruction))
-    ;; f32. Each word is the f64 one with ftype (bit 22) cleared.
-    (:aarch64/f32-add :aarch64/f32-subtract :aarch64/f32-multiply
-     :aarch64/f32-divide)
-    (a64-f32-binary (case encoding
-                      :aarch64/f32-add 0x1e212800
-                      :aarch64/f32-subtract 0x1e213800
-                      :aarch64/f32-multiply 0x1e210800
-                      :aarch64/f32-divide 0x1e211800)
-                    (:mir/dst instruction) (:mir/left instruction)
-                    (:mir/right instruction))
-    :aarch64/f32-sqrt
-    (vec (concat (a64-fmov-s0-w (:mir/input instruction))
-                 (u32le 0x1e21c000)
-                 (a64-fmov-w-s0 (:mir/dst instruction))
-                 (a64-sxtw (:mir/dst instruction))))
-    (:aarch64/f32-equal :aarch64/f32-less-than
-     :aarch64/f32-less-or-equal :aarch64/f32-greater-than
-     :aarch64/f32-greater-or-equal :aarch64/f32-unordered)
-    (a64-f32-compare (case encoding
-                       :aarch64/f32-equal 0x9a9f17e0
-                       :aarch64/f32-less-than 0x9a9f57e0
-                       :aarch64/f32-less-or-equal 0x9a9f87e0
-                       :aarch64/f32-greater-than 0x9a9fd7e0
-                       :aarch64/f32-greater-or-equal 0x9a9fb7e0
-                       :aarch64/f32-unordered 0x9a9f77e0)
-                     (:mir/dst instruction) (:mir/left instruction)
-                     (:mir/right instruction))
-    ;; Width conversions. Which FMOV comes back is decided by the RESULT's
-    ;; width: an f64 or i64 result fills the whole X register and gets no SXTW.
-    :aarch64/f32-to-f64
-    (vec (concat (a64-fmov-s0-w (:mir/input instruction))
-                 (u32le 0x1e22c000)
-                 (u32le (bit-or 0x9e660000 (a64-register (:mir/dst instruction))))))
-    :aarch64/f64-to-f32
-    (vec (concat (u32le (bit-or 0x9e670000
-                                (bit-shift-left (a64-register (:mir/input instruction)) 5)))
-                 (u32le 0x1e624000)
-                 (a64-fmov-w-s0 (:mir/dst instruction))
-                 (a64-sxtw (:mir/dst instruction))))
-    ;; SCVTF reads the 64-bit general register directly, so there is no FMOV in.
-    :aarch64/i64-to-f32
-    (vec (concat (u32le (bit-or 0x9e220000
-                                (bit-shift-left (a64-register (:mir/input instruction)) 5)))
-                 (a64-fmov-w-s0 (:mir/dst instruction))
-                 (a64-sxtw (:mir/dst instruction))))
-    :aarch64/i64-to-f64
-    (vec (concat (u32le (bit-or 0x9e620000
-                                (bit-shift-left (a64-register (:mir/input instruction)) 5)))
-                 (u32le (bit-or 0x9e660000 (a64-register (:mir/dst instruction))))))
-    (:aarch64/kernel-load-u8 :aarch64/kernel-load-u16
-     :aarch64/kernel-load-u32 :aarch64/kernel-load-u64
-     :aarch64/kernel-store-u8 :aarch64/kernel-store-u16
-     :aarch64/kernel-store-u32 :aarch64/kernel-store-u64)
-    (let [op (keyword "gmir" (name encoding))
-          store? (str/includes? (name encoding) "store")
-          bits (* 8 (kernel-access-bytes encoding))]
-      (a64-kernel-memory instruction-index bits store?
-                         (and (> bits 8)
-                              (not (contains? unaligned-accesses
-                                              [op (:mir/maximum instruction)])))
-                         instruction))
-    (:aarch64/slice-load-u8 :aarch64/slice-load-u16
-     :aarch64/slice-load-u32 :aarch64/slice-load-u64
-     :aarch64/slice-store-u8 :aarch64/slice-store-u16
-     :aarch64/slice-store-u32 :aarch64/slice-store-u64)
-    (a64-slice-memory instruction-index (* 8 (kernel-access-bytes encoding))
-                      (str/includes? (name encoding) "store") instruction)
-    :aarch64/kernel-try-lock-u32 (a64-kernel-lock instruction-index 0 1 instruction)
-    :aarch64/kernel-unlock-u32 (a64-kernel-lock instruction-index 1 0 instruction)
-    ;; sysops:
-    :aarch64/kernel-atomic-add-u32 (a64-kernel-atomic instruction-index :add 32 instruction)
-    :aarch64/kernel-atomic-add-u64 (a64-kernel-atomic instruction-index :add 64 instruction)
-    :aarch64/kernel-xchg-u32 (a64-kernel-atomic instruction-index :xchg 32 instruction)
-    :aarch64/kernel-xchg-u64 (a64-kernel-atomic instruction-index :xchg 64 instruction)
-    :aarch64/kernel-cmpxchg-u32 (a64-kernel-atomic instruction-index :cmpxchg 32 instruction)
-    :aarch64/kernel-cmpxchg-u64 (a64-kernel-atomic instruction-index :cmpxchg 64 instruction)
-    ;; sysops: end
-    :aarch64/kernel-subregion (a64-kernel-subregion instruction-index instruction)
-    (:aarch64/equal :aarch64/less-than :aarch64/greater-than
-     :aarch64/less-or-equal :aarch64/greater-or-equal)
-    (a64-compare (case encoding
-                   :aarch64/equal 0x9a9f17e0
-                   :aarch64/less-than 0x9a9fa7e0
-                   :aarch64/greater-than 0x9a9fd7e0
-                   :aarch64/less-or-equal 0x9a9fc7e0
-                   :aarch64/greater-or-equal 0x9a9fb7e0)
-                 (:mir/dst instruction) (:mir/left instruction)
-                 (:mir/right instruction))
-    :aarch64/spill-load
-    (a64-stack-memory 0xf9400000 (:mir/dst instruction) (:mir/slot instruction))
-    :aarch64/spill-store
-    (a64-stack-memory 0xf9000000 (:mir/src instruction) (:mir/slot instruction))
-    ;; A leaf's spill slot parked in a caller-saved SIMD register: FMOV is a
-    ;; one-instruction register-file crossing, where the stack round trip the
-    ;; slot form takes is a store-load through memory (measured +3.21% on the
-    ;; qualified deep-spill fixture -- amu docs/codegen-coscientist.md,
-    ;; iterations 23-24; rustc parks its overflow lanes the same way).
-    :aarch64/simd-park-store
-    (u32le (bit-or 0x9e670000
-                   (bit-shift-left (a64-register (:mir/src instruction)) 5)
-                   (+ 16 (:mir/slot instruction))))
-    :aarch64/simd-park-load
-    (u32le (bit-or 0x9e660000
-                   (bit-shift-left (+ 16 (:mir/slot instruction)) 5)
-                   (a64-register (:mir/dst instruction))))
-    :aarch64/move
-    (if (= (:mir/dst instruction) (:mir/src instruction))
-      []
-      (a64-mov (:mir/dst instruction) (:mir/src instruction)))
-    :aarch64/runtime-call (a64-runtime-call instruction)
-    :aarch64/capability-call (a64-capability-call instruction)
-    :aarch64/return
-    (vec (concat (when-not (= :aarch64/x0 (:mir/value instruction))
-                   (a64-mov :aarch64/x0 (:mir/value instruction)))
-                 return-suffix))
-    (reject! :mc-encode :unknown-encoding (assoc instruction :isa isa))))
+    (encode-selected-a64 isa frame-bytes return-suffix instruction-index
+                         load-a64-multiplier? instruction)))
+
 
 (defn- relative32 [opcode displacement]
   (into [opcode] (mapv byte-value

@@ -64,7 +64,15 @@
          ;; exactly. `peephole.cljc`'s own docstring names this hazard for
          ;; iteration order; representation is the same hazard by another
          ;; route.
-         :git/sha "ac69013644fdd74f10ae770b0360a84004297c4a"}
+         ;;
+         ;; Advanced 2026-09-09, ac690136 -> 55d78851 (kotoba-mir main, ahead
+         ;; 2, forward only). `select-target` no longer refuses
+         ;; `:gmir/kernel-dot-f32` for AArch64 -- this repo's
+         ;; `a64-kernel-dot-f32` is the arm that earned the lift, and without
+         ;; this pin the operation is selected here and rejected there. The
+         ;; fused dequantize-and-dot family is still refused, for a reason
+         ;; that is now narrower and is stated at the refusal.
+         :git/sha "55d78851e7548236f37e99c8c99d5e42e6336853"}
         io.github.kotoba-lang/kotoba-codegen
         {:git/url "https://github.com/kotoba-lang/kotoba-codegen.git"
          :git/sha "8f2726c7621930ea3c53957e8a510f57d2a35f58"}
