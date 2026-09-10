@@ -1425,6 +1425,25 @@
 
         (contains? '#{i64-shift-left i64-shift-right u64-shift-right} op)
         (let [[value count-form] args]
+          ;; REFUSED, not lowered, 2026-09-10. The frontend began admitting a
+          ;; computed count on that date and the x86-64 backend grew the range
+          ;; guard the change requires. This backend has NOT grown it: its
+          ;; conditional traps go through the label/relative-branch layout
+          ;; (`layout/relative-branch :aarch64/b-ne-imm19`, see
+          ;; `signed-division`), and the guard needs an unsigned `b.ls` kind
+          ;; that layout does not yet define.
+          ;;
+          ;; Refusing is the only honest option of the three available. Lowering
+          ;; it unguarded would make LSLV/ASRV/LSRV's mod-64 truncation
+          ;; reachable while `kotoba.kir` traps outside [0,63], so this ISA
+          ;; would disagree with the interpreter AND with x86-64 for exactly
+          ;; the inputs nobody writes a fixture for. Silently masking would be
+          ;; the same disagreement with a different spelling.
+          (when-not (some? (peephole/constant-operand count-form))
+            (throw (ex-info "aarch64 does not yet lower a computed shift count"
+                            {:phase :mc :op op
+                             :reason :aarch64/variable-shift-count-unguarded
+                             :fix "add an unsigned b.ls branch kind to the layout module and emit cmp x1,#63 / b.ls ok / brk #0, mirroring the x86-64 guard"})))
           (vec (concat (emit-expr value env depth)
                        (emit-rhs-window count-form env depth)
                        (case op

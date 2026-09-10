@@ -3527,6 +3527,22 @@
                  (x86-rr 0x89 :x86-64/r11 left))
                (when-not (= :x86-64/rcx right)
                  (x86-rr 0x89 :x86-64/rcx right))
+               ;; The range guard, 2026-09-10. `kotoba.kir` TRAPS on a shift
+               ;; count outside [0,63]; x86 takes CL mod 64. While the frontend
+               ;; admitted only a literal count that divergence was
+               ;; unreachable, and the backends said so in their own comments.
+               ;; The frontend now admits a computed count, so it is reachable,
+               ;; and without this an artifact would disagree with its own
+               ;; sealed oracle for every out-of-range count -- inputs nobody
+               ;; writes a fixture for, which is exactly why it has to be the
+               ;; machine's job and not a reviewer's.
+               ;;
+               ;; `jbe` is UNSIGNED, so a negative count is a large unsigned
+               ;; value, fails the compare and traps rather than shifting by
+               ;; its low six bits.
+               [0x48 0x83 0xf9 0x3f    ; cmp rcx,63
+                0x76 0x02              ; jbe +2
+                0x0f 0x0b]             ; ud2
                [0x49 0xd3 (bit-or 0xc0 (bit-shift-left subop 3) 3)]
                (x86-pop :x86-64/rcx)
                (when-not (= dst :x86-64/r11)
@@ -7330,6 +7346,9 @@
     :x86-64/jmp-rel32 (relative32 0xe9 displacement)
     :x86-64/call-rel32 (relative32 0xe8 displacement)
     :x86-64/jne-rel8 [0x75 (byte-value displacement)]
+    ;; jns: the fuel charge decrements first and branches on the SIGN of the
+    ;; result, so it needs no separate compare. See `fuel-charge-tokens`.
+    :x86-64/jns-rel8 [0x79 (byte-value displacement)]
     ;; boot-scratch: `lea dst,[rip+disp32]`, resolved against a function's
     ;; label rather than a literal pool offset. Same seven bytes and the same
     ;; ModRM as the pool's `lea`, which is why they share `x86-lea-rip-code`.
