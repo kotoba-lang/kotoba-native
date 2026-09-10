@@ -140,12 +140,35 @@
 
 (defn- fuel-charge-tokens [counter]
   ;; context v2: fuel is qword [r9+8].
+  ;;
+  ;; DECREMENT FIRST, then branch on the sign of the result. `dec` sets SF, so
+  ;; the separate `cmp qword [r9+8],0` the previous form opened with is
+  ;; redundant: the same fact is already in the flags.
+  ;;
+  ;;   was   cmp qword [r9+8],0 / jne present / ud2 / dec qword [r9+8]
+  ;;   now   dec qword [r9+8]   / jns present / ud2
+  ;;
+  ;; Three executed instructions on the fast path become two, and thirteen
+  ;; emitted bytes become eight. This is charged on EVERY step of every
+  ;; re-entering function, so it is a floor under everything the codegen ladder
+  ;; measures -- measured 2026-09-10 with `-icount`, a three-operation loop body
+  ;; costs 15 guest instructions per iteration and 3 of them are this charge.
+  ;;
+  ;; The observable contract is unchanged. Before, a step trapped when the
+  ;; counter was already 0 and the counter never went negative; now it traps
+  ;; when the decrement takes it below 0. Starting from N, both allow exactly N
+  ;; steps and trap on the (N+1)th. The only difference is the counter's value
+  ;; at the trap (-1 rather than 0), and `ud2` is the last thing that executes,
+  ;; so nothing observes it.
+  ;;
+  ;; `fuel-charge` above keeps the OLD bytes on purpose: the low-level native
+  ;; executor qualification dereferences that private var directly and predates
+  ;; deferred layout, so it is a compatibility constant, not this encoder.
   (let [present-label (fresh-label counter "fuel-present")]
-    (vec (concat [0x49 0x83 0x79 0x08 0x00]
-                 [(layout/relative-branch :x86-64/jne-rel8 present-label)]
+    (vec (concat [0x49 0xff 0x49 0x08]
+                 [(layout/relative-branch :x86-64/jns-rel8 present-label)]
                  [0x0f 0x0b]
-                 [(layout/label present-label)]
-                 [0x49 0xff 0x49 0x08]))))
+                 [(layout/label present-label)]))))
 
 (defn- token-size [token]
   (cond (some? (layout/token-size token)) (layout/token-size token)
@@ -2121,6 +2144,31 @@
               [value count-form] args]
           (vec (concat (emit-expr value env ctx)
                        (emit-rhs-window count-form env ctx)
+                       ;; The range guard, emitted 2026-09-10 when the frontend
+                       ;; began admitting a computed count. The paragraph above
+                       ;; is still true for a LITERAL count and no longer true
+                       ;; for a computed one: CL's mod-64 truncation IS now
+                       ;; reachable, and `kotoba.kir` traps on a count outside
+                       ;; [0,63] rather than masking. Without this, a native
+                       ;; artifact would silently disagree with its own sealed
+                       ;; oracle for every out-of-range count -- the failure the
+                       ;; sar/shr paragraph above warns about, arriving by a
+                       ;; different door.
+                       ;;
+                       ;; `peephole/constant-operand` is the SAME test
+                       ;; `emit-rhs-window` just used, so the guard appears
+                       ;; exactly when the constant path was not taken and a
+                       ;; literal-count shift keeps its previous bytes to the
+                       ;; byte -- which is what lets the existing sealed
+                       ;; fixtures stay valid.
+                       ;;
+                       ;; `jbe` is UNSIGNED, so a negative count is a huge
+                       ;; unsigned value, fails the compare, and traps rather
+                       ;; than shifting by its low six bits.
+                       (when-not (some? (peephole/constant-operand count-form))
+                         [0x48 0x83 0xf9 0x3f   ; cmp rcx,63
+                          0x76 0x02             ; jbe +2
+                          0x0f 0x0b])           ; ud2
                        (case op
                          i64-shift-left [0x48 0xd3 0xe0]    ; shl rax,cl
                          i64-shift-right [0x48 0xd3 0xf8]   ; sar rax,cl
@@ -2204,7 +2252,8 @@
          :x86-64/jae-rel32 (into [0x0f 0x83] (le32 displacement))
          :x86-64/jmp-rel32 (into [0xe9] (le32 displacement))
          :x86-64/jmp-rel8 [0xeb (bit-and displacement 0xff)]
-         :x86-64/jne-rel8 [0x75 (bit-and displacement 0xff)]))
+         :x86-64/jne-rel8 [0x75 (bit-and displacement 0xff)]
+         :x86-64/jns-rel8 [0x79 (bit-and displacement 0xff)]))
      (fn [token position]
        (cond
          (and (map? token) (:call token))

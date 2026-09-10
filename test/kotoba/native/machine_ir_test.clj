@@ -2513,7 +2513,13 @@
 (def ^:private a64-fuel-prefix
   [a64-fuel-ldr a64-fuel-subs-one a64-fuel-b-hs-eight
    a64-fuel-brk a64-fuel-str])
-(def ^:private x86-fuel-cmp [0x49 0x83 0x79 0x08 0x00])
+;; The first five bytes of an x86 fuel charge. Was `cmpq $0,8(r9)` until
+;; 2026-09-10, when the charge began decrementing first and branching on the
+;; sign its own `dec` leaves -- `decq 8(r9)` then the `jns` opcode. The name is
+;; kept because every use here asks the same question ("does a charge start
+;; here, and how many are there"), and that question did not change; only the
+;; instruction that answers it did.
+(def ^:private x86-fuel-cmp [0x49 0xff 0x49 0x08 0x79])
 
 (deftest aarch64-fuel-decrement-uses-unsigned-borrow-without-storing-on-trap
   (let [modulus 18446744073709551616N
