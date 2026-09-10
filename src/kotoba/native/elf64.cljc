@@ -778,9 +778,23 @@
                   0x0f 0x05 0xc3]                ; syscall; ret
                  (repeat (- 64 44) 0x90)))))
 
+;; The id is coerced for the same reason, and with the same words, as
+;; `emit-cap-call` in x86_64.cljc: a capability id arrives here as an arbitrary
+;; `.kotoba` VALUE from the KIR effect, which on cljs is a `bigint`, and JS
+;; bigint arithmetic throws ("Cannot mix BigInt and other types") the moment it
+;; meets a plain-number operand -- the literal `8` here, twice. Ids are
+;; validated in [0,255] elsewhere (`kotoba.verifier`'s `valid-effect?`), so a
+;; plain number is exact.
+;;
+;; Measured 2026-09-10: without this, `amu compile --target x86_64-aiueos-user-v1`
+;; on a source containing `(cap-call 16 0)` exited 70 with :kotoba/internal-error,
+;; while the SAME source compiled on wasm32, x86_64-linux, aarch64-macos and both
+;; aiueos kernel targets. This is the only caller that does arithmetic on an id
+;; during packaging, and `package-user` is the only route that reaches it.
 (defn- capability-bitmap [effects]
   (reduce (fn [bitmap [_ id]]
-            (update bitmap (quot id 8) bit-or (bit-shift-left 1 (mod id 8))))
+            (let [id #?(:clj id :cljs (js/Number id))]
+              (update bitmap (quot id 8) bit-or (bit-shift-left 1 (mod id 8)))))
           (vec (repeat 32 0))
           (filter #(= :cap/call (first %)) effects)))
 
