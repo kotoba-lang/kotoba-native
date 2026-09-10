@@ -158,3 +158,45 @@
     (is (<= block-end (:filesz rw)) "and is zero-initialised from the file")
     (is (<= (+ (:vaddr rx) (:memsz rx)) (:vaddr rw))
         "the RW page starts at or after the end of the text")))
+
+;; capability-bitmap, the one packaging step that does ARITHMETIC on a
+;; capability id -- and the one `packs-a-user-image` above cannot reach: that
+;; artifact declares no effects, so the reduce runs zero times and the id
+;; arithmetic is never executed. A user image with no capabilities was proving
+;; the capability path.
+;;
+;; The id is a bigint here deliberately: that is the shape the real pipeline
+;; delivers on cljs, and `x86_64.cljc`'s `emit-cap-call` coerces it with
+;; js/Number for exactly this reason, saying so in a comment. This file did
+;; not, so `(quot id 8)` against the literal 8 threw and every
+;; `--target x86_64-aiueos-user-v1` compile of a source containing `cap-call`
+;; failed with :kotoba/internal-error.
+;;
+;; Two ids rather than one, and the differing BYTE rather than "it did not
+;; throw": a coercion that silently lost the value would still not throw, and
+;; would still emit an image. 16 and 17 share a bitmap index (16/8 = 17/8 = 2)
+;; and differ only in the bit, so exactly one byte may move, from 1 to 2.
+(defn- user-image-with-capability [id]
+  (:bytes (elf64/package-user
+           (artifact/seal
+            {:target :x86_64-aiueos-user-v1
+             :target-profile {:runtime :none :ambient-syscalls false}
+             :program {:entry 'main}
+             :exports {'main {:offset 0 :arity 0}}
+             :limits {:fuel 4096}
+             :fuel-abi {:initial 4096}
+             :effects #{[:cap/call id]}
+             :code [0xc3]}))))
+
+(deftest a-capability-id-reaches-the-bitmap-as-a-bigint-on-cljs
+  (let [sixteen (user-image-with-capability #?(:clj 16 :cljs (js/BigInt 16)))
+        seventeen (user-image-with-capability #?(:clj 17 :cljs (js/BigInt 17)))
+        differing (->> (map vector sixteen seventeen)
+                       (keep-indexed (fn [i [a b]] (when (not= a b) [i a b])))
+                       vec)]
+    (is (= [0x7f 0x45 0x4c 0x46] (vec (take 4 sixteen))))
+    (is (every? #(<= 0 % 255) sixteen))
+    (is (= 1 (count differing))
+        "exactly one byte -- the bitmap byte for index 2 -- may differ")
+    (is (= [1 2] (vec (rest (first differing))))
+        "bit 1<<(16 mod 8) against bit 1<<(17 mod 8)")))
