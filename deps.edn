@@ -133,7 +133,7 @@
          ;; than 7 (ADR measures from the instruction itself), and a maximum
          ;; of 0xfffff rather than a branch's 0xffffc (ADR's displacement is
          ;; in BYTES).
-         :git/sha "3e6c815a83e0c9b92c8b05d3f2eb3a1ed80c6f92"}
+         :git/sha "ce1aada19c85404a67fcbd88aa5582579b5660ea"}
         io.github.kotoba-lang/kotoba-object
         {:git/url "https://github.com/kotoba-lang/kotoba-object.git"
          :git/sha "9b53a444cfe5550af6b76eef494b4190b5e4e461"}
