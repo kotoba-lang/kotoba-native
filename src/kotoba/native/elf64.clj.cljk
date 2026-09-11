@@ -298,6 +298,16 @@
    ;; is a handful of comparisons and takes the 1024 default.
    'aiueos-acpi-checksum-ok {:arity 2 :symbol "kotoba_aiueos_acpi_checksum_ok"}
    'aiueos-acpi-table-valid {:arity 4 :symbol "kotoba_aiueos_acpi_table_valid"}
+   ;; Murakumo relay lines (aiueos ADR-0213). The HELLO line the K16 sends the
+   ;; Mac relay and the ACK admission for the line that comes back retire
+   ;; `kernel/relay_protocol.c` -- the second implementation of a wire protocol
+   ;; the Kotoba side already owned. The boot nonce is a raw `rdtsc` whose top
+   ;; bit the C never masked, and words are signed on this side, so it crosses
+   ;; as two 32-bit halves: (out capacity nonce-hi nonce-lo mac) and
+   ;; (payload length nonce-hi nonce-lo). Fixed-width ASCII, no walk -- the
+   ;; 1024 default tier.
+   'aiueos-relay-hello-payload {:arity 5 :symbol "kotoba_aiueos_relay_hello_payload"}
+   'aiueos-relay-ack-payload-valid {:arity 4 :symbol "kotoba_aiueos_relay_ack_payload_valid"}
    ;; VT-d admission. vtd.c was the last kernel file with no decision moved out,
    ;; and one of its decisions is security-relevant: the IOTLB register offset is
    ;; DERIVED from a hardware-reported ECAP field and then bounds-checked, so an
