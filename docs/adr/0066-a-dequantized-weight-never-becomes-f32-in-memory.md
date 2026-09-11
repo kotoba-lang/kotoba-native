@@ -151,7 +151,7 @@ right number of times and adds nothing — a working instruction that answers
 
 ## Evidence
 
-- `test/kotoba/native/dequant_fusion_test.clj`, 12 tests / 45 assertions. Every
+- `test/kotoba/native/dequant_fusion_test.cljk`, 12 tests / 45 assertions. Every
   byte run was read back with
   `llvm-mc --disassemble --triple=x86_64-unknown-linux-gnu --show-encoding`
   (LLVM 22.1.7), not derived from the manual.

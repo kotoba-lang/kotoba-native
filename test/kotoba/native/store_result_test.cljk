@@ -30,7 +30,7 @@
 
   Every assertion below is about ENCODINGS. This repository does not run
   compiled programs. The execution claim is made elsewhere and is a different
-  claim: `scripts/store-answer-qemu-fixture.cljs` boots
+  claim: `scripts/store-answer-qemu-fixture.cljk` boots
   `test/fixtures/store-answer-qemu.kotoba` on a real x86-64 CPU under QEMU and
   reads the console it wrote.
 

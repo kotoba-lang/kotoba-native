@@ -10,7 +10,7 @@
 ;; a reason anyone can act on -- see the `root-permit-index` note in the
 ;; superproject's CLAUDE.md.
 ;;
-;;   nbb scripts/aiueos-store-answer-audit.cljs <path-to>/os/aiueos/kotoba
+;;   nbb scripts/aiueos-store-answer-audit.cljk <path-to>/os/aiueos/kotoba
 ;;
 ;; Every store is an expression, so "used in value position" cannot be read off
 ;; a grep. This propagates taint from each `kernel-store-*` / `slice-store-*`

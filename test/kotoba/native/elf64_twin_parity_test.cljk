@@ -72,8 +72,8 @@
     (into {} (map (fn [[_ n v]] [n v])) (re-seq fuel-arm-pattern region))))
 
 (deftest the-two-elf64-fuel-tiers-are-the-same-tiers
-  (let [clj (fuel-tiers "src/kotoba/native/elf64.clj")
-        cljc (fuel-tiers "src/kotoba/native/elf64.cljc")]
+  (let [clj (fuel-tiers "src/kotoba/native/elf64.clj.cljk")
+        cljc (fuel-tiers "src/kotoba/native/elf64.cljc.cljk")]
     ;; Evidence floor: a pattern that matched nothing has not found agreement.
     ;; Raised from 3 to 20 when the arms became numbers: the old byte pattern
     ;; could only match the shape it was written for, so a format change made
@@ -93,8 +93,8 @@
       (is (empty? disagreeing) (str "fuel tiers disagree: " disagreeing)))))
 
 (deftest the-two-elf64-tables-are-the-same-table
-  (let [clj (table "src/kotoba/native/elf64.clj")
-        cljc (table "src/kotoba/native/elf64.cljc")]
+  (let [clj (table "src/kotoba/native/elf64.clj.cljk")
+        cljc (table "src/kotoba/native/elf64.cljc.cljk")]
     ;; Evidence floor: a parse that found nothing has not found no difference.
     (is (< 50 (count clj)) "the .clj table did not parse")
     (is (< 50 (count cljc)) "the .cljc table did not parse")
@@ -112,7 +112,7 @@
       (is (= {} conflicts) "an entry disagrees on arity or symbol between the twins"))))
 
 (deftest every-symbol-carries-the-admitted-prefix
-  (doseq [[name [_ symbol]] (table "src/kotoba/native/elf64.clj")]
+  (doseq [[name [_ symbol]] (table "src/kotoba/native/elf64.clj.cljk")]
     (is (str/starts-with? symbol "kotoba_aiueos_")
         (str name " -> " symbol))
     (is (= symbol (str "kotoba_" (str/replace name "-" "_")))

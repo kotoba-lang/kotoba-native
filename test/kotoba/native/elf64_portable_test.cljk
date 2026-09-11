@@ -7,7 +7,7 @@
    rename -- a rename on its own asserts portability without executing it.
 
    Run without a JVM:
-     nbb --classpath \"src:test:<deps>\" run-tests.cljs"
+     nbb --classpath \"src:test:<deps>\" run-tests.cljk"
   (:require [clojure.test :refer [deftest is]]
             [kotoba.artifact.core :as artifact]
             [kotoba.native.interrupt-abi :as interrupt-abi]

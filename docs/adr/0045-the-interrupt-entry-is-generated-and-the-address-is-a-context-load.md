@@ -177,7 +177,7 @@ produce an image that boots and triple-faults on the first interrupt.
 ## Executed
 
 This repository does not run compiled programs, so its own suite is encodings
-only. `test/fixtures/isr-qemu.kotoba` and `scripts/isr-qemu-fixture.cljs` are
+only. `test/fixtures/isr-qemu.kotoba` and `scripts/isr-qemu-fixture.cljk` are
 what stands in for execution, and they are a FIXTURE rather than a test: they
 need amu, QEMU and OVMF, none of which this repository depends on.
 
