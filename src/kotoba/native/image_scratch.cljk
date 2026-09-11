@@ -24,7 +24,8 @@
   scratch there would be handed its own segment descriptors. The operation is
   therefore gated to the UEFI target in amu rather than given a second
   displacement, because a second displacement is a second layout that both ELF
-  twins would have to agree on byte for byte.")
+  twins would have to agree on byte for byte."
+  {:kotoba/export [bytes-reserved limit offset]})
 
 ;; The scratch area begins immediately after the hidden context. 96 is the
 ;; context's size under BOTH UEFI entry contracts -- the two-arity one parks

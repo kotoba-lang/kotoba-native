@@ -5,6 +5,7 @@
   payload is either scalar or a recursively boxed record cross extracted calls
   as one-word context-owned pair handles. Local flat non-escaping aggregates
   remain replaced."
+  {:kotoba/export [admit-closed-linkage! admit-extracted-call! aggregate-payload-variant-type? call-profile contract nested-record-type? record-boundary-plan reject-unextracted-call! scalar-record-type? scalar-variant-type? validate-contract! variant-boundary-plan]}
   (:require [clojure.set :as set]))
 
 (def contract

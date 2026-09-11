@@ -1,7 +1,8 @@
 (ns kotoba.native.vector-region
   "Conservative escape analysis and scalar-region lowering for bounded native
   vector literals.  A literal is admitted only when every lexical use is a
-  count/read with no identity observation or function-boundary escape.")
+  count/read with no identity observation or function-boundary escape."
+  {:kotoba/export [rewrite-expression rewrite-program]})
 
 (def ^:private max-items 32)
 (def ^:private constructors '#{vector-new vector-f64-new})
