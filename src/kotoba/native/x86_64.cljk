@@ -154,12 +154,21 @@
   ;; measures -- measured 2026-09-10 with `-icount`, a three-operation loop body
   ;; costs 15 guest instructions per iteration and 3 of them are this charge.
   ;;
-  ;; The observable contract is unchanged. Before, a step trapped when the
-  ;; counter was already 0 and the counter never went negative; now it traps
-  ;; when the decrement takes it below 0. Starting from N, both allow exactly N
-  ;; steps and trap on the (N+1)th. The only difference is the counter's value
-  ;; at the trap (-1 rather than 0), and `ud2` is the last thing that executes,
-  ;; so nothing observes it.
+  ;; Starting from N, both forms allow exactly N steps and trap on the (N+1)th.
+  ;; What differed was the counter's value AT the trap: the old form trapped
+  ;; with 0 still stored, the first `dec/jns` form with -1 -- and "ud2 is the
+  ;; last thing that executes, so nothing observes it" was wrong. The kexe
+  ;; loader's structured report reads the context after the trap and prints
+  ;; `:fuel {:initial N :remaining R}`; amu's `jdk-free-native-conformance`
+  ;; asserts `:remaining 0` on exhaustion, and the aarch64 backend (SUBS then
+  ;; branch, store only when no borrow) leaves 0. Measured 2026-09-11 on
+  ;; amu#937's ubuntu-latest run: x86-64 reported
+  ;; `:remaining 18446744073709551615`. So the TRAP PATH -- and only the trap
+  ;; path -- puts the counter back with `inc qword [r9+8]` before `ud2`. The
+  ;; fast path is still two instructions; the cold path grows by one that runs
+  ;; at most once per guest lifetime.
+  ;;
+  ;;   dec qword [r9+8] / jns present / inc qword [r9+8] / ud2
   ;;
   ;; `fuel-charge` above keeps the OLD bytes on purpose: the low-level native
   ;; executor qualification dereferences that private var directly and predates
@@ -167,6 +176,7 @@
   (let [present-label (fresh-label counter "fuel-present")]
     (vec (concat [0x49 0xff 0x49 0x08]
                  [(layout/relative-branch :x86-64/jns-rel8 present-label)]
+                 [0x49 0xff 0x41 0x08]
                  [0x0f 0x0b]
                  [(layout/label present-label)]))))
 
