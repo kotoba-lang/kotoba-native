@@ -1,5 +1,6 @@
 (ns kotoba.native.macho
   "Native-backend integration for typed relocation requests and Mach-O bytes."
+  {:kotoba/export [encode-text-object]}
   (:require [kotoba.codegen.relocation :as relocation]
             [kotoba.object.macho64 :as macho]))
 

@@ -5,6 +5,7 @@
   lowers through closed GMIR/MIR/MC data; unknown operations, unsupported value
   shapes, use-before-definition, register exhaustion, and malformed labels fail
   closed before either ISA encoder."
+  {:kotoba/export [coalesce-program-moves compile-expression compile-gmir compile-kir-module counted-self-recur-plans encode-mc encode-mc-module entry-fuel-prefixes function-reenters-guest? hoist-program-consumers lower-kir-expression lower-kir-module lower-mc pilot-expression? pilot-module? signed-division-magic word-result-type?]}
   (:require [kotoba.lang.text :as str]
             [clojure.walk :as walk]
             [kotoba.gmir :as gmir]

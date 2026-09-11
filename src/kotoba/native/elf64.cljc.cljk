@@ -1,4 +1,5 @@
 (ns kotoba.native.elf64
+  {:kotoba/export [max-object-fuel package-kernel package-kernel-aarch64 package-kernel-object package-user pinned-image-addresses]}
   (:require [kotoba.lang.text :as str]
             [kotoba.artifact.core :as artifact]
             [kotoba.native.interrupt-abi :as interrupt-abi]

@@ -1,4 +1,5 @@
 (ns kotoba.native.x86-64
+  {:kotoba/export [emit-expr emit-program]}
   ;; `kotoba.native.peephole` is required on BOTH runtimes, so the reader
   ;; conditional that used to wrap the whole `:require` (see
   ;; `kotoba.wasm.core`'s ns form for that original reasoning -- the `:clj`

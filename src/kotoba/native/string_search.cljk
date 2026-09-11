@@ -79,6 +79,7 @@
   keyword -- native traps carry no keyword at all, the loader reports
   `KEXE_TRAP` -- but the observable behaviour (no value is produced) agrees,
   and it needs no new trap encoding in either backend."
+  {:kotoba/export [augment-functions find-name lower-contains lower-index-of lower-replace-all replace-from-name span-name]}
   (:require [kotoba.lang.text]))
 
 ;; Bound to the two operands so each is evaluated exactly once, matching the

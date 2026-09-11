@@ -24,6 +24,7 @@
   That is what `kotoba-verifier` requires: it re-derives emission from sealed
   KIR and rejects any drift, so a nondeterministic pass would not merely be
   untidy, it would make every artifact unverifiable."
+  {:kotoba/export [constant-operand]}
   #?(:cljs (:require [kotoba.kir.cljs-i64 :as i64])))
 
 ;; The i64 VALUE a KIR operand materializes at compile time, or nil when the

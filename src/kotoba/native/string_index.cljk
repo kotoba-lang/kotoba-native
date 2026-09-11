@@ -13,7 +13,8 @@
 
   The reference limits are re-derived here: 128 entries and 65536 aggregate
   UTF-8 key bytes. A rejected insertion traps through an intentionally
-  out-of-range vector-at, using an existing native trap path.")
+  out-of-range vector-at, using an existing native trap path."
+  {:kotoba/export [augment-functions find-name key-bytes-name lower]})
 
 (def find-name 'kotoba$string-index-find)
 (def key-bytes-name 'kotoba$string-index-key-bytes)
