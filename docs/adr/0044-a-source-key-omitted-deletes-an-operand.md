@@ -77,7 +77,7 @@ suite could not have failed on this, because nothing in it asked the question.
 
 ## Verification
 
-`clojure -M:test`: 280 tests / 3483 assertions, 0 failures (was 279 / 3476).
+`kbb -M:test`: 280 tests / 3483 assertions, 0 failures (was 279 / 3476).
 
 Removing the three keys from `gmir-source-keys` again turns
 `dot-f32-keeps-the-definitions-of-its-literal-operands` red by name, on

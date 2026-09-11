@@ -398,4 +398,4 @@ replace-all: multi-byte needle                        "日本語"   "本"  "X"  
 replace-all: multi-byte replacement                   "a-b"     "-"   "日"    => "a日b"
 ```
 
-This repository's own suite: `clojure -M:test`.
+This repository's own suite: `kbb -M:test`.

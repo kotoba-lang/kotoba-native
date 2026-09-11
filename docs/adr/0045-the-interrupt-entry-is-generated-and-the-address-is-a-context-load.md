@@ -261,7 +261,7 @@ stronger claim: it says the byte reached memory, which is what an IDT needs.
 
 ## Evidence
 
-`clojure -M:test`: 302 tests, 4096 assertions, 0 failures (after merging origin/main).
+`kbb -M:test`: 302 tests, 4096 assertions, 0 failures (after merging origin/main).
 
 Five deliberate breaks, each producing the failure it names and no other:
 

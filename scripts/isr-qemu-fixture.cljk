@@ -1,4 +1,4 @@
-#!/usr/bin/env nbb
+#!/usr/bin/env kbb
 ;; isr: boot a Kotoba kernel image whose IDT names a toolchain-generated
 ;; interrupt entry, and read the console it wrote.
 ;;
@@ -9,7 +9,7 @@
 ;; none of which this repo depends on, so it is run by hand and its result is
 ;; quoted in the ADR rather than gating a suite.
 ;;
-;;   nbb scripts/isr-qemu-fixture.cljk --amu <path-to-amu-worktree>
+;;   kbb --backend sci scripts/isr-qemu-fixture.cljk --amu <path-to-amu-worktree>
 ;;
 ;; It refuses rather than skipping when a tool is missing. A fixture that
 ;; prints "ok" because it could not find QEMU is the failure class this

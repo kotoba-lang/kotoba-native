@@ -128,7 +128,7 @@ machine, agreeing with itself. The next format to arrive needs that row.
 
 ## Evidence
 
-- `clojure -M:test` in kotoba-native: 348 tests, 4758 assertions, 0 failures.
+- `kbb -M:test` in kotoba-native: 348 tests, 4758 assertions, 0 failures.
 - `kotoba.native.dequant-kquant-test`: 11 tests, 72 assertions.
 - Break/unbreak, 2026-09-03, each red for the reason named:
   - `:pair (quot g 4)` → `(quot g 8)`: `q4-k-unrolled-groups-read-what-the-c-reads`
