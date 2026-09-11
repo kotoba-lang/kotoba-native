@@ -1,8 +1,8 @@
 (ns aarch64-constant-selector-benchmark
   "Cold/steady evidence for the bounded AArch64 constant selector.
 
-  clojure -M scripts/aarch64-constant-selector-benchmark.cljc
-  nbb --classpath \"src:$(clojure -Spath)\" scripts/aarch64-constant-selector-benchmark.cljc"
+  clojure -M scripts/aarch64-constant-selector-benchmark.cljk
+  nbb --classpath \"src:$(clojure -Spath)\" scripts/aarch64-constant-selector-benchmark.cljk"
   (:require [kotoba.native.machine-ir]))
 
 (def selector

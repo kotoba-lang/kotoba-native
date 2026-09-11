@@ -110,7 +110,7 @@ not it read the answer, because the move is emitted unconditionally. This ADR
 does NOT rebuild them; the AIUEOS-PROJECT-CLEANUP and attestation streams own
 the roster (`qualification/jvm-free-object-parity.edn`) and the receipts.
 
-Measured 2026-09-02 by `scripts/aiueos-store-answer-audit.cljs` over
+Measured 2026-09-02 by `scripts/aiueos-store-answer-audit.cljk` over
 `os/aiueos/kotoba/*.kotoba` (83 sources; 67 objects in today's K16 link list).
 It is an audit, not a gate -- it takes the directory as an argument and refuses
 with exit 2 if any file will not read. It propagates taint over `let` bindings
@@ -157,7 +157,7 @@ honest direction for a list like this is to over-report.
 
 ## Evidence
 
-**Encodings.** `test/kotoba/native/store_result_test.clj` decodes the emitted
+**Encodings.** `test/kotoba/native/store_result_test.cljk` decodes the emitted
 store by its addressing form (`[r11]` on x86, `[x16]` on AArch64), reads the
 stored register out of it, and asserts the next instruction moves that register
 into the register the compiled expression answers with -- for all 20 store
@@ -180,7 +180,7 @@ Full suite after the change: 307 tests, 4461 assertions, 0 failures.
 0x12345678 and 0x0123456789ABCDEF at their natural alignments in a 4 KiB
 window and prints, per width, whether the store's ANSWER equals the word it was
 handed and whether a load back from the same address does too. Run by
-`scripts/store-answer-qemu-fixture.cljs` (amu `compile --artifact image` +
+`scripts/store-answer-qemu-fixture.cljk` (amu `compile --artifact image` +
 `package-aiueos-boot`, QEMU q35 + OVMF, `isa-debugcon` at 0xe9, `isa-debug-exit`
 at 0xf4). The load-backs are the control: they separate "the store did not run"
 from "the store ran and answered wrong", and those two produce the same digit

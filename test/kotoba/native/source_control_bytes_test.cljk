@@ -1,7 +1,7 @@
 (ns kotoba.native.source-control-bytes-test
   "A raw control byte makes grep treat a source file as binary, so it prints
   nothing and exits 1 -- which is what a file NOT containing the searched word
-  does. `src/kotoba/native/elf64.clj` carried four raw NULs inside the ELF
+  does. `src/kotoba/native/elf64.clj.cljk` carried four raw NULs inside the ELF
   shstrtab literal, and it is the JVM allowlist for every aiueos kernel export
   symbol (ADR-0036). Auditing that table with grep returned silence."
   (:require [clojure.java.io :as io]

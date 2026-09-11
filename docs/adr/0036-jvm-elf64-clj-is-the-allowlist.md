@@ -6,7 +6,7 @@
 
 ## Decision
 
-`package-kernel-object` in `src/kotoba/native/elf64.clj` refuses an
+`package-kernel-object` in `src/kotoba/native/elf64.clj.cljk` refuses an
 `aiueos-*` export that is not in `kernel-object-entries`. It does not
 hand that object the probe symbol.
 
