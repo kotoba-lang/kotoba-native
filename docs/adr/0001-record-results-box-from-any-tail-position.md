@@ -219,4 +219,4 @@ The `[:ref :t/r]` result spelling is proved end-to-end by the sweep instead —
 reference and now compile — because a row that ALSO projects the call's result
 is blocked in the verifier (see the residual gaps table).
 
-This repo's own suite: `clojure -M:test`.
+This repo's own suite: `kbb -M:test`.

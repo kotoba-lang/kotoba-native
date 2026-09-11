@@ -276,5 +276,5 @@ another codec.
 ## Test
 
 ```bash
-clojure -M:test
+kbb -M:test
 ```

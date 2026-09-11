@@ -70,7 +70,7 @@ have one when someone needs it.
 
 ## Evidence
 
-`clojure -M:test`: 248 tests, 2844 assertions, 0 failures.
+`kbb -M:test`: 248 tests, 2844 assertions, 0 failures.
 
 **Every byte string in the tests came from the system assembler, not from a
 hand carry.** `clang -target x86_64-unknown-none` and `clang -target

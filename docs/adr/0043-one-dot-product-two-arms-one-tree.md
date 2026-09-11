@@ -94,7 +94,7 @@ every length check there is.
 
 ## Verification
 
-`clojure -M:test`: 279 tests / 3476 assertions, 0 failures across the whole
+`kbb -M:test`: 279 tests / 3476 assertions, 0 failures across the whole
 suite.
 
 **Every byte run in the goldens was assembled and read back** with

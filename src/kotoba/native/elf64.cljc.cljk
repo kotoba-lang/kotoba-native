@@ -201,13 +201,13 @@
    ;; word types only (temporary; not a language ceiling).
    'aiueos-ime-commit {:arity 2 :symbol "kotoba_aiueos_ime_commit"}
    ;; Guest WM (aiueos ADR-0091). Two overlapping boot-desktop rects,
-   ;; z-front hit-test. Hosted `clojure -M:compositor wm` does not count.
+   ;; z-front hit-test. Hosted `kbb -M:compositor wm` does not count.
    ;; C prints the four vectors; this object owns which surface is hit.
    ;; Nested if, word types only (temporary; not a language ceiling).
    'aiueos-wm-hit {:arity 4 :symbol "kotoba_aiueos_wm_hit"}
    ;; Guest scanout-two (aiueos ADR-0095). Bind a second virtio-gpu
    ;; scanout when two 2D resources and two enabled modes exist.
-   ;; Hosted `clojure -M:compositor wm` does not count. C SET_SCANOUT
+   ;; Hosted `kbb -M:compositor wm` does not count. C SET_SCANOUT
    ;; is mechanism; this object owns how many scanouts to bind.
    ;; Nested if, word types only (temporary; not a language ceiling).
    'aiueos-scanout-bind {:arity 2 :symbol "kotoba_aiueos_scanout_bind"}

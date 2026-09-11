@@ -1,4 +1,4 @@
-#!/usr/bin/env nbb
+#!/usr/bin/env kbb
 ;; storefix: boot a Kotoba kernel image that stores a word at every transfer
 ;; width and prints, for each, whether the store's ANSWER was the word it was
 ;; handed and whether a load back agrees.
@@ -10,7 +10,7 @@
 ;; which this repo depends on, so it is run by hand and its result is quoted in
 ;; the ADR rather than gating a suite.
 ;;
-;;   nbb scripts/store-answer-qemu-fixture.cljk --amu <path-to-amu-worktree>
+;;   kbb --backend sci scripts/store-answer-qemu-fixture.cljk --amu <path-to-amu-worktree>
 ;;
 ;; `--expect X5X6X7X8` asks for the PRE-FIX console instead, which is how the
 ;; defect was shown to be real before it was fixed. Anything else is refused.

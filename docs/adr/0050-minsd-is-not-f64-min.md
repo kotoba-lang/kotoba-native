@@ -117,7 +117,7 @@ x86 NaN behaviour as the *reason* have been corrected to say so.
 
 ## Evidence
 
-- `clojure -M:test -n kotoba.native-test -n kotoba.native.machine-ir-test`:
+- `kbb -M:test -n kotoba.native-test -n kotoba.native.machine-ir-test`:
   143 tests, 1653 assertions, 0 failures (before the new goldens).
 - Execution, before: SCANNED 48, MISMATCHES 6 — all six on x86-64, none on
   AArch64, which is 24 observations per ISA.

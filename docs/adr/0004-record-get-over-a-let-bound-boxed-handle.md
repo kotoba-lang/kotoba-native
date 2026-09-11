@@ -213,7 +213,7 @@ by git SHA:
                 io.github.kotoba-lang/kotoba-verifier {:git/sha "<verifier ADR 0004 merge>"}}}'
 ```
 
-This repo's own suite: `clojure -M:test`.
+This repo's own suite: `kbb -M:test`.
 
 ## A note on measurement hygiene
 

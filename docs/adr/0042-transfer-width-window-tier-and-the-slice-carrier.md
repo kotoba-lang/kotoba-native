@@ -116,7 +116,7 @@ weaker of the two.
 
 ## Evidence
 
-`clojure -M:test` — **271 tests, 3411 assertions, 0 failures**, after merging
+`kbb -M:test` — **271 tests, 3411 assertions, 0 failures**, after merging
 `origin/main` (the sysops general atomics, the SIMD-prep VEX work, f32 on both
 ISAs, and the UEFI firmware boundary).
 
