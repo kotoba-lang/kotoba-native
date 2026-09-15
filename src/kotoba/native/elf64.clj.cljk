@@ -309,6 +309,13 @@
    ;; 1024 default tier.
    'aiueos-relay-hello-payload {:arity 5 :symbol "kotoba_aiueos_relay_hello_payload"}
    'aiueos-relay-ack-payload-valid {:arity 4 :symbol "kotoba_aiueos_relay_ack_payload_valid"}
+   ;; Install intent admission (aiueos ADR-0213's installer half). The
+   ;; installer's DECISION -- whether a live inspection report satisfies a
+   ;; signed install intent -- as one pure object: `(image length)`, one
+   ;; caller-owned memory image, reasons 0-9. The aiueos repo carries the
+   ;; contract (os/aiueos/contracts/install-intent-admit-v1.edn) and a
+   ;; parity gate against the JSON CLI's verdict.
+   'aiueos-install-intent-admit {:arity 2 :symbol "kotoba_aiueos_install_intent_admit"}
    ;; VT-d admission. vtd.c was the last kernel file with no decision moved out,
    ;; and one of its decisions is security-relevant: the IOTLB register offset is
    ;; DERIVED from a hardware-reported ECAP field and then bounds-checked, so an
