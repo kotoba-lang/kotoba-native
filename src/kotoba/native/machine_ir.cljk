@@ -2431,6 +2431,25 @@
                   [(vec (mapcat first lowered))
                    (second (peek lowered))])
 
+                ;; `(arena-scope body)` -- superproject ADR-2609160044, ABI
+                ;; v6. ENTER marks the arenas, the body runs, LEAVE releases
+                ;; everything allocated since; the body's scalar register is
+                ;; the value. The pair is emitted here and nowhere else: no
+                ;; KIR program names enter or leave, which is what makes the
+                ;; LIFO the host relies on hold by construction. The body is
+                ;; lowered in VALUE position on purpose -- a self-call inside
+                ;; it is not a tail call, since the leave follows it.
+                (and (seq? form) (= 'arena-scope (first form)) (= 2 (count form)))
+                (let [[body-code result] (value (second form) env)
+                      enter (fresh-reg)
+                      leave (fresh-reg)]
+                  [(-> [{:gmir/op :gmir/runtime-call :gmir/dst enter
+                         :gmir/runtime :arena-enter :gmir/arguments []}]
+                       (into body-code)
+                       (conj {:gmir/op :gmir/runtime-call :gmir/dst leave
+                              :gmir/runtime :arena-leave :gmir/arguments []}))
+                   result])
+
                 (and (seq? form) (contains? signatures (first form)))
                 (let [callee (first form)
                       arguments (vec (rest form))
@@ -2703,6 +2722,9 @@
                 (and (seq? form) (= 'do (first form)) (next form))
                 (let [shapes (mapv #(shape % env) (rest form))]
                   (when (every? some? shapes) (peek shapes)))
+
+                (and (seq? form) (= 'arena-scope (first form)) (= 2 (count form)))
+                (shape (second form) env)
 
                 :else nil))]
     (and (vector? params) (<= (count params) 5)

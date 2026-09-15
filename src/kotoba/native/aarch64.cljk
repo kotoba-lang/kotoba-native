@@ -721,7 +721,10 @@
    ;; ABI v5 (2026-09-15): the byte search is a host slot -- one call per
    ;; search instead of one substring handle and three or four callbacks per
    ;; haystack byte. Inside LDR's imm12 range like every offset above.
-   'string-index-of 216})
+   'string-index-of 216
+   ;; ABI v6 (2026-09-16, superproject ADR-2609160044): the region reset
+   ;; pair, reached only from `arena-scope` below -- no KIR head names them.
+   'arena-enter 224 'arena-leave 232})
 
 ;; `vector-f64-*` is the SAME host table. A native f64 is already an i64 word
 ;; carrying an IEEE-754 bit pattern (ADR-2608030300: "no new value
@@ -1156,6 +1159,14 @@
         ;; side effects execute exactly once, in order.
         (= op 'do)
         (vec (mapcat #(emit-expr % env depth) args))
+        ;; `(arena-scope body)`: enter, the body into x0, x0 saved across the
+        ;; leave call, restored. Same shape `kotoba.native.machine-ir` emits.
+        (and (= op 'arena-scope) (= 1 (count args)))
+        (vec (concat (emit-heap-call 'arena-enter [] env depth)
+                     (emit-expr (first args) env depth)
+                     (save-x0)
+                     (emit-heap-call 'arena-leave [] env (inc depth))
+                     (restore-to 0)))
         (= op 'let)
         (emit-let (first args) (second args) env depth)
         (= op 'cap-call)
