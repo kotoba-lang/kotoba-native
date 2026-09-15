@@ -140,7 +140,16 @@
   (testing "a source claiming no aiueos name still packages as the probe"
     (is (= "kotoba_aiueos_probe"
            (:export (elf64/package-kernel-object
-                     (sealed-kernel :x86_64-aiueos-kernel-v1 512)))))))
+                     (sealed-kernel :x86_64-aiueos-kernel-v1 512))))))
+  (testing "the install intent admission is admitted under its own symbol"
+    (let [object (elf64/package-kernel-object
+                  (-> (sealed-kernel :x86_64-aiueos-kernel-v1 512)
+                      (assoc :exports {'aiueos-install-intent-admit {:offset 0 :arity 2}
+                                       'main {:offset 1 :arity 0}}
+                             :code [0xc3 0xc3])
+                      (dissoc :sha256)
+                      artifact/seal)))]
+      (is (= "kotoba_aiueos_install_intent_admit" (:export object))))))
 
 ;; The Qwen3.5 forward-pass tranche. Two things are asserted, and the second is
 ;; the one that has gone wrong before (ADR-0036): the export symbol, and the
