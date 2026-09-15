@@ -524,7 +524,10 @@
    ;; search instead of one substring handle and three or four callbacks per
    ;; haystack byte. Past 127, so the disp32 form like every slot since
    ;; string-substring.
-   'string-index-of 216})
+   'string-index-of 216
+   ;; ABI v6 (2026-09-16, superproject ADR-2609160044): the region reset
+   ;; pair, reached only from `arena-scope` below -- no KIR head names them.
+   'arena-enter 224 'arena-leave 232})
 
 ;; `vector-f64-*` is the SAME host table. A native f64 is already an i64 word
 ;; carrying an IEEE-754 bit pattern (ADR-2608030300: "no new value
@@ -1676,6 +1679,15 @@
           (vec (mapcat (fn [i arg]
                          (emit-expr arg env (if (= i (dec n)) ctx (assoc ctx :tail? false))))
                        (range n) args)))
+        ;; `(arena-scope body)`: enter, the body into rax, rax pushed across
+        ;; the leave call (one deeper for the alignment bookkeeping), popped.
+        ;; Same shape `kotoba.native.machine-ir` emits.
+        (and (= op 'arena-scope) (= 1 (count args)))
+        (vec (concat (emit-heap-call 'arena-enter [] env ctx)
+                     (emit-expr (first args) env (assoc ctx :tail? false))
+                     [0x50]
+                     (emit-heap-call 'arena-leave [] env (update ctx :temp-depth inc))
+                     [0x58]))
 
         (= op 'cap-call)
         (emit-cap-call (first args) (second args) env ctx)
