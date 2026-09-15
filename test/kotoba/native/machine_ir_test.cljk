@@ -925,10 +925,11 @@
                             instructions))))))
 
 (deftest search-and-index-helpers-use-the-word-call-module
-  (doseq [function [{:name 'main :params '[subject needle]
-                     :result :bool
-                     :body '(string-contains? subject needle)}
-                    {:name 'main :params '[subject needle replacement]
+  ;; ABI v5 (2026-09-15): `string-contains?` is call-free -- the search is a
+  ;; host slot and the 0/1 fold needs no helper -- so it takes the
+  ;; per-expression route like `string=?` does, and is not listed here. The
+  ;; replace driver and the string-index helpers still call.
+  (doseq [function [{:name 'main :params '[subject needle replacement]
                      :result :string
                      :body '(string-replace-all subject needle replacement)}
                     {:name 'main :params '[index key]
