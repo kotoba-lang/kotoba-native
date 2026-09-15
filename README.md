@@ -78,13 +78,16 @@ lowering lives in neither backend: both consume the SAME rewrite, from
 program produces one value on both ISAs and two copies could drift while both
 stayed green.
 
-They lower entirely out of the four string callbacks the context ABI already
-has — `string=?`, `string-concat`, `string-substring`, `string-code-point-at` —
-so they cost no ABI bump, no loader change and no new value representation. The
-scan walks CODE POINTS rather than bytes because `string-substring` traps on an
-offset that splits one, and a trap cannot be caught; and the three helper
-functions it needs are appended to the program by `emit-program`, only when a
-body actually reaches one, and never exported. See ADR 0002.
+Since ABI v5 (2026-09-15, ADR 0082) `string-index-of` is a HOST operation at
+context slot 216, like `string=?` at 112: one call per search, memmem on the
+host's side, nothing allocated. The two rewrites lower onto it —
+`string-contains?` as the 0/1 fold, `string-replace-all` through one driver
+helper that `emit-program` appends only when a body reaches it, never
+exported. Until v5 the search itself was a rewrite over the four string
+callbacks — one substring handle and three or four host calls per haystack
+byte, which is what made a packaged `grep` exhaust a 4 Mi-handle arena after
+2 MB of a 3.3 MB file. See ADR 0002 for the rewrite era and ADR 0082 for the
+slot.
 
 ## Optimization
 

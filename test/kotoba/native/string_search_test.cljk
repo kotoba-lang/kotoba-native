@@ -1,35 +1,43 @@
 (ns kotoba.native.string-search-test
   "`string-contains?` / `string-index-of` / `string-replace-all` on both native
-  ISAs.
+  ISAs, with `string-index-of` a HOST operation since ABI v5 (2026-09-15).
 
-  Two things have to be true and they are proved separately.
+  Three things have to be true and they are proved separately.
 
-  **The rewrite computes the right answer.** Every row below is run TWICE
-  through `kotoba.kir/execute`: once as the operation itself, which the
-  reference interpreter implements directly, and once as the rewrite the
-  backends emit. The expected value is never written down -- the oracle
-  produces it -- so a row cannot be passed by an implementation and an
-  expectation being wrong in the same direction. This is a byte-search, which
-  is the classic place a wrong implementation returns a plausible answer, so
-  the table is built out of near misses: a needle at offset 0, a needle
-  touching the last byte, a needle absent but sharing a prefix with every
-  window, a needle longer than the haystack, overlapping occurrences, a
-  replacement that contains the needle, and multi-byte UTF-8 on both sides.
+  **The rewrites compute the right answer.** `string-contains?` and
+  `string-replace-all` are still rewrites (onto `string-index-of`), and every
+  row below is run TWICE through `kotoba.kir/execute`: once as the operation
+  itself, which the reference interpreter implements directly, and once as
+  the rewrite the backends emit. The expected value is never written down --
+  the oracle produces it -- so a row cannot be passed by an implementation
+  and an expectation being wrong in the same direction. The table is built
+  out of near misses: a needle at offset 0, a needle touching the last byte,
+  a needle absent but sharing a prefix with every window, a needle longer
+  than the haystack, overlapping occurrences, a replacement that contains
+  the needle, and multi-byte UTF-8 on both sides.
 
-  **Both backends emit it, identically shaped.** `emit-program` of a program
-  that uses the operation is asserted to produce EXACTLY the bytes of the
-  program with the rewrite already written out and the helpers already
-  declared -- so this is a rewrite into code both backends already emitted,
-  not a new encoding. Per ISA, on both ISAs.
+  **`string-index-of` is a runtime call at slot 216, on both ISAs.** It is no
+  longer rewritten: the KIR-to-GMIR lowering emits one `:gmir/runtime-call`
+  with `:string-index-of` and two arguments, and the machine code of a
+  program that searches contains the slot-216 load. The rows that pinned the
+  old scan's answers (the first of two occurrences, byte offsets that exceed
+  code-point indexes) now run through the reference interpreter only, which
+  is what the host is measured against in amu's conformance -- the host, not
+  this repository, owns the bytes.
+
+  **Both backends emit the rewrites, identically shaped.** `emit-program` of
+  a program that uses `string-contains?` / `string-replace-all` is asserted
+  to produce EXACTLY the bytes of the program with the rewrite already
+  written out and the helper already declared. Per ISA, on both ISAs.
 
   Machine-code EXECUTION is not here: this repository has no loader
-  (`tools/kexe_loader.c` belongs to kotoba-lang/compiler), as
-  `kotoba.native.isa-parity-test` also records. The rows executed as real
-  processes on both ISAs are reproduced in `docs/adr/0002-*`."
+  (`tools/kexe_loader.c` belongs to kotoba-lang/amu), as
+  `kotoba.native.isa-parity-test` also records."
   (:require [kotoba.lang.text] #?(:clj  [clojure.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing] :include-macros true])
             [kotoba.kir :as ir]
             [kotoba.native.aarch64 :as arm]
+            [kotoba.native.machine-ir :as machine]
             [kotoba.native.string-search :as search]
             [kotoba.native.x86-64 :as x86]))
 
@@ -148,43 +156,50 @@
          ;; empty-needle trap below were ever removed.
          ["a real match at offset 0" "abc" "a"]]))
 
-(deftest string-index-of-agrees-with-the-reference-interpreter
-  (doseq [[why haystack needle] index-of-rows]
-    (testing why
-      (let [op (list 'string-index-of haystack needle)]
-        (is (= (run (program :i64 op))
-               (run (rewritten :i64 op (search/lower-index-of [haystack needle]))))
-            (str "the rewrite must answer what `string-index-of` answers: "
-                 (pr-str haystack) " / " (pr-str needle)))))))
+(deftest string-index-of-answers-in-the-reference-interpreter
+  ;; The oracle's answers over the rows, pinned as VALUES for the offset
+  ;; rows that used to separate a right scan from a wrong one -- the host
+  ;; slot is measured against these same rows in amu's conformance.
+  ;; The interpreter answers a BigInt on nbb, so values are compared as text.
+  (let [answer (fn [h n] (str (run (program :i64 (list 'string-index-of h n)))))]
+    (doseq [[why haystack needle] index-of-rows]
+      (testing why
+        (is (re-matches #"-?[0-9]+" (answer haystack needle)) why)))
+    (is (= "0" (answer "abcabc" "abc")))
+    (is (= "6" (answer "日本語" "語")))
+    (is (= "3" (answer "日本語" "本")))
+    (is (= "-1" (answer "abc" "abcd")))
+    (is (= "0" (answer "xaxab" "xa")) "the FIRST of two occurrences")
+    (is (= "1" (answer "bxaxab" "xa")))))
 
-(deftest string-index-of-is-emitted-as-the-written-out-rewrite-on-both-isas
+(deftest string-index-of-is-a-runtime-call-at-slot-216-on-both-isas
+  ;; ABI v5. Not a rewrite: the lowering emits ONE runtime call with two
+  ;; arguments, and no helper is appended.
+  (let [instructions (:gmir/instructions
+                      (machine/lower-kir-expression '[h n] '(string-index-of h n)))
+        calls (filter #(= :gmir/runtime-call (:gmir/op %)) instructions)]
+    (is (= 1 (count calls)))
+    (is (= :string-index-of (:gmir/runtime (first calls))))
+    (is (= 2 (count (:gmir/arguments (first calls))))))
+  (let [fs [{:name 'main :params '[h n] :body '(string-index-of h n)}]]
+    (is (identical? fs (search/augment-functions fs))
+        "no helper: the search is the host's"))
   (doseq [[label emit] backends]
     (testing label
       (doseq [[why haystack needle] index-of-rows]
-        (let [op (list 'string-index-of haystack needle)
-              emitted (:code (emit (program :i64 op)))]
-          (is (seq emitted) why)
-          (is (= emitted
-                 (:code (emit (rewritten :i64 op (search/lower-index-of [haystack needle])))))
-              (str why " must emit exactly the written-out rewrite")))))))
-
-(deftest string-index-of-shares-one-copy-of-the-scan-with-string-contains
-  ;; The docstring of `lower-index-of` claims the operation appends no helper
-  ;; `string-contains?` did not already need, and that a program searching both
-  ;; ways emits ONE scan. Both halves are asserted, because a second copy would
-  ;; not fail any row above -- it would only make every call displacement past
-  ;; the first copy wrong, which is a bug that shows up somewhere else entirely.
-  (let [names (fn [body]
-                (mapv :name (search/augment-functions
-                             [{:name 'main :params [] :result :i64 :body body}])))]
-    (is (= (names '(string-contains? "abc" "b"))
-           (names '(string-index-of "abc" "b")))
-        "the same helper set, in the same order")
-    (is (= (names '(string-index-of "abc" "b"))
-           (names '(+ (string-index-of "abc" "b") (string-contains? "abc" "b"))))
-        "using both operations appends the helpers once, not twice")
-    (is (apply distinct? (names '(string-index-of "abc" "b")))
-        "and no name is declared twice")))
+        (let [emitted (:code (emit (program :i64 (list 'string-index-of haystack needle))))]
+          (is (seq emitted) why)))))
+  ;; The slot itself: 216 = 0xd8. AArch64 loads it from the context register
+  ;; with `ldr x16, [x7, #216]` = 0xf9406cf0; x86-64 calls through
+  ;; `call qword ptr [r9+0xd8]` = 41 ff 91 d8 00 00 00.
+  (let [contains-bytes? (fn [code needle]
+                          (boolean (some #(= (vec needle) %)
+                                         (partition (count needle) 1 code))))
+        arm-code (:code (arm/emit-program (program :i64 '(string-index-of "abc" "b"))))
+        x86-code (:code (x86/emit-program (program :i64 '(string-index-of "abc" "b"))))]
+    (is (contains-bytes? arm-code [0xf0 0x6c 0x40 0xf9]) "AArch64 ldr x16, [x7, #216]")
+    (is (contains-bytes? x86-code [0x41 0xff 0x91 0xd8 0x00 0x00 0x00])
+        "x86-64 call [r9+216]")))
 
 ;; ---------------------------------------------------------------------------
 ;; string-replace-all
@@ -245,24 +260,21 @@
 ;; ---------------------------------------------------------------------------
 
 (deftest an-empty-needle-traps-in-the-rewrite-because-it-traps-in-the-oracle
-  ;; `kotoba.kir` traps rather than answering, so the rewrite must not answer
-  ;; either. It reaches a trap through `(string-code-point-at n 0)`, which is
-  ;; out of bounds exactly when the needle is empty -- no new trap encoding in
-  ;; either backend.
+  ;; `kotoba.kir` traps rather than answering, so the rewrites must not
+  ;; answer either: every path reaches `string-index-of`, which traps on an
+  ;; empty needle in the oracle and in the host.
   (doseq [[why op lowered result]
           [["contains?" '(string-contains? "abc" "")
             (search/lower-contains ["abc" ""]) :i64]
            ["contains?, empty haystack too" '(string-contains? "" "")
             (search/lower-contains ["" ""]) :i64]
-           ;; An empty needle occurs at offset 0 in every string, so a
-           ;; lowering that answered here would return a plausible 0 -- the
-           ;; one wrong answer indistinguishable from a real match at the
-           ;; start. This row is why the trap is load-bearing for the offset
-           ;; in a way it is not for the predicate.
-           ["index-of" '(string-index-of "abc" "")
-            (search/lower-index-of ["abc" ""]) :i64]
-           ["index-of, empty haystack too" '(string-index-of "" "")
-            (search/lower-index-of ["" ""]) :i64]
+           ;; An empty needle occurs at offset 0 in every string, so a host
+           ;; that answered here would return a plausible 0 -- the one wrong
+           ;; answer indistinguishable from a real match at the start. The
+           ;; host slot traps (amu's loader raises SIGILL); the oracle traps
+           ;; here, and the rewrites reach the same operation.
+           ["index-of" '(string-index-of "abc" "") '(string-index-of "abc" "") :i64]
+           ["index-of, empty haystack too" '(string-index-of "" "") '(string-index-of "" "") :i64]
            ["replace-all" '(string-replace-all "abc" "" "x")
             (search/lower-replace-all ["abc" "" "x"]) :string]]]
     (testing why
@@ -287,12 +299,15 @@
   (let [functions [{:name 'main :params '[a] :body '(+ a 1)}]]
     (is (identical? functions (search/augment-functions functions))
         "not merely equal: the same collection, so nothing can have been added")
-    ;; The other string operations must not drag the helpers in either --
-    ;; only the two SEARCH operations do.
+    ;; The other string operations must not drag the helper in either --
+    ;; only `string-replace-all` does, since ABI v5 made the search itself a
+    ;; host slot.
     (doseq [body '[(string-byte-length a)
                    (string-concat a "x")
                    (string-substring a 0 1)
                    (string-code-point-at a 0)
+                   (string-contains? a "x")
+                   (string-index-of a "x")
                    (keyword-name a)]]
       (let [fs [{:name 'main :params '[a] :body body}]]
         (is (identical? fs (search/augment-functions fs)) (pr-str body)))))
@@ -304,20 +319,20 @@
       (let [plain {:format :kotoba.kir/v4 :exports ['main]
                    :functions [{:name 'main :params '[a] :body '(+ a 1)}]}
             searching {:format :kotoba.kir/v4 :exports ['main]
-                       :functions [{:name 'main :params '[a] :result :i64
-                                    :param-types [:i64]
-                                    :body '(+ a (string-contains? "abc" "b"))}]}]
+                       :functions (search/augment-functions
+                                   [{:name 'main :params '[a] :result :i64
+                                     :param-types [:i64]
+                                     :body '(string-byte-length (string-replace-all "a-b" "-" "+"))}])}]
         (is (not= (count (:code (emit plain))) (count (:code (emit searching))))
-            "the helpers are real code, so their absence is observable")))))
+            "the helper is real code, so its absence is observable")))))
 
 (deftest the-helpers-are-injected-once-and-never-exported
-  (let [module (program :i64 '(string-contains? "abc" "b"))
+  (let [module (program :string '(string-replace-all "a" "a" "b"))
         names (mapv :name (:functions module))]
-    (is (= ['main search/span-name search/find-name] names)
-        "contains? needs the span and the find, and nothing else")
-    (is (= ['main search/span-name search/find-name search/replace-from-name]
-           (mapv :name (:functions (program :string '(string-replace-all "a" "a" "b")))))
-        "replace-all additionally needs the driver")
+    (is (= ['main] (mapv :name (:functions (program :i64 '(string-contains? "abc" "b")))))
+        "contains? needs no helper: the search is the host's")
+    (is (= ['main search/replace-from-name] names)
+        "replace-all needs the driver, and nothing else")
     ;; Idempotent: emitting an already-augmented module must not append a
     ;; second copy, or every call displacement past the first copy would be
     ;; wrong.
@@ -335,8 +350,8 @@
   (is (thrown-with-msg?
        #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) #"collides with a native string-search helper"
        (search/augment-functions
-        [{:name 'main :params [] :body '(string-contains? "a" "a")}
-         {:name search/find-name :params '[a b c d] :body 'a}]))))
+        [{:name 'main :params [] :body '(string-replace-all "a" "a" "b")}
+         {:name search/replace-from-name :params '[a b c d e] :body 'a}]))))
 
 (deftest a-search-operation-of-the-wrong-arity-is-not-lowered
   ;; The arity guard is on the lowering clause, so a malformed call falls
