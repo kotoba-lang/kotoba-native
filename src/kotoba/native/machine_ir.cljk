@@ -945,7 +945,14 @@
    ;; `vector-f64-alloc` nor `vector-f64-assoc!`. The `vector-op-aliases`
    ;; tables in both legacy backends are correspondingly unchanged.
    'vector-alloc :vector-alloc
-   'vector-assoc! :vector-assoc-in-place})
+   'vector-assoc! :vector-assoc-in-place
+   ;; ABI v5 (2026-09-15). `string-index-of` was a source rewrite over the
+   ;; four string callbacks (string_search.cljk) -- one substring handle and
+   ;; three or four host calls per haystack byte, which is what made a
+   ;; packaged grep exhaust a 4 Mi-handle arena after 2 MB. It is a host
+   ;; operation now, memmem on the host's side, and `string-contains?` and
+   ;; `string-replace-all` are rewritten onto it.
+   'string-index-of :string-index-of})
 
 (def ^:private native-clock-request-type
   [:variant :kotoba.clock/request [[:wall :bool] [:monotonic :bool]]])
@@ -1246,8 +1253,8 @@
            (list 'string-concat ":" (first args))
            (and (= op 'string-contains?) (= 2 (count args)))
            (normalize-surface-operations (string-search/lower-contains args))
-           (and (= op 'string-index-of) (= 2 (count args)))
-           (normalize-surface-operations (string-search/lower-index-of args))
+           ;; `string-index-of` itself is a runtime operation (ABI v5) and
+           ;; reaches `kir-runtime-ops` untouched.
            (and (= op 'string-replace-all) (= 3 (count args)))
            (normalize-surface-operations (string-search/lower-replace-all args))
            (and (contains? '#{string-index-new string-index-count

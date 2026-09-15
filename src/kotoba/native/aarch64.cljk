@@ -716,7 +716,11 @@
    ;; lowered to a STORE, returning the same handle rather than a new one.
    ;; Both stay inside LDR's unsigned-offset imm12 range (8 * 4095), like
    ;; every offset above.
-   'vector-alloc 200 'vector-assoc! 208})
+   'vector-alloc 200 'vector-assoc! 208
+   ;; ABI v5 (2026-09-15): the byte search is a host slot -- one call per
+   ;; search instead of one substring handle and three or four callbacks per
+   ;; haystack byte. Inside LDR's imm12 range like every offset above.
+   'string-index-of 216})
 
 ;; `vector-f64-*` is the SAME host table. A native f64 is already an i64 word
 ;; carrying an IEEE-754 bit pattern (ADR-2608030300: "no new value
@@ -1262,16 +1266,13 @@
              (ascii-literal? (first args)))
         (emit-string-substring-of-ascii-literal (first args) (second args) (nth args 2) env depth)
 
-        ;; The three string SEARCH operations. See `kotoba.native.string-search`;
+        ;; The string SEARCH operations. See `kotoba.native.string-search`;
         ;; the rewrite is shared with the x86-64 backend rather than restated
         ;; here, so the two ISAs cannot drift in their search semantics.
+        ;; `string-index-of` itself is a host slot (ABI v5) and reaches
+        ;; `emit-heap-call` below like `string=?`.
         (and (= op 'string-contains?) (= 2 (count args)))
         (emit-expr (string-search/lower-contains args) env depth)
-
-        ;; `string-index-of` is the same scan without the 0/1 fold on top, so
-        ;; it appends no helper `string-contains?` did not already need.
-        (and (= op 'string-index-of) (= 2 (count args)))
-        (emit-expr (string-search/lower-index-of args) env depth)
 
         (and (= op 'string-replace-all) (= 3 (count args)))
         (emit-expr (string-search/lower-replace-all args) env depth)
@@ -1324,7 +1325,7 @@
         (contains? '#{pair pair-first pair-second
                       kgraph-assert! kgraph-get kgraph-count kgraph-entity-at
                       string-byte-length string=? string-concat
-                      string-substring string-code-point-at
+                      string-substring string-code-point-at string-index-of
                       vector-new-empty vector-conj vector-count
                       vector-at vector-assoc vector-drop
                       vector-alloc vector-assoc!} op)
