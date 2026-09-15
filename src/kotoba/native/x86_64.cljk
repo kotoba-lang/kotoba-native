@@ -9,6 +9,7 @@
             [kotoba.native.interrupt-abi :as interrupt-abi]
             [kotoba.native.machine-ir :as machine-ir]
             [kotoba.native.peephole :as peephole]
+            [kotoba.native.keyword-equality :as keyword-equality]
             [kotoba.native.string-index :as string-index]
             [kotoba.native.string-search :as string-search]
             [kotoba.native.vector-region :as vector-region]
@@ -2298,6 +2299,7 @@
 
 (defn emit-program [kir]
   (let [kir (-> kir
+                keyword-equality/rewrite-program
                 vector-region/rewrite-program
                 (update :functions #(-> % string-search/augment-functions
                                            string-index/augment-functions))
