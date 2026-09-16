@@ -1114,6 +1114,40 @@
         #?(:clj (.getBytes ^String content "UTF-8")
            :cljs (js/Array.from (.encode (js/TextEncoder.) content)))))
 
+;; literal-walk: `string-code-point-at` over an ASCII literal.
+;;
+;; The general operation is a runtime call (`:string-code-point-at`, context
+;; slot 144) because a string VALUE is a pair(offset, length) the host resolves
+;; against a runtime base -- and a kernel object HAS NO HOST: its packaged
+;; context's slots are zero, so the call is a jump to address 0. Measured
+;; 2026-09-16 on x86_64-aiueos-kernel-v1 under QEMU: the first kernel object
+;; whose literal walk actually executed (aiueos `aes128-gcm-selftest`) died
+;; with `#PF rip=0`, and four objects landed before it (`relay-hello-payload`,
+;; `relay-ack-payload-valid`, `job-protocol-dispatch`,
+;; `device-worker-poll-response`) walk literals the same way and had never
+;; run as machine code.
+;;
+;; An ASCII literal needs no host: every byte is a code point, the bytes can
+;; live in the code image's read-only pool (`:gmir/rodata-address`, the
+;; boot-lit machinery, hex-encoded so no new encoding is needed), and the
+;; access is one bounded byte load (`:gmir/kernel-load-u8`, whose window
+;; check traps on an index at or past the length -- the trap `kotoba.kir`
+;; and the loader's `checked_string_code_point_at` both raise). Non-ASCII
+;; literals and computed strings keep the runtime call; a kernel object
+;; cannot use those, and the target's admission is where that is refused.
+(defn- ascii-literal? [form]
+  (and (string? form) (every? #(< % 0x80) (utf8-bytes form))))
+
+(defn- literal-walk-form? [form]
+  (and (seq? form) (= 'string-code-point-at (first form)) (= 3 (count form))
+       (ascii-literal? (second form))))
+
+(defn- hex-of-bytes [bytes]
+  (apply str (map #(let [h (.toString (int %) 16)] (if (= 1 (count h)) (str "0" h) h)) bytes)))
+
+(defn- literal-walk-window [n]
+  (first (filter #(>= % n) (sort gmir/kernel-window-maxima))))
+
 (defn- scalar-record-fields [type]
   (when (aggregate-abi/scalar-record-type? type)
     (nth type 2)))
@@ -2262,6 +2296,29 @@
                           :gmir/action action :gmir/arguments registers})
                    dst])
 
+                ;; literal-walk (see `literal-walk-form?`): no host.
+                (literal-walk-form? form)
+                (let [content (second form)
+                      bytes (utf8-bytes content)
+                      n (count bytes)
+                      maximum (literal-walk-window n)
+                      [index-code index-value] (value (nth form 2) env)
+                      index (scalar-register! index-value form)
+                      address (fresh-reg) length (fresh-reg) dst (fresh-reg)]
+                  (when-not maximum
+                    (reject! :kir-to-gmir :literal-walk-too-long
+                             {:form (list 'string-code-point-at '... (nth form 2))
+                              :length n :maximum (apply max gmir/kernel-window-maxima)}))
+                  [(vec (concat index-code
+                                [{:gmir/op :gmir/rodata-address :gmir/dst address
+                                  :gmir/content (hex-of-bytes bytes)
+                                  :gmir/rodata-encoding :hex-bytes}
+                                 {:gmir/op :gmir/constant :gmir/dst length :gmir/value n}
+                                 {:gmir/op :gmir/kernel-load-u8 :gmir/dst dst
+                                  :gmir/base address :gmir/length length
+                                  :gmir/index index :gmir/maximum maximum}]))
+                   dst])
+
                 (and (seq? form) (contains? kir-runtime-ops (first form)))
                 (let [runtime (get kir-runtime-ops (first form))
                       arguments (vec (rest form))
@@ -2654,6 +2711,12 @@
                      (= kir-function-address-op (first form))
                      (= 2 (count form))
                      (simple-symbol? (second form)))
+                :scalar
+
+                ;; literal-walk: one byte, one word; the literal's own shape
+                ;; is deliberately not consulted (it is a string literal).
+                (and (literal-walk-form? form)
+                     (= :scalar (shape (nth form 2) env)))
                 :scalar
 
                 (and (seq? form) (contains? kir-runtime-ops (first form))
