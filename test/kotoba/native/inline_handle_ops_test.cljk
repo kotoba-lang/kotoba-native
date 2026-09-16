@@ -36,12 +36,16 @@
 (deftest aarch64-vector-at-loads-through-the-item-arena
   (let [code (:code (arm/emit-program (program '[v] [:vector-i64] '(vector-at v 3))))]
     (is (contains-bytes? code [0xf0 0x9c 0x40 0xf9]) "ldr x16, [x7, #312] -- the vector-used pointer")
-    (is (contains-bytes? code [0x11 0x0e 0x40 0xa9 0x5f 0x00 0x03 0xeb]) "ldp x17, x3, [x16] ; cmp x2, x3 -- the index bound")
+    (is (contains-bytes? code [0x11 0x42 0x40 0xa9 0x5f 0x00 0x10 0xeb]) "ldp x17, x16, [x16] ; cmp x2, x16 -- the index bound, the length kept out of x3")
     (is (contains-bytes? code [0x00 0x7a 0x71 0xf8]) "ldr x0, [x16, x17, lsl #3]")))
 
 (deftest aarch64-assoc-stores-and-answers-the-handle
   (let [code (:code (arm/emit-program (program '[v] [:vector-i64] '(vector-count (vector-assoc! v 0 7)))))]
-    (is (contains-bytes? code [0x03 0x7a 0x31 0xf8 0xe0 0x03 0x01 0xaa]) "str x3, [x16, x17, lsl #3] ; mov x0, x1")))
+    (is (contains-bytes? code [0x03 0x7a 0x31 0xf8 0xe0 0x03 0x01 0xaa]) "str x3, [x16, x17, lsl #3] ; mov x0, x1")
+    ;; The value register survives to the store: nothing between the
+    ;; argument moves and `str x3` writes x3. The first cut loaded the
+    ;; length into x3 and stored 4 in every slot.
+    (is (not (contains-bytes? code [0x11 0x0e 0x40 0xa9])) "no ldp into x3 anywhere in the sequence")))
 
 (deftest x86-64-emits-the-check-and-never-the-slot
   (doseq [[body params types slot] cases]
