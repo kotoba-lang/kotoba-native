@@ -530,7 +530,9 @@
    'arena-enter 224 'arena-leave 232
    ;; ABI v7 (2026-09-16): the four text slots.
    'string-compare 240 'string-fold-ascii 248
-   'string-find-blank 256 'string-skip-blank 264})
+   'string-find-blank 256 'string-skip-blank 264
+   ;; ABI v8 (2026-09-16): the two line slots.
+   'string-index-of-from 272 'string-compare-lines 280})
 
 ;; `vector-f64-*` is the SAME host table. A native f64 is already an i64 word
 ;; carrying an IEEE-754 bit pattern (ADR-2608030300: "no new value
@@ -1893,6 +1895,7 @@
                       string-byte-length string=? string-concat
                       string-substring string-code-point-at string-index-of
                       string-compare string-fold-ascii string-find-blank string-skip-blank
+                      string-index-of-from string-compare-lines
                       vector-new-empty vector-conj vector-count
                       vector-at vector-assoc vector-drop
                       vector-alloc vector-assoc!} op)
