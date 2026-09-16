@@ -114,6 +114,34 @@
            (vec (subvec (vec object) 71 85)))
         "movabs r10, 4300000000 then mov [r9+8], r10")))
 
+;; aiueos C-free waves 1-2 (aiueos ADR-0219 / ADR-0220): the four objects that
+;; do not take the 1024 default carry their tier in the narrow immediate, and
+;; the four that do are asserted AT the default. Same offset as the narrow
+;; replenish test above: `mov qword [r9+8], imm32`'s immediate is at 75.
+(deftest cfree-wave-objects-carry-their-measured-fuel-tiers
+  (doseq [[entry arity fuel]
+          [['aiueos-device-worker-poll-response 3 10000000]
+           ['aiueos-job-protocol 5 65536]
+           ['aiueos-micro-infer-next 3 4096]
+           ['aiueos-aes128-gcm-selftest 2 250000000]
+           ['aiueos-inference-status-valid 2 1024]
+           ['aiueos-inference-milli-tokens-per-second 2 1024]
+           ['aiueos-model-mapping-plan 3 1024]
+           ['aiueos-model-handoff-validate 2 1024]]]
+    (let [object (vec (:bytes (elf64/package-kernel-object
+                               (artifact/seal
+                                {:target :x86_64-aiueos-kernel-v1
+                                 :target-profile {:runtime :none :ambient-syscalls false}
+                                 :program {:entry 'main}
+                                 :exports {entry {:offset 0 :arity arity}
+                                           'main {:offset 1 :arity 0}}
+                                 :limits {:fuel 512}
+                                 :fuel-abi {:initial 512}
+                                 :code [0xc3 0xc3]}))))
+          immediate (reduce (fn [v i] (+ v (* (nth object (+ 75 i)) (Math/pow 256 i))))
+                            0 (range 4))]
+      (is (= fuel immediate) (str entry " fuel tier")))))
+
 (deftest the-narrow-fuel-replenish-did-not-move
   (let [object (:bytes (elf64/package-kernel-object
                         (artifact/seal
