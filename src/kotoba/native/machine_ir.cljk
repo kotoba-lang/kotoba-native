@@ -6255,36 +6255,182 @@
     (vec (concat (a64-constant :aarch64/x17 divisor)
                  (a64-quotient dst left :aarch64/x17)))))
 
+;; --- inline handle operations (context ABI v9, ADR 0084) --------------------
+;;
+;; Five runtime operations are emitted IN LINE rather than as a call through
+;; the context table: `pair-first`, `pair-second` (which `string-byte-length`
+;; shares, slot 72), `vector-count`, `vector-at` and `vector-assoc!`
+;; (`vector-assoc-in-place`). Each is a handle-range check, a table read and
+;; one load or store -- the whole of what the loader's `checked_*` twin does,
+;; minus the C call around it. Everything else stays a call: a search or a
+;; comparison is a loop, and the loader's is libc's.
+;;
+;; The check is the same one, emitted: `(uint64)(handle - 1) < *used` (a
+;; handle of 0 wraps to the largest value and fails like any other out of
+;; range), then for a vector `(uint64)index < length`, and the failure is
+;; `udf` / `ud2` -- SIGILL, the signal `raise(SIGILL)` in the C twin sends,
+;; so a supervisor cannot tell an inline refusal from a host one. What the
+;; inline path READS -- the used counters, the pair and vector tables, the
+;; item arena -- it reaches through six POINTERS the loader writes into the
+;; context at start (ABI v9, offsets 288-328) and nothing writes afterwards:
+;; guest code has no store but the kernel window family, which the frontend
+;; admits separately, so the pointers and the tables are as trustworthy in
+;; line as they are behind a call. The registers are the runtime-call
+;; profile's own -- arguments in x1..x3 / rsi..rcx, the answer in x0 / rax,
+;; which the call would have clobbered -- plus the encoder scratch pair
+;; x16/x17 / r10/r11 that no allocated value ever occupies.
+;;
+;; Measured 2026-09-16 on org-ieee-sort's index merge sort over 33 MB
+;; (769,400 lines, ~15 M comparisons, two `vector-at` and one
+;; `vector-assoc!` each): see ADR 0084 and the conformance in amu.
+(def ^:private inline-context-offsets
+  {:pair-used-pointer 288 :pairs-base 296 :pair-validated-base 304
+   :vector-used-pointer 312 :vectors-base 320 :vector-items-base 328})
+
+(def ^:private inline-runtime-operations
+  #{:pair-first :pair-second :string-byte-length :vector-count :vector-at
+    :vector-assoc-in-place})
+
+(defn- a64-ldr-x16-context
+  "ldr x16, [x7, #offset]"
+  [offset]
+  (u32le (bit-or 0xf9400000 (bit-shift-left (quot offset 8) 10)
+                 (bit-shift-left 7 5) 16)))
+
+(defn- a64-inline-handle
+  "The shared preamble: x16 = *used, x17 = handle - 1, trap unless x17 < x16
+  (unsigned), then x16 = table-base + x17 * 16. Encodings from the system
+  assembler (`clang -target arm64-apple-macos`, 2026-09-16)."
+  [trap used-offset base-offset]
+  (vec (concat
+        (a64-ldr-x16-context used-offset)
+        (u32le 0xf9400210)                                    ; ldr x16, [x16]
+        (u32le 0xd1000431)                                    ; sub x17, x1, #1
+        (u32le 0xeb10023f)                                    ; cmp x17, x16
+        [(layout/relative-branch :aarch64/b-hs-imm19 trap)]
+        (a64-ldr-x16-context base-offset)
+        (u32le 0x8b111210))))                                 ; add x16, x16, x17, lsl #4
+
+(defn- a64-inline-runtime
+  [instruction-index runtime]
+  (let [trap (memory-label instruction-index "handle-trap")
+        done (memory-label instruction-index "handle-done")
+        {:keys [pair-used-pointer pairs-base vector-used-pointer vectors-base
+                vector-items-base]} inline-context-offsets
+        body (case runtime
+               (:pair-first)
+               (concat (a64-inline-handle trap pair-used-pointer pairs-base)
+                       (u32le 0xf9400200))                    ; ldr x0, [x16]
+               (:pair-second :string-byte-length)
+               (concat (a64-inline-handle trap pair-used-pointer pairs-base)
+                       (u32le 0xf9400600))                    ; ldr x0, [x16, #8]
+               :vector-count
+               (concat (a64-inline-handle trap vector-used-pointer vectors-base)
+                       (u32le 0xf9400600))                    ; ldr x0, [x16, #8]
+               (:vector-at :vector-assoc-in-place)
+               (concat (a64-inline-handle trap vector-used-pointer vectors-base)
+                       (u32le 0xa9400e11)                     ; ldp x17, x3, [x16]: offset, length (x3 is an argument register the call profile clobbers)
+                       (u32le 0xeb03005f)                     ; cmp x2, x3
+                       [(layout/relative-branch :aarch64/b-hs-imm19 trap)]
+                       (a64-ldr-x16-context vector-items-base)
+                       (u32le 0x8b020231)                     ; add x17, x17, x2
+                       (if (= runtime :vector-at)
+                         (u32le 0xf8717a00)                   ; ldr x0, [x16, x17, lsl #3]
+                         (concat (u32le 0xf8317a03)           ; str x3, [x16, x17, lsl #3]
+                                 (a64-mov :aarch64/x0 :aarch64/x1)))))]
+    (vec (concat body
+                 [(layout/relative-branch :aarch64/b-imm26 done)
+                  (layout/label trap)]
+                 (u32le 0x00000000)                            ; udf #0 -> SIGILL
+                 [(layout/label done)]))))
+
+(defn- x86-mov-r10-context
+  "mov r10, [r9 + offset]"
+  [offset]
+  (vec (concat [0x4d 0x8b 0x91] (u32le offset))))
+
+(defn- x86-inline-handle
+  "r10 = *used, r11 = handle - 1, trap unless r11 < r10 (unsigned), then
+  r10 = table-base + r11 * 16, r11 free."
+  [trap used-offset base-offset]
+  (vec (concat
+        (x86-mov-r10-context used-offset)
+        [0x4d 0x8b 0x12]                                      ; mov r10, [r10]
+        [0x4c 0x8d 0x5e 0xff]                                 ; lea r11, [rsi - 1]
+        [0x4d 0x39 0xd3]                                      ; cmp r11, r10
+        [(layout/relative-branch :x86-64/jae-rel32 trap)]
+        (x86-mov-r10-context base-offset)
+        [0x49 0xc1 0xe3 0x04]                                 ; shl r11, 4
+        [0x4d 0x01 0xda])))                                   ; add r10, r11
+
+(defn- x86-inline-runtime
+  [instruction-index runtime]
+  (let [trap (memory-label instruction-index "handle-trap")
+        done (memory-label instruction-index "handle-done")
+        {:keys [pair-used-pointer pairs-base vector-used-pointer vectors-base
+                vector-items-base]} inline-context-offsets
+        body (case runtime
+               (:pair-first)
+               (concat (x86-inline-handle trap pair-used-pointer pairs-base)
+                       [0x49 0x8b 0x02])                      ; mov rax, [r10]
+               (:pair-second :string-byte-length)
+               (concat (x86-inline-handle trap pair-used-pointer pairs-base)
+                       [0x49 0x8b 0x42 0x08])                 ; mov rax, [r10 + 8]
+               :vector-count
+               (concat (x86-inline-handle trap vector-used-pointer vectors-base)
+                       [0x49 0x8b 0x42 0x08])                 ; mov rax, [r10 + 8]
+               (:vector-at :vector-assoc-in-place)
+               (concat (x86-inline-handle trap vector-used-pointer vectors-base)
+                       [0x4d 0x8b 0x1a]                       ; mov r11, [r10]      (offset)
+                       [0x4d 0x8b 0x52 0x08]                  ; mov r10, [r10 + 8]  (length)
+                       [0x4c 0x39 0xd2]                       ; cmp rdx, r10
+                       [(layout/relative-branch :x86-64/jae-rel32 trap)]
+                       (x86-mov-r10-context vector-items-base)
+                       [0x49 0x01 0xd3]                       ; add r11, rdx
+                       (if (= runtime :vector-at)
+                         [0x4b 0x8b 0x04 0xda]                ; mov rax, [r10 + r11*8]
+                         (concat [0x4b 0x89 0x0c 0xda]        ; mov [r10 + r11*8], rcx
+                                 [0x48 0x89 0xf0]))))]        ; mov rax, rsi
+    (vec (concat body
+                 [(layout/relative-branch :x86-64/jmp-rel32 done)
+                  (layout/label trap)]
+                 [0x0f 0x0b]                                   ; ud2 -> SIGILL
+                 [(layout/label done)]))))
+
 (defn- x86-runtime-call
-  [frame-bytes {:mir/keys [context-offset] :as instruction}]
+  [frame-bytes instruction-index {:mir/keys [context-offset runtime] :as instruction}]
   (when (or (< frame-bytes 8) (not (zero? (mod context-offset 8))))
     (reject! :mc-encode :invalid-runtime-call-frame instruction))
-  (let [context-slot (quot (- frame-bytes 8) 8)
-        indirect-call (if (<= context-offset 127)
-                        [0x41 0xff 0x51 context-offset]
-                        (vec (concat [0x41 0xff 0x91]
-                                     (u32le context-offset))))]
-    (vec (concat
-          (x86-stack-memory 0x89 :x86-64/r9 context-slot)
-          (x86-rr 0x89 :x86-64/rdi :x86-64/r9)
-          indirect-call
-          (x86-stack-memory 0x8b :x86-64/r9 context-slot)))))
+  (if (contains? inline-runtime-operations runtime)
+    (x86-inline-runtime instruction-index runtime)
+    (let [context-slot (quot (- frame-bytes 8) 8)
+          indirect-call (if (<= context-offset 127)
+                          [0x41 0xff 0x51 context-offset]
+                          (vec (concat [0x41 0xff 0x91]
+                                       (u32le context-offset))))]
+      (vec (concat
+            (x86-stack-memory 0x89 :x86-64/r9 context-slot)
+            (x86-rr 0x89 :x86-64/rdi :x86-64/r9)
+            indirect-call
+            (x86-stack-memory 0x8b :x86-64/r9 context-slot))))))
 
 (defn- a64-runtime-call
-  [{:mir/keys [context-offset] :as instruction}]
+  [instruction-index {:mir/keys [context-offset runtime] :as instruction}]
   (when (or (neg? context-offset) (not (zero? (mod context-offset 8)))
             (> (quot context-offset 8) 4095))
     (reject! :mc-encode :invalid-runtime-context-offset instruction))
-  (vec (concat
-        (a64-adjust-stack 0xd10003ff 16)
-        (a64-stack-memory 0xf9000000 :aarch64/x7 0)
-        (a64-mov :aarch64/x0 :aarch64/x7)
-        (u32le (bit-or 0xf9400000
-                       (bit-shift-left (quot context-offset 8) 10)
-                       (bit-shift-left 7 5) 16))
-        (u32le 0xd63f0200)
-        (a64-stack-memory 0xf9400000 :aarch64/x7 0)
-        (a64-adjust-stack 0x910003ff 16))))
+  (if (contains? inline-runtime-operations runtime)
+    (a64-inline-runtime instruction-index runtime)
+    (vec (concat
+          (a64-adjust-stack 0xd10003ff 16)
+          (a64-stack-memory 0xf9000000 :aarch64/x7 0)
+          (a64-mov :aarch64/x0 :aarch64/x7)
+          (u32le (bit-or 0xf9400000
+                         (bit-shift-left (quot context-offset 8) 10)
+                         (bit-shift-left 7 5) 16))
+          (u32le 0xd63f0200)
+          (a64-stack-memory 0xf9400000 :aarch64/x7 0)
+          (a64-adjust-stack 0x910003ff 16)))))
 
 (defn- x86-capability-call
   [frame-bytes {:mir/keys [capability kind context-offset] :as instruction}]
@@ -7188,7 +7334,7 @@
     (if (= (:mir/dst instruction) (:mir/src instruction))
       []
       (a64-mov (:mir/dst instruction) (:mir/src instruction)))
-    :aarch64/runtime-call (a64-runtime-call instruction)
+    :aarch64/runtime-call (a64-runtime-call instruction-index instruction)
     :aarch64/capability-call (a64-capability-call instruction)
     :aarch64/return
     (vec (concat (when-not (= :aarch64/x0 (:mir/value instruction))
@@ -7393,7 +7539,7 @@
     (if (= (:mir/dst instruction) (:mir/src instruction))
       []
       (x86-rr 0x89 (:mir/dst instruction) (:mir/src instruction)))
-    :x86-64/runtime-call (x86-runtime-call frame-bytes instruction)
+    :x86-64/runtime-call (x86-runtime-call frame-bytes instruction-index instruction)
     :x86-64/capability-call (x86-capability-call frame-bytes instruction)
     :x86-64/x86-privileged (x86-privileged instruction)
     :x86-64/return
