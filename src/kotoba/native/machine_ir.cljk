@@ -6329,8 +6329,16 @@
                        (u32le 0xf9400600))                    ; ldr x0, [x16, #8]
                (:vector-at :vector-assoc-in-place)
                (concat (a64-inline-handle trap vector-used-pointer vectors-base)
-                       (u32le 0xa9400e11)                     ; ldp x17, x3, [x16]: offset, length (x3 is an argument register the call profile clobbers)
-                       (u32le 0xeb03005f)                     ; cmp x2, x3
+                       ;; ldp x17, x16, [x16]: offset, length. The length
+                       ;; lands in x16 (the base, read before it is written,
+                       ;; which LDP without writeback permits) and NOT in x3:
+                       ;; x3 is `vector-assoc!`'s VALUE, and the first cut of
+                       ;; this sequence stored the length in its place --
+                       ;; measured 2026-09-16 under the loader before the
+                       ;; conformance fixture was written to catch exactly
+                       ;; a clobbered argument (every slot read back 4).
+                       (u32le 0xa9404211)
+                       (u32le 0xeb10005f)                     ; cmp x2, x16
                        [(layout/relative-branch :aarch64/b-hs-imm19 trap)]
                        (a64-ldr-x16-context vector-items-base)
                        (u32le 0x8b020231)                     ; add x17, x17, x2
