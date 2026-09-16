@@ -21,6 +21,7 @@
             [kotoba.native.text-slots-test]
             [kotoba.native.line-slots-test]
             [kotoba.native.inline-handle-ops-test]
+            [kotoba.native.range-slots-test]
             [kotoba.native.macho-test]
             [kotoba.native.affine-test]
             [kotoba.native.elf64-portable-test]
@@ -33,7 +34,7 @@
     (set! (.-exitCode js/process) 1)))
 
 (t/run-tests 'kotoba.native.macho-test
-             'kotoba.native.peephole-test 'kotoba.native.boot-scratch-test 'kotoba.native.vector-region-test 'kotoba.native.string-index-test 'kotoba.native.string-search-test 'kotoba.native.code-point-literal-test 'kotoba.native.arena-scope-test 'kotoba.native.text-slots-test 'kotoba.native.line-slots-test 'kotoba.native.inline-handle-ops-test
+             'kotoba.native.peephole-test 'kotoba.native.boot-scratch-test 'kotoba.native.vector-region-test 'kotoba.native.string-index-test 'kotoba.native.string-search-test 'kotoba.native.code-point-literal-test 'kotoba.native.arena-scope-test 'kotoba.native.text-slots-test 'kotoba.native.line-slots-test 'kotoba.native.inline-handle-ops-test 'kotoba.native.range-slots-test
              'kotoba.native.affine-test
              'kotoba.native.elf64-portable-test
              'kotoba.native.aggregate-abi-portable-test)

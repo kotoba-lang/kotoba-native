@@ -963,7 +963,10 @@
    ;; first four-argument runtime operation; kotoba-mir carries its fourth
    ;; argument in the fourth runtime argument register.
    'string-index-of-from :string-index-of-from
-   'string-compare-lines :string-compare-lines})
+   'string-compare-lines :string-compare-lines
+   ;; ABI v10 (2026-09-16): the two range slots -- no view taken, none minted.
+   'string-find-byte :string-find-byte
+   'string-append-range :string-append-range})
 
 (def ^:private native-clock-request-type
   [:variant :kotoba.clock/request [[:wall :bool] [:monotonic :bool]]])
