@@ -316,6 +316,19 @@
    ;; contract (os/aiueos/contracts/install-intent-admit-v1.edn) and a
    ;; parity gate against the JSON CLI's verdict.
    'aiueos-install-intent-admit {:arity 2 :symbol "kotoba_aiueos_install_intent_admit"}
+   ;; aiueos C-free wave 1 (aiueos ADR-0219): four layer-0 kernel C files whose
+   ;; decisions read C structs through pointers. A pointer loaded from memory
+   ;; cannot be a region root on the guest side, so each struct crosses as ONE
+   ;; flat record the C packs and the object reads by offset -- the record
+   ;; layout is the object's header comment, the C side is marshalling only.
+   ;; Contracts: os/aiueos/contracts/{inference-status-valid,
+   ;; inference-milli-tokens-per-second, model-mapping-plan,
+   ;; model-handoff-validate, device-worker-poll-response}-v1.edn.
+   'aiueos-inference-status-valid {:arity 2 :symbol "kotoba_aiueos_inference_status_valid"}
+   'aiueos-inference-milli-tokens-per-second {:arity 2 :symbol "kotoba_aiueos_inference_milli_tokens_per_second"}
+   'aiueos-model-mapping-plan {:arity 3 :symbol "kotoba_aiueos_model_mapping_plan"}
+   'aiueos-model-handoff-validate {:arity 2 :symbol "kotoba_aiueos_model_handoff_validate"}
+   'aiueos-device-worker-poll-response {:arity 3 :symbol "kotoba_aiueos_device_worker_poll_response"}
    ;; VT-d admission. vtd.c was the last kernel file with no decision moved out,
    ;; and one of its decisions is security-relevant: the IOTLB register offset is
    ;; DERIVED from a hardware-reported ECAP field and then bounds-checked, so an
