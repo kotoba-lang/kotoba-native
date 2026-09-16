@@ -265,6 +265,15 @@
    'aiueos-model-mapping-plan {:arity 3 :symbol "kotoba_aiueos_model_mapping_plan"}
    'aiueos-model-handoff-validate {:arity 2 :symbol "kotoba_aiueos_model_handoff_validate"}
    'aiueos-device-worker-poll-response {:arity 3 :symbol "kotoba_aiueos_device_worker_poll_response"}
+   ;; aiueos C-free wave 2 (aiueos ADR-0220): the murakumo job path's four wire
+   ;; lines behind one mode word (job-protocol), the frozen-bigram inference
+   ;; over the shared native.micro-infer table (micro-infer-next), and the
+   ;; AES-128-GCM boot known-answer test over the shared core module
+   ;; (aes128-gcm-selftest). Contracts: os/aiueos/contracts/{job-protocol,
+   ;; micro-infer-next, aes128-gcm-selftest}-v1.edn.
+   'aiueos-job-protocol {:arity 5 :symbol "kotoba_aiueos_job_protocol"}
+   'aiueos-micro-infer-next {:arity 3 :symbol "kotoba_aiueos_micro_infer_next"}
+   'aiueos-aes128-gcm-selftest {:arity 2 :symbol "kotoba_aiueos_aes128_gcm_selftest"}
    ;; VT-d admission. vtd.c was the last kernel file with no decision moved out,
    ;; and one of its decisions is security-relevant: the IOTLB register offset is
    ;; DERIVED from a hardware-reported ECAP field and then bounds-checked, so an

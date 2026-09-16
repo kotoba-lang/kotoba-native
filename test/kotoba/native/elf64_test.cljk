@@ -155,7 +155,10 @@
                                   ['aiueos-inference-milli-tokens-per-second 2 "kotoba_aiueos_inference_milli_tokens_per_second"]
                                   ['aiueos-model-mapping-plan 3 "kotoba_aiueos_model_mapping_plan"]
                                   ['aiueos-model-handoff-validate 2 "kotoba_aiueos_model_handoff_validate"]
-                                  ['aiueos-device-worker-poll-response 3 "kotoba_aiueos_device_worker_poll_response"]]]
+                                  ['aiueos-device-worker-poll-response 3 "kotoba_aiueos_device_worker_poll_response"]
+                                  ['aiueos-job-protocol 5 "kotoba_aiueos_job_protocol"]
+                                  ['aiueos-micro-infer-next 3 "kotoba_aiueos_micro_infer_next"]
+                                  ['aiueos-aes128-gcm-selftest 2 "kotoba_aiueos_aes128_gcm_selftest"]]]
       (let [object (elf64/package-kernel-object
                     (-> (sealed-kernel :x86_64-aiueos-kernel-v1 512)
                         (assoc :exports {entry {:offset 0 :arity arity}
