@@ -952,7 +952,13 @@
    ;; packaged grep exhaust a 4 Mi-handle arena after 2 MB. It is a host
    ;; operation now, memmem on the host's side, and `string-contains?` and
    ;; `string-replace-all` are rewritten onto it.
-   'string-index-of :string-index-of})
+   'string-index-of :string-index-of
+   ;; ABI v7 (2026-09-16): the four text slots, host operations like the
+   ;; search above.
+   'string-compare :string-compare
+   'string-fold-ascii :string-fold-ascii
+   'string-find-blank :string-find-blank
+   'string-skip-blank :string-skip-blank})
 
 (def ^:private native-clock-request-type
   [:variant :kotoba.clock/request [[:wall :bool] [:monotonic :bool]]])
