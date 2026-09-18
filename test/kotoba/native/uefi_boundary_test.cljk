@@ -7,7 +7,9 @@
   and what its goldens are really asserting is the register discipline rather
   than the instruction selection: three separate things have to hold at a
   Microsoft x64 call site and none of them holds on arrival."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:refer-clojure :exclude [bit-and])
+  (:require [kotoba.native.test-support :refer [bit-and]]
+            [clojure.test :refer [deftest is testing]]
             [kotoba.native.x86-64 :as x86]))
 
 (defn- program [params body]

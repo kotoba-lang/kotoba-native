@@ -1,5 +1,7 @@
 (ns kotoba.native-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:refer-clojure :exclude [bit-and bit-or bit-shift-left])
+  (:require [kotoba.native.test-support :refer [bit-and bit-or bit-shift-left]]
+            [clojure.test :refer [deftest is testing]]
             [kotoba.native.x86-64 :as x86]
             [kotoba.native.aarch64 :as arm]
             [kotoba.native.machine-ir :as machine]
@@ -47,28 +49,32 @@
                  (partition (count needle) 1 bytes))))
 
 (deftest production-runtime-handle-calls-route-through-machine-ir
+  ;; Through `vector-alloc` (slot 200) since ADR 0084 made `vector-count`
+  ;; inline; what is tested is the runtime-call ROUTE, so any operation that
+  ;; is still a call carries it. Two calls -> two slot reads, and the context
+  ;; register is spilled/preserved around them.
   (let [kir {:format :kotoba.kir/v4 :exports ['main]
-             :functions [{:name 'main :params ['v] :result :i64
-                          :body '(+ (vector-count v) (vector-count v))}]}
+             :functions [{:name 'main :params ['n] :result :i64
+                          :body '(+ (vector-count (vector-alloc n)) (vector-count (vector-alloc n)))}]}
         x86-code (:code (x86/emit-program kir))
         arm-code (:code (arm/emit-program kir))]
-    (is (machine/pilot-expression? '[v]
-                                   '(+ (vector-count v) (vector-count v))))
-    (is (= 2 (count (filter #(= [0x41 0xff 0x91 0xa8 0x00 0x00 0x00] %)
+    (is (machine/pilot-expression? '[n]
+                                   '(+ (vector-count (vector-alloc n)) (vector-count (vector-alloc n)))))
+    (is (= 2 (count (filter #(= [0x41 0xff 0x91 0xc8 0x00 0x00 0x00] %)
                             (partition 7 1 x86-code))))
-        "both x86 runtime calls use [r9+168]")
+        "both x86 runtime calls use [r9+200]")
     (is (contains-bytes? x86-code [0x4c 0x89 0x8c 0x24])
         "the production x86 path uses the MIR-owned context spill")
-    (is (= 2 (count (filter #(= [0xf0 0x54 0x40 0xf9] %)
+    (is (= 2 (count (filter #(= [0xf0 0x64 0x40 0xf9] %)
                             (partition 4 1 arm-code))))
-        "both AArch64 runtime calls load [x7,#168]")
+        "both AArch64 runtime calls load [x7,#200]")
     (is (contains-bytes? arm-code [0xe7 0x03 0x00 0xf9])
         "the production AArch64 path preserves x7")))
 
 (deftest f64-production-slice-routes-through-machine-ir
   (let [binary-forms
-        {'f64-add '(f64-add (f64-from-bits 4607182418800017408)
-                            (f64-from-bits 4611686018427387904))
+        {'f64-add (list 'f64-add (list 'f64-from-bits (js/BigInt "4607182418800017408"))
+                                 (list 'f64-from-bits (js/BigInt "4611686018427387904")))
          'f64-sub '(f64-sub 1 2) 'f64-mul '(f64-mul 1 2)
          'f64-div '(f64-div 1 2) 'f64-min '(f64-min 1 2)
          'f64-max '(f64-max 1 2) 'f64-eq '(f64-eq 1 2)
@@ -117,14 +123,14 @@
 
 (deftest f64-from-and-to-bits-are-identities-on-this-backend
   (testing "the value is already its bit pattern in x0, so no instruction is needed"
-    (is (= (emit 4614253070214989087)
-           (emit (list 'f64-from-bits 4614253070214989087))
-           (emit (list 'f64-to-bits (list 'f64-from-bits 4614253070214989087)))))))
+    (is (= (emit (js/BigInt "4614253070214989087"))
+           (emit (list 'f64-from-bits (js/BigInt "4614253070214989087")))
+           (emit (list 'f64-to-bits (list 'f64-from-bits (js/BigInt "4614253070214989087"))))))))
 
 (deftest f64-binary-ops-move-through-the-fp-bank
   (let [code (emit (list 'f64-add
-                         (list 'f64-from-bits 4611686018427387904)
-                         (list 'f64-from-bits 4613937818241073152)))
+                         (list 'f64-from-bits (js/BigInt "4611686018427387904"))
+                         (list 'f64-from-bits (js/BigInt "4613937818241073152"))))
         tail (take-last 4 code)]
     (testing "fmov d0,x0 · fmov d1,x1 · fadd d0,d0,d1 · fmov x0,d0"
       (is (= [0x9e670000 0x9e670021 0x1e612800 0x9e660000] (vec tail)))))
@@ -136,7 +142,7 @@
 
 (deftest f64-unary-ops-need-no-second-register
   (doseq [[op word] {'f64-abs 0x1e60c000 'f64-neg 0x1e614000 'f64-sqrt 0x1e61c000}]
-    (let [code (vec (emit (list op (list 'f64-from-bits 4611686018427387904))))]
+    (let [code (vec (emit (list op (list 'f64-from-bits (js/BigInt "4611686018427387904")))))]
       (is (= [0x9e670000 word 0x9e660000] (vec (take-last 3 code))) (str op)))))
 
 (deftest f64-arithmetic-nests
@@ -155,8 +161,8 @@
 
 (deftest x86-f64-matches-the-assembler
   (testing "from-bits and to-bits emit nothing here either"
-    (is (= (emit86 4611686018427387904)
-           (emit86 (list 'f64-from-bits 4611686018427387904)))))
+    (is (= (emit86 (js/BigInt "4611686018427387904"))
+           (emit86 (list 'f64-from-bits (js/BigInt "4611686018427387904"))))))
   (testing "addsd through the SSE bank, lhs in rax and rhs in rcx"
     (let [code (emit86 (list 'f64-add (list 'f64-from-bits 1) (list 'f64-from-bits 2)))]
       (is (= [0x66 0x48 0x0f 0x6e 0xc0 0x66 0x48 0x0f 0x6e 0xc9

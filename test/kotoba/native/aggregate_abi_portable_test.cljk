@@ -59,7 +59,7 @@
           [[:a dropped-target] [:b ambient-policy] [:c case-limit-past-boundary]
            [:d target-ambient-policy] [:e missing-extraction]]]
     (testing (str what)
-      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+      (is (thrown? #?(:clj ExceptionInfo :cljs ExceptionInfo)
                    (abi/validate-contract! invalid))))))
 
 (deftest scalar-record-boundary-is-one-owned-admitted-handle
@@ -79,7 +79,7 @@
   (doseq [type [[:record :test/empty []]
                 [:record :test/duplicate [[:x :i64] [:x :bool]]]
                 [:variant :test/v [[:x :i64]]]]]
-    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+    (is (thrown? #?(:clj ExceptionInfo :cljs ExceptionInfo)
                  (abi/record-boundary-plan type)) type)))
 
 
@@ -93,7 +93,7 @@
     (is (= :admitted
            (:boundary/extracted-admission
             (abi/record-boundary-plan (nested 32)))))
-    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+    (is (thrown? #?(:clj ExceptionInfo :cljs ExceptionInfo)
                  (abi/record-boundary-plan (nested 33))))))
 
 
@@ -119,7 +119,7 @@
                 [:variant :test/duplicate [[:x :i64] [:x :bool]]]
                 [:variant :test/text [[:x :string]]]
                 [:record :test/not-variant [[:x :i64]]]]]
-    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+    (is (thrown? #?(:clj ExceptionInfo :cljs ExceptionInfo)
                  (abi/variant-boundary-plan type)) type)))
 
 
@@ -129,7 +129,7 @@
           (abi/call-profile target)]
       (is (= :all-allocator-registers call-clobbers) target)
       (is (contains? (set allocator-registers) return-register) target)))
-  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) (abi/call-profile :riscv64))))
+  (is (thrown? #?(:clj ExceptionInfo :cljs ExceptionInfo) (abi/call-profile :riscv64))))
 
 
 (deftest scalar-call-admission-requires-all-versioned-guarantees
@@ -137,7 +137,7 @@
     (try
       (abi/admit-extracted-call! :x86-64 #{:per-function-frame})
       (is false "call must fail without every guarantee")
-      (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) error
+      (catch #?(:clj ExceptionInfo :cljs ExceptionInfo) error
         (is (= :missing-call-guarantees (:problem (ex-data error))))
         (is (= #{:spill-live-values-across-call
                  :parallel-argument-assignment
@@ -156,7 +156,7 @@
     (try
       (machine/lower-kir-expression ['x] '(callee x))
       (is false "call-shaped KIR must not enter GMIR")
-      (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) error
+      (catch #?(:clj ExceptionInfo :cljs ExceptionInfo) error
         (is (= :aggregate-abi (:phase (ex-data error))))
         (is (= :call-abi-not-admitted (:problem (ex-data error)))))))
   (is (not (machine/pilot-expression? ['x] '(callee x)))))
@@ -180,6 +180,6 @@
                      (assoc evidence :ambient-symbols true)
                      (assoc evidence :module-graph-digest "not-a-digest")
                      (dissoc evidence :unresolved-symbols)]]
-      (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+      (is (thrown-with-msg? #?(:clj ExceptionInfo :cljs ExceptionInfo)
                             #"unsealed-external-linkage"
                             (abi/admit-closed-linkage! invalid))))))

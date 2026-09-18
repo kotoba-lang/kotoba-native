@@ -11,7 +11,9 @@
   OFFSET and an ADDRESS. `:x86-64/data-address` resolves to `mov reg, imm64`
   holding an offset from the start of the emitted buffer, and something else
   adds the base. Under firmware there is no something else."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:refer-clojure :exclude [bit-and bit-or bit-shift-left])
+  (:require [kotoba.native.test-support :refer [bit-and bit-or bit-shift-left]]
+            [clojure.test :refer [deftest is testing]]
             [kotoba.gmir :as gmir]
             [kotoba.native.x86-64 :as x86]))
 
@@ -137,11 +139,11 @@
                         ["odd hex"      '(bytes-literal "abc")]
                         ["a surrogate"  '(ucs2 "hello😀")]]]
     (testing label
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"rodata-literal-malformed"
+      (is (thrown-with-msg? ExceptionInfo #"rodata-literal-malformed"
                             (code [] form))
           label)))
   (testing "and a non-literal argument is refused too"
-    (is (thrown? clojure.lang.ExceptionInfo (code '[s] '(ucs2 s))))))
+    (is (thrown? ExceptionInfo (code '[s] '(ucs2 s))))))
 
 ;; ── the wider firmware calls ────────────────────────────────────────────────
 

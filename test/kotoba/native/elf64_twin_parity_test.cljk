@@ -37,7 +37,7 @@
   run the two packagers under two runtimes and compare the bytes, which is what
   aiueos's `verify-jvm-free-object-parity.cljs` does. This test is the cheap
   source-level guard that catches the drift earlier."
-  (:require [clojure.java.io :as io]
+  (:require [kotoba.native.test-support :as support]
             [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is]]))
 
@@ -47,7 +47,7 @@
   #"'(aiueos-[a-z0-9-]+)\s*\{:arity\s+(\d+)\s+:symbol\s+\"([a-z0-9_]+)\"\}")
 
 (defn- table [path]
-  (let [text (slurp (io/file path))
+  (let [text (support/read-text path)
         entries (into {} (map (fn [[_ n a s]] [n [(parse-long a) s]]))
                       (re-seq entry-pattern (str/replace text #"\n\s+\{:arity" " {:arity")))]
     entries))
@@ -65,7 +65,7 @@
 (def ^:private fuel-arm-pattern #"\n\s+([a-z0-9-]+\?|:else)\s+(\d+)")
 
 (defn- fuel-tiers [path]
-  (let [text (slurp (io/file path))
+  (let [text (support/read-text path)
         start (str/index-of text fuel-cond-start)
         _ (assert start (str "the replenish cond moved in " path))
         region (subs text start (+ start (or (str/index-of (subs text start) "))\n") 0) 3))]

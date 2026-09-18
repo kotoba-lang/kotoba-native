@@ -1,16 +1,31 @@
 (ns run-tests
-  "The portable slice of the native backend on nbb -- no JVM in this path.
+  "The whole suite on the kbb engine -- no JVM anywhere in this path.
 
-   kbb --backend sci --classpath \"src:test:$(kbb -Spath -M:test)\" run-tests.cljk"
+     kbb --backend sci --classpath \"src:resources:test\" run-tests.cljk
+     kbb -M:test                       ; the same namespaces through the alias
+
+   Until 2026-09-18 this file ran the 15 portable namespaces and the other 22
+   ran on the JVM only -- and had no runner at all since the `.cljk` rename
+   (2026-09-11) removed the JVM route: `kbb -M:test` substituted cljs.test and
+   died on the first `Throwable`, `clojure -M:test` found 0 tests. ADR 0086.
+
+   Two things this runner counts that a plain `run-tests` would fold into one
+   number:
+
+   * EVERY `*_test.cljk` under test/ must be in the list below. The scan is
+     printed (`SCANNED`) and a file the list does not name is a failure, not a
+     smaller suite.
+   * `known-red` names the deftests that fail for ONE named reason -- today,
+     the 18 tests of the x86-64 aiueos kernel image that read features only
+     the JVM twin `elf64.clj.cljk` lays (GDT/TSS/rsp0, value-runtime syscall
+     shim, interrupt entry region, context slot block; ADR 0036). They RUN,
+     their failures are printed, and they are counted apart as
+     `known-red`. A failure outside that list fails the run; a known-red
+     test that PASSES also fails the run (the list is stale, shorten it)."
   (:require [cljs.test :as t]
-            ;; 2026-09-08: `affine.cljc` carries no reader conditional at all --
-            ;; it is portable by construction -- and its test was `.cljc` too, and
-            ;; still ran on one host, because this runner is an explicit list and
-            ;; did not name it. `scripts/verify-cljs-runner-completeness.cljs` did.
-            ;; 2026-09-08: five more `.cljc` tests of `.cljc` sources that ran on
-            ;; the JVM only. None contains a single java interop form -- they were
-            ;; `.clj` by habit, not by need. The superproject's
-            ;; `verify-portable-source-tested-on-one-host.cljs` names the class.
+            ["fs" :as fs]
+            ["path" :as path]
+            [clojure.string :as str]
             [kotoba.native.peephole-test]
             [kotoba.native.boot-scratch-test]
             [kotoba.native.vector-region-test]
@@ -25,16 +40,124 @@
             [kotoba.native.macho-test]
             [kotoba.native.affine-test]
             [kotoba.native.elf64-portable-test]
-            [kotoba.native.aggregate-abi-portable-test]))
+            [kotoba.native.aggregate-abi-portable-test]
+            ;; the 22 that were JVM-only until 2026-09-18
+            [kotoba.native.aggregate-abi-test]
+            [kotoba.native.context-slots-test]
+            [kotoba.native.dequant-fusion-test]
+            [kotoba.native.dequant-kquant-test]
+            [kotoba.native.elf64-test]
+            [kotoba.native.elf64-twin-parity-test]
+            [kotoba.native.f32-test]
+            [kotoba.native.false-argument-test]
+            [kotoba.native.firmware-store-test]
+            [kotoba.native.fuel64-test]
+            [kotoba.native.interrupt-abi-test]
+            [kotoba.native.isa-parity-test]
+            [kotoba.native.keyword-equality-test]
+            [kotoba.native.layout-test]
+            [kotoba.native.machine-ir-test]
+            [kotoba.native.rodata-literal-test]
+            [kotoba.native.source-control-bytes-test]
+            [kotoba.native.store-result-test]
+            [kotoba.native.uefi-boundary-test]
+            [kotoba.native.vector-boundary-spelling-test]
+            [kotoba.native.vector-test]
+            [kotoba.native-test]))
+
+(def namespaces
+  '[kotoba.native.peephole-test kotoba.native.boot-scratch-test kotoba.native.vector-region-test
+    kotoba.native.string-index-test kotoba.native.string-search-test kotoba.native.code-point-literal-test
+    kotoba.native.arena-scope-test kotoba.native.text-slots-test kotoba.native.line-slots-test
+    kotoba.native.inline-handle-ops-test kotoba.native.range-slots-test kotoba.native.macho-test
+    kotoba.native.affine-test kotoba.native.elf64-portable-test kotoba.native.aggregate-abi-portable-test
+    kotoba.native.aggregate-abi-test kotoba.native.context-slots-test kotoba.native.dequant-fusion-test
+    kotoba.native.dequant-kquant-test kotoba.native.elf64-test kotoba.native.elf64-twin-parity-test
+    kotoba.native.f32-test kotoba.native.false-argument-test kotoba.native.firmware-store-test
+    kotoba.native.fuel64-test kotoba.native.interrupt-abi-test kotoba.native.isa-parity-test
+    kotoba.native.keyword-equality-test kotoba.native.layout-test kotoba.native.machine-ir-test
+    kotoba.native.rodata-literal-test kotoba.native.source-control-bytes-test kotoba.native.store-result-test
+    kotoba.native.uefi-boundary-test kotoba.native.vector-boundary-spelling-test kotoba.native.vector-test
+    kotoba.native-test])
+
+;; deftest name -> the one reason it is red on this host. Every entry is the
+;; x86-64 aiueos kernel image reading what only the JVM twin lays (ADR 0036):
+;; `elf64.cljc.cljk` refuses with `:isr-image-needs-the-jvm-packager` or has
+;; no interrupt entry region / GDT / TSS / value-runtime shim. Shortening this
+;; list is the port of those features into the portable twin.
+(def known-red
+  (let [twin "elf64 twin gap: the portable packager lays no GDT/TSS/rsp0 stack, value-runtime shim or interrupt entry region (ADR 0036; port pending)"]
+    {'value-runtime-kernel-installs-and-enters-a-closed-syscall-shim twin
+     'the-slot-block-lies-inside-the-rw-segment twin
+     'x86-kernel-image-owns-gdt-tss-and-rsp0-stack twin
+     'an-image-entry-body-with-the-wrong-arity-is-refused twin
+     'the-image-context-word-was-always-64-bit twin
+     'large-kernel-image-moves-data-to-the-next-page twin
+     'kernel-image-context-uses-the-sealed-fuel-bound twin
+     'an-image-with-no-entry-declares-no-region twin
+     'aiueos-user-packaging-refuses-value-runtime-until-c-free-provider-qualification twin
+     'a-half-value-runtime-boundary-never-installs-lstar twin
+     'the-undefined-opcode-slot-names-itself twin
+     'the-scan-goes-red-on-a-re-hardcoded-slot twin
+     'the-immediate-scan-goes-red-on-the-re-hardcoded-data-page twin
+     'the-image-lays-an-entry-region-and-names-its-base twin
+     'the-image-entry-reaches-its-body-and-its-context twin
+     'the-aiueos-geometry-put-the-old-slots-inside-rx-text twin
+     'every-vector-in-the-table-has-a-slot twin
+     'emitted-text-has-no-absolute-operand-into-itself twin}))
+
+(defn- current-test []
+  (some-> (t/get-current-env) :testing-vars first meta :name))
+
+;; failures per deftest, so known-red and unexpected can be told apart
+(def ^:private red (atom {}))
+(defn- note-red! [] (when-let [n (current-test)] (swap! red update n (fnil inc 0))))
+(def ^:private started (atom #{}))
+(defmethod t/report [:cljs.test/default :begin-test-var] [m]
+  (swap! started conj (-> m :var meta :name)))
+(defmethod t/report [:cljs.test/default :fail] [m]
+  (note-red!)
+  (t/inc-report-counter! :fail)
+  (println "\nFAIL in" (t/testing-vars-str m))
+  (when (seq (:testing-contexts (t/get-current-env))) (println (t/testing-contexts-str)))
+  (when-let [message (:message m)] (println message))
+  (println "expected:" (pr-str (:expected m)))
+  (println "  actual:" (pr-str (:actual m))))
+(defmethod t/report [:cljs.test/default :error] [m]
+  (note-red!)
+  (t/inc-report-counter! :error)
+  (println "\nERROR in" (t/testing-vars-str m))
+  (when (seq (:testing-contexts (t/get-current-env))) (println (t/testing-contexts-str)))
+  (when-let [message (:message m)] (println message))
+  (println "expected:" (pr-str (:expected m)))
+  (println "  actual:" (pr-str (:actual m))))
+
+(defn- test-files-on-disk []
+  (letfn [(walk [d] (mapcat (fn [n] (let [p (path/join d n)]
+                                       (if (.isDirectory (.statSync fs p)) (walk p) [p])))
+                            (.readdirSync fs d)))]
+    (->> (walk "test") (filter #(str/ends-with? % "_test.cljk"))
+         (map #(-> % (subs (count "test/")) (str/replace #"\.cljk$" "") (str/replace "/" ".") (str/replace "_" "-") symbol))
+         set)))
 
 (defmethod t/report [:cljs.test/default :end-run-tests] [m]
-  (println (str "\nnbb: " (:test m) " tests, " (:pass m) " passed, "
-                (:fail m) " failed, " (:error m) " errors"))
-  (when (pos? (+ (or (:fail m) 0) (or (:error m) 0)))
-    (set! (.-exitCode js/process) 1)))
+  (let [on-disk (test-files-on-disk)
+        listed (set namespaces)
+        unlisted (sort (remove listed on-disk))
+        reds @red
+        known (into {} (filter (fn [[n _]] (contains? known-red n)) reds))
+        unexpected (into {} (remove (fn [[n _]] (contains? known-red n)) reds))
+        stale (sort (remove reds (filter @started (keys known-red))))]
+    (println (str "\nRan " (:test m) " tests containing " (+ (:pass m) (:fail m) (:error m)) " assertions."))
+    (println (str (:fail m) " failures, " (:error m) " errors."))
+    (println (str "SCANNED\t" (count on-disk) " test files on disk against " (count listed) " listed"))
+    (doseq [[n c] (sort known)] (println (str "known-red\t" n "\t" c " failing assertion(s)\t" (known-red n))))
+    (println (str "known-red tests\t" (count known) " of " (count known-red) " listed"))
+    (doseq [[n c] (sort unexpected)] (println (str "UNEXPECTED-RED\t" n "\t" c)))
+    (doseq [n stale] (println (str "STALE-KNOWN-RED\t" n "\tpassed; remove it from known-red")))
+    (doseq [n unlisted] (println (str "UNLISTED-TEST-FILE\t" n)))
+    (let [ok? (and (empty? unexpected) (empty? stale) (empty? unlisted) (pos? (:test m)))]
+      (println (if ok? "kotoba-native suite: OK (known-red counted apart)" "kotoba-native suite: FAIL"))
+      (set! (.-exitCode js/process) (if ok? 0 1)))))
 
-(t/run-tests 'kotoba.native.macho-test
-             'kotoba.native.peephole-test 'kotoba.native.boot-scratch-test 'kotoba.native.vector-region-test 'kotoba.native.string-index-test 'kotoba.native.string-search-test 'kotoba.native.code-point-literal-test 'kotoba.native.arena-scope-test 'kotoba.native.text-slots-test 'kotoba.native.line-slots-test 'kotoba.native.inline-handle-ops-test 'kotoba.native.range-slots-test
-             'kotoba.native.affine-test
-             'kotoba.native.elf64-portable-test
-             'kotoba.native.aggregate-abi-portable-test)
+(apply t/run-tests namespaces)

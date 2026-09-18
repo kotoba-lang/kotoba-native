@@ -31,7 +31,7 @@
 
 (defn- rejection [kir]
   (try (machine/lower-kir-module kir) nil
-       (catch clojure.lang.ExceptionInfo error (ex-data error))))
+       (catch ExceptionInfo error (ex-data error))))
 
 (deftest kir-vector-boundary-types-are-spelled-the-same-way
   ;; Derived from the producer rather than restated, so an upstream rename

@@ -13,7 +13,9 @@
   which is what stands in for execution -- and the two are different claims:
   this file says the bytes are the instructions they are named for, and that
   says they do what the instructions mean."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:refer-clojure :exclude [bit-shift-left])
+  (:require [kotoba.native.test-support :refer [bit-shift-left]]
+            [clojure.test :refer [deftest is testing]]
             [kotoba.artifact.core :as artifact]
             [kotoba.native.elf64 :as elf64]
             [kotoba.native.interrupt-abi :as isr]
@@ -381,7 +383,7 @@
                               :functions [{:name 'main :params []
                                            :body '(kernel-isr-entry-address 3)}]}))
                     nil
-                    (catch clojure.lang.ExceptionInfo e e))]
+                    (catch ExceptionInfo e e))]
     (is (some? thrown))
     (is (= :isr-address-needs-image (:reason (ex-data thrown))))
     (is (= 'main (:entry (ex-data thrown))))
@@ -414,7 +416,7 @@
                                            :body '(kernel-isr-entry-address v)}]})]
         (is (= :isr-address-needs-image
                (:reason (try (elf64/package-kernel-object reaching)
-                             (catch clojure.lang.ExceptionInfo e (ex-data e))))))))))
+                             (catch ExceptionInfo e (ex-data e))))))))))
 
 (deftest an-entry-body-with-the-wrong-arity-is-refused
   ;; The entry loads four registers from the frame and calls. A body of any
@@ -422,7 +424,7 @@
   (doseq [arity [0 2 3 5]]
     (testing (str "arity " arity)
       (is (thrown-with-msg?
-           clojure.lang.ExceptionInfo #"invalid SysV arity"
+           ExceptionInfo #"invalid SysV arity"
            (elf64/package-kernel-object
             (entry-object-artifact 'aiueos-isr-3 arity)))))))
 
@@ -432,7 +434,7 @@
       (let [data (try (elf64/package-kernel-object
                        (entry-object-artifact name 4))
                       nil
-                      (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+                      (catch ExceptionInfo e (ex-data e)))]
         (is (= :isr-name-not-a-vector (:reason data)))
         (is (= [name] (:names data)))
         (is (= 64 (:vector-limit data)))))))
@@ -446,7 +448,7 @@
                             :functions [(entry-body 'aiueos-isr-3)
                                         (entry-body 'aiueos-isr-14)]}))
                   nil
-                  (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+                  (catch ExceptionInfo e (ex-data e)))]
     (is (= :isr-object-has-one-entry (:reason data)))
     (is (= [3 14] (:vectors data)))))
 
@@ -571,7 +573,7 @@
                             :functions [{:name 'main :params [] :body 0}
                                         (entry-body 'aiueos-isr-3)]}))
                   nil
-                  (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+                  (catch ExceptionInfo e (ex-data e)))]
     (is (= :isr-body-arity (:reason data)))
     (is (= 3 (:vector data)))
     (is (= 2 (:arity data)))

@@ -1,5 +1,7 @@
 (ns kotoba.native.elf64-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:refer-clojure :exclude [bit-shift-left])
+  (:require [kotoba.native.test-support :refer [bit-shift-left]]
+            [clojure.test :refer [deftest is testing]]
             [kotoba.artifact.core :as artifact]
             [kotoba.native.elf64 :as elf64]))
 
@@ -102,7 +104,7 @@
   (let [value (assoc (sealed-kernel :x86_64-aiueos-kernel-v1 4096)
                      :fuel-abi {:initial 512})]
     (testing "resealing does not make contradictory context authority valid"
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo
+      (is (thrown-with-msg? ExceptionInfo
                             #"one valid sealed fuel bound"
                             (elf64/package-kernel
                              (artifact/seal (dissoc value :sha256))))))))
@@ -116,7 +118,7 @@
                 :exports {'main {:offset 0 :arity 0}}
                 :effects #{}
                 :code [0xc3]})]
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo
+    (is (thrown-with-msg? ExceptionInfo
                           #"ValueRuntime provider is not qualified"
                           (elf64/package-user value)))))
 
@@ -132,8 +134,8 @@
                        (dissoc :sha256)
                        artifact/seal)
           thrown (try (elf64/package-kernel-object artifact)
-                      (catch clojure.lang.ExceptionInfo e e))]
-      (is (instance? clojure.lang.ExceptionInfo thrown)
+                      (catch ExceptionInfo e e))]
+      (is (instance? ExceptionInfo thrown)
           "packaging must refuse rather than emit a colliding symbol")
       (is (re-find #"no admitted symbol" (ex-message thrown)))
       (is (= '[aiueos-not-in-the-table] (:unlisted-exports (ex-data thrown))))))
@@ -148,7 +150,7 @@
                                        'main {:offset 1 :arity 0}}
                              :code [0xc3 0xc3])
                       (dissoc :sha256)
-                      artifact/seal)))]
+                      artifact/seal))]
       (is (= "kotoba_aiueos_install_intent_admit" (:export object)))))
   (testing "the C-free wave 1 flat-record objects are admitted under their own symbols (aiueos ADR-0219)"
     (doseq [[entry arity symbol] [['aiueos-inference-status-valid 2 "kotoba_aiueos_inference_status_valid"]

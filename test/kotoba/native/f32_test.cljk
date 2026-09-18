@@ -29,7 +29,9 @@
   the same register, whichever register that is. Pinning the allocator's current
   answer would make this file go red for a reason that has nothing to do with
   floating point."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:refer-clojure :exclude [bit-and])
+  (:require [kotoba.native.test-support :refer [bit-and]]
+            [clojure.test :refer [deftest is testing]]
             [kotoba.native.x86-64 :as x86]
             [kotoba.native.aarch64 :as arm]))
 
@@ -278,7 +280,7 @@
   (try (seq (:code (emit {:format :kotoba.kir/v4 :exports ['main]
                           :functions [{:name 'main :params '[a b] :result :i64
                                        :body body}]})))
-       (catch Throwable _ false)))
+       (catch :default _ false)))
 
 (deftest min-and-max-are-absent-from-both-and-that-is-the-decision
   ;; x86 MINSS/MAXSS return the SECOND operand when either input is NaN;

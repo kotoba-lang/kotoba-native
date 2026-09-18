@@ -486,7 +486,7 @@
                                      false)))
       (let [thrown (try (code 'kernel-dequant-dot-q8-0)
                         nil
-                        (catch clojure.lang.ExceptionInfo e e))]
+                        (catch ExceptionInfo e e))]
         (is (some? thrown) "a format with :emitted? false must be refused")
         (is (= :dequant-format-not-emitted (:problem (ex-data thrown))))
         (is (= :mc-encode (:phase (ex-data thrown))))
@@ -519,7 +519,7 @@
   (doseq [head '[kernel-dequant-dot-iq4-xs kernel-dequant-dot-iq2-s
                  kernel-dequant-dot-iq3-xxs kernel-dequant-dot-iq3-s]]
     (let [thrown (try (code head) nil
-                      (catch clojure.lang.ExceptionInfo e e))
+                      (catch ExceptionInfo e e))
           data (ex-data thrown)]
       (is (some? thrown) (str head " must be refused, not emitted"))
       (is (= :dequant-format-not-emitted (:problem data))

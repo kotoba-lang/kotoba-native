@@ -1,5 +1,9 @@
 (ns kotoba.native.machine-ir-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:refer-clojure :exclude [bit-and bit-or bit-xor bit-not bit-shift-left bit-shift-right unsigned-bit-shift-right])
+  (:require [kotoba.native.test-support :as support]
+            [kotoba.native.test-support :refer [bit-and bit-or bit-xor bit-not bit-shift-left bit-shift-right unsigned-bit-shift-right]]
+            [kotoba.kir.cljs-i64 :as i64]
+            [clojure.test :refer [deftest is testing]]
             [kotoba.gmir :as gmir]
             [kotoba.mir :as mir]
             [kotoba.native.aggregate-abi :as aggregate-abi]
@@ -9,6 +13,19 @@
             [kotoba.native.x86-64 :as x86]
             [kotoba.native.string-index :as string-index]
             [kotoba.native.string-search :as string-search]))
+
+;; Wide (unbounded) integers on this host are JS BigInt -- `kotoba.kir.cljs-i64`,
+;; the same representation `machine/signed-division-magic` computes in. `/` on
+;; two BigInts truncates toward zero, which is `quot`; `zero?`/`neg?` from
+;; cljs.core do not see a BigInt, so the comparisons are spelled against
+;; `i64/zero` (2026-09-18, ADR 0086 -- this test was JVM `bigint` before).
+(def ^:private wide-zero i64/zero)
+(def ^:private wide-one i64/one)
+(def ^:private wide-two64 (js/BigInt "18446744073709551616"))
+(defn- wide [x] (i64/->bigint x))
+(defn- wide-neg? [x] (< x wide-zero))
+(defn- pow2 [shift] (js/BigInt (js/Math.pow 2 shift)))
+
 
 (def v0 (gmir/vreg 0))
 (def v1 (gmir/vreg 1))
@@ -39,7 +56,7 @@
     (is (= [0x00 0x00 0x80 0xd2] (encode 0)) "zero is one MOVZ")
     (is (= 4 (count (encode 48271))) "a low positive constant is one MOVZ")
     (is (= [0x00 0x00 0x80 0x92] (encode -1)) "all ones is one MOVN")
-    (is (= 4 (count (encode Long/MIN_VALUE))) "a lone high lane is one MOVZ")
+    (is (= 4 (count (encode i64/min-i64))) "a lone high lane is one MOVZ")
     (is (= 4 (count (encode -281470681808896)))
         "a repeated mask beats the two-word MOVN sequence")
     (is (= 16 (count (encode 0x0001000200030004)))
@@ -51,7 +68,7 @@
   (let [encode #(#'machine/a64-constant :aarch64/x0 %)]
     (is (= [0xe0 0x7b 0x40 0xb2] (encode 0x7fffffff))
         "the runtime kernel divisor is MOV X0,#0x7fffffff")
-    (is (= 4 (count (encode 0x00ff00ff00ff00ff)))
+    (is (= 4 (count (encode (js/BigInt "0x00ff00ff00ff00ff"))))
         "replicated rotated bitmasks use one ORR-immediate word")
     (is (= [0x00 0x00 0x80 0x92] (encode -1))
         "the forbidden all-ones logical immediate stays one MOVN")
@@ -59,7 +76,7 @@
         "non-bitmask constants retain their exact wide-move sequence")))
 
 (deftest aarch64-logical-immediates-can-seed-one-lane-patches
-  (let [magic -9223372032559808509
+  (let [magic (js/BigInt "-9223372032559808509")
         encode #(#'machine/a64-constant :aarch64/x0 %)
         reconstruct (fn [target-chunks]
                       (when-let [{:keys [patch-lanes] :as plan}
@@ -396,7 +413,9 @@
     (is (= 1 (count muls)) "eight lanes share one n*C")
     (is (contains? #{(:gmir/left (first muls)) (:gmir/right (first muls))} arg)
         "the multiply's non-constant operand is the argument, not n+k")
-    (is (some #(= 337898 (:gmir/value %)) insts)
+    ;; GMIR constants are i64 -- BigInt on this host -- so the fold is
+    ;; compared as one (`=` on a Number and a BigInt is false in cljs).
+    (is (some #(= (wide 337898) (:gmir/value %)) insts)
         "lane k=7 folds to the wrapping i64 7*48271+1")
     (is (= 1 (count (filter #{:mul} kinds)))
         "encoded bytes keep the shared product")
@@ -476,14 +495,14 @@
     (is (= 1 (count (filter #(= :gmir/multiply (:gmir/op %)) insts))))))
 
 (deftest gmir-distributes-offset-mul-with-wrapping-i64
-  (let [form '(* (+ n 2) 9223372036854775807)
+  (let [form (list '* '(+ n 2) i64/max-i64)
         insts (:gmir/instructions (machine/lower-kir-expression ['n] form))
         arg (some #(when (= :gmir/argument (:gmir/op %)) (:gmir/dst %)) insts)
         muls (filterv #(= :gmir/multiply (:gmir/op %)) insts)]
     (is (= 1 (count muls)))
     (is (contains? #{(:gmir/left (first muls)) (:gmir/right (first muls))} arg))
-    (is (some #(= -2 (:gmir/value %)) insts)
-        "2*Long/MAX_VALUE wraps to -2; Clojure * would become a BigInt")))
+    (is (some #(= (wide -2) (:gmir/value %)) insts)
+        "2*MAX_I64 wraps to -2 (i64 wrap, not unbounded arithmetic)")))
 
 
 (deftest aarch64-coalesces-phi-edge-and-return-moves-into-direct-results
@@ -694,19 +713,21 @@
                (count (:gmir/arguments call))) (str runtime))))))
 
 (deftest runtime-call-encoders-preserve-the-hidden-context-register
-  (let [x86-code (machine/compile-expression :x86-64 '[v] '(vector-count v))
-        arm-code (machine/compile-expression :aarch64 '[v] '(vector-count v))
+  ;; Through `vector-alloc` (slot 200): `vector-count` has been inline since
+  ;; ADR 0084 and reaches no slot, and the subject here is the CALL encoder.
+  (let [x86-code (machine/compile-expression :x86-64 '[n] '(vector-alloc n))
+        arm-code (machine/compile-expression :aarch64 '[n] '(vector-alloc n))
         contains-bytes? (fn [bytes needle]
                           (boolean (some #(= (vec needle) %)
                                          (partition (count needle) 1 bytes))))]
-    (is (contains-bytes? x86-code [0x41 0xff 0x91 0xa8 0x00 0x00 0x00])
-        "x86 calls qword ptr [r9+168]")
+    (is (contains-bytes? x86-code [0x41 0xff 0x91 0xc8 0x00 0x00 0x00])
+        "x86 calls qword ptr [r9+200]")
     (is (contains-bytes? x86-code [0x4c 0x89 0x8c 0x24])
         "x86 saves r9 in its reserved call-frame slot")
     (is (contains-bytes? x86-code [0x4c 0x8b 0x8c 0x24])
         "x86 restores r9 after the host call")
-    (is (contains-bytes? arm-code [0xf0 0x54 0x40 0xf9])
-        "AArch64 loads x16 from [x7,#168]")
+    (is (contains-bytes? arm-code [0xf0 0x64 0x40 0xf9])
+        "AArch64 loads x16 from [x7,#200]")
     (is (contains-bytes? arm-code [0x00 0x02 0x3f 0xd6])
         "AArch64 calls x16")
     (is (contains-bytes? arm-code [0xe7 0x03 0x00 0xf9])
@@ -953,7 +974,7 @@
       (is (some #(= :pair (:gmir/runtime %))
                 (:gmir/instructions lowered)) (pr-str form))))
   (let [content "hello😀"
-        bytes (mapv #(bit-and (int %) 0xff) (.getBytes content "UTF-8"))
+        bytes (support/utf8-bytes content)
         kir {:format :kotoba.kir/v4 :exports ['main]
              :functions [{:name 'main :params [] :param-types []
                           :result :string :body content}]}]
@@ -972,14 +993,14 @@
   (is (= (machine/compile-gmir :x86-64 program)
          (machine/compile-gmir :x86-64 program)))
   (testing "use before definition"
-    (is (thrown? clojure.lang.ExceptionInfo
+    (is (thrown? ExceptionInfo
                  (machine/compile-gmir
                   :x86-64
                   {:gmir/version 1
                    :gmir/instructions
                    [{:gmir/op :gmir/return :gmir/value v0}]}))))
   (testing "unknown operations do not fall through"
-    (is (thrown? clojure.lang.ExceptionInfo
+    (is (thrown? ExceptionInfo
                  (machine/compile-gmir
                   :aarch64
                   {:gmir/version 1
@@ -987,11 +1008,11 @@
 
 (deftest shared-mc-contract-gates-the-target-encoder
   (let [mc (machine/compile-gmir :x86-64 program)]
-    (is (thrown? clojure.lang.ExceptionInfo
+    (is (thrown? ExceptionInfo
                  (machine/encode-mc
                   (assoc-in mc [:mc/instructions 0 :mc/encoding]
                             :aarch64/argument))))
-    (is (thrown? clojure.lang.ExceptionInfo
+    (is (thrown? ExceptionInfo
                  (machine/encode-mc
                   (assoc-in mc [:mc/instructions 0 :ambient/policy] true))))))
 
@@ -1166,7 +1187,7 @@
               bytes (machine/compile-expression :x86-64 params form)]
           (is (= action (:gmir/action operation)))
           (is (contains-bytes? bytes needle)))
-        (is (thrown-with-msg? clojure.lang.ExceptionInfo
+        (is (thrown-with-msg? ExceptionInfo
                               #"x86-privileged-target-mismatch"
                               (machine/compile-expression :aarch64 params form)))))))
 
@@ -1212,31 +1233,30 @@
         "the guarded operation remains sdiv x2,x0,x1 after allocation")))
 
 (defn- floor-div [left right]
-  (let [q (quot left right)
+  (let [q (/ left right)
         remainder (- left (* q right))]
-    (if (and (neg? left) (not (zero? remainder))) (dec q) q)))
+    (if (and (wide-neg? left) (not= remainder wide-zero)) (- q wide-one) q)))
 
 (defn- apply-signed-division-magic [numerator divisor]
-  (let [numerator (bigint numerator)
+  (let [numerator (wide numerator)
         {:keys [multiplier shift add-numerator? subtract-numerator?]}
         (machine/signed-division-magic divisor)
-        high (floor-div (* numerator multiplier)
-                        18446744073709551616N)
+        high (floor-div (* numerator (wide multiplier)) wide-two64)
         corrected (cond add-numerator? (+ high numerator)
                         subtract-numerator? (- high numerator)
                         :else high)
-        shifted (floor-div corrected (bit-shift-left 1 shift))]
-    (+ shifted (if (neg? shifted) 1 0))))
+        shifted (floor-div corrected (pow2 shift))]
+    (+ shifted (if (wide-neg? shifted) wide-one wide-zero))))
 
 (deftest signed-constant-division-reciprocals-match-i64-truncation
-  (let [divisors [2 3 5 7 10 31 127 255 1024 2147483647
-                  -2 -3 -5 -7 -10 -31 -127 -255 -1024 -2147483647
-                  Long/MAX_VALUE (- Long/MAX_VALUE)]
-        numerators [Long/MIN_VALUE (inc Long/MIN_VALUE) -1000000000000
-                    -1000 -1 0 1 2 1000 1000000000000
-                    (dec Long/MAX_VALUE) Long/MAX_VALUE]]
+  (let [divisors (mapv wide [2 3 5 7 10 31 127 255 1024 2147483647
+                             -2 -3 -5 -7 -10 -31 -127 -255 -1024 -2147483647
+                             i64/max-i64 (- i64/max-i64)])
+        numerators (mapv wide [i64/min-i64 (+ i64/min-i64 wide-one) -1000000000000
+                               -1000 -1 0 1 2 1000 1000000000000
+                               (- i64/max-i64 wide-one) i64/max-i64])]
     (doseq [divisor divisors, numerator numerators]
-      (is (= (quot numerator divisor)
+      (is (= (/ numerator divisor)
              (apply-signed-division-magic numerator divisor))
           {:numerator numerator :divisor divisor})))
   (is (nil? (machine/signed-division-magic 0)))
@@ -1634,9 +1654,9 @@
 (deftest kir-to-gmir-boundary-rejects-unsupported-shapes
   (is (machine/pilot-expression? ['a] '(+ a (if a 1 2))))
   (is (seq (machine/compile-expression :aarch64 ['a] '(+ a (if a 1 2)))))
-  (is (thrown? clojure.lang.ExceptionInfo
+  (is (thrown? ExceptionInfo
                (machine/compile-expression :aarch64 ['a] '(if a 1))))
-  (is (thrown? clojure.lang.ExceptionInfo
+  (is (thrown? ExceptionInfo
                (machine/compile-expression :aarch64 ['a] '(unknown a)))))
 
 (deftest value-position-if-uses-versioned-phi-and-direct-edge-moves
@@ -1737,7 +1757,7 @@
                        (list 'record-new nested-type
                              (list 'record-new scalar-record-type 1 2))
                        :child))))
-    (is (thrown? clojure.lang.ExceptionInfo
+    (is (thrown? ExceptionInfo
                  (machine/lower-kir-expression
                   [] (list '+ (list 'record-new scalar-record-type 1 2) 3))))))
 
@@ -1785,17 +1805,17 @@
               [] (list 'variant-match scalar-variant-type
                        (list 'variant-new scalar-variant-type :number 1)
                        [[:flag 'x 0] [:number 'x 'x]]))))
-    (is (thrown? clojure.lang.ExceptionInfo
+    (is (thrown? ExceptionInfo
                  (machine/lower-kir-expression
                   [] (list '+ (list 'variant-new scalar-variant-type :number 1) 3))))))
 
 (deftest full-signed-i64-immediates-have-canonical-wire-bytes
   (is (= [0x48 0xb8 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0x7f 0xc3]
-         (machine/compile-expression :x86-64 [] Long/MAX_VALUE)))
+         (machine/compile-expression :x86-64 [] i64/max-i64)))
   (is (= [0x00 0x00 0xf0 0x92 0xc0 0x03 0x5f 0xd6]
-         (machine/compile-expression :aarch64 [] Long/MAX_VALUE)))
-  (is (thrown? clojure.lang.ExceptionInfo
-               (machine/compile-expression :x86-64 [] (inc (bigint Long/MAX_VALUE))))))
+         (machine/compile-expression :aarch64 [] i64/max-i64)))
+  (is (thrown? ExceptionInfo
+               (machine/compile-expression :x86-64 [] (+ i64/max-i64 i64/one)))))
 
 (def scalar-call-kir
   {:format :kotoba.kir/v4
@@ -2136,7 +2156,7 @@
           (is (= 1 (get-in compiled [:exports (first (:exports kir)) :arity]))
               target)))))
   (testing "case order and payload family remain fail closed in the producer"
-    (is (thrown? clojure.lang.ExceptionInfo
+    (is (thrown? ExceptionInfo
                  (machine/lower-kir-module
                   (assoc-in scalar-variant-boundary-kir [:functions 1 :body]
                             (list 'variant-match scalar-variant-type
@@ -2334,7 +2354,7 @@
              (set (keys (:exports (machine/compile-kir-module target multi-export))))))))
   (is (not (machine/pilot-module?
             (assoc-in scalar-call-kir [:functions 1 :body] '(missing x)))))
-  (is (thrown? clojure.lang.ExceptionInfo
+  (is (thrown? ExceptionInfo
                (machine/lower-kir-module
                 (assoc-in scalar-call-kir [:functions 1 :body] '(add-one x x)))))
   (is (= 3 (:gmir/version
@@ -2354,7 +2374,7 @@
                    [[:value field-type]]])
                 :i64
                 (range 33))]
-    (is (thrown? clojure.lang.ExceptionInfo
+    (is (thrown? ExceptionInfo
                  (machine/lower-kir-module
                   (assoc-in scalar-call-kir [:functions 0 :result]
                             too-deep))))))
@@ -2523,12 +2543,16 @@
 (def ^:private x86-fuel-cmp [0x49 0xff 0x49 0x08 0x79])
 
 (deftest aarch64-fuel-decrement-uses-unsigned-borrow-without-storing-on-trap
-  (let [modulus 18446744073709551616N
-        maximum (dec modulus)
+  ;; Unsigned 64-bit arithmetic on this host is BigInt (cljs-i64): `mod` in
+  ;; cljs.core is number-only, so the wrap is written out as the JS `%`
+  ;; corrected for the sign, and `neg?` is a comparison against `i64/zero`.
+  (let [modulus wide-two64
+        maximum (- modulus wide-one)
         transition (fn [fuel]
-                     (let [difference (- fuel 1)
-                           carry? (not (neg? difference))
-                           wrapped (mod difference modulus)]
+                     (let [fuel (wide fuel)
+                           difference (- fuel wide-one)
+                           carry? (not (wide-neg? difference))
+                           wrapped (if carry? difference (+ difference modulus))]
                        {:branch-hs? carry?
                         :trap? (not carry?)
                         :register wrapped
@@ -2543,19 +2567,19 @@
            (a64-le-words @#'kotoba.native.aarch64/fuel-charge))
         "the compatibility byte vector uses the same five exact instructions")
     (is (= {:branch-hs? false :trap? true
-            :register maximum :stored 0N}
-           (transition 0N))
+            :register maximum :stored wide-zero}
+           (transition 0))
         "fuel zero traps before the wrapped UINT64_MAX register is stored")
     (is (= {:branch-hs? true :trap? false
-            :register 0N :stored 0N}
-           (transition 1N))
+            :register wide-zero :stored wide-zero}
+           (transition 1))
         "fuel one succeeds and stores zero")
     (is (= {:branch-hs? true :trap? false
-            :register 1N :stored 1N}
-           (transition 2N))
+            :register wide-one :stored wide-one}
+           (transition 2))
         "fuel two succeeds and stores one")
     (is (= {:branch-hs? true :trap? false
-            :register (dec maximum) :stored (dec maximum)}
+            :register (- maximum wide-one) :stored (- maximum wide-one)}
            (transition maximum))
         "UINT64_MAX succeeds and stores UINT64_MAX-1")))
 
@@ -3012,8 +3036,8 @@
     (testing "RAX is the fixed comparand, so it is pushed and popped"
       (is (contains-subvector? acquire [0x50]) "push rax")
       (is (contains-subvector? acquire [0x58]) "pop rax")
-      (is (< (.indexOf ^java.util.List acquire (int 0x50))
-             (.indexOf ^java.util.List acquire (int 0x58)))
+      (is (< (.indexOf acquire 0x50)
+             (.indexOf acquire 0x58))
           "the push precedes the pop"))
     (testing "the comparand and replacement are the operation's, not the guest's"
       ;; mov eax, imm32 / mov r10d, imm32
@@ -3243,8 +3267,8 @@
                          ['[b l i d] '(kernel-cmpxchg-u32 b l i d)]
                          ['[b l i d e f] '(kernel-cmpxchg-u64 b l i d e f)]]]
     (testing (str body)
-      (is (thrown? clojure.lang.ExceptionInfo (sysops-x86 params body)) body)
-      (is (thrown? clojure.lang.ExceptionInfo (sysops-arm params body)) body))))
+      (is (thrown? ExceptionInfo (sysops-x86 params body)) body)
+      (is (thrown? ExceptionInfo (sysops-arm params body)) body))))
 
 ;; ── simdprep: VEX prefix and AVX/AVX2 encoding goldens ──────────────────────
 ;;
@@ -3428,7 +3452,7 @@
 
 (defn- vex-rejection [f]
   (try (f) nil
-       (catch clojure.lang.ExceptionInfo e (:problem (ex-data e)))))
+       (catch ExceptionInfo e (:problem (ex-data e)))))
 
 (deftest vex-encoders-refuse-what-they-cannot-encode
   ;; Each row pins the REASON, not merely that something threw. A rename

@@ -278,9 +278,9 @@
            ["replace-all" '(string-replace-all "abc" "" "x")
             (search/lower-replace-all ["abc" "" "x"]) :string]]]
     (testing why
-      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) (run (program result op)))
+      (is (thrown? #?(:clj ExceptionInfo :cljs ExceptionInfo) (run (program result op)))
           "the oracle traps")
-      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) (run (rewritten result op lowered)))
+      (is (thrown? #?(:clj ExceptionInfo :cljs ExceptionInfo) (run (rewritten result op lowered)))
           "so the rewrite must trap")))
   ;; And it still reaches machine code on both backends: the trap is a runtime
   ;; outcome, not an emission-time refusal.
@@ -348,7 +348,7 @@
 
 (deftest a-helper-name-collision-is-refused
   (is (thrown-with-msg?
-       #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) #"collides with a native string-search helper"
+       #?(:clj ExceptionInfo :cljs ExceptionInfo) #"collides with a native string-search helper"
        (search/augment-functions
         [{:name 'main :params [] :body '(string-replace-all "a" "a" "b")}
          {:name search/replace-from-name :params '[a b c d e] :body 'a}]))))
@@ -364,7 +364,7 @@
                     '(string-contains? "a" "b" "c")
                     '(string-replace-all "a" "b")
                     '(string-replace-all "a" "b" "c" "d")]]
-        (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+        (is (thrown? #?(:clj ExceptionInfo :cljs ExceptionInfo)
                      (emit {:format :kotoba.kir/v4 :exports ['main]
                             :functions [{:name 'main :params [] :body body}]}))
             (pr-str body))))))
