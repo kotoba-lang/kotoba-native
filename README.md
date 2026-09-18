@@ -279,5 +279,14 @@ another codec.
 ## Test
 
 ```bash
-kbb -M:test
+kbb --backend sci --classpath "src:resources:test" run-tests.cljk   # the whole suite, counted
+kbb -M:test                                                          # the same namespaces through the alias
 ```
+
+No JVM anywhere in this path (ADR 0086, 2026-09-18). `run-tests.cljk` runs all
+37 test namespaces, refuses a test file it does not list, and counts the
+`known-red` deftests apart -- today the 18 x86-64 aiueos kernel-image tests
+that read what only the JVM twin `elf64.clj.cljk` lays (ADR 0036). They run
+and their failures print; a failure outside the list, or a listed test that
+passes, fails the run. The six coordinates the tests reach are declared in
+`nbb.edn` (same shas as `deps.edn`).

@@ -1,6 +1,6 @@
 (ns kotoba.native.aggregate-abi-test
   (:require [clojure.edn :as edn]
-            [clojure.java.io :as io]
+            [kotoba.native.test-support :as support]
             [clojure.test :refer [deftest is testing]]
             [kotoba.native.aggregate-abi :as abi]
             [kotoba.native.machine-ir :as machine]))
@@ -28,4 +28,4 @@
   ;; they moved to `kotoba.native.aggregate-abi-portable-test` on 2026-09-10 —
   ;; along with the six deftests that were JVM-bound only by sharing this file.
   (is (= abi/contract
-         (-> "aggregate-abi.edn" io/resource slurp edn/read-string))))
+         (-> "aggregate-abi.edn" support/resource-text edn/read-string))))

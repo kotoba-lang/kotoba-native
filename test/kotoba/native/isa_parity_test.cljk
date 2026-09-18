@@ -14,7 +14,10 @@
   `bit-xor` missing on AArch64, and `kernel-load-u32`/`kernel-store-u32`
   missing on x86-64. All three are portable operators that
   `kotoba.compiler.frontend` admits for every native target."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:refer-clojure :exclude [bit-and bit-or bit-xor bit-not bit-shift-left bit-shift-right unsigned-bit-shift-right])
+  (:require [kotoba.native.test-support :refer [bit-and bit-or bit-xor bit-not bit-shift-left bit-shift-right unsigned-bit-shift-right]]
+            [kotoba.native.test-support :as support]
+            [clojure.test :refer [deftest is testing]]
             [kotoba.native.x86-64 :as x86]
             [kotoba.native.aarch64 :as arm]
             [kotoba.native.machine-ir :as machine]))
@@ -29,7 +32,7 @@
 
 (defn- emits? [emit params body]
   (try (seq (:code (emit (program params body))))
-       (catch Throwable _ false)))
+       (catch :default _ false)))
 
 ;; ---------------------------------------------------------------------------
 ;; Portable operators -- both backends, no exceptions
@@ -415,10 +418,10 @@
                               ["AArch64" arm/emit-program :aarch64]]]
     (testing label
       (let [thrown (try (emit (program [] '(no-such-operator)))
-                        (catch Throwable e e))]
-        (is (instance? clojure.lang.ExceptionInfo thrown)
+                        (catch :default e e))]
+        (is (instance? ExceptionInfo thrown)
             (str label " must reject with ex-info, got "
-                 (some-> thrown class .getSimpleName)))
+                 (some-> thrown type pr-str)))
         (is (= "aggregate ABI rejected: call-abi-not-admitted"
                (ex-message thrown)))
         (is (= :call-abi-not-admitted (:problem (ex-data thrown))))
@@ -437,7 +440,7 @@
   ;; or the reverse, without anything going red.
   (doseq [[params body] x86-only]
     (let [thrown (try (arm/emit-program (program params body)) nil
-                      (catch clojure.lang.ExceptionInfo e e))
+                      (catch ExceptionInfo e e))
           expected (cond
                      ;; simd: `kernel-dot-f32` is NOT in this set any more --
                      ;; it emits on AArch64. The keyword and the branch stay,
@@ -543,8 +546,8 @@
     ;; that reaches the wrong address, which is the worst of the three
     ;; possible outcomes -- worse than refusing and worse than crashing.
     (let [encode @#'kotoba.native.machine-ir/a64-adr]
-      (is (thrown? clojure.lang.ExceptionInfo (encode :aarch64/x0 1048576)))
-      (is (thrown? clojure.lang.ExceptionInfo (encode :aarch64/x0 -1048577)))
+      (is (thrown? ExceptionInfo (encode :aarch64/x0 1048576)))
+      (is (thrown? ExceptionInfo (encode :aarch64/x0 -1048577)))
       (is (some? (encode :aarch64/x0 1048575)))
       (is (some? (encode :aarch64/x0 -1048576)))))
   (testing "all three literal heads reach real AArch64 code"
@@ -889,7 +892,7 @@
     (let [expected (mapv #(bit-and (unsigned-bit-shift-right word (* 8 %)) 0xff) (range 4))
           code (:code (arm/emit-program (program '[a b] (list op 'a 'b))))]
       (is (some #(= expected %) (partition 4 1 code))
-          (str op " must emit " (format "0x%08x" word))))))
+          (str op " must emit " (support/format "0x%08x" word))))))
 
 (deftest both-isas-stay-deterministic-across-the-new-surface
   (doseq [[params body] (concat portable x86-only)]
@@ -1038,7 +1041,7 @@
   ;; bare reference must be refused rather than loading one of its slots.
   (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
     (testing label
-      (is (thrown? clojure.lang.ExceptionInfo
+      (is (thrown? ExceptionInfo
                    (emit (rec-program (list 'let ['r (list 'record-new rec-type 1 2)] 'r))))))))
 
 (deftest a-projection-must-match-the-schema-it-was-bound-with
@@ -1046,11 +1049,11 @@
     (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
       (testing label
         (is (thrown-with-msg?
-          clojure.lang.ExceptionInfo #"(identical to the schema its operand was bound with|record-type-mismatch)"
+          ExceptionInfo #"(identical to the schema its operand was bound with|record-type-mismatch)"
              (emit (rec-program (list 'let ['r (list 'record-new rec-type 1 2)]
                                       (list 'record-get other 'r :a))))))
         (is (thrown-with-msg?
-          clojure.lang.ExceptionInfo #"(undeclared field|unknown-record-field)"
+          ExceptionInfo #"(undeclared field|unknown-record-field)"
              (emit (rec-program (list 'let ['r (list 'record-new rec-type 1 2)]
                                       (list 'record-get rec-type 'r :nope))))))))))
 
@@ -1374,7 +1377,7 @@
     (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
       (testing label
         (is (thrown-with-msg?
-             clojure.lang.ExceptionInfo #"(result-schema-mismatch|record-new is only supported)"
+             ExceptionInfo #"(result-schema-mismatch|record-new is only supported)"
              (emit (mk-program tail-ref (list 'record-new other 1 2 3) :a))))))))
 
 (deftest a-non-tail-record-of-another-schema-is-a-local-not-a-boundary
@@ -1521,7 +1524,7 @@
           (is (seq (:code (emit flattened))) (str field))
           ;; The walked spelling is not even emittable here -- `r` is N slots,
           ;; not a word -- which is precisely the distinction being preserved.
-          (is (thrown? clojure.lang.ExceptionInfo (emit walked))
+          (is (thrown? ExceptionInfo (emit walked))
               (str field ": a flattened record binding is not a word"))))))
 
   ;; And the flattened read must not have become a chain walk: the pair-chain
@@ -1543,7 +1546,7 @@
   (doseq [[label emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
     (testing label
       (is (thrown-with-msg?
-           clojure.lang.ExceptionInfo #"(undeclared field|invalid-projection)"
+           ExceptionInfo #"(undeclared field|invalid-projection)"
            (emit (handle-program (list 'let ['h '(mk)]
                                        (list 'record-get pair-rec 'h :nope)))))))))
 

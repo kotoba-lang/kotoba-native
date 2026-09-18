@@ -35,7 +35,10 @@
   reads the console it wrote.
 
   Decided by docs/adr/0051-a-bounded-store-answers-with-the-word-it-stored.md."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:refer-clojure :exclude [bit-and bit-or bit-shift-left bit-shift-right])
+  (:require [kotoba.native.test-support :refer [bit-and bit-or bit-shift-left bit-shift-right]]
+            [kotoba.native.test-support :as support]
+            [clojure.test :refer [deftest is testing]]
             [kotoba.native.machine-ir :as machine]))
 
 (def ^:private window-store-ops
@@ -184,7 +187,7 @@
                 (str op ": the store's result register is not written -- the "
                      "instruction after the store must be `mov dst, stored`, "
                      "and instead the sequence continues with "
-                     (format "%02x %02x %02x" (nth bytes end)
+                     (support/format "%02x %02x %02x" (nth bytes end)
                              (nth bytes (inc end)) (nth bytes (+ end 2)))))
             (when answer
               (is (= stored (second answer))
@@ -211,7 +214,7 @@
                 (str op ": the store's result register is not written -- the "
                      "word after the store must be `mov dst, stored`, and "
                      "instead it is "
-                     (format "%08x" (get words (inc index) 0))))
+                     (support/format "%08x" (get words (inc index) 0))))
             (when answer
               (is (= stored (second answer))
                   (str op ": the answer move must read the STORED register"))

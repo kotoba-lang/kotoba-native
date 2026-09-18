@@ -12,7 +12,9 @@
   merely plausible: the host table offsets, that construction is linear rather
   than quadratic, and that the f64 family is the SAME lowering rather than a
   parallel one that could drift."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:refer-clojure :exclude [bit-and bit-or bit-shift-left bit-shift-right])
+  (:require [kotoba.native.test-support :refer [bit-and bit-or bit-shift-left bit-shift-right]]
+            [clojure.test :refer [deftest is testing]]
             [kotoba.native.x86-64 :as x86]
             [kotoba.native.aarch64 :as arm]))
 
@@ -44,15 +46,24 @@
 ;; cannot catch: they only prove the C struct's own layout, never that the
 ;; compiler calls the slot it means to.
 (deftest each-operation-calls-its-own-context-slot
-  (doseq [[body offset] [['(vector-count v) 168]
-                         ['(vector-at v i) 176]
-                         ['(vector-assoc v i x) 184]
+  ;; ADR 0084 (2026-09-16): `vector-count`, `vector-at` and `vector-assoc!`
+  ;; are emitted IN LINE and reach no slot -- `inline-handle-ops-test` pins
+  ;; their bytes. The operations that are still a call keep their own slot.
+  ;; This test was written before 0084 and asserted one call for the inline
+  ;; three; no runner executed it between 0084 and 2026-09-18 (ADR 0086).
+  (doseq [[body offset] [['(vector-assoc v i x) 184]
                          ['(vector-conj v x) 160]
                          ['(vector-drop v n) 192]]]
     (testing (str body)
       (is (= 1 (occurrences (code x86/emit-program '[v i x n] body)
                             (x86-context-call offset)))
-          "exactly one call, to this operation's own slot"))))
+          "exactly one call, to this operation's own slot")))
+  (doseq [[body offset] [['(vector-count v) 168]
+                         ['(vector-at v i) 176]]]
+    (testing (str body " is inline (ADR 0084)")
+      (is (= 0 (occurrences (code x86/emit-program '[v i x n] body)
+                            (x86-context-call offset)))
+          "no call to the slot it used to reach"))))
 
 (deftest an-empty-vector-is-one-call-to-the-construction-slot
   (is (= 1 (occurrences (code x86/emit-program [] '(vector-new))
@@ -79,26 +90,39 @@
 ;; model the operation exists for. So a test that only checked the ANSWER
 ;; could not see this regression at all; nothing but the emitted slot can.
 (deftest abi-v4-operations-call-their-own-context-slot
-  (doseq [[body offset] [['(vector-alloc n) 200]
-                         ['(vector-assoc! v i x) 208]]]
+  ;; `vector-alloc` is still a call. `vector-assoc!` is inline since ADR 0084
+  ;; (its store is pinned in `inline-handle-ops-test`), so here it is asserted
+  ;; to reach NEITHER its old slot 208 nor the copying slot 184 on either ISA.
+  (doseq [[body offset] [['(vector-alloc n) 200]]]
     (testing (str body)
       (is (= 1 (occurrences (code x86/emit-program '[v i x n] body)
                             (x86-context-call offset)))
           "x86-64: exactly one call, to this operation's own slot")
       (is (= 1 (occurrences (code arm/emit-program '[v i x n] body)
                             (arm-context-load offset)))
-          "AArch64: exactly one context load, of this operation's own slot"))))
+          "AArch64: exactly one context load, of this operation's own slot")))
+  (testing "(vector-assoc! v i x) is inline (ADR 0084)"
+    (let [x86 (code x86/emit-program '[v i x n] '(vector-assoc! v i x))
+          arm (code arm/emit-program '[v i x n] '(vector-assoc! v i x))]
+      (is (= 0 (occurrences x86 (x86-context-call 208))))
+      (is (= 0 (occurrences x86 (x86-context-call 184))) "and not the copying slot either")
+      (is (= 0 (occurrences arm (arm-context-load 208))))
+      (is (= 0 (occurrences arm (arm-context-load 184)))))))
 
 (deftest the-bang-is-the-only-difference-between-the-store-and-the-copy
+  ;; Since ADR 0084 the difference is larger than a slot number: the copy is
+  ;; still a call to 184 and the store is an inline check + table read +
+  ;; store that reaches no slot at all. What must still hold is that the
+  ;; store never reaches the ALLOCATING slot -- a store that copied would
+  ;; compute the right answer and lose the cost model the operation exists for.
   (let [copy (code x86/emit-program '[v i x] '(vector-assoc v i x))
         store (code x86/emit-program '[v i x] '(vector-assoc! v i x))]
     (is (= 1 (occurrences copy (x86-context-call 184))))
     (is (= 0 (occurrences copy (x86-context-call 208))))
-    (is (= 1 (occurrences store (x86-context-call 208))))
+    (is (= 0 (occurrences store (x86-context-call 208))) "inline, no slot (ADR 0084)")
     (is (= 0 (occurrences store (x86-context-call 184)))
         "the store must not reach the allocating slot")
-    (is (= (count copy) (count store))
-        "same shape, same size -- only the slot number differs")))
+    (is (not= copy store) "a copy and a store are different code")))
 
 ;; KIR declares no `vector-f64-alloc` and no `vector-f64-assoc!`, so unlike
 ;; every operation in `vector-op-aliases` these two have no f64 twin to stay
@@ -107,9 +131,9 @@
 (deftest the-abi-v4-operations-have-no-f64-twin
   (doseq [body ['(vector-f64-alloc n) '(vector-f64-assoc! v i x)]]
     (testing (str body)
-      (is (thrown? clojure.lang.ExceptionInfo
+      (is (thrown? ExceptionInfo
                    (code x86/emit-program '[v i x n] body)))
-      (is (thrown? clojure.lang.ExceptionInfo
+      (is (thrown? ExceptionInfo
                    (code arm/emit-program '[v i x n] body))))))
 
 ;; ---------------------------------------------------------------------------
@@ -167,16 +191,23 @@
 ;; the fallback is emitted ONCE, so nesting a `vector-get` inside another
 ;; one's fallback cannot double the code size at each level.
 (deftest vector-get-tests-both-bounds-and-emits-its-fallback-once
-  (let [emitted (code x86/emit-program '[v i d] '(vector-get v i d))]
-    (is (= 1 (occurrences emitted (x86-context-call 168)))
-        "the upper bound is read from the vector's own count")
-    (is (= 1 (occurrences emitted (x86-context-call 176)))
-        "the element is read through vector-at, once"))
-  (let [single (code x86/emit-program '[v i d] '(vector-get v i d))
+  ;; ADR 0084: `vector-count` and `vector-at` are inline, so the bound and
+  ;; the element read are no longer slot calls but the inline handle check
+  ;; (`lea r11,[rsi-1]; cmp r11,r10; jae`), which appears once per inline
+  ;; operation. What this test still says: one level of `vector-get` reads
+  ;; the count and the element exactly once each, and nesting adds one level.
+  (let [check [0x4c 0x8d 0x5e 0xff 0x4d 0x39 0xd3 0x0f 0x83]
+        emitted (code x86/emit-program '[v i d] '(vector-get v i d))]
+    (is (= 0 (occurrences emitted (x86-context-call 168))) "vector-count is inline")
+    (is (= 0 (occurrences emitted (x86-context-call 176))) "vector-at is inline")
+    (is (= 2 (occurrences emitted check))
+        "one inline handle check for the count and one for the element"))
+  (let [check [0x4c 0x8d 0x5e 0xff 0x4d 0x39 0xd3 0x0f 0x83]
+        single (code x86/emit-program '[v i d] '(vector-get v i d))
         nested (code x86/emit-program '[v i d]
                      '(vector-get v i (vector-get v i d)))]
-    (is (= 2 (occurrences nested (x86-context-call 176)))
-        "one vector-at per nesting level, not one per level squared")
+    (is (= 4 (occurrences nested check))
+        "two inline checks per nesting level, not per level squared")
     (is (< (count nested) (* 2 (count single)))
         "nesting adds a level, it does not double the whole expansion")))
 

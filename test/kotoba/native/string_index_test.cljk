@@ -52,7 +52,7 @@
            (mapv :name indexed)))
     (is (= indexed (string-index/augment-functions indexed))))
   (is (thrown-with-msg?
-       #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+       #?(:clj ExceptionInfo :cljs ExceptionInfo)
        #"collides with a native string-index helper"
        (string-index/augment-functions
         [{:name 'main :params [] :body '(string-index-new)}
