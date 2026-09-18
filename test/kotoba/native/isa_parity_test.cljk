@@ -624,11 +624,30 @@
       ;; FMOV S0..S3, WZR. `fsub s0,s0,s0` would answer -0.0 for a NaN-free
       ;; start and +0.0 otherwise, which is a different first addend.
       (is (= [0x1e2703e0 0x1e2703e1 0x1e2703e2 0x1e2703e3]
-             (subvec words 18 22))))
+             (subvec words 20 24))))
+    (testing "the operands are saved after the checks and restored before dst"
+      ;; The pointers advance and the count counts down IN THE CALLER'S OWN
+      ;; REGISTERS -- in a leaf allocation a parameter stays in x0..x4 and a
+      ;; let-bound count in x5 -- so the arm saves the three it mutates right
+      ;; after the trap checks (a trap leaves SP where the function had it)
+      ;; and restores them right before writing `dst`. Measured 2026-09-18 on
+      ;; the M1 through amu's kexe loader: without this pair a program that
+      ;; read its block count after `kernel-dequant-dot-q8-0` got 0, and a
+      ;; second call in a counted loop folded zero blocks. The x86 arm never
+      ;; had the defect because it works on r10/r11 and pushes what else it
+      ;; touches.
+      ;;
+      ;; stp x0,x2,[sp,#-32]! ; str x5,[sp,#16]  ...  ldr x5,[sp,#16] ; ldp x0,x2,[sp],#32
+      (is (= [0xa9be0be0 0xf9000be5] (subvec words 18 20)) "the save")
+      (is (= [0xf9400be5 0xa8c20be0] (subvec words 75 77)) "the restore")
+      (is (< (.indexOf words 0xa9be0be0) (.indexOf words 0x1e2703e0))
+          "saved before the accumulators are zeroed")
+      (is (< (.indexOf words 0xa8c20be0) (.indexOf words 0x93407cc6))
+          "restored before dst is sign-extended"))
     (testing "element e of each eight-element group goes into accumulator e mod 4"
       ;; The block body, from the first LDR. Lane order is the whole contract:
       ;; 0 1 2 3 for the lower half, then 0 1 2 3 again for the upper.
-      (let [block (subvec words 23 55)
+      (let [block (subvec words 25 57)
             lanes (mapv (fn [i] (bit-and (nth block (+ (* 4 i) 3)) 0x1f))
                         (range 8))
             offsets (mapv (fn [i] (* 4 (bit-and (bit-shift-right
@@ -650,7 +669,7 @@
       ;; fadd s0,s0,s1 ; fadd s2,s2,s3 ; fadd s0,s0,s2 -- the tree the x86
       ;; arm's two `vhaddps` compute. A chain would be s0+=s1; s0+=s2; s0+=s3.
       (is (= [0x1e212800 0x1e232842 0x1e222800]
-             (subvec words 60 63))))
+             (subvec words 62 65))))
     (testing "no feature guard, because there is nothing to choose between"
       ;; The x86 sequence asks `cpuid` which of two arms to run. There is one
       ;; arm here, and FMUL/FADD/SCVTF/LDR-S are AArch64 base -- so a runtime
@@ -661,8 +680,8 @@
     (testing "the answer is sign-extended from bit 31"
       ;; FMOV W then SXTW. Without the extension every negative result is a
       ;; word `f32-from-bits` refuses.
-      (is (= 0x1e260000 (bit-and (nth words 73) 0xfffffc00)))
-      (is (= 0x93407c00 (bit-and (nth words 74) 0xfffffc00))))
+      (is (= 0x1e260000 (bit-and (nth words 77) 0xfffffc00)))
+      (is (= 0x93407c00 (bit-and (nth words 78) 0xfffffc00))))
     (testing "an out-of-bounds request traps rather than reading"
       (is (some #(= 0xd4200000 %) words) "SCANNED the BRK"))))
 (def ^:private a64-q8-words
@@ -751,10 +770,31 @@
             lanes (mapv #(bit-and % 0x1f) (subvec adds 0 8))]
         (is (= [0 1 2 3 0 1 2 3] lanes) "SCANNED 8 lanes")))
     (testing "the reduction is (s0+s1)+(s2+s3)"
-      ;; Nine from the end, because the epilogue below them is FMOV W, SXTW,
-      ;; B, BRK, MOV and RET.
+      ;; Twelve from the end, because the epilogue below them is the three
+      ;; restores, FMOV W, SXTW, B, BRK, MOV and RET.
       (is (= [0x1e212800 0x1e232842 0x1e222800]
-             (subvec words (- (count words) 9) (- (count words) 6)))))
+             (subvec words (- (count words) 12) (- (count words) 9)))))
+    (testing "all five operands are saved after the checks and restored before dst"
+      ;; This arm advances both pointers, counts the block count and the
+      ;; group counter down and uses `second-length` as the fp16 sign
+      ;; temporary -- in the CALLER'S registers, which in a leaf allocation
+      ;; are the parameters' own x0..x3 and a let-bound x5. Measured
+      ;; 2026-09-18 on the M1 through amu's kexe loader (root
+      ;; ADR-2609182300): without the pair below, a program that read
+      ;; `blocks` after the call got 0, `wlen`/`xlen` read 0, and the two
+      ;; bases had walked one block forward; a counted loop over rows folded
+      ;; row 0 and then zero blocks for every other row. The x86 arm works on
+      ;; r10/r11 and pushes what else it touches, so it never had the defect.
+      ;;
+      ;; stp x0,x1,[sp,#-48]! ; stp x2,x3,[sp,#16] ; str x5,[sp,#32]
+      ;; ... ldr x5,[sp,#32] ; ldp x2,x3,[sp,#16] ; ldp x0,x1,[sp],#48
+      (let [save [0xa9bd07e0 0xa9010fe2 0xf90013e5]
+            restore [0xf94013e5 0xa9410fe2 0xa8c307e0]
+            n (count words)]
+        (is (= save (subvec words 19 22)) "the save, right after the last trap check")
+        (is (= restore (subvec words (- n 9) (- n 6))) "the restore, right before FMOV W")
+        (is (= 0x1e260000 (bit-and (nth words (- n 6)) 0xfffffc00)) "FMOV W after the restore")
+        (is (= 0x93407c00 (bit-and (nth words (- n 5)) 0xfffffc00)) "SXTW after the restore")))
     (testing "the half-precision scale takes the x86 EQUATION, not FCVT"
       ;; AArch64 has `FCVT S,H` and it is exact for every finite half. It is
       ;; still the wrong instruction: the two arms have to agree on the

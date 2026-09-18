@@ -3000,7 +3000,7 @@
                  :subtract-numerator? (and negative-divisor?
                                             (not (wide-neg? multiplier)))}))))))))
 
-(declare a64-register x86-mov-imm x86-mov-imm-fixed)
+(declare a64-register x86-mov-imm x86-mov-imm-fixed a64-saved-frame)
 
 (defn- x86-stack-memory [opcode register slot]
   (let [code (get x86-register-code register)
@@ -5000,6 +5000,12 @@
         pa base
         pb second-base
         remaining elements
+        ;; The three registers this arm advances or counts down are the
+        ;; caller's own in a leaf allocation (see `a64-kernel-dequant-dot`,
+        ;; same finding, 2026-09-18), so they are saved after the checks and
+        ;; restored before `dst` is written.
+        {saved-operands :save restored-operands :restore}
+        (a64-saved-frame (vec (distinct [base second-base elements])))
         ;; One element: load both, multiply, add into the lane it belongs to.
         ;; The x86 scalar arm's `movss/movss/mulss/addss`, word for word.
         step (fn [disp lane]
@@ -5042,7 +5048,8 @@
           (a64-cmp-rr :aarch64/x16 second-length)
           [(layout/relative-branch :aarch64/b-hi-imm19 trap)]
 
-          ;; ── the one arm ───────────────────────────────────────────────
+          ;; ── rescue the operands, then run the one arm ─────────────────
+          saved-operands
           (a64-f32-zero 0) (a64-f32-zero 1)
           (a64-f32-zero 2) (a64-f32-zero 3)
           (counted-loop
@@ -5066,10 +5073,11 @@
                    (a64-add-imm pb pb 4)
                    (a64-sub-imm remaining remaining 1)))
 
-          ;; ── the answer ────────────────────────────────────────────────
+          ;; ── the answer: restore the operands, then write dst ──────────
           ;; FMOV W writes 32 bits and zeroes the upper half; the canonical f32
           ;; word is sign-extended from bit 31, so SXTW re-establishes it. The
           ;; x86 arm's `movd`+`movsxd`, for the same reason.
+          restored-operands
           (a64-fmov-w-s0 dst)
           (a64-sxtw dst)
           [(layout/relative-branch :aarch64/b-imm26 done)
@@ -5822,10 +5830,26 @@
                               (str "a64-dq-" (name encoding) "-" suffix)))
         trap (label "trap")
         done (label "done")
-        ;; The five operands arrive on the call-argument tier with nothing live
-        ;; across the instruction, so all five are scratch here. `length` and
-        ;; `second-length` are dead the moment the checks finish, which is what
-        ;; makes the group counter and the fp16 temporaries free.
+        ;; The five operands are USED IN PLACE -- the pointers advance, the
+        ;; block count and the group counter count down, and `second-length`
+        ;; is the fp16 sign temporary -- and every one of them is SAVED FIRST
+        ;; and restored at the join. The comment that stood here ("the five
+        ;; operands arrive on the call-argument tier with nothing live across
+        ;; the instruction, so all five are scratch") described the spilled
+        ;; lowering only. In a LEAF allocation the operands are the caller's
+        ;; own registers: a parameter stays in x0..x4 and a let-bound block
+        ;; count in x5, and this arm was decrementing that x5 to zero and
+        ;; walking x0/x2 off the end of their regions. Measured 2026-09-18
+        ;; (root ADR-2609182300, amu-native probe `dq_clobber.kotoba`): after
+        ;; `(kernel-dequant-dot-q8-0 wbase wlen xbase xlen blocks)` the program
+        ;; read wlen = 0, xlen = 0, blocks = 0 and xbase - wbase = 128 where 34
+        ;; went in; the x86 arm, which works on r10/r11 and pushes what else it
+        ;; touches, answered the original five. A counted loop over rows --
+        ;; the shape every matvec has -- therefore computed row 0 and then
+        ;; forty rows of +0.0 on AArch64 while agreeing with itself.
+        ;;
+        ;; The answer is formed in s0 and written to `dst` AFTER the restore,
+        ;; so a `dst` that aliases a dead operand still receives it.
         pw base
         px second-base
         remaining blocks
@@ -5833,6 +5857,8 @@
         sign second-length
         work 6
         magic 7
+        {saved-operands :save restored-operands :restore}
+        (a64-saved-frame (vec (distinct [base length second-base second-length blocks])))
         ;; One element: sign-extend the code through a 64-bit register, convert,
         ;; scale by the block's `d`, multiply by the activation, add into lane
         ;; `e mod 4`. The x86 scalar arm's movsx/cvtsi2ss/mulss/movss/mulss/
@@ -5881,7 +5907,9 @@
           (a64-cmp-rr :aarch64/x16 second-length)
           [(layout/relative-branch :aarch64/b-hi-imm19 trap)]
 
-          ;; ── the one arm ───────────────────────────────────────────────
+          ;; ── rescue the operands, then run the one arm ─────────────────
+          ;; After the checks, so a trap leaves SP where the function had it.
+          saved-operands
           (a64-f32-zero 0) (a64-f32-zero 1)
           (a64-f32-zero 2) (a64-f32-zero 3)
           (a64-constant :aarch64/x16 x86-dequant-magic)
@@ -5906,7 +5934,8 @@
           (a64-f32-rrr a64-fadd-s 2 2 3)
           (a64-f32-rrr a64-fadd-s 0 0 2)
 
-          ;; ── the answer ────────────────────────────────────────────────
+          ;; ── the answer: restore the operands, then write dst ──────────
+          restored-operands
           (a64-fmov-w-s dst 0)
           (a64-sxtw dst)
           [(layout/relative-branch :aarch64/b-imm26 done)
