@@ -545,6 +545,15 @@
    ;; with the C here.
    'aiueos-qwen35-recurrent-step
    {:arity 4 :symbol "kotoba_aiueos_qwen35_recurrent_step"}
+   ;; `aiueos-qwen35-hadamard` is the activation transform around a
+   ;; Prism-folded (Hadamard-latent) weight of the Ternary Bonsai 2 artifact
+   ;; (aiueos ADR-0222 stage A): permute (ssm_out only), multiply by the
+   ;; artifact's +-1 signs, then the normalized Sylvester-Walsh-Hadamard
+   ;; butterflies per 1024-block, in place on the output; the inverse after
+   ;; the token_embd lookup. `[arena arena-length plan plan-length]`, a
+   ;; 64-byte plan, the same reason as the matvec above.
+   'aiueos-qwen35-hadamard
+   {:arity 4 :symbol "kotoba_aiueos_qwen35_hadamard"}
    ;; The tokenizer beside them. The three admission objects above answer
    ;; "is this the file" without ever reading a token STRING; these three read
    ;; the two arrays those coordinates name -- 248,320 vocabulary entries and
@@ -1520,6 +1529,15 @@
           ;; Two arms, so that re-measuring one cannot silently move the other.
           qwen-attention-fuel? (= 'aiueos-qwen35-attention object-entry)
           qwen-recurrent-fuel? (= 'aiueos-qwen35-recurrent-step object-entry)
+          ;; The Bonsai Hadamard transform (aiueos ADR-0222). MEASURED by
+          ;; bisection in the KIR oracle on the real ssm_out case, 6,144
+          ;; elements with the [128, 16, 3] permutation and the artifact's own
+          ;; sign vector: passes at 524,288 and traps at 262,144, so 43-85
+          ;; per element (a permuted load, a sign load, two multiplies and a
+          ;; store per element, plus ten butterfly passes per 1024-block).
+          ;; At the admitted ceiling of 65,536 elements the upper bound is
+          ;; 5,570,560. Tier 33,554,432 is 6.0x that.
+          qwen-hadamard-fuel? (= 'aiueos-qwen35-hadamard object-entry)
           ;; The GPT-2 BPE index build. COMPUTED, and the computation depends
           ;; on an argument, which is why the object refuses a model window
           ;; above 16 MiB: every token and every merge string is hashed and
@@ -1707,6 +1725,7 @@
                        qwen-norm-fuel? 250000000      ; 9x
                        qwen-attention-fuel? 33554432  ; 12.7x
                        qwen-recurrent-fuel? 4194304   ; 10.9x
+                       qwen-hadamard-fuel? 33554432   ; 6.0x
                        qwen-index-fuel? 2147483647
                        qwen-tokenize-fuel? 250000000
                        qwen-detokenize-fuel? 10000000

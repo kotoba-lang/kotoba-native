@@ -188,7 +188,9 @@
            ['aiueos-qwen35-norm        5 "kotoba_aiueos_qwen35_norm"        250000000]
            ['aiueos-qwen35-attention   4 "kotoba_aiueos_qwen35_attention"   33554432]
            ['aiueos-qwen35-recurrent-step
-            4 "kotoba_aiueos_qwen35_recurrent_step" 4194304]]]
+            4 "kotoba_aiueos_qwen35_recurrent_step" 4194304]
+           ;; the Bonsai Hadamard transform (aiueos ADR-0222 stage A)
+           ['aiueos-qwen35-hadamard    4 "kotoba_aiueos_qwen35_hadamard"    33554432]]]
     (let [artifact (-> (sealed-kernel :x86_64-aiueos-kernel-v1 512)
                        (assoc :exports {entry {:offset 0 :arity arity}
                                         'main {:offset 1 :arity 0}}
