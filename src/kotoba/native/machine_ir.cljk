@@ -1849,7 +1849,7 @@
                   (= (count params) (count (distinct params)))
                   (map? signatures)
                   (every? gmir/function-id? (keys signatures))
-                  (every? #(and (integer? %) (<= 0 % 5)) (vals signatures)))
+                  (every? #(and (integer? %) (<= 0 % gmir/max-arity)) (vals signatures)))
      (reject! :kir-to-gmir :invalid-parameters
               {:params params :signatures signatures}))
    (let [body (normalize-surface-operations body)
@@ -2585,9 +2585,22 @@
                              {:form form :callee callee :expected expected}))
                   (let [lowered (mapv #(value % env) arguments)
                         registers (mapv #(scalar-register! (second %) form) lowered)]
-                    (into (vec (mapcat first lowered))
-                          [{:gmir/op :gmir/tail-call :gmir/callee callee
-                            :gmir/arguments registers}])))
+                    ;; A tail call reuses THIS function's incoming stack area
+                    ;; for the callee's stack arguments (kotoba-mir
+                    ;; `stack-argument-rewrite`), so it can only pass as many
+                    ;; as this function received. One that needs more is an
+                    ;; ordinary call followed by a return. A self call always
+                    ;; fits, which is what keeps a loop a loop.
+                    (if (and (> (count arguments) 5)
+                             (> (count arguments) (count params)))
+                      (let [dst (fresh-reg)]
+                        (into (vec (mapcat first lowered))
+                              [{:gmir/op :gmir/call :gmir/dst dst
+                                :gmir/callee callee :gmir/arguments registers}
+                               {:gmir/op :gmir/return :gmir/value dst}]))
+                      (into (vec (mapcat first lowered))
+                            [{:gmir/op :gmir/tail-call :gmir/callee callee
+                              :gmir/arguments registers}]))))
 
                 :else
                 (let [[code result-value] (value form env)
@@ -3032,6 +3045,21 @@
                  (bit-shift-left slot 10)
                  (bit-shift-left 31 5)
                  (a64-register register))))
+
+(defn- x86-stack-displacement [opcode register displacement]
+  (let [code (get x86-register-code register)]
+    (when-not (some? code)
+      (reject! :mc-encode :unsupported-register {:register register}))
+    (vec (concat [(bit-or 0x48 (if (>= code 8) 4 0))
+                  opcode
+                  (bit-or 0x84 (bit-shift-left (bit-and code 7) 3))
+                  0x24]
+                 (u32le displacement)))))
+
+(defn- a64-stack-displacement [opcode register displacement]
+  (when-not (and (zero? (mod displacement 8)) (<= 0 (quot displacement 8) 4095))
+    (reject! :mc-encode :stack-argument-out-of-range {:displacement displacement}))
+  (a64-stack-memory opcode register (quot displacement 8)))
 
 (defn- x86-rr [opcode dst src]
   (let [d (get x86-register-code dst)
@@ -7357,6 +7385,12 @@
     (a64-stack-memory 0xf9400000 (:mir/dst instruction) (:mir/slot instruction))
     :aarch64/spill-store
     (a64-stack-memory 0xf9000000 (:mir/src instruction) (:mir/slot instruction))
+    :aarch64/incoming-load
+    (a64-stack-displacement 0xf9400000 (:mir/dst instruction) (:mir/displacement instruction))
+    :aarch64/outgoing-argument
+    (a64-stack-displacement 0xf9000000 (:mir/src instruction) (:mir/displacement instruction))
+    :aarch64/incoming-argument-store
+    (a64-stack-displacement 0xf9000000 (:mir/src instruction) (:mir/displacement instruction))
     ;; A leaf's spill slot parked in a caller-saved SIMD register: FMOV is a
     ;; one-instruction register-file crossing, where the stack round trip the
     ;; slot form takes is a store-load through memory (measured +3.21% on the
@@ -7575,6 +7609,12 @@
     (x86-stack-memory 0x8b (:mir/dst instruction) (:mir/slot instruction))
     :x86-64/spill-store
     (x86-stack-memory 0x89 (:mir/src instruction) (:mir/slot instruction))
+    :x86-64/incoming-load
+    (x86-stack-displacement 0x8b (:mir/dst instruction) (:mir/displacement instruction))
+    :x86-64/outgoing-argument
+    (x86-stack-displacement 0x89 (:mir/src instruction) (:mir/displacement instruction))
+    :x86-64/incoming-argument-store
+    (x86-stack-displacement 0x89 (:mir/src instruction) (:mir/displacement instruction))
     :x86-64/move
     (if (= (:mir/dst instruction) (:mir/src instruction))
       []
@@ -9114,6 +9154,64 @@
           (recur (inc attempt))
           candidate)))))
 
+;; ── stack-passed arguments ──────────────────────────────────────────────────
+;;
+;; Arguments past the fifth travel on the stack (kotoba-mir
+;; `stack-argument-rewrite`). A caller stores argument i at [sp + 8(i - 5)] --
+;; the bottom of its own frame, which is why a function making such a call
+;; moves its spill slots up by the number of stack arguments it passes. The
+;; callee finds them above everything it pushed:
+;;
+;;   x86-64   frame-bytes + 8 * saved + odd-count pad + 8 (return address)
+;;   AArch64  frame-bytes + the save area (16 per pair, fp/lr included)
+;;
+;; A function with none of these instructions is untouched: same slots, same
+;; frame, same bytes.
+
+(defn- stack-argument-op? [instruction op]
+  (some-> (:mc/encoding instruction) name (= op)))
+
+(defn- stack-argument-frame
+  [{:mc/keys [frame-slots instructions] :as function}]
+  (let [reserve (reduce (fn [reserve instruction]
+                          (if (stack-argument-op? instruction "outgoing-argument")
+                            (max reserve (- (:mir/index instruction) 4))
+                            reserve))
+                        0 instructions)]
+    (if (zero? reserve)
+      function
+      (assoc function
+             :mc/frame-slots (+ (or frame-slots 0) reserve)
+             :mc/instructions
+             (mapv (fn [instruction]
+                     (if (contains? instruction :mir/slot)
+                       (update instruction :mir/slot + reserve)
+                       instruction))
+                   instructions)))))
+
+(defn- incoming-argument-base [target frame-bytes saved frame-policy]
+  (case target
+    :x86-64 (+ frame-bytes (* 8 (count saved)) (if (odd? (count saved)) 8 0) 8)
+    :aarch64 (+ frame-bytes
+                (* 16 (count (partition-all 2 saved)))
+                (if (call-frame-policy? frame-policy) 16 0))))
+
+(defn- resolve-stack-argument-offsets
+  [target frame-bytes saved frame-policy instructions]
+  (let [base (incoming-argument-base target frame-bytes saved frame-policy)]
+    (mapv (fn [instruction]
+            (cond
+              (stack-argument-op? instruction "outgoing-argument")
+              (assoc instruction :mir/displacement (* 8 (- (:mir/index instruction) 5)))
+
+              (or (stack-argument-op? instruction "incoming-load")
+                  (stack-argument-op? instruction "incoming-argument-store"))
+              (assoc instruction :mir/displacement
+                     (+ base (* 8 (- (:mir/index instruction) 5))))
+
+              :else instruction))
+          instructions)))
+
 (defn encode-mc-module
   "Encode an allocated MC v3 module. PREFIXES is an optional function-name to
   target-token map used by production fuel instrumentation; it participates in
@@ -9148,11 +9246,16 @@
           (mapcat
            (fn [index function]
              (let [{:mc/keys [name frame-slots frame-policy instructions]}
-                   (if (= :aarch64 target)
-                     (a64-simd-park-spills function)
-                     function)
-                   {:keys [frame-bytes prologue return-suffix tail-suffix]}
+                   (stack-argument-frame
+                    (if (= :aarch64 target)
+                      (a64-simd-park-spills function)
+                      function))
+                   {:keys [frame-bytes prologue return-suffix tail-suffix
+                           saved-registers]}
                    (function-frame target frame-slots frame-policy instructions)
+                   instructions (resolve-stack-argument-offsets
+                                 target frame-bytes saved-registers frame-policy
+                                 instructions)
                    instrumentation (get prefixes name [])
                    fallback-prefix (when (map? instrumentation)
                                      (:fallback instrumentation))

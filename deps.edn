@@ -30,7 +30,7 @@
          :git/sha "1a81e2d7df947a719b75db1e6e5616a900f3ebb7"}
         io.github.kotoba-lang/kotoba-gmir
         {:git/url "https://github.com/kotoba-lang/kotoba-gmir.git"
-         :git/sha "3350ad20a436c1270fc9a693dfea910f68ca9e08"}
+         :git/sha "cf39f7c1a239666b5e0e3ac82c27bdeb6add0807"}
         ;; kotoba-mir 4bf67c0: call+loop uses the scanner (:call-live), the
         ;; conservative fallback colors frame slots from CFG liveness, and
         ;; pure integer SSA segments are scheduled per basic block after physical
@@ -117,7 +117,7 @@
          ;; selection. The refusal it removes said a function's address is
          ;; x86-only "for exactly the reason the literal is" -- and the
          ;; literal's reason had stopped holding a few hours earlier.
-         :git/sha "944b5d304ed4b8d56ff4c8ab0bf49285970ba5c3"}
+         :git/sha "6d92aea9085914dc013560cc1bb6cf1c171c9c86"}
         io.github.kotoba-lang/kotoba-codegen
         {:git/url "https://github.com/kotoba-lang/kotoba-codegen.git"
          ;;
@@ -133,7 +133,7 @@
          ;; than 7 (ADR measures from the instruction itself), and a maximum
          ;; of 0xfffff rather than a branch's 0xffffc (ADR's displacement is
          ;; in BYTES).
-         :git/sha "ce1aada19c85404a67fcbd88aa5582579b5660ea"}
+         :git/sha "9a54c2496f8d185223ca89b1fc1817f4f9c5bf19"}
         io.github.kotoba-lang/kotoba-object
         {:git/url "https://github.com/kotoba-lang/kotoba-object.git"
          :git/sha "9b53a444cfe5550af6b76eef494b4190b5e4e461"}
