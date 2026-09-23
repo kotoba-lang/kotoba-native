@@ -554,6 +554,14 @@
    ;; 64-byte plan, the same reason as the matvec above.
    'aiueos-qwen35-hadamard
    {:arity 4 :symbol "kotoba_aiueos_qwen35_hadamard"}
+   ;; `aiueos-qwen35-rope` is the rotary embedding of the full-attention
+   ;; heads (aiueos ADR-0222 stage B, the rope stage): Prism llama.cpp's
+   ;; iterated-theta NEOX rotation over the first 64 of each 256-float head,
+   ;; with the language's bounded sine/cosine written out in binary64 because
+   ;; this target has no lowering for the intrinsic. `[values values-bytes
+   ;; heads position]`, in place.
+   'aiueos-qwen35-rope
+   {:arity 4 :symbol "kotoba_aiueos_qwen35_rope"}
    ;; The tokenizer beside them. The three admission objects above answer
    ;; "is this the file" without ever reading a token STRING; these three read
    ;; the two arrays those coordinates name -- 248,320 vocabulary entries and
@@ -1538,6 +1546,14 @@
           ;; At the admitted ceiling of 65,536 elements the upper bound is
           ;; 5,570,560. Tier 33,554,432 is 6.0x that.
           qwen-hadamard-fuel? (= 'aiueos-qwen35-hadamard object-entry)
+          ;; The rope (aiueos ADR-0222). MEASURED by bisection in the KIR
+          ;; oracle: 24 heads at position 6 pass at 81,920 and trap at 65,536;
+          ;; one head at the last admitted position, 25,735, passes at 8,192
+          ;; and traps at 6,144 -- the dearest head measured, because its
+          ;; angles have the exponents that walk the floor/quadrant
+          ;; recursion furthest. At the 64-head ceiling with twice that per
+          ;; head the bound is 1,048,576. Tier 16,777,216 is 16x that.
+          qwen-rope-fuel? (= 'aiueos-qwen35-rope object-entry)
           ;; The GPT-2 BPE index build. COMPUTED, and the computation depends
           ;; on an argument, which is why the object refuses a model window
           ;; above 16 MiB: every token and every merge string is hashed and
@@ -1726,6 +1742,7 @@
                        qwen-attention-fuel? 33554432  ; 12.7x
                        qwen-recurrent-fuel? 4194304   ; 10.9x
                        qwen-hadamard-fuel? 33554432   ; 6.0x
+                       qwen-rope-fuel? 16777216       ; 16x
                        qwen-index-fuel? 2147483647
                        qwen-tokenize-fuel? 250000000
                        qwen-detokenize-fuel? 10000000
