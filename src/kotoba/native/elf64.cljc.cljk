@@ -234,6 +234,10 @@
    ;; it never picks a window, an order or a colour.
    'aiueos-browser-frame {:arity 4 :symbol "kotoba_aiueos_browser_frame"}
    'aiueos-browser-reduce {:arity 5 :symbol "kotoba_aiueos_browser_reduce"}
+   ;; The same desktop with text (aiueos ADR-0224): one list of rects AND
+   ;; glyphs, window by window in stack order, laid out against the
+   ;; aiueos-font/v1 blob (`[surface surface-bytes font font-bytes]`).
+   'aiueos-browser-frame2 {:arity 4 :symbol "kotoba_aiueos_browser_frame2"}
    ;; MMIO mapping admission. The page-table walk stays C -- it allocates
    ;; directory slots and writes PTEs -- but WHETHER a physical range may be
    ;; mapped at all is a decision, and it was the last one still living in
@@ -1565,6 +1569,14 @@
           ;; recursion furthest. At the 64-head ceiling with twice that per
           ;; head the bound is 1,048,576. Tier 16,777,216 is 16x that.
           qwen-rope-fuel? (= 'aiueos-qwen35-rope object-entry)
+          ;; The desktop frame with text (aiueos ADR-0224). MEASURED by
+          ;; bisection in aiueos's KIR oracle (browser-frame2-v1): the worst
+          ;; vector -- four windows asking for 384 glyphs, refused past 272
+          ;; ops -- traps at 8,192 and passes at 16,384 over a five-glyph
+          ;; fixture. The committed font has 7,422 glyphs, so each lookup is
+          ;; ~10 binary-search steps deeper: ~4,000 more at 384 glyphs, a
+          ;; bound near 20,500. Tier 262,144 is ~12x that.
+          browser-frame2-fuel? (= 'aiueos-browser-frame2 object-entry)
           ;; The GPT-2 BPE index build. COMPUTED, and the computation depends
           ;; on an argument, which is why the object refuses a model window
           ;; above 16 MiB: every token and every merge string is hashed and
@@ -1754,6 +1766,7 @@
                        qwen-recurrent-fuel? 4194304   ; 10.9x
                        qwen-hadamard-fuel? 33554432   ; 6.0x
                        qwen-rope-fuel? 16777216       ; 16x
+                       browser-frame2-fuel? 262144    ; ~12x
                        qwen-index-fuel? 2147483647
                        qwen-tokenize-fuel? 250000000
                        qwen-detokenize-fuel? 10000000
