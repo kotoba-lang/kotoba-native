@@ -223,6 +223,17 @@
    ;; front the sealed session admits. Nested if, word types only
    ;; (temporary; not a language ceiling).
    'aiueos-session-restore {:arity 1 :symbol "kotoba_aiueos_session_restore"}
+   ;; Guest browser desktop (aiueos ADR-0223). kotoba-lang/browser ADR 0002
+   ;; makes the browser surface the aiueos desktop; these two objects are
+   ;; that guest on KERNEL.ELF. `aiueos-browser-frame` turns the 128-byte
+   ;; surface state into the retained draw list C presents
+   ;; (`[state state-bytes ops ops-bytes]`); `aiueos-browser-reduce` applies
+   ;; one canonical input event -- pointer/down focuses and raises the
+   ;; topmost window under the point, as browser.input + browser.surface do
+   ;; (`[state state-bytes kind a b]`). C rasterizes and scales tablet axes;
+   ;; it never picks a window, an order or a colour.
+   'aiueos-browser-frame {:arity 4 :symbol "kotoba_aiueos_browser_frame"}
+   'aiueos-browser-reduce {:arity 5 :symbol "kotoba_aiueos_browser_reduce"}
    ;; MMIO mapping admission. The page-table walk stays C -- it allocates
    ;; directory slots and writes PTEs -- but WHETHER a physical range may be
    ;; mapped at all is a decision, and it was the last one still living in
