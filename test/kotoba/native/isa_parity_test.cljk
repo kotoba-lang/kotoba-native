@@ -17,7 +17,7 @@
   (:refer-clojure :exclude [bit-and bit-or bit-xor bit-not bit-shift-left bit-shift-right unsigned-bit-shift-right])
   (:require [kotoba.native.test-support :refer [bit-and bit-or bit-xor bit-not bit-shift-left bit-shift-right unsigned-bit-shift-right]]
             [kotoba.native.test-support :as support]
-            [clojure.test :refer [deftest is testing]]
+            [kotoba.test :refer [deftest is testing]]
             [kotoba.native.x86-64 :as x86]
             [kotoba.native.aarch64 :as arm]
             [kotoba.native.machine-ir :as machine]))

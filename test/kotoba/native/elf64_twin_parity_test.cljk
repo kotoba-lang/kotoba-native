@@ -39,7 +39,7 @@
   source-level guard that catches the drift earlier."
   (:require [kotoba.native.test-support :as support]
             [kotoba.lang.text :as str]
-            [clojure.test :refer [deftest is]]))
+            [kotoba.test :refer [deftest is]]))
 
 (def ^:private entry-pattern
   ;; `'name {:arity N :symbol "sym"}`, with the map allowed to sit on the next

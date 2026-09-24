@@ -17,7 +17,7 @@
   `aggregate-abi` carries no reader conditional and no bit arithmetic in 309
   lines, so the expected result is parity. Parity nobody has executed is an
   assumption."
-  (:require #?(:clj  [clojure.test :refer [deftest is testing]]
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing] :include-macros true])
             [kotoba.native.aggregate-abi :as abi]
             [kotoba.native.machine-ir :as machine]))

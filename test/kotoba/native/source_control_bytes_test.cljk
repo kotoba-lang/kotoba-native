@@ -7,7 +7,7 @@
   (:refer-clojure :exclude [bit-and])
   (:require [kotoba.native.test-support :refer [bit-and]]
             [kotoba.native.test-support :as support]
-            [clojure.test :refer [deftest is]]))
+            [kotoba.test :refer [deftest is]]))
 
 (defn- control-bytes [f]
   (let [bytes (support/read-bytes f)]

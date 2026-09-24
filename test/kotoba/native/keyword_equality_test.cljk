@@ -23,7 +23,7 @@
   (`tools/kexe_loader.c` belongs to kotoba-lang/amu). The defect was measured
   there: `(= :end :end)` answered 0 on aarch64 at amu 73ddd26 (2026-09-15)
   while KIR, js and wasm answered 1."
-  (:require [kotoba.lang.text] #?(:clj  [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.lang.text] #?(:clj  [kotoba.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing] :include-macros true])
             [kotoba.kir :as ir]
             [kotoba.native.aarch64 :as arm]

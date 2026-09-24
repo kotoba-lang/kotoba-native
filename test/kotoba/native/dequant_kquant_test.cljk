@@ -38,7 +38,7 @@
   Every byte run below was assembled and read back with
   `llvm-mc --disassemble --triple=x86_64-unknown-linux-gnu` (Homebrew LLVM
   22.1.7) on 2026-09-03, not derived from the manual and trusted."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [kotoba.native.machine-ir :as mir]
             [kotoba.native.x86-64 :as x86]))
 

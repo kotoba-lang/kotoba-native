@@ -5,7 +5,7 @@
   aarch64 range bound, and that a 7- and a 64-argument call lower and encode
   end to end on both targets with the stores at the displacements the ABI
   names."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [kotoba.lang.coll]
             [kotoba.gmir :as gmir]
             [kotoba.native.machine-ir :as machine]))

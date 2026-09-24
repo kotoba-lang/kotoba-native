@@ -15,7 +15,7 @@
   Execution against a real host is amu's conformance, where the loader
   answers with the arenas reset; the reference interpreter's identity
   answer is pinned in osaho."
-  (:require #?(:clj  [clojure.test :refer [deftest is testing]]
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing] :include-macros true])
             [kotoba.native.aarch64 :as arm]
             [kotoba.native.machine-ir :as machine]

@@ -15,7 +15,7 @@
   Per ISA: the slot-144 load is absent from a literal walk and present for a
   computed string (so the fast path is known to be narrow), and the literal's
   bytes are in the emitted code (the address the load reaches is real)."
-  (:require [kotoba.lang.text] #?(:clj  [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.lang.text] #?(:clj  [kotoba.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing] :include-macros true])
             [kotoba.native.aarch64 :as arm]
             [kotoba.native.x86-64 :as x86]))

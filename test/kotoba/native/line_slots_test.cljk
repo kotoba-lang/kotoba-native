@@ -2,7 +2,7 @@
   "The ABI v8 line heads on both native ISAs: each is one runtime call at
   its slot (272 / 280), with its arity -- `string-compare-lines` the first
   four-argument runtime call -- and the slot load reaches the machine code."
-  (:require #?(:clj  [clojure.test :refer [deftest is testing]]
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing] :include-macros true])
             [kotoba.native.aarch64 :as arm]
             [kotoba.native.machine-ir :as machine]

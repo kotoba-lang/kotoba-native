@@ -2,7 +2,7 @@
   "The ABI v10 range heads on both native ISAs: one runtime call each at
   336 / 344, with its arity, the slot load reaching the machine code -- and
   NOT in line (ADR 0084 inlines table reads, not appends or searches)."
-  (:require #?(:clj  [clojure.test :refer [deftest is testing]]
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing] :include-macros true])
             [kotoba.native.aarch64 :as arm]
             [kotoba.native.machine-ir :as machine]

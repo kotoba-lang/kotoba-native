@@ -9,7 +9,7 @@
   the module again -- and the negative control below asserts the rejection
   arrives with `:problem :unsupported-function-module`, so a module that
   breaks for some other reason cannot be counted as this test discriminating."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [kotoba.kir :as kir]
             [kotoba.native.machine-ir :as machine]
             [kotoba.native.aarch64 :as aarch64]
