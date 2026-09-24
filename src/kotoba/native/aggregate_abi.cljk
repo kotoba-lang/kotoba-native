@@ -6,7 +6,7 @@
   as one-word context-owned pair handles. Local flat non-escaping aggregates
   remain replaced."
   {:kotoba/export [admit-closed-linkage! admit-extracted-call! aggregate-payload-variant-type? call-profile contract hetero-vector-type? nested-record-type? record-boundary-plan reject-unextracted-call! scalar-record-type? scalar-variant-type? validate-contract! variant-boundary-plan]}
-  (:require [clojure.set :as set]))
+  (:require [kotoba.lang.coll :as set]))
 
 (def contract
   {:abi/id :kotoba.native/aggregate-boundary
