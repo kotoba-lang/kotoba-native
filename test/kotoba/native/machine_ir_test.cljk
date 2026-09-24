@@ -1790,7 +1790,9 @@
 
 (deftest scalar-variant-sroa-fails-closed-outside-its-local-contract
   (let [other [:variant :test/other [[:number :i64] [:flag :bool]]]
-        non-scalar [:variant :test/text [[:number :i64] [:text :string]]]]
+        ;; ABI v8 admits every one-word payload (a string is a pair handle),
+        ;; so the fail-closed case is a payload that is NOT one word.
+        non-scalar [:variant :test/bytes [[:number :i64] [:blob :bytes]]]]
     (is (not (machine/pilot-expression?
               [] (list 'variant-new scalar-variant-type :number 1))))
     (is (not (machine/pilot-expression?
@@ -1800,7 +1802,7 @@
     (is (not (machine/pilot-expression?
               [] (list 'variant-match non-scalar
                        (list 'variant-new non-scalar :number 1)
-                       [[:number 'x 'x] [:text 'x 0]]))))
+                       [[:number 'x 'x] [:blob 'x 0]]))))
     (is (not (machine/pilot-expression?
               [] (list 'variant-match scalar-variant-type
                        (list 'variant-new scalar-variant-type :number 1)
@@ -2165,7 +2167,7 @@
                                    [:number 'payload 'payload]])))))
     (is (not (machine/pilot-module?
               (assoc-in scalar-variant-result-kir [:functions 0 :result]
-                        [:variant :test/text [[:text :string]]]))))))
+                        [:variant :test/bytes [[:blob :bytes]]]))))))
 
 (deftest aggregate-payload-variants-cross-calls-as-recursive-handles
   (is (aggregate-abi/aggregate-payload-variant-type? aggregate-variant-type))
