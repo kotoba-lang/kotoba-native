@@ -50,6 +50,16 @@
   {:kotoba/export [consuming linear-let-thread? linear-parameter? linear? reading]}
   (:require [clojure.set :as set]))
 
+;; clojure.core/some, spelled as the loop it is. In Kotoba `some` is the
+;; option constructor and a two-argument `(some pred coll)` is refused as a
+;; name collision (kotoba-sema frontend); this is the same definition as
+;; clojure.core/some -- the first logical-true (pred x), in order, stopping
+;; there -- so the host answer is unchanged on nbb and the JVM.
+(defn- first-truthy [pred coll]
+  (loop [s (seq coll)]
+    (when s
+      (or (pred (first s)) (recur (next s))))))
+
 (def consuming
   "Operations that make the vector they are given dead.
 
@@ -208,7 +218,7 @@
               ;; enough here: one read of a consumed name is still one use, and
               ;; it is precisely the read that would see the in-place store.
               (every? (fn [n]
-                        (and (some (fn [pair] (consuming-call? (second pair) n)) pairs)
+                        (and (first-truthy (fn [pair] (consuming-call? (second pair) n)) pairs)
                              (every? #(zero? (sym-uses % n)) body)))
                       (butlast names))
               ;; The last name is the live one and may be read, linearly.
