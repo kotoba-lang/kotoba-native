@@ -6,7 +6,7 @@
   end to end on both targets with the stores at the displacements the ABI
   names."
   (:require [clojure.test :refer [deftest is testing]]
-            [clojure.set]
+            [kotoba.lang.coll]
             [kotoba.gmir :as gmir]
             [kotoba.native.machine-ir :as machine]))
 
@@ -99,7 +99,7 @@
           stores (set (if (= :x86-64 target) (x86-rsp-stores code) (a64-sp-stores code)))
           wanted (set (map #(* 8 %) (range (- arity 5))))]
       (is (seq code) [target arity])
-      (is (= wanted (clojure.set/intersection wanted stores))
+      (is (= wanted (kotoba.lang.coll/intersection wanted stores))
           [target arity "a store at [sp + 8(i - 5)] for every stack argument"])
       (is (= code (:code (machine/encode-mc-module
                           (machine/compile-gmir target (wide-module arity)))))

@@ -48,7 +48,7 @@
   Not wired to a backend. `surface-status.edn` records the widening and its
   preconditions, and the lowering is one of them."
   {:kotoba/export [consuming linear-let-thread? linear-parameter? linear? reading]}
-  (:require [clojure.set :as set]))
+  (:require [kotoba.lang.coll :as set]))
 
 (def consuming
   "Operations that make the vector they are given dead.
