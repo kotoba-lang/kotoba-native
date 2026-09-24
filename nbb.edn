@@ -31,11 +31,11 @@
         ;; deps.edn; a drift between the two files is a red in
         ;; `nbb-edn-mirrors-deps-edn-test`.
         io.github.kotoba-lang/osaho {:git/url "https://github.com/kotoba-lang/osaho.git"
-                                     :git/sha "1a81e2d7df947a719b75db1e6e5616a900f3ebb7"}
+                                     :git/sha "353dd5f30bf803528f355f3b8090413a71e51bc8"}
         io.github.kotoba-lang/kotoba-gmir {:git/url "https://github.com/kotoba-lang/kotoba-gmir.git"
-                                           :git/sha "cf39f7c1a239666b5e0e3ac82c27bdeb6add0807"}
+                                           :git/sha "47763164ceec7be14d67fc35ef619f71d383eab9"}
         io.github.kotoba-lang/kotoba-mir {:git/url "https://github.com/kotoba-lang/kotoba-mir.git"
-                                          :git/sha "6d92aea9085914dc013560cc1bb6cf1c171c9c86"}
+                                          :git/sha "67a83d0635e8502acab7f56cb6c4cf50f31de575"}
         io.github.kotoba-lang/kotoba-codegen {:git/url "https://github.com/kotoba-lang/kotoba-codegen.git"
                                               :git/sha "9a54c2496f8d185223ca89b1fc1817f4f9c5bf19"}
         io.github.kotoba-lang/kotoba-object {:git/url "https://github.com/kotoba-lang/kotoba-object.git"

@@ -731,7 +731,13 @@
    ;; ABI v8 (2026-09-16): the two line slots.
    'string-index-of-from 272 'string-compare-lines 280
    ;; ABI v10 (2026-09-16): the two range slots, after the v9 data pointers.
-   'string-find-byte 336 'string-append-range 344})
+   'string-find-byte 336 'string-append-range 344
+   ;; ABI v11 (2026-09-25): the string constructor and three bytes slots.
+   ;; bytes-empty / bytes-count / bytes-at are the vector slots (see
+   ;; `bytes-op-aliases`), and vector-i64-from-bytes is a bytes-from-vector
+   ;; copy whose range check always passes.
+   'string-from-utf8 352 'bytes-from-vector-i64 360 'vector-i64-from-bytes 360
+   'bytes-slice 368 'bytes-concat 376})
 
 ;; `vector-f64-*` is the SAME host table. A native f64 is already an i64 word
 ;; carrying an IEEE-754 bit pattern (ADR-2608030300: "no new value
@@ -744,7 +750,10 @@
   '{vector-f64-new vector-new vector-f64-conj vector-conj
     vector-f64-count vector-count vector-f64-at vector-at
     vector-f64-assoc vector-assoc vector-f64-drop vector-drop
-    vector-f64-get vector-get})
+    vector-f64-get vector-get
+    ;; `:bytes` (ABI v11, 2026-09-25) is a vector-arena handle too: its
+    ;; empty value and its two reads ARE the vector ones.
+    bytes-empty vector-new-empty bytes-count vector-count bytes-at vector-at})
 
 (defn- emit-heap-call [op args env depth]
   (let [offset (get heap-call-offsets op)
@@ -1348,6 +1357,8 @@
                       string-compare string-fold-ascii string-find-blank string-skip-blank
                       string-index-of-from string-compare-lines
                       string-find-byte string-append-range
+                      string-from-utf8 bytes-from-vector-i64 vector-i64-from-bytes
+                      bytes-slice bytes-concat
                       vector-new-empty vector-conj vector-count
                       vector-at vector-assoc vector-drop
                       vector-alloc vector-assoc!} op)

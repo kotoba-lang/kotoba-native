@@ -966,7 +966,23 @@
    'string-compare-lines :string-compare-lines
    ;; ABI v10 (2026-09-16): the two range slots -- no view taken, none minted.
    'string-find-byte :string-find-byte
-   'string-append-range :string-append-range})
+   'string-append-range :string-append-range
+   ;; ABI v11 (2026-09-25, superproject adr-2609242330): `:bytes`. A bytes
+   ;; value is a vector-arena handle whose items are 0..255, so the three
+   ;; reads and the empty value ARE the vector slots; the type is what keeps
+   ;; it apart from a vector-i64, and that was settled before KIR. The four
+   ;; slots below are what the vector table cannot express.
+   'bytes-empty :vector-new-empty
+   'bytes-count :vector-count
+   'bytes-at :vector-at
+   'string-from-utf8 :string-from-utf8
+   'bytes-from-vector-i64 :bytes-from-vector
+   ;; The copy back is the same host call: a bytes value's items are all in
+   ;; [0,255], so the range check it makes always passes, and it COPIES --
+   ;; a view would let `vector-assoc!` on the result write into the bytes.
+   'vector-i64-from-bytes :bytes-from-vector
+   'bytes-slice :bytes-slice
+   'bytes-concat :bytes-concat})
 
 (def ^:private native-clock-request-type
   [:variant :kotoba.clock/request [[:wall :bool] [:monotonic :bool]]])
@@ -1101,7 +1117,9 @@
   [type]
   (or (contains? #{nil :i64 :bool :f32 :f64 :string :keyword :document
                    :option-i64 :result-i64
-                   :vector-i64 :vector-f64 :string-index} type)
+                   :vector-i64 :vector-f64 :string-index
+                   ;; `:bytes` (ABI v11, 2026-09-25): a vector-arena handle.
+                   :bytes} type)
       (and (vector? type)
            (contains? #{:option :result :list :set :map :ref}
                       (first type)))))
