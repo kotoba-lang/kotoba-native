@@ -21,7 +21,7 @@
   (:require [kotoba.native.test-support :refer [bit-shift-left]]
             [kotoba.kir.cljs-i64 :as i64]
             [kotoba.native.test-support :as support]
-            [clojure.edn :as edn]
+            [kotoba.lang.edn :as edn]
             [kotoba.test :refer [deftest is testing]]
             [kotoba.artifact.core :as artifact]
             [kotoba.native.elf64 :as elf64]
