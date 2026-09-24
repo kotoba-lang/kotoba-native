@@ -1,5 +1,5 @@
 (ns kotoba.native.aggregate-abi-test
-  (:require [clojure.edn :as edn]
+  (:require [kotoba.lang.edn :as edn]
             [kotoba.native.test-support :as support]
             [kotoba.test :refer [deftest is testing]]
             [kotoba.native.aggregate-abi :as abi]
