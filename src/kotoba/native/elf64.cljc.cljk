@@ -238,6 +238,13 @@
    ;; glyphs, window by window in stack order, laid out against the
    ;; aiueos-font/v1 blob (`[surface surface-bytes font font-bytes]`).
    'aiueos-browser-frame2 {:arity 4 :symbol "kotoba_aiueos_browser_frame2"}
+   ;; The desktop's input method (aiueos ADR-0225): one key press, decided by
+   ;; the hosted IME's rules (src/aiueos/compositor/ime.cljk), committed into
+   ;; the focused window's body (`[surface surface-bytes key-code value]`).
+   ;; Default tier: bisected in aiueos's KIR oracle (browser-ime-v1), the
+   ;; dearest step -- a commit scanning a full 64-code-point body -- traps at
+   ;; 128 and passes at 256; 1024 is 4x.
+   'aiueos-browser-key {:arity 4 :symbol "kotoba_aiueos_browser_key"}
    ;; MMIO mapping admission. The page-table walk stays C -- it allocates
    ;; directory slots and writes PTEs -- but WHETHER a physical range may be
    ;; mapped at all is a decision, and it was the last one still living in
