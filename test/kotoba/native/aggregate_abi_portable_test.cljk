@@ -104,7 +104,7 @@
     (is (= :zero-based-declaration-ordinal (:boundary/tag plan)))
     (is (= [:count :ready] (:boundary/cases plan)))
     (is (= [:i64 :bool] (:boundary/payload-schemas plan)))
-    (is (= #{:i64 :bool :record} (:boundary/payload-types plan)))
+    (is (= #{:i64 :bool :record :handle} (:boundary/payload-types plan)))
     (is (= #{0 1} (:boundary/bool-words plan)))
     (is (= :admitted (:boundary/extracted-admission plan))))
   (let [plan (abi/variant-boundary-plan aggregate-variant)]
@@ -117,10 +117,34 @@
   (doseq [type [[:variant :unqualified [[:x :i64]]]
                 [:variant :test/empty []]
                 [:variant :test/duplicate [[:x :i64] [:x :bool]]]
-                [:variant :test/text [[:x :string]]]
+                [:variant :test/unknown-payload [[:x :banana]]]
+                [:variant :test/unqualified-ref [[:x [:ref :node]]]]
+                [:variant :test/wide (mapv (fn [n] [(keyword (str "c" n)) :i64]) (range 33))]
                 [:record :test/not-variant [[:x :i64]]]]]
     (is (thrown? #?(:clj ExceptionInfo :cljs ExceptionInfo)
                  (abi/variant-boundary-plan type)) type)))
+
+;; ABI v8: a variant payload is any one-word handle, so a type may name itself.
+(def tree
+  [:variant :test/node [[:leaf :i64]
+                        [:branch [:vector [[:ref :test/node] [:ref :test/node]]]]]])
+
+(deftest recursive-and-generic-payloads-are-one-word-handles
+  (doseq [type [tree
+                [:variant :test/text [[:x :string]]]
+                [:variant :test/maybe [[:some [:option [:ref :test/node]]] [:none :i64]]]
+                [:variant :test/nest [[:inner scalar-variant] [:n :i64]]]]]
+    (is (= :admitted (:boundary/extracted-admission (abi/variant-boundary-plan type))) type)
+    (is (abi/aggregate-payload-variant-type? type) type))
+  (is (not (abi/aggregate-payload-variant-type? scalar-variant)))
+  (is (abi/hetero-vector-type? [:vector [[:ref :test/node] :i64]]))
+  (is (abi/scalar-record-type? [:record :test/cell [[:head :i64] [:tail [:ref :test/list]]]]))
+  (is (abi/scalar-record-type? [:record :test/holder [[:tree tree]]]))
+  (doseq [type [[:vector []]
+                [:vector (vec (repeat 33 :i64))]
+                [:vector [:banana]]
+                [:vector :i64]]]
+    (is (not (abi/hetero-vector-type? type)) type)))
 
 
 (deftest every-allocator-register-is-call-clobbered

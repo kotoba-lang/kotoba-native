@@ -1370,6 +1370,13 @@
            :else form))))
    body))
 
+(defn- host-index
+  "A literal position as a host integer, or nil. Under nbb every guest literal
+  is a BigInt, which `nth` refuses; the index is bounded by 32 positions."
+  [index]
+  (when (gmir/i64-value? index)
+    #?(:clj (long index) :cljs (js/Number index))))
+
 (defn- normalize-scalar-record-boundary
   "Lower admitted record parameters/results and nested records to the
   declaration-order pair-chain handle. Post-order rewriting makes every inner
@@ -1388,6 +1395,55 @@
                         {:type type :values values}))
              (reduce (fn [tail value] (list 'pair value tail))
                      0 (reverse values)))
+
+           ;; ABI v8: a heterogeneous vector is a record whose fields are
+           ;; positions -- the same declaration-order pair chain, projected
+           ;; by a literal index the frontend already bounds-checked.
+           (and (= op 'hetero-vector-new) (aggregate-abi/hetero-vector-type? (first args)))
+           (let [[type & values] args]
+             (when-not (= (count (second type)) (count values))
+               (reject! :record-boundary :invalid-hetero-vector
+                        {:type type :values values}))
+             (reduce (fn [tail value] (list 'pair value tail))
+                     0 (reverse values)))
+
+           (and (= op 'hetero-vector-at) (= 3 (count args))
+                (aggregate-abi/hetero-vector-type? (first args)))
+           (let [[type value index] args
+                 index (host-index index)]
+             (when-not (and (some? index) (<= 0 index)
+                            (< index (count (second type))))
+               (reject! :record-boundary :invalid-hetero-vector-index
+                        {:type type :index index}))
+             (list 'pair-first
+                   (nth (iterate (fn [handle] (list 'pair-second handle)) value)
+                        index)))
+
+           (and (= op 'hetero-vector-count) (= 2 (count args))
+                (aggregate-abi/hetero-vector-type? (first args)))
+           (let [[type value] args, subject (gensym "hvec__")]
+             (list 'let [subject value] (count (second type))))
+
+           (and (= op 'hetero-vector-assoc) (= 4 (count args))
+                (aggregate-abi/hetero-vector-type? (first args)))
+           (let [[type value index item] args
+                 index (host-index index)
+                 width (count (second type))
+                 subject (gensym "hvec__"), replacement (gensym "hvec_item__")]
+             (when-not (and (some? index) (<= 0 index) (< index width))
+               (reject! :record-boundary :invalid-hetero-vector-index
+                        {:type type :index index}))
+             (list 'let [subject value replacement item]
+                   (reduce (fn [tail position]
+                             (list 'pair
+                                   (if (= position index)
+                                     replacement
+                                     (list 'pair-first
+                                           (nth (iterate (fn [handle] (list 'pair-second handle))
+                                                         subject)
+                                                position)))
+                                   tail))
+                           0 (reverse (range width)))))
 
            (and (= op 'record-get) (= 3 (count args)))
            (let [[type value field] args
@@ -1481,7 +1537,8 @@
 (defn- scalar-boundary-type? [type]
   (or (word-result-type? type)
       (aggregate-abi/scalar-record-type? type)
-      (aggregate-abi/scalar-variant-type? type)))
+      (aggregate-abi/scalar-variant-type? type)
+      (aggregate-abi/hetero-vector-type? type)))
 
 (defn- function-boundary-types [{:keys [params param-types result]}]
   (let [types (or param-types (vec (repeat (count params) :i64)))]
@@ -1536,6 +1593,12 @@
      ;; A flat record used as an aggregate variant payload is also boxed before
      ;; the enclosing tag/payload pair is constructed.
      (some aggregate-abi/aggregate-payload-variant-type?
+           (tree-seq coll? seq functions))
+     ;; ABI v8: a heterogeneous vector has no SROA form at all; it is only
+     ;; ever the pair chain this normalization builds.
+     (some #(and (seq? %) (contains? '#{hetero-vector-new hetero-vector-at
+                                        hetero-vector-count hetero-vector-assoc}
+                                      (first %)))
            (tree-seq coll? seq functions))))))
 
 (defn- provider-boundary-module? [functions]

@@ -1,5 +1,5 @@
 {:abi/id :kotoba.native/aggregate-boundary
- :abi/version 7
+ :abi/version 8
  :abi/word-bits 64
  :portable/record
  {:boundary/parameters :pair-chain-handle
@@ -17,7 +17,7 @@
   :boundary/results :pair-tag-payload-handle
   :boundary/word-count 1
   :boundary/tag :zero-based-declaration-ordinal
-  :boundary/payload-types #{:i64 :bool :record}
+  :boundary/payload-types #{:i64 :bool :record :handle}
   :boundary/payload-representation :recursive-word-handles
   :boundary/max-payload-nesting-depth 32
   :boundary/bool-words #{0 1}
