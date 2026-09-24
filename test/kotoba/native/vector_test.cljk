@@ -14,7 +14,7 @@
   parallel one that could drift."
   (:refer-clojure :exclude [bit-and bit-or bit-shift-left bit-shift-right])
   (:require [kotoba.native.test-support :refer [bit-and bit-or bit-shift-left bit-shift-right]]
-            [clojure.test :refer [deftest is testing]]
+            [kotoba.test :refer [deftest is testing]]
             [kotoba.native.x86-64 :as x86]
             [kotoba.native.aarch64 :as arm]))
 

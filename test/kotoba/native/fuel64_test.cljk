@@ -22,7 +22,7 @@
             [kotoba.kir.cljs-i64 :as i64]
             [kotoba.native.test-support :as support]
             [clojure.edn :as edn]
-            [clojure.test :refer [deftest is testing]]
+            [kotoba.test :refer [deftest is testing]]
             [kotoba.artifact.core :as artifact]
             [kotoba.native.elf64 :as elf64]
             [kotoba.native.interrupt-abi :as interrupt-abi]))

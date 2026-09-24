@@ -9,7 +9,7 @@
   Microsoft x64 call site and none of them holds on arrival."
   (:refer-clojure :exclude [bit-and])
   (:require [kotoba.native.test-support :refer [bit-and]]
-            [clojure.test :refer [deftest is testing]]
+            [kotoba.test :refer [deftest is testing]]
             [kotoba.native.x86-64 :as x86]))
 
 (defn- program [params body]

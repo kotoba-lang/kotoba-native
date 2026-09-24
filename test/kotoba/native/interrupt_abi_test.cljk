@@ -15,7 +15,7 @@
   says they do what the instructions mean."
   (:refer-clojure :exclude [bit-shift-left])
   (:require [kotoba.native.test-support :refer [bit-shift-left]]
-            [clojure.test :refer [deftest is testing]]
+            [kotoba.test :refer [deftest is testing]]
             [kotoba.artifact.core :as artifact]
             [kotoba.native.elf64 :as elf64]
             [kotoba.native.interrupt-abi :as isr]

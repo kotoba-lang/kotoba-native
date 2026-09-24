@@ -7,7 +7,7 @@
   this kind of encoding goes wrong, and a wrong one still validates."
   (:refer-clojure :exclude [bit-and bit-or bit-shift-left bit-shift-right])
   (:require [kotoba.native.test-support :refer [bit-and bit-or bit-shift-left bit-shift-right]]
-            #?(:clj  [clojure.test :refer [deftest is testing]]
+            #?(:clj  [kotoba.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing] :include-macros true])
             [kotoba.native.image-scratch :as image-scratch]
             [kotoba.native.machine-ir]

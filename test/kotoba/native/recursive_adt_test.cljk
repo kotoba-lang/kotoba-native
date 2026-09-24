@@ -4,7 +4,7 @@
   hand -- the same evidence ADR 0031 gave for nested records. Equal machine
   code on both ISAs is the claim; that the pair program itself computes the
   right answer is what the pair primitives' own tests already establish."
-  (:require #?(:clj  [clojure.test :refer [deftest is testing]]
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing] :include-macros true])
             [kotoba.native.machine-ir :as machine]))
 

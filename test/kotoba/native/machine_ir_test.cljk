@@ -3,7 +3,7 @@
   (:require [kotoba.native.test-support :as support]
             [kotoba.native.test-support :refer [bit-and bit-or bit-xor bit-not bit-shift-left bit-shift-right unsigned-bit-shift-right]]
             [kotoba.kir.cljs-i64 :as i64]
-            [clojure.test :refer [deftest is testing]]
+            [kotoba.test :refer [deftest is testing]]
             [kotoba.gmir :as gmir]
             [kotoba.mir :as mir]
             [kotoba.native.aggregate-abi :as aggregate-abi]

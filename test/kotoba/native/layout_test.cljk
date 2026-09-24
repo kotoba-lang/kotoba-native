@@ -1,7 +1,7 @@
 (ns kotoba.native.layout-test
   (:refer-clojure :exclude [bit-and unsigned-bit-shift-right])
   (:require [kotoba.native.test-support :refer [bit-and unsigned-bit-shift-right]]
-            [clojure.test :refer [deftest is testing]]
+            [kotoba.test :refer [deftest is testing]]
             [kotoba.native.aarch64 :as arm]
             [kotoba.codegen.layout :as layout]
             [kotoba.native.machine-ir :as machine]

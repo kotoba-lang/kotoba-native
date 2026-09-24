@@ -1,7 +1,7 @@
 (ns kotoba.native-test
   (:refer-clojure :exclude [bit-and bit-or bit-shift-left])
   (:require [kotoba.native.test-support :refer [bit-and bit-or bit-shift-left]]
-            [clojure.test :refer [deftest is testing]]
+            [kotoba.test :refer [deftest is testing]]
             [kotoba.native.x86-64 :as x86]
             [kotoba.native.aarch64 :as arm]
             [kotoba.native.machine-ir :as machine]

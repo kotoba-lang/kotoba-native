@@ -33,7 +33,7 @@
   Machine-code EXECUTION is not here: this repository has no loader
   (`tools/kexe_loader.c` belongs to kotoba-lang/amu), as
   `kotoba.native.isa-parity-test` also records."
-  (:require [kotoba.lang.text] #?(:clj  [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.lang.text] #?(:clj  [kotoba.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing] :include-macros true])
             [kotoba.kir :as ir]
             [kotoba.native.aarch64 :as arm]

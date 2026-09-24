@@ -26,7 +26,7 @@
   the pair rather than a remark -- the defect was never about how a `:bool` is
   represented (both backends carry it as an i64 word), only about how one
   backend's loop was written."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [kotoba.native.x86-64 :as x86]
             [kotoba.native.aarch64 :as arm]))
 

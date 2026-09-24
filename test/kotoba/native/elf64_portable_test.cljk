@@ -8,7 +8,7 @@
 
    Run without a JVM:
      kbb --backend sci --classpath \"src:test:<deps>\" run-tests.cljk"
-  (:require [clojure.test :refer [deftest is]]
+  (:require [kotoba.test :refer [deftest is]]
             [kotoba.artifact.core :as artifact]
             [kotoba.native.interrupt-abi :as interrupt-abi]
             [kotoba.native.elf64 :as elf64]
