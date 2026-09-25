@@ -304,11 +304,11 @@
    'aiueos-browser-frame2 {:arity 4 :symbol "kotoba_aiueos_browser_frame2"}
    ;; The desktop's input method (aiueos ADR-0225): one key press, decided by
    ;; the hosted IME's rules (src/aiueos/compositor/ime.cljk), committed into
-   ;; the focused window's body (`[surface surface-bytes key-code value]`).
-   ;; Default tier: bisected in aiueos's KIR oracle (browser-ime-v1), the
-   ;; dearest step -- a commit scanning a full 64-code-point body -- traps at
-   ;; 128 and passes at 256; 1024 is 4x.
-   'aiueos-browser-key {:arity 4 :symbol "kotoba_aiueos_browser_key"}
+   ;; the focused window's body. Since aiueos ADR-0235 it converts through
+   ;; the kana-kanji dictionary C hands it from the initramfs
+   ;; (`[surface surface-bytes dictionary dictionary-bytes key]`, key =
+   ;; evdev code * 4 + value); its fuel tier is `browser-key-fuel?`.
+   'aiueos-browser-key {:arity 5 :symbol "kotoba_aiueos_browser_key"}
    ;; MMIO mapping admission. The page-table walk stays C -- it allocates
    ;; directory slots and writes PTEs -- but WHETHER a physical range may be
    ;; mapped at all is a decision, and it was the last one still living in
@@ -1781,6 +1781,14 @@
           ;; ~10 binary-search steps deeper: ~4,000 more at 384 glyphs, a
           ;; bound near 20,500. Tier 262,144 is ~12x that.
           browser-frame2-fuel? (= 'aiueos-browser-frame2 object-entry)
+          ;; The desktop's input method with the dictionary (aiueos ADR-0235).
+          ;; MEASURED by bisection in aiueos's KIR oracle (browser-ime-v2,
+          ;; every vector against the committed 3,871-reading dictionary):
+          ;; the dearest step -- Space on a reading the binary search does
+          ;; not find, twelve probes -- traps at 600 and passes at 640. A
+          ;; ten-code-point reading whose neighbours share its prefix costs
+          ;; ~50 more per probe: a bound near 1,300. Tier 16,384 is ~12x that.
+          browser-key-fuel? (= 'aiueos-browser-key object-entry)
           ;; The GPT-2 BPE index build. COMPUTED, and the computation depends
           ;; on an argument, which is why the object refuses a model window
           ;; above 16 MiB: every token and every merge string is hashed and
@@ -1977,6 +1985,7 @@
                        qwen-hadamard-fuel? 33554432   ; 6.0x
                        qwen-rope-fuel? 16777216       ; 16x
                        browser-frame2-fuel? 262144    ; ~12x
+                       browser-key-fuel? 16384        ; ~12x
                        qwen-index-fuel? 2147483647
                        qwen-tokenize-fuel? 250000000
                        qwen-detokenize-fuel? 10000000
