@@ -1,0 +1,921 @@
+(ns kotoba.native.linux-static
+  "The loader-less Linux static ELF: a sealed native artifact plus a prelude,
+  packaged as an ET_EXEC with no interpreter, no dynamic section and no libc
+  (superproject adr-2609251400 C2).
+
+  Every native kexe runs today under amu `tools/kexe_loader.c`: the loader
+  maps the code, lays the context the code calls through (the pair arena,
+  the string pool, the runtime-op slots, the fuel word), meters budgets and
+  names traps. Linux's syscall ABI is stable, so none of that needs C. This
+  namespace emits what the loader did for a PURE program, as machine code:
+
+    _start      records argc/argv, installs an alternate signal stack and the
+                trap handler (rt_sigaction), points the hidden context register
+                (x86-64 r9, AArch64 x7) at the context, calls `main`, writes its
+                i64 to stdout as the loader's default mode does, exit_group(0).
+    slots       the context ABI slots named admitted by the profile (see
+                below), implemented over the same arenas the loader keeps
+                (pair arena = cells, string pool = bytes). Every other slot of
+                the artifact's context ABI is a stub that traps
+                :slot/unimplemented naming the slot.
+    traps       a budget trap writes `KEXE_TRAP {...}` (the loader's text) to
+                stderr with write(2) and exit_group()s with that trap's code; a
+                guest trap (udf / ud2 / brk -- fuel, an inline handle check, a
+                refused slot input) arrives as a signal and is named the way
+                the loader names it (:budget/fuel when metered and the counter
+                is 0, otherwise the signal).
+
+  MECHANISM, emitted directly: the syscall instructions, the register saves,
+  the bump allocation and range checks (the ADR's line). DECISIONS are data:
+  the budgets, the admitted slots, the trap names and the exit codes are read
+  from the native profile of kotoba-lang `lang/limits.edn` (`:profile/native`,
+  its `:static-elf` entry), which the caller passes in; the context layout and
+  the fuel word come from the sealed artifact's own `:context-abi` and
+  `:fuel-abi`. Nothing below restates a budget or a trap code.
+
+  The prelude is written once in a small register IR (`prelude-ir`) and
+  lowered to each ISA by an encoder that knows ~30 instruction forms and
+  nothing else. The artifact's code bytes are copied verbatim after it, so the
+  verifier can re-emit them and compare (kotoba-verifier
+  `kotoba.verifier.linux-static`)."
+  {:kotoba/export [package plan targets image-layout slot-names
+                   implemented-slots]}
+  (:require [kotoba.lang.text :as str]
+            [kotoba.artifact.core :as artifact]
+            [kotoba.object.elf64 :as object-elf]))
+
+;; ---------------------------------------------------------------------------
+;; Targets
+;; ---------------------------------------------------------------------------
+
+(def targets
+  "The two target profiles this packager serves, and each one's ISA."
+  {:x86_64-linux-static-kotoba-v1 {:isa :x86_64 :machine :x86-64
+                                   :context-register :r9}
+   :aarch64-linux-static-kotoba-v1 {:isa :aarch64 :machine :aarch64
+                                    :context-register :x7}})
+
+;; ---------------------------------------------------------------------------
+;; Linux syscall numbers (the stable ABI, per ISA). Mechanism.
+;; ---------------------------------------------------------------------------
+
+(def ^:private syscalls
+  {:x86_64 {:write 1 :rt-sigaction 13 :sigaltstack 131 :exit-group 231}
+   :aarch64 {:write 64 :rt-sigaction 134 :sigaltstack 132 :exit-group 94}})
+
+;; SA_ONSTACK | SA_RESTORER. x86-64 refuses to deliver a signal to a handler
+;; installed without SA_RESTORER (the frame's return address would be
+;; unset); the handler never returns, so the restorer is the handler itself.
+(def ^:private sigaction-flags (+ 0x08000000 0x04000000))
+
+;; SIGILL SIGTRAP SIGBUS SIGFPE SIGSEGV -- the numbers are the same on both
+;; ISAs (asm-generic and x86 agree on these five).
+(def ^:private trapped-signals
+  [[4 "SIGILL"] [5 "SIGTRAP"] [7 "SIGBUS"] [8 "SIGFPE"] [11 "SIGSEGV"]])
+
+;; ---------------------------------------------------------------------------
+;; Byte helpers
+;; ---------------------------------------------------------------------------
+
+(defn- num [n] #?(:clj n :cljs (js/Number n)))
+(defn- le [n width] (object-elf/little-endian n width))
+(defn- utf8 [s] #?(:clj (vec (map #(bit-and (int %) 0xff) (.getBytes ^String s "UTF-8")))
+                   :cljs (vec (js/Array.from (.encode (js/TextEncoder.) s)))))
+(defn- w32 [x] (le (bit-and x 0xffffffff) 4))
+(defn- align-up [n a] (* a (quot (+ n (dec a)) a)))
+
+;; ---------------------------------------------------------------------------
+;; Register IR -> machine code
+;;
+;; Virtual registers name a physical register per ISA. The mapping keeps
+;; the slot calling convention of the loader's C functions: context in the
+;; first argument register, arguments after it, result in the return
+;; register. Aliases are deliberate and listed: :ret/:nr/:t0 are one x86
+;; register (rax), :ret/:ctx/:p0 one AArch64 register (x0).
+;; ---------------------------------------------------------------------------
+
+(def ^:private registers
+  {:x86_64 {:ctx 7 :a1 6 :a2 2 :a3 1 :a4 8
+            :t0 0 :t1 10 :t2 11 :t3 9 :t4 3 :t5 12 :t6 13 :t7 14 :t8 15
+            :gctx 9 :nr 0 :p0 7 :p1 6 :p2 2 :p3 10 :ret 0}
+   :aarch64 {:ctx 0 :a1 1 :a2 2 :a3 3 :a4 4
+             :t0 9 :t1 10 :t2 11 :t3 12 :t4 13 :t5 14 :t6 15 :t7 5 :t8 6
+             :gctx 7 :nr 8 :p0 0 :p1 1 :p2 2 :p3 3 :ret 0}})
+
+;; x86-64 callee-saved registers the IR's :t4..:t8 land on. Every slot
+;; routine saves them (the guest keeps values in rbx / r12..r15 across a slot
+;; call); on AArch64 the same saves are harmless.
+(def ^:private saved [:t4 :t5 :t6 :t7 :t8])
+
+(defn- reg [isa r]
+  (or (get-in registers [isa r])
+      (throw (ex-info "linux-static prelude names an unknown register"
+                      {:reason :unknown-register :isa isa :register r}))))
+
+(defn- label-address [labels label]
+  (or (get labels label)
+      (throw (ex-info "linux-static prelude references an undefined label"
+                      {:reason :undefined-label :label label}))))
+
+;; --- x86-64 -----------------------------------------------------------------
+
+(defn- rex [w r x b]
+  (bit-or 0x40 (if w 8 0) (if (>= r 8) 4 0) (if (>= x 8) 2 0) (if (>= b 8) 1 0)))
+(defn- modrm [mod r m] (bit-or (bit-shift-left mod 6) (bit-shift-left (bit-and r 7) 3) (bit-and m 7)))
+
+(defn- x86-mem [r b off]
+  ;; [b + disp32]; rsp / r12 as base need a SIB byte.
+  (vec (concat [(modrm 2 r b)] (when (= 4 (bit-and b 7)) [0x24]) (le off 4))))
+
+(def ^:private x86-cc {:eq 0x4 :ne 0x5 :lo 0x2 :hs 0x3 :ls 0x6 :hi 0x7
+                       :lt 0xc :ge 0xd :le 0xe :gt 0xf})
+(def ^:private x86-alu {:add 0x01 :sub 0x29 :and 0x21 :or 0x09 :cmp 0x39})
+(def ^:private x86-alu-ext {:add 0 :or 1 :and 4 :sub 5 :cmp 7})
+
+(defn- x86-size [[op & args :as ins]]
+  (case op
+    :label 0 :li 10 :la 7 :mov 3
+    (:ld :st) (let [b (reg :x86_64 (second args))] (+ 3 (if (= 4 (bit-and b 7)) 1 0) 4))
+    (:ldb) 6 :stb 5 :alu 3 :alui 7 (:shli :shri) 4 (:not :neg) 3
+    :bcc 6 (:b :call) 5 :ret 1 :syscall 2 :trap 2
+    (:push :pop) (if (>= (reg :x86_64 (first args)) 8) 2 1)
+    (:ld-sp :lea-sp) 8
+    :udiv10 (+ 3 2 10 3 3 3) :save-lr 0 :restore-lr 0 :bytes (count (first args))
+    :align 0
+    (throw (ex-info "x86-64 prelude op is not encodable" {:op op :ins ins}))))
+
+(defn- x86-encode [[op & args] pc labels]
+  (let [r #(reg :x86_64 %)
+        rel (fn [label size] (- (label-address labels label) (+ pc size)))]
+    (case op
+      :label []
+      :li (let [[d imm] args d (r d)] (vec (concat [(rex true 0 0 d) (+ 0xb8 (bit-and d 7))] (le imm 8))))
+      :la (let [[d l] args d (r d)] (vec (concat [(rex true d 0 0) 0x8d (modrm 0 d 5)] (le (rel l 7) 4))))
+      :mov (let [[d s] args d (r d) s (r s)] [(rex true s 0 d) 0x89 (modrm 3 s d)])
+      :ld (let [[d b off] args d (r d) b (r b)] (vec (concat [(rex true d 0 b) 0x8b] (x86-mem d b off))))
+      :st (let [[s b off] args s (r s) b (r b)] (vec (concat [(rex true s 0 b) 0x89] (x86-mem s b off))))
+      :ldb (let [[d b i] args d (r d) b (r b) i (r i)]
+             ;; movzx r64, byte [b + i*1 + 0]
+             [(rex true d i b) 0x0f 0xb6 (modrm 1 d 4) (modrm 0 i b) 0x00])
+      :stb (let [[s b i] args s (r s) b (r b) i (r i)]
+             [(rex false s i b) 0x88 (modrm 1 s 4) (modrm 0 i b) 0x00])
+      :alu (let [[o d s] args d (r d) s (r s)] [(rex true s 0 d) (x86-alu o) (modrm 3 s d)])
+      :alui (let [[o d imm] args d (r d)]
+              (vec (concat [(rex true 0 0 d) 0x81 (modrm 3 (x86-alu-ext o) d)] (le imm 4))))
+      :shli (let [[d n] args d (r d)] [(rex true 0 0 d) 0xc1 (modrm 3 4 d) n])
+      :shri (let [[d n] args d (r d)] [(rex true 0 0 d) 0xc1 (modrm 3 5 d) n])
+      :not (let [[d] args d (r d)] [(rex true 0 0 d) 0xf7 (modrm 3 2 d)])
+      :neg (let [[d] args d (r d)] [(rex true 0 0 d) 0xf7 (modrm 3 3 d)])
+      :bcc (let [[c l] args] (vec (concat [0x0f (+ 0x80 (x86-cc c))] (le (rel l 6) 4))))
+      :b (vec (concat [0xe9] (le (rel (first args) 5) 4)))
+      :call (vec (concat [0xe8] (le (rel (first args) 5) 4)))
+      :ret [0xc3]
+      :syscall [0x0f 0x05]
+      :trap [0x0f 0x0b]
+      :push (let [x (r (first args))] (if (>= x 8) [0x41 (+ 0x50 (bit-and x 7))] [(+ 0x50 x)]))
+      :pop (let [x (r (first args))] (if (>= x 8) [0x41 (+ 0x58 (bit-and x 7))] [(+ 0x58 x)]))
+      :ld-sp (let [[d off] args d (r d)] (vec (concat [(rex true d 0 0) 0x8b (modrm 2 d 4) 0x24] (le off 4))))
+      :lea-sp (let [[d off] args d (r d)] (vec (concat [(rex true d 0 0) 0x8d (modrm 2 d 4) 0x24] (le off 4))))
+      ;; rax = s; edx = 0; r11 = 10; div r11 -> rax quotient, rdx remainder.
+      :udiv10 (let [[q rr s] args q (r q) rr (r rr) s (r s)]
+                (vec (concat [(rex true s 0 0) 0x89 (modrm 3 s 0)]
+                             [0x31 0xd2]
+                             [(rex true 0 0 11) (+ 0xb8 3)] (le 10 8)
+                             [(rex true 0 0 11) 0xf7 (modrm 3 6 11)]
+                             [(rex true 0 0 q) 0x89 (modrm 3 0 q)]
+                             [(rex true 2 0 rr) 0x89 (modrm 3 2 rr)])))
+      :save-lr [] :restore-lr []
+      :bytes (vec (first args))
+      :align [])))
+
+;; --- AArch64 ----------------------------------------------------------------
+
+(def ^:private a64-cc {:eq 0 :ne 1 :hs 2 :lo 3 :hi 8 :ls 9 :ge 10 :lt 11 :gt 12 :le 13})
+(def ^:private a64-alu {:add 0x8b000000 :sub 0xcb000000 :and 0x8a000000 :or 0xaa000000})
+
+(defn- a64-li-words [d imm]
+  (let [bytes (le imm 8)
+        chunk (fn [i] (+ (nth bytes (* 2 i)) (* 256 (nth bytes (inc (* 2 i))))))]
+    (vec (concat (w32 (bit-or 0xd2800000 (bit-shift-left (chunk 0) 5) d))
+                 (mapcat (fn [i] (w32 (bit-or 0xf2800000 (bit-shift-left i 21)
+                                              (bit-shift-left (chunk i) 5) d)))
+                         [1 2 3])))))
+
+(defn- a64-small-imm? [o imm] (and (contains? #{:add :sub :cmp} o) (<= 0 imm 4095)))
+
+(defn- a64-size [[op & args :as ins]]
+  (case op
+    :label 0 :li 16 :la 4 :mov 4 :ld 4 :st 4 :ldb 4 :stb 4 :alu 4
+    :alui (let [[o _ imm] args] (if (a64-small-imm? o imm) 4 20))
+    (:shli :shri :not :neg) 4 :bcc 4 (:b :call) 4 :ret 4 :syscall 4 :trap 4
+    (:push :pop) 4 (:ld-sp :lea-sp) 4 :udiv10 16 :save-lr 4 :restore-lr 4
+    :bytes (count (first args)) :align 0
+    (throw (ex-info "AArch64 prelude op is not encodable" {:op op :ins ins}))))
+
+(defn- a64-encode [[op & args] pc labels]
+  (let [r #(reg :aarch64 %)
+        rel (fn [label] (- (label-address labels label) pc))]
+    (case op
+      :label []
+      :li (let [[d imm] args] (a64-li-words (r d) imm))
+      :la (let [[d l] args off (rel l)]
+            (w32 (bit-or 0x10000000 (bit-shift-left (bit-and off 3) 29)
+                         (bit-shift-left (bit-and (bit-shift-right off 2) 0x7ffff) 5) (r d))))
+      :mov (let [[d s] args] (w32 (bit-or 0xaa0003e0 (bit-shift-left (r s) 16) (r d))))
+      :ld (let [[d b off] args]
+            (w32 (bit-or 0xf9400000 (bit-shift-left (quot off 8) 10) (bit-shift-left (r b) 5) (r d))))
+      :st (let [[s b off] args]
+            (w32 (bit-or 0xf9000000 (bit-shift-left (quot off 8) 10) (bit-shift-left (r b) 5) (r s))))
+      :ldb (let [[d b i] args]
+             (w32 (bit-or 0x38606800 (bit-shift-left (r i) 16) (bit-shift-left (r b) 5) (r d))))
+      :stb (let [[s b i] args]
+             (w32 (bit-or 0x38206800 (bit-shift-left (r i) 16) (bit-shift-left (r b) 5) (r s))))
+      :alu (let [[o d s] args d (r d) s (r s)]
+             (if (= o :cmp)
+               (w32 (bit-or 0xeb00001f (bit-shift-left s 16) (bit-shift-left d 5)))
+               (w32 (bit-or (a64-alu o) (bit-shift-left s 16) (bit-shift-left d 5) d))))
+      :alui (let [[o d imm] args d (r d)]
+              (if (a64-small-imm? o imm)
+                (w32 (case o
+                       :add (bit-or 0x91000000 (bit-shift-left imm 10) (bit-shift-left d 5) d)
+                       :sub (bit-or 0xd1000000 (bit-shift-left imm 10) (bit-shift-left d 5) d)
+                       :cmp (bit-or 0xf100001f (bit-shift-left imm 10) (bit-shift-left d 5))))
+                ;; x17 is the assembler's scratch (the IR never names it).
+                (vec (concat (a64-li-words 17 imm)
+                             (if (= o :cmp)
+                               (w32 (bit-or 0xeb00001f (bit-shift-left 17 16) (bit-shift-left d 5)))
+                               (w32 (bit-or (a64-alu o) (bit-shift-left 17 16) (bit-shift-left d 5) d)))))))
+      :shli (let [[d n] args d (r d)]
+              (w32 (bit-or 0xd3400000 (bit-shift-left (mod (- 64 n) 64) 16)
+                           (bit-shift-left (- 63 n) 10) (bit-shift-left d 5) d)))
+      :shri (let [[d n] args d (r d)]
+              (w32 (bit-or 0xd340fc00 (bit-shift-left n 16) (bit-shift-left d 5) d)))
+      :not (let [[d] args d (r d)] (w32 (bit-or 0xaa2003e0 (bit-shift-left d 16) d)))
+      :neg (let [[d] args d (r d)] (w32 (bit-or 0xcb0003e0 (bit-shift-left d 16) d)))
+      :bcc (let [[c l] args]
+             (w32 (bit-or 0x54000000 (bit-shift-left (bit-and (quot (rel l) 4) 0x7ffff) 5) (a64-cc c))))
+      :b (w32 (bit-or 0x14000000 (bit-and (quot (rel (first args)) 4) 0x3ffffff)))
+      :call (w32 (bit-or 0x94000000 (bit-and (quot (rel (first args)) 4) 0x3ffffff)))
+      :ret (w32 0xd65f03c0)
+      :syscall (w32 0xd4000001)
+      :trap (w32 0x00000000)                          ; udf #0 -> SIGILL
+      :push (w32 (bit-or 0xf81f0fe0 (r (first args)))) ; str x, [sp,#-16]!
+      :pop (w32 (bit-or 0xf84107e0 (r (first args))))  ; ldr x, [sp],#16
+      :ld-sp (let [[d off] args] (w32 (bit-or 0xf94003e0 (bit-shift-left (quot off 8) 10) (r d))))
+      :lea-sp (let [[d off] args] (w32 (bit-or 0x910003e0 (bit-shift-left off 10) (r d))))
+      :udiv10 (let [[q rr s] args q (r q) rr (r rr) s (r s)]
+                (vec (concat (w32 0xd2800151)                                        ; movz x17,#10
+                             (w32 (bit-or 0x9ac00800 (bit-shift-left 17 16) (bit-shift-left s 5) 16)) ; udiv x16,s,x17
+                             (w32 (bit-or 0x9b008000 (bit-shift-left 17 16) (bit-shift-left s 10)
+                                          (bit-shift-left 16 5) rr))                   ; msub rr,x16,x17,s
+                             (w32 (bit-or 0xaa0003e0 (bit-shift-left 16 16) q)))))   ; mov q,x16
+      :save-lr (w32 (bit-or 0xf81f0fe0 30))
+      :restore-lr (w32 (bit-or 0xf84107e0 30))
+      :bytes (vec (first args))
+      :align [])))
+
+(defn- assemble
+  "Two passes over fixed-size encodings: label addresses, then bytes.
+  `external` supplies labels that live outside the IR (the guest's entry)."
+  [isa base items external]
+  (let [size (case isa :x86_64 x86-size :aarch64 a64-size)
+        encode (case isa :x86_64 x86-encode :aarch64 a64-encode)
+        [labels end] (reduce (fn [[labels pc] [op a :as ins]]
+                               (let [pc (if (= op :align) (align-up pc a) pc)]
+                                 [(if (= op :label)
+                                    (do (when (contains? labels a)
+                                          (throw (ex-info "linux-static prelude label defined twice"
+                                                          {:reason :duplicate-label :label a})))
+                                        (assoc labels a pc))
+                                    labels)
+                                  (+ pc (size ins))]))
+                             [external base] items)
+        bytes (reduce (fn [out [op a :as ins]]
+                        (let [pc (+ base (count out))
+                              out (if (= op :align) (into out (repeat (- (align-up pc a) pc) 0)) out)
+                              pc (+ base (count out))
+                              code (encode ins pc labels)]
+                          (when-not (= (count code) (size ins))
+                            (throw (ex-info "linux-static encoder size disagrees with its own table"
+                                            {:reason :encoding-size :ins ins :size (count code)})))
+                          (into out code)))
+                      [] items)]
+    (when-not (= (+ base (count bytes)) end)
+      (throw (ex-info "linux-static assembler passes disagree" {:reason :assembler-passes})))
+    {:bytes bytes :labels labels}))
+
+;; ---------------------------------------------------------------------------
+;; Decisions, from data
+;; ---------------------------------------------------------------------------
+
+(defn slot-names
+  "The artifact's `:context-abi` keys that name a callable slot, mapped to the
+  slot's name. Derived, not listed: a key ending in `-offset` whose value is a
+  code pointer. The data pointers (v9) and the fuel / bitmap words are not
+  slots and are named here so they are excluded rather than forgotten."
+  [context-abi]
+  (let [data-words #{:fuel-offset :allow-bitmap-offset :pair-used-pointer-offset
+                       :pairs-base-offset :pair-validated-base-offset
+                       :vector-used-pointer-offset :vectors-base-offset
+                       :vector-items-base-offset}]
+      (into (sorted-map)
+            (keep (fn [[k v]]
+                    (let [n (name k)]
+                      (when (and (str/ends-with? n "-offset") (not (contains? data-words k)))
+                        [(keyword (subs n 0 (- (count n) (count "-offset")))) (num v)]))))
+            context-abi)))
+
+(def implemented-slots
+  "Slots this namespace has machine code for. What is ADMITTED is the
+  profile's decision (`:static-elf :admitted-slots`); a slot admitted there
+  that is missing here is a packaging refusal, never a silent stub."
+  #{:pair-new :pair-first :pair-second :string-equal :string-concat
+    :string-substring :string-index-of})
+
+(defn- profile-value [profile path what]
+  (let [v (get-in profile path)]
+    (when (nil? v)
+      (throw (ex-info (str "the native profile names no " what)
+                      {:reason :native-profile-incomplete :path path})))
+    v))
+
+(defn plan
+  "Everything the prelude decides, read from the artifact and the native
+  profile (`(:profile/native limits-table)`). `overrides` may lower or raise
+  the cell / byte budgets within the profile's maxima (a packaged command
+  bakes its budget, `:profile/native` says so)."
+  ([artifact profile] (plan artifact profile {}))
+  ([artifact profile overrides]
+   (let [static (profile-value profile [:static-elf] ":static-elf entry")
+         cells (num (or (:cells overrides) (profile-value profile [:cells :default :value] "cell budget")))
+         cells-max (num (profile-value profile [:cells :pair-arena-max :value] "pair-arena maximum"))
+         bytes (num (or (:bytes overrides) (profile-value profile [:bytes :default :value] "byte budget")))
+         bytes-max (num (profile-value profile [:bytes :max :value] "string-pool maximum"))
+         exit-codes (profile-value profile [:static-elf :exit-codes :value] "static-elf exit codes")
+         admitted (set (profile-value profile [:static-elf :admitted-slots :value] "admitted slot list"))
+         missing (remove implemented-slots admitted)
+         context-abi (:context-abi artifact)
+         slots (slot-names context-abi)
+         fuel-abi (:fuel-abi artifact)
+         metered? (not= :off (get-in artifact [:limits :fuel-metering]))]
+     (when (seq missing)
+       (throw (ex-info "the native profile admits a slot the static prelude does not implement"
+                       {:reason :admitted-slot-unimplemented :slots (vec (sort missing))})))
+     (when-not (and (integer? cells) (<= 1 cells cells-max))
+       (throw (ex-info "cell budget outside the native profile" {:reason :cells-outside-profile :cells cells :maximum cells-max})))
+     (when-not (and (integer? bytes) (<= 1 bytes bytes-max))
+       (throw (ex-info "byte budget outside the native profile" {:reason :bytes-outside-profile :bytes bytes :maximum bytes-max})))
+     (when-not (= 11 (num (:version context-abi)))
+       (throw (ex-info "the static prelude implements context ABI v11 only"
+                       {:reason :context-abi-version :version (:version context-abi)})))
+     (doseq [k [:ok :trap/signal :budget/fuel :budget/cells :budget/bytes
+                (:unimplemented-slot-trap static)]]
+       (when-not (integer? (get exit-codes k))
+         (throw (ex-info "the native profile names no exit code for an outcome"
+                         {:reason :exit-code-missing :outcome k}))))
+     {:cells cells :bytes bytes :metered? metered?
+      :fuel (num (:initial fuel-abi))
+      :trap-names {:fuel (profile-value profile [:fuel :trap] "fuel trap")
+                   :cells (profile-value profile [:cells :trap] "cell trap")
+                   :bytes (profile-value profile [:bytes :trap] "byte trap")
+                   :slot (profile-value profile [:static-elf :unimplemented-slot-trap] "slot trap")}
+      :exit-codes exit-codes
+      :slots (into (sorted-map)
+                   (map (fn [[slot offset]]
+                          [slot {:offset offset :admitted? (contains? admitted slot)}]))
+                   slots)
+      :context-abi context-abi})))
+
+;; ---------------------------------------------------------------------------
+;; Layout
+;; ---------------------------------------------------------------------------
+
+(def ^:private page 0x1000)
+(def ^:private image-base 0x400000)
+(def ^:private state-offset 512)
+(def ^:private data-file-size 1024)
+(def ^:private alt-stack-size 0x4000)
+
+(def ^:private state
+  {:pair-used 0 :pool-used 8 :zero 16 :cells 24 :bytes 32 :metered 40
+   :code-base 48 :code-length 56 :pool-base 64 :argc 72 :argv 80
+   :sigaction 88 :stack-t 120 :itoa 144})
+
+(defn- st [k] (+ state-offset (get state k)))
+
+(defn image-layout
+  "Addresses of every region, from the text size and the plan. Pure; the
+  verifier calls it to know where to look."
+  [text-size {:keys [cells bytes]}]
+  (let [text-offset page
+        data-offset (align-up (+ text-offset text-size) page)
+        data (+ image-base data-offset)
+        alt (+ data page)
+        pairs (+ alt alt-stack-size)
+        valid (+ pairs (* 16 cells))
+        pool (+ valid (align-up cells 16))
+        end (align-up (+ pool bytes) 16)]
+    {:text-offset text-offset :text (+ image-base text-offset)
+     :data-offset data-offset :data data :alt alt :pairs pairs :valid valid
+     :pool pool :memory-size (- end data)}))
+
+;; ---------------------------------------------------------------------------
+;; The prelude, in the register IR
+;; ---------------------------------------------------------------------------
+
+(defn- gensym-label [counter prefix]
+  (keyword "ls" (str prefix "-" (swap! counter inc))))
+
+(defn- check-handle
+  "h in (0, pair_used] else SIGILL; p := &pairs[h-1]. Scratch s."
+  [c h p s]
+  (let [ok (gensym-label c "handle-ok")]
+    [[:alui :cmp h 0] [:bcc :le ::bad]
+     [:ld s :ctx (st :pair-used)] [:alu :cmp h s] [:bcc :hi ::bad]
+     [:label ok]
+     [:ld p :ctx ::pairs-base] [:mov s h] [:alui :sub s 1] [:shli s 4] [:alu :add p s]]))
+
+(defn- resolve-string
+  "h -> p (pointer to the bytes), n (length); the loader's
+  resolve_string_bytes: a non-negative offset is into the artifact's code and
+  literal bytes, a negative one (~offset) into the string pool, and the range
+  must lie inside the bytes that exist."
+  [c h p n s1 s2]
+  (let [pool (gensym-label c "pool") done (gensym-label c "resolved")]
+    (vec (concat
+          (check-handle c h p s1)
+          [[:ld n p 8] [:ld p p 0]
+           [:alui :cmp n 0] [:bcc :lt ::bad]
+           [:alui :cmp p 0] [:bcc :lt pool]
+           [:mov s1 p] [:alu :add s1 n] [:ld s2 :ctx (st :code-length)]
+           [:alu :cmp s1 s2] [:bcc :hi ::bad]
+           [:ld s2 :ctx (st :code-base)] [:alu :add p s2] [:b done]
+           [:label pool]
+           [:not p] [:mov s1 p] [:alu :add s1 n] [:ld s2 :ctx (st :pool-used)]
+           [:alu :cmp s1 s2] [:bcc :hi ::bad]
+           [:ld s2 :ctx (st :pool-base)] [:alu :add p s2]
+           [:label done]]))))
+
+(defn- continuation
+  "The byte at p[i] is a UTF-8 continuation byte, else SIGILL. Scratch a, b."
+  [p i a b]
+  [[:ldb a p i] [:mov b a] [:alui :and b 0xc0] [:alui :cmp b 0x80] [:bcc :ne ::bad]])
+
+(defn- validate
+  "The loader's ensure_valid_string: validate h's bytes as canonical UTF-8
+  once, and remember it on the handle (pair_validated). Scratch i a b v."
+  [c h p n i a b v]
+  (let [done (gensym-label c "valid") loop (gensym-label c "utf8")
+        three (gensym-label c "utf8-3") four (gensym-label c "utf8-4")
+        e0 (gensym-label c "utf8-e0") ed (gensym-label c "utf8-ed")
+        f0 (gensym-label c "utf8-f0") f4 (gensym-label c "utf8-f4")
+        ok (gensym-label c "utf8-ok")]
+    (vec (concat
+          [[:ld v :ctx ::validated-base] [:mov i h] [:alui :sub i 1]
+           [:ldb a v i] [:alui :cmp a 0] [:bcc :ne done]
+           [:li i 0]
+           [:label loop]
+           [:alu :cmp i n] [:bcc :hs ok]
+           [:ldb a p i] [:alui :add i 1]
+           [:alui :cmp a 0x7f] [:bcc :ls loop]
+           [:alui :cmp a 0xc2] [:bcc :lo ::bad]
+           [:alui :cmp a 0xdf] [:bcc :hi three]
+           [:alu :cmp i n] [:bcc :hs ::bad]]
+          (continuation p i b v)
+          [[:alui :add i 1] [:b loop]
+           [:label three]
+           [:alui :cmp a 0xef] [:bcc :hi four]
+           [:mov b i] [:alui :add b 1] [:alu :cmp b n] [:bcc :hs ::bad]]
+          (continuation p i b v)
+          [[:ldb b p i]
+           [:alui :cmp a 0xe0] [:bcc :ne e0] [:alui :cmp b 0xa0] [:bcc :lo ::bad]
+           [:label e0]
+           [:alui :cmp a 0xed] [:bcc :ne ed] [:alui :cmp b 0xa0] [:bcc :hs ::bad]
+           [:label ed]
+           [:alui :add i 1]]
+          (continuation p i b v)
+          [[:alui :add i 1] [:b loop]
+           [:label four]
+           [:alui :cmp a 0xf4] [:bcc :hi ::bad]
+           [:mov b i] [:alui :add b 2] [:alu :cmp b n] [:bcc :hs ::bad]]
+          (continuation p i b v)
+          [[:ldb b p i]
+           [:alui :cmp a 0xf0] [:bcc :ne f0] [:alui :cmp b 0x90] [:bcc :lo ::bad]
+           [:label f0]
+           [:alui :cmp a 0xf4] [:bcc :ne f4] [:alui :cmp b 0x90] [:bcc :hs ::bad]
+           [:label f4]
+           [:alui :add i 1]]
+          (continuation p i b v)
+          [[:alui :add i 1]]
+          (continuation p i b v)
+          [[:alui :add i 1] [:b loop]
+           [:label ok]
+           [:ld v :ctx ::validated-base] [:mov i h] [:alui :sub i 1]
+           [:li a 1] [:stb a v i]
+           [:label done]]))))
+
+(defn- pair-new
+  "The loader's checked_pair_new over (f, s) -> :t0, marking the handle
+  validated when `validated?`. Refuses at the cell budget with the cells trap.
+  Scratch :t1 :t2 :t3. f and s must not be :t0..:t3."
+  [validated? f s]
+  [[:ld :t0 :ctx (st :pair-used)] [:ld :t1 :ctx (st :cells)]
+   [:alu :cmp :t0 :t1] [:bcc :hs ::trap-cells]
+   [:ld :t1 :ctx ::pairs-base] [:mov :t2 :t0] [:shli :t2 4] [:alu :add :t2 :t1]
+   [:st f :t2 0] [:st s :t2 8]
+   [:ld :t1 :ctx ::validated-base] [:li :t3 (if validated? 1 0)] [:stb :t3 :t1 :t0]
+   [:alui :add :t0 1] [:st :t0 :ctx (st :pair-used)]])
+
+(defn- routine [label body]
+  (vec (concat [[:align 16] [:label label]]
+               (map (fn [r] [:push r]) saved) [[:save-lr]]
+               body
+               [[:label (keyword "ls" (str (name label) "-out"))]
+                [:restore-lr]] (map (fn [r] [:pop r]) (reverse saved))
+               [[:mov :ret :t0] [:ret]])))
+
+(defn- out [label] (keyword "ls" (str (name label) "-out")))
+
+(defn- slot-routines [c]
+  {:pair-new
+   (routine ::pair-new (concat [[:mov :t4 :a1] [:mov :t5 :a2]] (pair-new false :t4 :t5)))
+   :pair-first
+   (routine ::pair-first (concat [[:mov :t4 :a1]] (check-handle c :t4 :t1 :t2) [[:ld :t0 :t1 0]]))
+   :pair-second
+   (routine ::pair-second (concat [[:mov :t4 :a1]] (check-handle c :t4 :t1 :t2) [[:ld :t0 :t1 8]]))
+   :string-equal
+   (let [l (gensym-label c "eq") yes (gensym-label c "eq-yes") no (gensym-label c "eq-no")]
+     (routine ::string-equal
+              (concat (resolve-string c :a1 :t1 :t2 :t0 :t3)
+                      (resolve-string c :a2 :t4 :t5 :t0 :t3)
+                      [[:alu :cmp :t2 :t5] [:bcc :ne no]
+                       [:li :t0 0]
+                       [:label l]
+                       [:alu :cmp :t0 :t2] [:bcc :hs yes]
+                       [:ldb :t3 :t1 :t0] [:ldb :t6 :t4 :t0] [:alu :cmp :t3 :t6] [:bcc :ne no]
+                       [:alui :add :t0 1] [:b l]
+                       [:label yes] [:li :t0 1] [:b (out ::string-equal)]
+                       [:label no] [:li :t0 0]])))
+   :string-index-of
+   (let [outer (gensym-label c "idx") inner (gensym-label c "idx-in")
+         next (gensym-label c "idx-next") found (gensym-label c "idx-found")
+         none (gensym-label c "idx-none")]
+     (routine ::string-index-of
+              (concat (resolve-string c :a1 :t1 :t2 :t0 :t3)
+                      (resolve-string c :a2 :t4 :t5 :t0 :t3)
+                      ;; an EMPTY needle traps, as in the reference interpreter
+                      [[:alui :cmp :t5 0] [:bcc :le ::bad]]
+                      (validate c :a1 :t1 :t2 :t0 :t3 :t6 :t7)
+                      (validate c :a2 :t4 :t5 :t0 :t3 :t6 :t7)
+                      [[:alu :cmp :t5 :t2] [:bcc :gt none]
+                       [:mov :t8 :t2] [:alu :sub :t8 :t5] [:li :t0 0]
+                       [:label outer]
+                       [:alu :cmp :t0 :t8] [:bcc :gt none]
+                       [:li :t3 0]
+                       [:label inner]
+                       [:alu :cmp :t3 :t5] [:bcc :hs found]
+                       [:mov :t6 :t0] [:alu :add :t6 :t3] [:ldb :t7 :t1 :t6]
+                       [:ldb :t6 :t4 :t3] [:alu :cmp :t7 :t6] [:bcc :ne next]
+                       [:alui :add :t3 1] [:b inner]
+                       [:label next] [:alui :add :t0 1] [:b outer]
+                       [:label found] [:b (out ::string-index-of)]
+                       [:label none] [:li :t0 -1]])))
+   :string-substring
+   (let [s-ok (gensym-label c "sub-s") e-ok (gensym-label c "sub-e")
+         neg (gensym-label c "sub-neg") mk (gensym-label c "sub-mk")]
+     (routine ::string-substring
+              (concat (resolve-string c :a1 :t1 :t2 :t0 :t3)
+                      [[:alui :cmp :a2 0] [:bcc :lt ::bad]
+                       [:alu :cmp :a3 :a2] [:bcc :lt ::bad]
+                       [:alu :cmp :a3 :t2] [:bcc :gt ::bad]]
+                      (validate c :a1 :t1 :t2 :t0 :t3 :t6 :t7)
+                      ;; both cuts on code-point boundaries
+                      [[:alu :cmp :a2 :t2] [:bcc :hs s-ok]
+                       [:ldb :t3 :t1 :a2] [:alui :and :t3 0xc0] [:alui :cmp :t3 0x80] [:bcc :eq ::bad]
+                       [:label s-ok]
+                       [:alu :cmp :a3 :t2] [:bcc :hs e-ok]
+                       [:ldb :t3 :t1 :a3] [:alui :and :t3 0xc0] [:alui :cmp :t3 0x80] [:bcc :eq ::bad]
+                       [:label e-ok]]
+                      (check-handle c :a1 :t4 :t0)
+                      [[:ld :t4 :t4 0]
+                       [:alui :cmp :t4 0] [:bcc :lt neg]
+                       [:alu :add :t4 :a2] [:b mk]
+                       [:label neg] [:alu :sub :t4 :a2]
+                       [:label mk]
+                       [:mov :t5 :a3] [:alu :sub :t5 :a2]]
+                      (pair-new true :t4 :t5))))
+   :string-concat
+   (let [not-tail (gensym-label c "cat-copy") mk (gensym-label c "cat-mk")
+         l1 (gensym-label c "cat-b") d1 (gensym-label c "cat-b-done")
+         l2 (gensym-label c "cat-a2") d2 (gensym-label c "cat-a2-done")
+         l3 (gensym-label c "cat-b2") d3 (gensym-label c "cat-b2-done")]
+     (routine ::string-concat
+              (concat (resolve-string c :a1 :t1 :t2 :t0 :t3)
+                      (resolve-string c :a2 :t4 :t5 :t0 :t3)
+                      (validate c :a1 :t1 :t2 :t0 :t3 :t6 :t7)
+                      (validate c :a2 :t4 :t5 :t0 :t3 :t6 :t7)
+                      (check-handle c :a1 :t6 :t0)
+                      [[:ld :t6 :t6 0]
+                       [:mov :t8 :t2] [:alu :add :t8 :t5]
+                       [:ld :t0 :ctx (st :pool-used)] [:ld :t3 :ctx (st :bytes)]
+                       ;; A is the pool's tail: append B in place (the loader's
+                       ;; a_is_tail), charging only B's bytes.
+                       [:alui :cmp :t6 0] [:bcc :ge not-tail]
+                       [:mov :t7 :t6] [:not :t7] [:alu :add :t7 :t2] [:alu :cmp :t7 :t0] [:bcc :ne not-tail]
+                       [:mov :t7 :t0] [:alu :add :t7 :t5] [:alu :cmp :t7 :t3] [:bcc :hi ::trap-bytes]
+                       [:ld :t7 :ctx (st :pool-base)] [:alu :add :t7 :t0]
+                       [:li :t1 0]
+                       [:label l1] [:alu :cmp :t1 :t5] [:bcc :hs d1]
+                       [:ldb :t2 :t4 :t1] [:stb :t2 :t7 :t1] [:alui :add :t1 1] [:b l1]
+                       [:label d1]
+                       [:alu :add :t0 :t5] [:st :t0 :ctx (st :pool-used)] [:b mk]
+                       [:label not-tail]
+                       [:mov :t7 :t0] [:alu :add :t7 :t8] [:alu :cmp :t7 :t3] [:bcc :hi ::trap-bytes]
+                       [:ld :t7 :ctx (st :pool-base)] [:alu :add :t7 :t0]
+                       [:li :t3 0]
+                       [:label l2] [:alu :cmp :t3 :t2] [:bcc :hs d2]
+                       [:ldb :t6 :t1 :t3] [:stb :t6 :t7 :t3] [:alui :add :t3 1] [:b l2]
+                       [:label d2]
+                       [:alu :add :t7 :t2] [:li :t3 0]
+                       [:label l3] [:alu :cmp :t3 :t5] [:bcc :hs d3]
+                       [:ldb :t6 :t4 :t3] [:stb :t6 :t7 :t3] [:alui :add :t3 1] [:b l3]
+                       [:label d3]
+                       [:mov :t6 :t0] [:not :t6] [:alu :add :t0 :t8] [:st :t0 :ctx (st :pool-used)]
+                       [:label mk]]
+                      (pair-new true :t6 :t8))))})
+
+(defn- trap-line [fields]
+  (str "KEXE_TRAP {" (str/join " " fields) "}\n"))
+
+(defn- kw [k] (str k))
+
+(defn- trap-block
+  "Write `message` to stderr and exit_group(code)."
+  [label message-label code]
+  [[:label label] [:la :p1 message-label] [:li :t5 code] [:li :t4 message-label] [:b ::trap-exit]])
+
+(defn- prelude-ir
+  "The whole prelude. `guest-main` is an external label (the artifact's
+  `main`), `layout` the region addresses, `plan` the decisions."
+  [isa plan layout]
+  (let [c (atom 0)
+        sys (get syscalls isa)
+        {:keys [trap-names exit-codes slots]} plan
+        messages (atom [])
+        message! (fn [text]
+                   (let [l (keyword "ls" (str "msg-" (count @messages)))]
+                     (swap! messages conj [l (utf8 text)])
+                     l))
+        fuel-msg (message! (trap-line [":kind :budget" (str ":reason " (kw (:fuel trap-names)))]))
+        cells-msg (message! (trap-line [":kind :budget" (str ":reason " (kw (:cells trap-names))) ":arena :pairs"]))
+        bytes-msg (message! (trap-line [":kind :budget" (str ":reason " (kw (:bytes trap-names))) ":arena :string-pool"]))
+        signal-msgs (mapv (fn [[n s]] [n (message! (trap-line [":kind :signal" (str ":signal :" s)]))])
+                          trapped-signals)
+        unknown-msg (message! (trap-line [":kind :signal" ":signal :unknown"]))
+        routines (slot-routines c)
+        ;; eager: every message must exist before the message table is laid
+        stubs (vec (for [[slot {:keys [admitted?]}] slots
+                    :when (not admitted?)]
+                [slot (keyword "ls" (str "stub-" (name slot)))
+                 (message! (trap-line [":kind :slot" (str ":reason " (kw (:slot trap-names)))
+                                       (str ":slot " (kw slot))]))]))
+        signal-code (get exit-codes :trap/signal)
+        data (:data layout)
+        body
+        (concat
+         ;; _start
+         [[:label ::start]
+          [:li :t1 data]
+          [:ld-sp :t0 0] [:st :t0 :t1 (st :argc)]
+          [:lea-sp :t0 8] [:st :t0 :t1 (st :argv)]
+          [:li :nr (:sigaltstack sys)] [:li :p0 (+ data (st :stack-t))] [:li :p1 0] [:syscall]]
+         (mapcat (fn [[n _]]
+                   [[:li :nr (:rt-sigaction sys)] [:li :p0 n] [:li :p1 (+ data (st :sigaction))]
+                    [:li :p2 0] [:li :p3 8] [:syscall]])
+                 trapped-signals)
+         [[:li :a1 0] [:li :a2 0] [:li :a3 0] [:li :a4 0] [:li :ctx 0]
+          [:li :gctx data]
+          [:call ::guest-main]
+          ;; the loader's write_i64: decimal, a newline, one write(2)
+          [:mov :t4 :ret]
+          [:li :t8 0]
+          [:li :t6 (+ data (st :itoa) 31)] [:li :t7 (+ data (st :itoa) 32)]
+          [:li :t0 10] [:li :t1 0] [:stb :t0 :t6 :t1]
+          [:alui :cmp :t4 0] [:bcc :ge ::itoa]
+          [:li :t8 1] [:neg :t4]
+          [:label ::itoa]
+          [:udiv10 :t4 :t5 :t4]
+          [:alui :add :t5 48] [:alui :sub :t6 1] [:li :t1 0] [:stb :t5 :t6 :t1]
+          [:alui :cmp :t4 0] [:bcc :ne ::itoa]
+          [:alui :cmp :t8 0] [:bcc :eq ::itoa-done]
+          [:alui :sub :t6 1] [:li :t0 45] [:li :t1 0] [:stb :t0 :t6 :t1]
+          [:label ::itoa-done]
+          [:alu :sub :t7 :t6]
+          [:li :nr (:write sys)] [:mov :p1 :t6] [:mov :p2 :t7] [:li :p0 1] [:syscall]
+          [:li :nr (:exit-group sys)] [:li :p0 (get exit-codes :ok)] [:syscall]
+          [:trap]]
+         ;; the signal handler: :budget/fuel when metered and the counter is 0
+         ;; (the loader's report_budget_trap default arm), else the signal.
+         [[:align 16] [:label ::handler]
+          [:li :t1 data] [:ld :t0 :t1 (st :metered)] [:alui :cmp :t0 0] [:bcc :eq ::not-fuel]
+          [:ld :t0 :t1 (num (:fuel-offset (:context-abi plan)))] [:alui :cmp :t0 0] [:bcc :eq ::trap-fuel]
+          [:label ::not-fuel]]
+         (mapcat (fn [[n l]]
+                   (let [skip (gensym-label c "sig")]
+                     [[:alui :cmp :p0 n] [:bcc :ne skip]
+                      [:la :p1 l] [:li :t5 signal-code] [:li :t4 l] [:b ::trap-exit]
+                      [:label skip]]))
+                 signal-msgs)
+         [[:la :p1 unknown-msg] [:li :t5 signal-code] [:li :t4 unknown-msg] [:b ::trap-exit]]
+         ;; named traps
+         (trap-block ::trap-fuel fuel-msg (get exit-codes (:fuel trap-names)))
+         (trap-block ::trap-cells cells-msg (get exit-codes (:cells trap-names)))
+         (trap-block ::trap-bytes bytes-msg (get exit-codes (:bytes trap-names)))
+         [[:label ::bad] [:trap]]
+         ;; :trap-exit expects p1 = message address, t4 = its label (length
+         ;; is resolved below), t5 = exit code.
+         [[:label ::trap-exit]]
+         [[:label ::trap-write]
+          [:li :nr (:write sys)] [:li :p0 2] [:syscall]
+          [:li :nr (:exit-group sys)] [:mov :p0 :t5] [:syscall] [:trap]]
+         ;; slots
+         (mapcat (fn [[slot {:keys [admitted?]}]]
+                   (when admitted? (get routines slot)))
+                 slots)
+         (mapcat (fn [[_ l msg]]
+                   [[:align 16] [:label l] [:la :p1 msg] [:li :t5 (get exit-codes (:slot trap-names))]
+                    [:li :t4 msg] [:b ::trap-exit]])
+                 stubs)
+         [[:align 16] [:label ::messages]]
+         (mapcat (fn [[l bytes]] [[:label l] [:bytes bytes]]) @messages)
+         [[:align 16] [:label ::text-end]])]
+    {:ir (vec body) :messages @messages :stubs (vec stubs)}))
+
+;; `::li :t4 <message label>` above loads a LABEL as an immediate, which the
+;; register IR has no form for: it is rewritten here into the message's
+;; length, since the length is what ::trap-write needs and it is known.
+(defn- resolve-message-lengths [ir messages]
+  (let [lengths (into {} (map (fn [[l b]] [l (count b)])) messages)]
+    (mapv (fn [[op a b :as ins]]
+            (if (and (= op :li) (= a :t4) (keyword? b))
+              [:li :p2 (or (get lengths b)
+                           (throw (ex-info "trap names an unknown message" {:label b})))]
+              ins))
+          ir)))
+
+;; ---------------------------------------------------------------------------
+;; Package
+;; ---------------------------------------------------------------------------
+
+(defn- bind-context-labels [ir context-abi]
+  (let [abi (fn [k] (num (get context-abi k)))
+        subst {::pairs-base (abi :pairs-base-offset)
+               ::validated-base (abi :pair-validated-base-offset)}]
+    (mapv (fn [ins] (mapv #(get subst % %) ins)) ir)))
+
+(defn- context-bytes
+  "The data page: the context the guest reads (laid at the artifact's own
+  `:context-abi` offsets) followed by the prelude's state block."
+  [plan layout labels]
+  (let [{:keys [context-abi slots fuel metered? cells bytes]} plan
+        abi (fn [k] (num (get context-abi k)))
+        {:keys [data pairs valid pool]} layout
+        context-words
+        (merge
+         {0 11
+          (abi :fuel-offset) fuel
+          (abi :pair-used-pointer-offset) (+ data (st :pair-used))
+          (abi :pairs-base-offset) pairs
+          (abi :pair-validated-base-offset) valid
+          (abi :vector-used-pointer-offset) (+ data (st :zero))
+          (abi :vectors-base-offset) (+ data (st :zero))
+          (abi :vector-items-base-offset) (+ data (st :zero))}
+         (into {} (map (fn [[slot {:keys [offset admitted?]}]]
+                         [offset (get labels (if admitted?
+                                               (keyword "kotoba.native.linux-static" (name slot))
+                                               (keyword "ls" (str "stub-" (name slot)))))]))
+               slots))
+        state-words
+        {(st :cells) cells (st :bytes) bytes (st :metered) (if metered? 1 0)
+         (st :code-base) (get labels ::code) (st :code-length) (get labels ::code-length)
+         (st :pool-base) pool
+         (st :sigaction) (get labels ::handler)
+         (+ (st :sigaction) 8) sigaction-flags
+         (+ (st :sigaction) 16) (get labels ::handler)
+         (st :stack-t) (:alt layout)
+         (+ (st :stack-t) 16) alt-stack-size}]
+    (when (> (+ 8 (apply max (keys context-words))) state-offset)
+      (throw (ex-info "the context ABI reaches the prelude's state block"
+                      {:reason :context-abi-overlaps-state})))
+    (reduce (fn [out [offset value]]
+              (when (nil? value)
+                (throw (ex-info "context word has no value" {:reason :context-word-unbound :offset offset})))
+              (let [b (le value 8)]
+                (reduce (fn [o i] (assoc o (+ offset i) (nth b i))) out (range 8))))
+            (vec (repeat data-file-size 0))
+            (concat context-words state-words))))
+
+(defn- build [isa artifact plan]
+  (let [main-export (get-in artifact [:exports (get-in artifact [:program :entry])])
+        code (mapv #(bit-and (num %) 0xff) (:code artifact))
+        {:keys [ir messages]} (prelude-ir isa plan {:data 0})
+        ir (-> ir (resolve-message-lengths messages) (bind-context-labels (:context-abi plan)))
+        text-base (+ image-base page)
+        ;; pass 0: the prelude's size does not depend on any address (every
+        ;; encoding is fixed-size), so assemble once at a provisional data
+        ;; address to learn it, then again at the real one.
+        probe (assemble isa text-base ir {::guest-main text-base})
+        prelude-size (- (get-in probe [:labels ::text-end]) text-base)
+        text-size (+ prelude-size (count code))
+        layout (image-layout text-size plan)
+        {:keys [ir messages]} (prelude-ir isa plan layout)
+        ir (-> ir (resolve-message-lengths messages) (bind-context-labels (:context-abi plan)))
+        code-address (+ text-base prelude-size)
+        main-address (+ code-address (num (:offset main-export)))
+        {:keys [bytes labels]} (assemble isa text-base ir {::guest-main main-address})]
+    (when-not (= (count bytes) prelude-size)
+      (throw (ex-info "linux-static prelude size moved between passes" {:reason :prelude-size})))
+    {:prelude bytes :code code :layout layout :prelude-size prelude-size
+     :labels (assoc labels ::code code-address ::code-length (count code))
+     :main-address main-address}))
+
+(defn package
+  "Package a sealed native artifact for `x86_64-linux-static-kotoba-v1` or
+  `aarch64-linux-static-kotoba-v1` as a static ELF64 ET_EXEC.
+
+  `profile` is `(:profile/native limits-table)`: kotoba-lang lang/limits.edn
+  as data (amu passes `kotoba.compiler.limits/table`). Refuses an unsealed
+  artifact, another target, an entryless or non-zero-arity program, a program
+  with capability effects (C3's handlers are not here yet), and any profile
+  that admits a slot this prelude has no code for."
+  ([artifact profile] (package artifact profile {}))
+  ([artifact profile overrides]
+   (when-not (artifact/valid-seal? artifact)
+     (throw (ex-info "linux-static packaging requires a sealed artifact" {:reason :unsealed})))
+   (let [target (:target artifact)
+         {:keys [isa machine]} (get targets target)]
+     (when-not isa
+       (throw (ex-info "linux-static packaging requires a linux-static target"
+                       {:reason :not-linux-static :target target})))
+     (let [entry (get-in artifact [:program :entry])
+           export (get-in artifact [:exports entry])]
+       (when-not (and export (zero? (num (:arity export))))
+         (throw (ex-info "a linux-static program needs a zero-arity exported entry"
+                         {:reason :entry-not-zero-arity :entry entry})))
+       (when (seq (:effects artifact))
+         (throw (ex-info "a linux-static program may not declare capability effects yet (adr-2609251400 C3)"
+                         {:reason :effects-not-admitted :effects (:effects artifact)}))))
+     (let [plan (plan artifact profile overrides)
+           {:keys [prelude code layout labels main-address prelude-size]} (build isa artifact plan)
+           text (vec (concat prelude code))
+           {:keys [text-offset data-offset data memory-size]} layout
+           context (context-bytes plan layout labels)
+           names (utf8 "\u0000.text\u0000.data\u0000.bss\u0000.shstrtab\u0000")
+           names-offset (+ data-offset data-file-size)
+           section-offset (align-up (+ names-offset (count names)) 8)
+           entry (get labels ::start)
+           sections [(vec (repeat 64 0))
+                     (object-elf/encode-section-header
+                      {:name-offset 1 :type :progbits :flags 0x6 :address (:text layout)
+                       :offset text-offset :size (count text) :alignment 16})
+                     (object-elf/encode-section-header
+                      {:name-offset 7 :type :progbits :flags 0x3 :address data
+                       :offset data-offset :size data-file-size :alignment 16})
+                     (object-elf/encode-section-header
+                      {:name-offset 13 :type :nobits :flags 0x3 :address (+ data page)
+                       :offset (+ data-offset data-file-size) :size (- memory-size page) :alignment 16})
+                     (object-elf/encode-section-header
+                      {:name-offset 18 :type :strtab :offset names-offset :size (count names) :alignment 1})]
+           header (object-elf/encode-header
+                   {:type :executable :machine machine :entry entry
+                    :program-header-offset 64 :program-header-count 3
+                    :section-header-offset section-offset
+                    :section-header-count (count sections) :section-name-index 4})
+           phdrs (concat
+                  (object-elf/encode-program-header
+                   {:type :load :flags 0x5 :offset text-offset :virtual-address (:text layout)
+                    :file-size (count text) :memory-size (count text) :alignment page})
+                  (object-elf/encode-program-header
+                   {:type :load :flags 0x6 :offset data-offset :virtual-address data
+                    :file-size data-file-size :memory-size memory-size :alignment page})
+                  ;; PT_GNU_STACK, RW: the stack is not executable.
+                  (object-elf/encode-program-header
+                   {:type 0x6474e551 :flags 0x6 :alignment 16}))
+           before-text (object-elf/pad-to (concat header phdrs) text-offset)
+           before-data (object-elf/pad-to (concat before-text text) data-offset)
+           before-sections (object-elf/pad-to (concat before-data context names) section-offset)
+           bytes (vec (concat before-sections (mapcat identity sections)))]
+       {:format :elf64/v1 :target target :entry :_start :entry-address entry
+        :source-entry (get-in artifact [:program :entry])
+        :main-address main-address
+        :text-offset text-offset :prelude-size prelude-size
+        :code-offset (+ text-offset prelude-size) :code-size (count code)
+        :data-offset data-offset :data-address data
+        :budgets {:cells (:cells plan) :bytes (:bytes plan)}
+        :fuel {:initial (:fuel plan) :metered (:metered? plan)}
+        :slots (into (sorted-map) (map (fn [[s {:keys [admitted?]}]]
+                                         [s (if admitted? :implemented :traps)]))
+                     (:slots plan))
+        :sections [:text :data :bss :shstrtab]
+        :imports [] :interpreter nil :dynamic nil
+        :bytes bytes}))))
