@@ -195,7 +195,9 @@
            ;; the guest browser desktop frame with text (aiueos ADR-0224)
            ['aiueos-browser-frame2     4 "kotoba_aiueos_browser_frame2"     262144]
            ;; the guest browser desktop input method with the dictionary (aiueos ADR-0235)
-           ['aiueos-browser-key        5 "kotoba_aiueos_browser_key"        16384]]]
+           ['aiueos-browser-key        5 "kotoba_aiueos_browser_key"        16384]
+           ;; the guest browser desktop damage (aiueos ADR-0242)
+           ['aiueos-browser-damage     5 "kotoba_aiueos_browser_damage"     262144]]]
     (let [artifact (-> (sealed-kernel :x86_64-aiueos-kernel-v1 512)
                        (assoc :exports {entry {:offset 0 :arity arity}
                                         'main {:offset 1 :arity 0}}

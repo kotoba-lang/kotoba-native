@@ -245,6 +245,12 @@
    ;; (`[surface surface-bytes dictionary dictionary-bytes key]`, key =
    ;; evdev code * 4 + value); its fuel tier is `browser-key-fuel?`.
    'aiueos-browser-key {:arity 5 :symbol "kotoba_aiueos_browser_key"}
+   ;; The desktop's damage (aiueos ADR-0242): the previous frame's draw list
+   ;; (in the caller's 8192-byte shadow) and this one's -> the one rectangle
+   ;; a present sends, the list copied over the previous
+   ;; (`[ops ops-bytes shadow shadow-bytes count]`). C transfers and flushes
+   ;; that rectangle; its fuel tier is `browser-damage-fuel?`.
+   'aiueos-browser-damage {:arity 5 :symbol "kotoba_aiueos_browser_damage"}
    ;; MMIO mapping admission. The page-table walk stays C -- it allocates
    ;; directory slots and writes PTEs -- but WHETHER a physical range may be
    ;; mapped at all is a decision, and it was the last one still living in
@@ -1592,6 +1598,13 @@
           ;; ten-code-point reading whose neighbours share its prefix costs
           ;; ~50 more per probe: a bound near 1,300. Tier 16,384 is ~12x that.
           browser-key-fuel? (= 'aiueos-browser-key object-entry)
+          ;; The desktop's damage (aiueos ADR-0242). MEASURED by bisection in
+          ;; aiueos's KIR oracle (browser-damage-v1): the dearest vector --
+          ;; 261 ops against 261, every slot changed, the most the object
+          ;; admits -- traps at 30,256 and passes at 30,319. Each slot costs
+          ;; the same whatever it holds, so that is the bound. Tier 262,144 is
+          ;; ~8.6x that.
+          browser-damage-fuel? (= 'aiueos-browser-damage object-entry)
           ;; The GPT-2 BPE index build. COMPUTED, and the computation depends
           ;; on an argument, which is why the object refuses a model window
           ;; above 16 MiB: every token and every merge string is hashed and
@@ -1783,6 +1796,7 @@
                        qwen-rope-fuel? 16777216       ; 16x
                        browser-frame2-fuel? 262144    ; ~12x
                        browser-key-fuel? 16384        ; ~12x
+                       browser-damage-fuel? 262144    ; ~8.6x
                        qwen-index-fuel? 2147483647
                        qwen-tokenize-fuel? 250000000
                        qwen-detokenize-fuel? 10000000
