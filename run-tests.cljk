@@ -25,7 +25,7 @@
   (:require [cljs.test :as t]
             ["fs" :as fs]
             ["path" :as path]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [kotoba.native.peephole-test]
             [kotoba.native.boot-scratch-test]
             [kotoba.native.vector-region-test]

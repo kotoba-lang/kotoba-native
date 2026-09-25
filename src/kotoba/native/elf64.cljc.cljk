@@ -1,6 +1,6 @@
 (ns kotoba.native.elf64
   {:kotoba/export [max-object-fuel package-kernel package-kernel-aarch64 package-kernel-object package-user pinned-image-addresses]}
-  (:require [kotoba.lang.text :as str]
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.text :as str]
             [kotoba.artifact.core :as artifact]
             [kotoba.native.interrupt-abi :as interrupt-abi]
             [kotoba.object.elf64 :as object-elf]
@@ -11,7 +11,7 @@
 ;; UTF-8-safe peer. Every string this is applied to here is an ASCII
 ;; section-name or symbol-name table, so the two agree byte for byte.
 (defn- utf8-bytes [s]
-  #?(:clj (.getBytes ^String s "UTF-8")
+  #?(:clj (kbytes/utf8-bytes ^String s)
      :cljs (js/Array.from (.encode (js/TextEncoder.) s))))
 
 (def ^:private kernel-target :x86_64-aiueos-kernel-v1)

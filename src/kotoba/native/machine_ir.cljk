@@ -6,7 +6,7 @@
   shapes, use-before-definition, register exhaustion, and malformed labels fail
   closed before either ISA encoder."
   {:kotoba/export [coalesce-program-moves compile-expression compile-gmir compile-kir-module counted-self-recur-plans encode-mc encode-mc-module entry-fuel-prefixes function-reenters-guest? hoist-program-consumers lower-kir-expression lower-kir-module lower-mc pilot-expression? pilot-module? signed-division-magic word-result-type?]}
-  (:require [kotoba.lang.text :as str]
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.text :as str]
             [kotoba.lang.coll :as walk]
             [kotoba.gmir :as gmir]
             [kotoba.mir :as mir]
@@ -1132,7 +1132,7 @@
 
 (defn- utf8-bytes [content]
   (mapv #(bit-and (int %) 0xff)
-        #?(:clj (.getBytes ^String content "UTF-8")
+        #?(:clj (kbytes/utf8-bytes ^String content)
            :cljs (js/Array.from (.encode (js/TextEncoder.) content)))))
 
 ;; literal-walk: `string-code-point-at` over an ASCII literal.
@@ -2970,7 +2970,7 @@
                                           (:gmir/op instruction)))
                              (:gmir/instructions %))
                       (:gmir/functions module)))))
-         (catch #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) _ false)))
+         (catch js/Error _ false)))
 
 ;; ── MC -> bytes ──────────────────────────────────────────────────────────────
 
