@@ -49,8 +49,7 @@
   tail-self-call fast path (`emit-call` requires `(zero? temp-depth)`), while
   repeating it costs only `string-substring`, a VIEW -- no pool bytes and no
   fuel."
-  {:kotoba/export [augment-functions lower-contains lower-replace-all replace-from-name]}
-  (:require [kotoba.lang.text]))
+  {:kotoba/export [augment-functions lower-contains lower-replace-all replace-from-name]})
 
 ;; Bound to the operands so each is evaluated exactly once, matching the
 ;; reference interpreter, which evaluates every argument once before applying.
