@@ -4,7 +4,7 @@
   hand -- the same evidence ADR 0031 gave for nested records. Equal machine
   code on both ISAs is the claim; that the pair program itself computes the
   right answer is what the pair primitives' own tests already establish."
-  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
+  (:require [kotoba.lang.error :as kerror] #?(:clj  [kotoba.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing] :include-macros true])
             [kotoba.native.machine-ir :as machine]))
 
@@ -69,5 +69,5 @@
     (try
       (machine/lower-kir-module bad)
       (is false "an index past the declared positions must not lower")
-      (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) error
+      (catch kerror/ExceptionInfo error
         (is (= :invalid-hetero-vector-index (:problem (ex-data error))))))))
