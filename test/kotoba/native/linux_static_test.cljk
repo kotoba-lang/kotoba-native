@@ -1,0 +1,171 @@
+(ns kotoba.native.linux-static-test
+  "The loader-less Linux static ELF packager (superproject adr-2609251400 C2).
+
+  What these tests can say on a macOS host is the image's STRUCTURE and that
+  every decision in it comes from the profile passed in. Execution is not
+  claimed here: the images were run on Linux (aarch64 natively, x86-64 under
+  qemu-x86_64 user mode) when the target landed -- recursive-list 500500,
+  recursive-tree 10, string-index-of 189600 on both ISAs, equal to the kexe
+  loader -- and that record is in the ADR, not in an assertion that could not
+  have failed here."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.artifact.core :as artifact]
+            [kotoba.native.linux-static :as linux-static]))
+
+;; The context ABI v11 an ordinary native artifact seals (amu nbb/cli
+;; compile-native!), restated because this repository does not depend on amu.
+(def context-abi
+  {:version 11 :fuel-offset 8 :allow-bitmap-offset 16 :allow-bitmap-bytes 32
+   :cap-call-offset 48 :pair-new-offset 56 :pair-first-offset 64
+   :pair-second-offset 72 :pair-capacity 4096 :kgraph-assert-offset 80
+   :kgraph-get-offset 88 :kgraph-count-offset 96 :kgraph-entity-at-offset 104
+   :kgraph-capacity 4096 :string-equal-offset 112 :string-concat-offset 120
+   :typed-cap-call-offset 128 :string-substring-offset 136
+   :string-code-point-at-offset 144 :string-pool-capacity 65536
+   :vector-new-empty-offset 152 :vector-conj-offset 160 :vector-count-offset 168
+   :vector-at-offset 176 :vector-assoc-offset 184 :vector-drop-offset 192
+   :vector-alloc-offset 200 :vector-assoc-in-place-offset 208
+   :string-index-of-offset 216 :arena-enter-offset 224 :arena-leave-offset 232
+   :string-compare-offset 240 :string-fold-ascii-offset 248
+   :string-find-blank-offset 256 :string-skip-blank-offset 264
+   :string-index-of-from-offset 272 :string-compare-lines-offset 280
+   :pair-used-pointer-offset 288 :pairs-base-offset 296
+   :pair-validated-base-offset 304 :vector-used-pointer-offset 312
+   :vectors-base-offset 320 :vector-items-base-offset 328
+   :string-find-byte-offset 336 :string-append-range-offset 344
+   :string-from-utf8-offset 352 :bytes-from-vector-offset 360
+   :bytes-slice-offset 368 :bytes-concat-offset 376
+   :vector-capacity 4096 :vector-item-capacity 65536})
+
+;; The shape of kotoba-lang lang/limits.edn :profile/native, reduced to the
+;; entries the packager reads. amu passes the real one.
+(def profile
+  {:fuel {:trap :budget/fuel}
+   :cells {:trap :budget/cells :default {:value 4096} :pair-arena-max {:value 67108864}}
+   :bytes {:trap :budget/bytes :default {:value 65536} :max {:value 1073741824}}
+   :static-elf {:admitted-slots {:value [:pair-new :pair-first :pair-second :string-equal
+                                         :string-concat :string-substring :string-index-of]}
+                :unimplemented-slot-trap :slot/unimplemented
+                :exit-codes {:value {:ok 0 :trap/signal 120 :budget/fuel 122 :budget/cells 123
+                                     :budget/bytes 124 :slot/unimplemented 125}}}})
+
+(def ^:private main-code
+  ;; x86-64: mov eax,42 ; ret     AArch64: movz x0,#42 ; ret
+  {:x86_64-linux-static-kotoba-v1 [0xb8 42 0 0 0 0xc3]
+   :aarch64-linux-static-kotoba-v1 [0x40 0x05 0x80 0xd2 0xc0 0x03 0x5f 0xd6]})
+
+(defn- sealed
+  ([target] (sealed target {}))
+  ([target extra]
+   (artifact/seal
+    (merge {:format :kotoba.kexe/v1 :target target
+            :program {:entry 'main}
+            :exports {'main {:offset 0 :arity 0}}
+            :limits {:fuel 100000 :fuel-metering :off}
+            :fuel-abi {:initial 9007199254740991}
+            :context-abi context-abi
+            :effects []
+            :code (get main-code target)}
+           extra))))
+
+(defn- u64 [bytes offset]
+  (reduce (fn [acc i] (+ (* acc 256) (nth bytes (+ offset i)))) 0 (range 7 -1 -1)))
+(defn- u16 [bytes offset] (+ (nth bytes offset) (* 256 (nth bytes (inc offset)))))
+(defn- u32 [bytes offset] (+ (u16 bytes offset) (* 65536 (u16 bytes (+ offset 2)))))
+
+(defn- segments [bytes]
+  (let [phoff (u64 bytes 32) n (u16 bytes 56)]
+    (mapv (fn [i] (let [o (+ phoff (* 56 i))]
+                    {:type (u32 bytes o) :flags (u32 bytes (+ o 4))
+                     :offset (u64 bytes (+ o 8)) :address (u64 bytes (+ o 16))
+                     :file-size (u64 bytes (+ o 32)) :memory-size (u64 bytes (+ o 40))}))
+          (range n))))
+
+(deftest packs-a-static-executable-with-no-interpreter-and-no-dynamic-section
+  (doseq [[target machine] [[:x86_64-linux-static-kotoba-v1 0x3e]
+                            [:aarch64-linux-static-kotoba-v1 0xb7]]]
+    (testing (name target)
+      (let [image (linux-static/package (sealed target) profile)
+            bytes (:bytes image)
+            segs (segments bytes)
+            loads (filter #(= 1 (:type %)) segs)
+            text (first (filter #(= 5 (:flags %)) loads))
+            entry (u64 bytes 24)]
+        (is (= [0x7f 0x45 0x4c 0x46 2 1 1] (subvec bytes 0 7)))
+        (is (= 2 (u16 bytes 16)) "ET_EXEC")
+        (is (= machine (u16 bytes 18)))
+        (is (= [1 1 0x6474e551] (mapv :type segs)) "two PT_LOADs and PT_GNU_STACK, nothing else")
+        (is (not-any? #(contains? #{2 3} (:type %)) segs) "no PT_DYNAMIC, no PT_INTERP")
+        (is (not-any? #(= 3 (bit-and (:flags %) 3)) loads) "no W+X segment")
+        (is (<= (:address text) entry (+ (:address text) (:file-size text))))
+        (is (= (get main-code target)
+               (subvec bytes (:code-offset image) (+ (:code-offset image) (:code-size image))))
+            "the artifact's code bytes, verbatim")
+        (is (= 11 (u64 bytes (:data-offset image))) "context version")
+        (is (= 9007199254740991 (u64 bytes (+ (:data-offset image) 8)))
+            "the fuel word is the artifact's :fuel-abi :initial")
+        (is (= {:cells 4096 :bytes 65536} (:budgets image)))
+        (is (= (:bytes image) (:bytes (linux-static/package (sealed target) profile)))
+            "deterministic")))))
+
+(deftest every-slot-is-bound-admitted-ones-to-code-the-rest-to-a-named-stub
+  (let [image (linux-static/package (sealed :aarch64-linux-static-kotoba-v1) profile)
+        bytes (:bytes image)
+        data (:data-offset image)
+        text (first (filter #(= 5 (:flags %)) (segments bytes)))
+        slot (fn [k] (u64 bytes (+ data (get context-abi k))))]
+    (is (= :implemented (get-in image [:slots :pair-new])))
+    (is (= :traps (get-in image [:slots :vector-conj])))
+    (is (= :traps (get-in image [:slots :cap-call])))
+    (is (not (contains? (:slots image) :pairs-base)) "a data pointer is not a slot")
+    (doseq [k [:pair-new-offset :string-index-of-offset :vector-conj-offset :cap-call-offset]]
+      (is (<= (:address text) (slot k) (+ (:address text) (:file-size text)))
+          (str k " points into the text")))
+    (is (= 36 (count (:slots image))) "every callable slot of context ABI v11")
+    (is (= (count (:slots image))
+           (count (distinct (map #(slot (keyword (str (name %) "-offset")))
+                                 (keys (:slots image))))))
+        "every slot has its own entry point")))
+
+(deftest the-decisions-are-the-profiles
+  (let [target :x86_64-linux-static-kotoba-v1
+        base (linux-static/package (sealed target) profile)]
+    (testing "a budget moves the image"
+      (let [small (linux-static/package (sealed target)
+                                        (assoc-in profile [:cells :default :value] 100))]
+        (is (= 100 (get-in small [:budgets :cells])))
+        (is (not= (:bytes base) (:bytes small)))))
+    (testing "an exit code moves the image"
+      (is (not= (:bytes base)
+                (:bytes (linux-static/package
+                         (sealed target)
+                         (assoc-in profile [:static-elf :exit-codes :value :budget/cells] 99))))))
+    (testing "an admitted slot with no code is a refusal, not a stub"
+      (is (= :admitted-slot-unimplemented
+             (try (linux-static/package
+                   (sealed target)
+                   (update-in profile [:static-elf :admitted-slots :value] conj :vector-conj))
+                  nil
+                  (catch #?(:clj Exception :cljs :default) e (:reason (ex-data e)))))))
+    (testing "a profile with no static-elf entry is refused, never defaulted"
+      (is (= :native-profile-incomplete
+             (try (linux-static/package (sealed target) (dissoc profile :static-elf))
+                  nil
+                  (catch #?(:clj Exception :cljs :default) e (:reason (ex-data e)))))))
+    (testing "a budget outside the profile's maximum is refused"
+      (is (= :cells-outside-profile
+             (try (linux-static/package (sealed target) profile {:cells 67108865})
+                  nil
+                  (catch #?(:clj Exception :cljs :default) e (:reason (ex-data e)))))))))
+
+(deftest refuses-what-a-pure-static-program-is-not
+  (let [target :aarch64-linux-static-kotoba-v1
+        reason (fn [f] (try (f) nil (catch #?(:clj Exception :cljs :default) e (:reason (ex-data e)))))]
+    (is (= :effects-not-admitted
+           (reason #(linux-static/package (sealed target {:effects [[:cap/call 3]]}) profile))))
+    (is (= :entry-not-zero-arity
+           (reason #(linux-static/package (sealed target {:exports {'main {:offset 0 :arity 1}}}) profile))))
+    (is (= :not-linux-static
+           (reason #(linux-static/package (sealed :aarch64-linux-kotoba-v1) profile))))
+    (is (= :unsealed
+           (reason #(linux-static/package (assoc (sealed target) :code [0]) profile))))))
