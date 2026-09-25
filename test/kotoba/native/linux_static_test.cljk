@@ -46,12 +46,16 @@
    :static-elf {:admitted-slots {:value [:pair-new :pair-first :pair-second :string-equal
                                          :string-concat :string-substring :string-index-of
                                          :typed-cap-call]}
-                :capability-handlers {:value {7 :clock/now 33 :env/read 34 :fs/browse 35 :fs/app-data
+                :capability-handlers {:value {7 :clock/now 20 :process/spawn 23 :entropy/draw
+                                              33 :env/read 34 :fs/browse 35 :fs/app-data
                                               37 :io/write 38 :cli/args 39 :io/write-error 41 :io/read}}
-                :refused-capabilities {:value {20 :process/spawn 23 :entropy/draw}}
+                ;; the real profile names none since C3's second half; the
+                ;; mechanism that names a refusal is exercised with one here
+                :refused-capabilities {:value {42 :gpu/compute}}
                 :unimplemented-slot-trap :slot/unimplemented
                 :exit-codes {:value {:ok 0 :trap/signal 120 :budget/fuel 122 :budget/cells 123
-                                     :budget/bytes 124 :slot/unimplemented 125}}}})
+                                     :budget/bytes 124 :slot/unimplemented 125
+                                     :capability/refused 126}}}})
 
 (def ^:private main-code
   ;; x86-64: mov eax,42 ; ret     AArch64: movz x0,#42 ; ret
@@ -241,9 +245,9 @@
         art (fn [effects] (sealed target {:effects effects}))
         opts {:handlers (handlers :aarch64)}]
     (testing "a capability with no handler here, by name"
-      (let [d (reason-of #(linux-static/package (art [[:cap/call 37] [:cap/call 20]]) profile opts))]
+      (let [d (reason-of #(linux-static/package (art [[:cap/call 37] [:cap/call 42]]) profile opts))]
         (is (= :capability-without-handler (:reason d)))
-        (is (= [[20 :process/spawn]] (:capabilities d)))))
+        (is (= [[42 :gpu/compute]] (:capabilities d)))))
     (testing "a grant may narrow the effects, never widen them"
       (is (= {:reason :grant-widens-effects :wire-ids [41]}
              (reason-of #(linux-static/package (art io-effects) profile (assoc opts :grant #{37 41}))))))
@@ -263,3 +267,42 @@
     (testing "an effect that is not a capability call"
       (is (= :effect-not-capability
              (:reason (reason-of #(linux-static/package (art [[:abort 1]]) profile opts))))))))
+
+;; C3, second half (2026-09-25): :process/spawn's grant is sealed from the
+;; compile policy like the fs scope, and refused when it could be misread.
+(def ^:private spawn-effects [[:cap/call 20] [:cap/call 37]])
+
+(deftest the-spawn-grant-is-sealed-and-checked
+  (let [target :aarch64-linux-static-kotoba-v1
+        art (fn [effects] (sealed target {:effects effects}))
+        opts {:handlers (handlers :aarch64)}
+        spawn {:programs ["/bin/echo" "/usr/bin/false"] :env ["LANG"]}
+        pkg (fn [effects extra] (linux-static/package (art effects) profile (merge opts extra)))]
+    (testing "the grant is reported, defaults filled"
+      (is (= {:programs ["/bin/echo" "/usr/bin/false"] :path-lookup false :env ["LANG"]}
+             (:spawn (pkg spawn-effects {:spawn spawn}))))
+      (is (= {:programs [] :path-lookup false :env []} (:spawn (pkg spawn-effects {})))
+          "no :spawn: every program is refused at run time"))
+    (testing "the programs are sealed into the text: another list, another image"
+      (is (not= (:bytes (pkg spawn-effects {:spawn spawn}))
+                (:bytes (pkg spawn-effects {:spawn (assoc spawn :programs ["/bin/echo"])})))))
+    (testing "refusals, by reason"
+      (doseq [[reason effects bad] [[:spawn-without-capability io-effects spawn]
+                                    [:spawn-programs-malformed spawn-effects {:programs ["echo"]}]
+                                    [:spawn-programs-malformed spawn-effects {:programs ["/"]}]
+                                    [:spawn-programs-malformed spawn-effects {:programs ["/bin/../bin/echo"]}]
+                                    [:spawn-programs-malformed spawn-effects {:programs ["/bin/echo" "/bin/echo"]}]
+                                    [:spawn-programs-malformed spawn-effects
+                                     {:programs (mapv #(str "/p" %) (range 17))}]
+                                    [:spawn-path-lookup-malformed spawn-effects {:programs [] :path-lookup "yes"}]
+                                    [:spawn-lookup-ambiguous spawn-effects
+                                     {:programs ["/bin/echo" "/usr/bin/echo"] :path-lookup true}]
+                                    [:spawn-env-malformed spawn-effects {:env ["A=B"]}]
+                                    [:spawn-env-malformed spawn-effects {:env [""]}]]]
+        (is (= reason (:reason (reason-of #(pkg effects {:spawn bad}))))
+            (pr-str bad))))
+    (testing "a grant narrowed past wire 20 cannot carry a program list"
+      (is (= :spawn-without-capability
+             (:reason (reason-of #(pkg spawn-effects {:spawn spawn :grant #{37}}))))))
+    (testing "the same last segment is fine without lookup"
+      (is (= 2 (count (:programs (:spawn (pkg spawn-effects {:spawn {:programs ["/bin/echo" "/usr/bin/echo"]}})))))))))

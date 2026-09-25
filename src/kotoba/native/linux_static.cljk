@@ -46,7 +46,19 @@
   mkdirat, unlinkat, renameat2, clock_gettime, getcwd). The handlers are
   mechanism in the same IR; every decision they take is amu-compiled Kotoba
   placed after the guest's code (`handler-ir`, `decision-text`). The grant is
-  sealed into the context's allow mask, the fs scope into the text."
+  sealed into the context's allow mask, the fs scope into the text.
+
+  C3, second half (2026-09-25): :entropy/draw (getrandom, flags 0; ENOSYS a
+  named refusal), :process/spawn (pipe2, clone(SIGCHLD), dup3, close_range
+  CLOSE_RANGE_CLOEXEC, PR_SET_NO_NEW_PRIVS, fchdir, execve, ppoll, wait4,
+  kill; the programs, lookup rule and passed variables sealed from the
+  policy's :linux-static :spawn), the :fs/app-data forms append, range
+  (pread64), chmod (fchmod), and the proposed fsync, make-temp-dir (mkdirat
+  under a descriptor of the directory) and stat-nofollow (O_PATH |
+  O_NOFOLLOW). The scope root is admitted in both spellings, as sealed and
+  as the kernel spells it (getcwd after fchdir at _start), each through the
+  one RESOLVE_BENEATH root descriptor. A named refusal writes
+  `KEXE_TRAP {:kind :capability ...}` and exits :capability/refused."
   {:kotoba/export [package plan targets image-layout slot-names
                    implemented-slots]}
   (:require [kotoba.lang.text :as str]
@@ -72,11 +84,18 @@
   {:x86_64 {:write 1 :rt-sigaction 13 :sigaltstack 131 :exit-group 231
             :read 0 :close 3 :fstat 5 :getdents64 217 :getcwd 79 :openat 257
             :openat2 437 :mkdirat 258 :unlinkat 263 :renameat2 316
-            :clock-gettime 228}
+            :clock-gettime 228
+            ;; C3, second half
+            :pread64 17 :fchmod 91 :fsync 74 :getrandom 318 :pipe2 293
+            :clone 56 :dup3 292 :close-range 436 :prctl 157 :fchdir 81
+            :execve 59 :wait4 61 :kill 62 :ppoll 271}
    :aarch64 {:write 64 :rt-sigaction 134 :sigaltstack 132 :exit-group 94
              :read 63 :close 57 :fstat 80 :getdents64 61 :getcwd 17 :openat 56
              :openat2 437 :mkdirat 34 :unlinkat 35 :renameat2 276
-             :clock-gettime 113}})
+             :clock-gettime 113
+             :pread64 67 :fchmod 52 :fsync 82 :getrandom 278 :pipe2 59
+             :clone 220 :dup3 24 :close-range 436 :prctl 167 :fchdir 50
+             :execve 221 :wait4 260 :kill 129 :ppoll 73}})
 
 ;; The open(2) flag bits that differ between the two ABIs, and where
 ;; `struct stat` keeps st_mode (x86-64's own layout vs asm-generic). Mechanism:
@@ -385,6 +404,47 @@
                         (rest (str/split path #"/")))))
        (not (str/includes? path "\u0000"))))
 
+(defn- spawn-grant
+  "C3, second half: what :process/spawn may run, sealed like the fs scope.
+  `spawn` is the policy's `:linux-static :spawn`:
+
+    :programs     canonical absolute paths of the executables the image may
+                  run (at most 16). Nothing else runs: the guest names a
+                  program and the image execs the SEALED spelling.
+    :path-lookup  true admits a bare name, found by the last segment of a
+                  sealed program -- never through $PATH. Default false.
+    :env          names of the variables the child receives from the image's
+                  own environment (at most 16). Default none: the child's
+                  environment is empty.
+
+  Refused when the grant does not carry :process/spawn (wire 20): a program
+  list with no authority to run it would read as one that is in force."
+  [spawn grant]
+  (when spawn
+    (let [{:keys [programs path-lookup env]} spawn
+          base (fn [p] (last (str/split p #"/")))
+          name-ok? (fn [n] (and (string? n) (< 0 (count n) 256)
+                                (not (str/includes? n "="))
+                                (not (str/includes? n "\u0000"))))]
+      (when-not (contains? grant 20)
+        (throw (ex-info "a linux-static :spawn grant needs :process/spawn (wire 20) in the grant"
+                        {:reason :spawn-without-capability})))
+      (when-not (and (vector? (or programs [])) (<= (count programs) 16)
+                     (every? #(and (canonical-scope? %) (not= "/" %)) programs)
+                     (= (count programs) (count (distinct programs))))
+        (throw (ex-info "linux-static :spawn :programs must be at most 16 distinct canonical absolute paths"
+                        {:reason :spawn-programs-malformed :programs programs})))
+      (when-not (contains? #{nil true false} path-lookup)
+        (throw (ex-info "linux-static :spawn :path-lookup is true or false"
+                        {:reason :spawn-path-lookup-malformed :path-lookup path-lookup})))
+      (when (and path-lookup (not= (count programs) (count (distinct (map base programs)))))
+        (throw (ex-info "linux-static :spawn :path-lookup needs programs whose last segments differ"
+                        {:reason :spawn-lookup-ambiguous :programs programs})))
+      (when-not (and (vector? (or env [])) (<= (count env) 16) (every? name-ok? env))
+        (throw (ex-info "linux-static :spawn :env names at most 16 variables, each without = or NUL"
+                        {:reason :spawn-env-malformed :env env})))
+      {:programs (vec programs) :path-lookup (boolean path-lookup) :env (vec env)})))
+
 (defn- handler-code
   "The code bytes and export offsets of a sealed handler-decision artifact
   compiled by amu for `isa` (its `:lowering` names the ABI)."
@@ -453,7 +513,9 @@
                       {:reason :fs-scope-not-canonical :fs-scope scope})))
     (when (and (seq effect-ids) (not (contains? targets (:target artifact))))
       (throw (ex-info "not a linux-static target" {:reason :not-linux-static})))
-    (cond-> {:effect-ids effect-ids :grant grant :fs-scope scope}
+    (cond-> {:effect-ids effect-ids :grant grant :fs-scope scope
+             :spawn (or (spawn-grant (:spawn overrides) grant)
+                        {:programs [] :path-lookup false :env []})}
       (seq effect-ids)
       (assoc :handler-code
              (let [{:keys [decisions handlers]} (:handlers overrides)]
@@ -494,8 +556,11 @@
      (when-not (= 11 (num (:version context-abi)))
        (throw (ex-info "the static prelude implements context ABI v11 only"
                        {:reason :context-abi-version :version (:version context-abi)})))
-     (doseq [k [:ok :trap/signal :budget/fuel :budget/cells :budget/bytes
-                (:unimplemented-slot-trap static)]]
+     (doseq [k (cond-> [:ok :trap/signal :budget/fuel :budget/cells :budget/bytes
+                        (:unimplemented-slot-trap static)]
+                 ;; C3, second half: a capability refused by name (spawn's
+                 ;; program / budget refusals, entropy without getrandom)
+                 handlers? (conj :capability/refused))]
        (when-not (integer? (get exit-codes k))
          (throw (ex-info "the native profile names no exit code for an outcome"
                          {:reason :exit-code-missing :outcome k}))))
@@ -539,7 +604,13 @@
           :ts :ts-nsec :how :how-mode :how-resolve
           :id :rk :xk :req :rp :rl :h :res :form :fd :pfd :want :start :room
           :whole :limit :cnt :tot :n1 :x0 :x1 :x2 :x3 :x4 :x5 :x6
-          :len-a :rel-a :len-c :rel-c])))
+          :len-a :rel-a :len-c :rel-c
+          ;; C3, second half: RANGE / CHMOD / MAKE-TEMP-DIR, entropy, spawn
+          :r-off :r-len :r-ok :m-k :m-plen :m-pre :m-dfd :m-n
+          :sp-count :sp-plen :sp-nul :sp-slash :sp-prog :sp-envn :sp-pid
+          :sp-start :sp-total :sp-limit :sp-exit :sp-in-r :sp-in-w :sp-out-r
+          :sp-out-w :sp-st-r :sp-st-w :sp-dlen :sp-word
+          :root-real-len :ru-a :ru-c])))
 
 (defn- st [k] (+ state-offset (get state k)))
 
@@ -563,6 +634,11 @@
                   (let [regions [[:buf-a 4096] [:buf-b 4096] [:buf-c 4096] [:cwd 4096]
                                  [:dents 32768] [:stat-buf 256] [:answer 256]
                                  [:tokens 256] [:probe 16]
+                                 ;; C3, second half: process/spawn's three
+                                 ;; pipes, wait4 status, pollfd and timespec
+                                 [:spawn-io 64]
+                                 ;; the scope root as the kernel spells it
+                                 [:root-real 4096]
                                  [:names (align-up bytes 16)]
                                  [:index (align-up (* 24 (+ 2 (quot bytes 3))) 16)]]]
                     (reduce (fn [m [k size]] (assoc m k (:end m) :end (+ (:end m) size)))
@@ -826,20 +902,35 @@
 
 (def ^:private fs-tokens
   "The :fs/app-data request tokens, in the index order of
-  linux_static_handlers.kotoba op 1 (the loader's test order)."
+  linux_static_handlers.kotoba op 1 (the loader's test order). The last three
+  are C3's proposed forms (kotoba-lang lang/capability-catalog.edn
+  :fs/app-data :forms), which the kexe loader does not answer yet."
   ["WRITE_SEP" "APPEND_SEP" "EXISTS_SEP" "RANGE_SEP" "STAT_SEP" "MTIME_SEP"
-   "CHMOD_SEP" "MKDIR_SEP" "UNLINK_SEP" "RMDIR_SEP" "RENAME_SEP"])
+   "CHMOD_SEP" "MKDIR_SEP" "UNLINK_SEP" "RMDIR_SEP" "RENAME_SEP"
+   "FSYNC_SEP" "MKTEMP_SEP" "NOFOLLOW_SEP"])
 
 (def ^:private unimplemented-forms
-  "Forms op 2 answers 0 for, and the name their trap carries."
-  {2 ":append" 4 ":range" 7 ":chmod"})
+  "Forms op 2 answers 0 for, and the name their trap carries. None since the
+  second half of C3; the mechanism stays so a form the decisions withdraw is
+  still trapped by name."
+  {})
+
+(def ^:private spawn-refusals
+  "The named refusals of :process/spawn, by the code the decisions answer
+  (ops 33 / 35 / 42) or the mechanism's own step."
+  [:argv-budget :program-not-granted :path-lookup-denied :output-budget
+   :timeout :exec-failed :isolation-unavailable :setup-failed])
 
 (def ^:private open-flags
   {:o-wronly 1 :o-creat 64 :o-trunc 512 :o-cloexec 524288 :o-path 2097152
    ;; RESOLVE_BENEATH (8) | RESOLVE_NO_MAGICLINKS (2): openat2 refuses, with
    ;; EXDEV, any resolution that leaves the directory it starts from -- an
    ;; absolute symlink, `..` through a symlink -- and /proc magic links.
-   :resolve 10 :at-fdcwd -100 :at-removedir 512})
+   :resolve 10 :at-fdcwd -100 :at-removedir 512
+   ;; C3, second half. O_APPEND (02000) and O_RDONLY are the same on both
+   ;; ABIs; SIGCHLD is 17 on both.
+   :o-append 1024 :o-rdonly 0 :sigchld 17 :sigkill 9 :wnohang 1 :pollin 1
+   :close-range-cloexec 4 :pr-set-no-new-privs 38})
 
 (defn- operand
   "Load one operand into register `dst`: a register keyword, an integer, or
@@ -861,9 +952,16 @@
   [isa plan layout c message!]
   (let [sys-nr (get syscalls isa)
         {:keys [o-directory o-nofollow stat-mode]} (get isa-abi isa)
-        {:keys [o-wronly o-creat o-trunc o-cloexec o-path resolve at-fdcwd at-removedir]} open-flags
+        {:keys [o-wronly o-creat o-trunc o-cloexec o-path resolve at-fdcwd at-removedir
+                o-append o-rdonly sigchld sigkill wnohang pollin close-range-cloexec
+                pr-set-no-new-privs]} open-flags
         {:keys [data]} layout
-        {:keys [buf-a buf-b buf-c cwd dents stat-buf answer tokens probe names index]} layout
+        {:keys [buf-a buf-b buf-c cwd dents stat-buf answer tokens probe names index
+                spawn-io]} layout
+        n-tokens (count fs-tokens)
+        root-real (:root-real layout)
+        ;; the root spelling a resolved path was admitted under, per path
+        root-key {:len-a :ru-a :len-c :ru-c}
         scope (:fs-scope plan)
         root-len (count (utf8 (or scope "")))
         ;; paths the kernel reads are NUL-terminated
@@ -884,6 +982,28 @@
                                                               ":capability :fs/app-data"
                                                               (str ":form " n)]))]))
                         unimplemented-forms)
+        refused-code (get exit-codes :capability/refused)
+        capability-msg (fn [cap reason]
+                         (message! (trap-line [":kind :capability" (str ":capability " cap)
+                                               (str ":reason " reason)])))
+        entropy-msg (capability-msg ":entropy/draw" ":entropy/unavailable")
+        spawn-msgs (into {} (map (fn [k] [k (capability-msg ":process/spawn" (str ":spawn/" (name k)))]))
+                         spawn-refusals)
+        ;; the sealed :process/spawn grant: each program NUL-terminated (what
+        ;; execve reads), with its length and where its last segment starts;
+        ;; each environment name as bytes
+        spawn (:spawn plan)
+        programs (mapv (fn [p]
+                         (let [b (utf8 p)
+                               last-slash (last (keep-indexed (fn [i x] (when (= x 47) i)) b))]
+                           {:label (message! (str p "\u0000")) :length (count b)
+                            :base-start (inc last-slash) :base-length (- (count b) (inc last-slash))}))
+                       (:programs spawn))
+        lookup (if (:path-lookup spawn) 1 0)
+        env-names (mapv (fn [n] {:label (message! n) :length (count (utf8 n))}) (:env spawn))
+        arg-sep-label (message! "ARG_SEP")
+        minus-one-label (message! "-1")
+        newline-label (message! "\n")
         L (fn [p] (gensym-label c p))
         ;; --- calls and syscalls -------------------------------------------
         dcall (fn [target & args]
@@ -900,7 +1020,7 @@
                   [[:li :t1 0] [:alui :cmp :t0 0] [:bcc :ge ok] [:mov :t1 :t0] [:neg :t1] [:label ok]]))
         ;; outcome of the syscall result in :t0 -> branch: retry / negative
         ;; / trap, fall through on success. The result is kept in :x6.
-        outcome (fn [form stage retry negative]
+        outcome (fn [form stage retry negative & [named]]
                   (let [go (L "proceed")]
                     (vec (concat [[:st :t0 :s0 (st :x6)]]
                                  (errno)
@@ -908,8 +1028,13 @@
                                  [[:alui :cmp :t0 3] [:bcc :eq go]
                                   [:alui :cmp :t0 2] [:bcc :eq retry]
                                   [:alui :cmp :t0 0] [:bcc :eq negative]
+                                  [:alui :cmp :t0 4] [:bcc :eq (or named ::bad)]
                                   [:b ::bad]
                                   [:label go] [:ld :t0 :s0 (st :x6)]]))))
+        ;; a named capability refusal: message to stderr, the refused exit code
+        named-trap (fn [label msg]
+                     [[:label label] [:la :p1 msg] [:li :t5 refused-code] [:li :t4 msg]
+                      [:b ::trap-exit]])
         ;; --- bytes ----------------------------------------------------------
         copy (fn [dst src n]   ; dst, src, n registers, none of :t0 :t1
                (let [l (L "copy") d (L "copied")]
@@ -980,7 +1105,7 @@
                 rel-done (L "rel-done") first-no (L "first-no")
                 lp (L "seg") sk (L "skip") skd (L "skipped") sg (L "segscan") sgd (L "segend")
                 push (L "push") popl (L "pop") end (L "end") endd (L "end-done")
-                c1 (L "cls1") c2 (L "cls2") cls (L "cls-done")]
+                c1 (L "cls1") c2 (L "cls2") cls (L "cls-done") admitted (L "admitted")]
             (vec
              (concat
               [[:li :t2 0] [:alui :cmp :s2 0] [:bcc :le first-no]
@@ -1038,21 +1163,43 @@
                [:label end]
                [:alui :cmp :s2 1] [:bcc :ls endd] [:alui :sub :s2 1]
                [:label endd] [:li :t0 0] [:stb :t0 :s4 :s2] [:st :s2 :s0 (st len-key)]
-               ;; scope: C1 decide op 8 over (prefix-equal, next byte, length)
-               [:ld :t0 :s0 (st :root-fd)] [:alui :cmp :t0 0] [:bcc :lt fail]
-               [:li :t2 0] [:alui :cmp :s2 root-len] [:bcc :lo pe-done]
-               [:la :a2 root-label] [:li :a1 0]
-               [:label pe-loop] [:alui :cmp :a1 root-len] [:bcc :hs pe-no]
-               [:ldb :t0 :s4 :a1] [:ldb :t1 :a2 :a1] [:alu :cmp :t0 :t1] [:bcc :ne pe-done]
-               [:alui :add :a1 1] [:b pe-loop]
-               [:label pe-no] [:li :t2 1]
-               [:label pe-done]
-               [:li :t1 0] [:alui :cmp :t2 0] [:bcc :eq next-done]
-               [:li :t1 root-len] [:ldb :t1 :s4 :t1]
-               [:label next-done] [:st :t1 :s0 (st :x4)]]
-              (dcall ::c1-decide 8 :t2 [:f :x4] [:f len-key] 0)
-              [[:alui :cmp :t0 1] [:bcc :ne fail]
-               [:li :t2 (+ out root-len)] [:ld :t1 :s0 (st :x4)]
+               ;; scope: C1 decide op 8 over (prefix-equal, next byte, length),
+               ;; against the root as sealed and then as the kernel spells it
+               ;; (its realpath, read once at _start), each only when
+               ;; linux_static_handlers.kotoba op 43 admits that spelling --
+               ;; the kexe loader keeps a scope entry in both spellings too.
+               ;; Either way the open is openat2 beneath the one root fd.
+               [:ld :t0 :s0 (st :root-fd)] [:alui :cmp :t0 0] [:bcc :lt fail]]
+              (mapcat (fn [[k load-len load-addr]]
+                        (let [pe-loop (L "pe") pe-no (L "pe-no") pe-done (L "pe-done")
+                              next-done (L "next-done") skip (L "spelling-no")]
+                          (concat
+                           (hd 43 k)
+                           [[:alui :cmp :t0 1] [:bcc :ne skip]]
+                           load-len
+                           [[:alui :cmp :t0 0] [:bcc :eq skip]
+                            [:st :t0 :s0 (st (root-key len-key))]
+                            [:mov :a3 :t0]
+                            [:li :t2 0] [:alu :cmp :s2 :a3] [:bcc :lo pe-done]]
+                           load-addr
+                           [[:li :a1 0]
+                            [:label pe-loop] [:alu :cmp :a1 :a3] [:bcc :hs pe-no]
+                            [:ldb :t0 :s4 :a1] [:ldb :t1 :a2 :a1] [:alu :cmp :t0 :t1] [:bcc :ne pe-done]
+                            [:alui :add :a1 1] [:b pe-loop]
+                            [:label pe-no] [:li :t2 1]
+                            [:label pe-done]
+                            [:li :t1 0] [:alui :cmp :t2 0] [:bcc :eq next-done]
+                            [:ldb :t1 :s4 :a3]
+                            [:label next-done] [:st :t1 :s0 (st :x4)]]
+                           (dcall ::c1-decide 8 :t2 [:f :x4] [:f len-key] 0)
+                           [[:alui :cmp :t0 1] [:bcc :eq admitted]
+                            [:label skip]])))
+                      [[0 [[:li :t0 root-len]] [[:la :a2 root-label]]]
+                       [1 [[:ld :t0 :s0 (st :root-real-len)]] [[:li :a2 root-real]]]])
+              [[:b fail]
+               [:label admitted]
+               [:li :t2 out] [:ld :t0 :s0 (st (root-key len-key))] [:alu :add :t2 :t0]
+               [:ld :t1 :s0 (st :x4)]
                [:alui :cmp :t1 47] [:bcc :ne rel-slash] [:alui :add :t2 1]
                [:label rel-slash]
                [:li :t0 0] [:ldb :t1 :t2 :t0] [:alui :cmp :t1 0] [:bcc :ne rel-done]
@@ -1088,12 +1235,12 @@
                [:label bcls] [:st :a2 :s0 (st :x3)] [:st :s3 :s0 (st base-key)]]
               (hd 15 :s1 :s2 [:f :x3])
               [[:alui :cmp :t0 1] [:bcc :ne ::bad]]
-              (hd 19 :s1 root-len)
+              (hd 19 :s1 [:f (root-key len-key)])
               [[:alui :cmp :t0 0] [:bcc :eq ::bad]
                [:la :t2 dot-label] [:alui :cmp :t0 1] [:bcc :eq dot]
                ;; beneath the root: the parent's spelling below it, cut at the slash
                [:li :t0 0] [:stb :t0 :s4 :s1]
-               [:li :t2 (+ out root-len 1)]
+               [:li :t2 (+ out 1)] [:ld :t0 :s0 (st (root-key len-key))] [:alu :add :t2 :t0]
                [:label dot] [:st :t2 :s0 (st :x5)]
                [:label retry]]
               (open-at [:f :x5] (+ o-path o-directory o-cloexec) 0)
@@ -1278,18 +1425,255 @@
                        [[:ld :t2 :s0 (st :x2)] [:alu :add :t2 :s2]]
                        (when space? [[:li :t0 32] [:li :t1 answer] [:stb :t0 :t1 :t2] [:alui :add :t2 1]])
                        [[:st :t2 :s0 (st :x2)]])))
+        ;; --- C3, second half: the :fs/app-data forms APPEND, RANGE, CHMOD and
+        ;; the proposals FSYNC, MAKE-TEMP-DIR, STAT-NOFOLLOW. Mechanism only;
+        ;; every question goes to linux_static_handlers.kotoba.
+        ;;
+        ;; a decimal span at [:f start-key] of [:f len-key] bytes -> :s1, or
+        ;; `fail` (op 20: 1..20 digits; op 3: a digit, saturating)
+        parse-span
+        (fn [start-key len-key fail]
+          (let [l (L "span") d (L "span-done")]
+            (vec (concat
+                  (hd 20 [:f len-key])
+                  [[:alui :cmp :t0 1] [:bcc :ne fail]
+                   [:li :s1 0] [:li :s4 0] [:ld :s2 :s0 (st start-key)] [:ld :s3 :s0 (st len-key)]
+                   [:label l] [:alu :cmp :s4 :s3] [:bcc :hs d]
+                   [:ldb :t1 :s2 :s4]]
+                  (hd 3 :s1 :t1)
+                  [[:alui :cmp :t0 -2] [:bcc :eq fail]
+                   [:mov :s1 :t0] [:alui :add :s4 1] [:b l]
+                   [:label d]]))))
+        ;; the bytes after token K (its first occurrence, TOKEN-LENGTH long):
+        ;; start -> :s1, length -> :s2
+        after-token
+        (fn [k]
+          [[:li :t1 tokens] [:ld :t0 :t1 (+ 8 (* 16 k))] [:alui :add :t0 (count (nth fs-tokens k))]
+           [:ld :s1 :s0 (st :rp)] [:alu :add :s1 :t0]
+           [:ld :s2 :s0 (st :rl)] [:alu :sub :s2 :t0]])
+        fs-forms-c3b
+        (fn [forms]
+          (concat
+           ;; 2 append: an EXISTING file (no O_CREAT), content after APPEND_SEP,
+           ;; answered with itself (fs_app_data_write_provider, append)
+           (let [ao (L "aopen")]
+             (concat [[:label (forms 2)] [:label ao]]
+                     (open-at [:f :rel-a] (+ o-wronly o-append o-nofollow o-cloexec) 0)
+                     (outcome 2 0 ao ::bad)
+                     [[:st :t0 :s0 (st :fd)]]
+                     (after-token 1)
+                     [[:st :s1 :s0 (st :x0)] [:st :s2 :s0 (st :x1)]]
+                     (write-all 2)
+                     (sys :close [:f :fd])
+                     [[:ld :s1 :s0 (st :x0)] [:ld :s2 :s0 (st :x1)]]
+                     (intern) (finish)))
+           ;; 4 range: "<off>:<len>" after RANGE_SEP -> exactly those bytes
+           (let [cl (L "colon") cf (L "colon-found") check (L "spec-check") ro (L "ropen")
+                 notreg (L "notreg") pl (L "pread") pd (L "pread-done")]
+             (concat [[:label (forms 4)]]
+                     (after-token 3)
+                     [[:li :t0 0] [:st :t0 :s0 (st :r-ok)]
+                      [:li :t0 0]
+                      [:label cl] [:alu :cmp :t0 :s2] [:bcc :hs check]
+                      [:ldb :t1 :s1 :t0] [:alui :cmp :t1 58] [:bcc :eq cf]
+                      [:alui :add :t0 1] [:b cl]
+                      [:label cf]
+                      [:st :s1 :s0 (st :x0)] [:st :t0 :s0 (st :x1)]
+                      [:mov :t1 :s1] [:alu :add :t1 :t0] [:alui :add :t1 1] [:st :t1 :s0 (st :x2)]
+                      [:mov :t1 :s2] [:alu :sub :t1 :t0] [:alui :sub :t1 1] [:st :t1 :s0 (st :x3)]]
+                     (parse-span :x0 :x1 check)
+                     [[:st :s1 :s0 (st :r-off)]]
+                     (parse-span :x2 :x3 check)
+                     [[:st :s1 :s0 (st :r-len)] [:li :t0 1] [:st :t0 :s0 (st :r-ok)]
+                      [:label check]]
+                     (hd 21 [:f :r-ok] [:f :r-len] [:f :bytes])
+                     [[:alui :cmp :t0 0] [:bcc :eq ::trap-bytes]
+                      [:label ro]]
+                     (open-at [:f :rel-a] (+ o-rdonly o-nofollow o-cloexec) 0)
+                     (outcome 4 0 ro ::bad)
+                     [[:st :t0 :s0 (st :fd)]]
+                     (sys :fstat [:f :fd] stat-buf)
+                     [[:alui :cmp :t0 0] [:bcc :ne ::bad]
+                      [:li :t1 stat-buf] [:ld :t0 :t1 stat-mode] [:shli :t0 32] [:shri :t0 32]
+                      [:st :t0 :s0 (st :x3)]]
+                     (hd 16 2 [:f :x3])
+                     ;; regular: op 16's kind 0
+                     [[:li :t1 0] [:alui :cmp :t0 0] [:bcc :ne notreg] [:li :t1 1]
+                      [:label notreg] [:st :t1 :s0 (st :x4)]
+                      [:li :t1 stat-buf] [:ld :t1 :t1 48] [:st :t1 :s0 (st :x5)]]
+                     (hd 22 [:f :r-off] [:f :r-len] [:f :x5] [:f :x4])
+                     [[:alui :cmp :t0 1] [:bcc :ne ::bad]]
+                     (hd 6 [:f :pool-used] [:f :r-len] [:f :bytes])
+                     [[:alui :cmp :t0 0] [:bcc :eq ::trap-bytes]
+                      ;; memory: the window lies inside the pool region
+                      [:ld :t0 :s0 (st :pool-used)] [:ld :t1 :s0 (st :r-len)] [:alu :add :t0 :t1]
+                      [:ld :t1 :s0 (st :bytes)] [:alu :cmp :t0 :t1] [:bcc :hi ::trap-bytes]
+                      [:li :s2 0]
+                      [:label pl] [:ld :t0 :s0 (st :r-len)] [:alu :cmp :s2 :t0] [:bcc :hs pd]
+                      [:ld :s3 :s0 (st :pool-base)] [:ld :t1 :s0 (st :pool-used)] [:alu :add :s3 :t1] [:alu :add :s3 :s2]
+                      [:mov :s4 :t0] [:alu :sub :s4 :s2]
+                      [:ld :s1 :s0 (st :r-off)] [:alu :add :s1 :s2]]
+                     (sys :pread64 [:f :fd] :s3 :s4 :s1)
+                     (outcome 4 3 pl ::bad)
+                     ;; the file shrank: a short window is refused
+                     [[:alui :cmp :t0 0] [:bcc :eq ::bad]
+                      [:alu :add :s2 :t0] [:b pl]
+                      [:label pd]]
+                     (sys :close [:f :fd])
+                     [[:ld :s3 :s0 (st :pool-used)] [:ld :s2 :s0 (st :r-len)]
+                      [:mov :t0 :s3] [:alu :add :t0 :s2] [:st :t0 :s0 (st :pool-used)]
+                      [:mov :s4 :s3] [:not :s4] [:mov :ctx :s0]]
+                     (pair-new false :s4 :s2)
+                     (finish)))
+           ;; 7 chmod: 1..6 octal digits after CHMOD_SEP; "1" / "0"
+           (let [ol (L "oct") od (L "oct-done") co (L "copen") no (L "ch-no")]
+             (concat [[:label (forms 7)]]
+                     (after-token 6)
+                     [[:mov :s3 :s2] [:mov :s2 :s1]]
+                     (hd 24 :s3)
+                     [[:alui :cmp :t0 1] [:bcc :ne ::bad]
+                      [:li :s1 0] [:li :s4 0]
+                      [:label ol] [:alu :cmp :s4 :s3] [:bcc :hs od]
+                      [:ldb :t1 :s2 :s4]]
+                     (hd 23 :s1 :t1)
+                     [[:alui :cmp :t0 -2] [:bcc :eq ::bad]
+                      [:mov :s1 :t0] [:alui :add :s4 1] [:b ol]
+                      [:label od]]
+                     (hd 25 :s1)
+                     [[:st :t0 :s0 (st :x2)]
+                      [:label co]]
+                     (open-at [:f :rel-a] (+ o-rdonly o-nofollow o-cloexec) 0)
+                     (outcome 7 0 co no)
+                     [[:st :t0 :s0 (st :fd)]]
+                     (sys :fchmod [:f :fd] [:f :x2])
+                     [[:st :t0 :s0 (st :x1)]]
+                     (sys :close [:f :fd])
+                     [[:ld :t0 :s0 (st :x1)]]
+                     (outcome 7 2 ::bad no)
+                     (answer-bool one-label)
+                     [[:label no]]
+                     (answer-bool zero-label)))
+           ;; 12 fsync: "1" once the kernel has it on stable storage, "0" when
+           ;; the file cannot be opened or the flush fails
+           (let [fo (L "fopen") fs (L "fsync") no (L "fs-no") no2 (L "fs-no2")]
+             (concat [[:label (forms 12)] [:label fo]]
+                     (open-at [:f :rel-a] (+ o-rdonly o-nofollow o-cloexec) 0)
+                     (outcome 12 0 fo no)
+                     [[:st :t0 :s0 (st :fd)]
+                      [:label fs]]
+                     (sys :fsync [:f :fd])
+                     (outcome 12 3 fs no2)
+                     (sys :close [:f :fd])
+                     (answer-bool one-label)
+                     [[:label no2]]
+                     (sys :close [:f :fd])
+                     [[:label no]]
+                     (answer-bool zero-label)))
+           ;; 13 make-temp-dir: "<dir>MKTEMP_SEP<prefix>" -> the new directory's
+           ;; absolute path, "" when <dir> cannot be opened or no name is free
+           (let [pl (L "pre") pd (L "pre-done") hit (L "pre-hit") dopen (L "dopen")
+                 try (L "mk-try") gr (L "mk-rand") sl (L "mk-suffix") sd (L "mk-suffix-done")
+                 mk (L "mk") done (L "mk-done") noslash (L "mk-noslash")
+                 exhausted (L "mk-exhausted") empty (L "mk-empty") named (L "mk-entropy")]
+             (concat [[:label (forms 13)]]
+                     (after-token 12)
+                     [[:st :s1 :s0 (st :m-pre)] [:st :s2 :s0 (st :m-plen)]
+                      [:li :t2 0] [:li :t0 0]
+                      [:label pl] [:alu :cmp :t0 :s2] [:bcc :hs pd]
+                      [:ldb :t1 :s1 :t0] [:alui :cmp :t1 47] [:bcc :eq hit]
+                      [:alui :cmp :t1 0] [:bcc :eq hit]
+                      [:alui :add :t0 1] [:b pl]
+                      [:label hit] [:li :t2 1]
+                      [:label pd]]
+                     (hd 26 [:f :m-plen] :t2)
+                     [[:alui :cmp :t0 1] [:bcc :ne ::bad]
+                      ;; memory: prefix + suffix + NUL inside buf-c
+                      [:ld :t0 :s0 (st :m-plen)] [:alui :cmp :t0 4000] [:bcc :hi ::bad]
+                      [:label dopen]]
+                     (open-at [:f :rel-a] (+ o-path o-directory o-cloexec) 0)
+                     (outcome 13 1 dopen empty)
+                     [[:st :t0 :s0 (st :m-dfd)]
+                      [:li :t0 0] [:st :t0 :s0 (st :m-k)]
+                      [:ld :s1 :s0 (st :m-pre)] [:ld :s2 :s0 (st :m-plen)] [:li :s3 buf-c]]
+                     (copy :s3 :s1 :s2)
+                     [[:label try]]
+                     (hd 28 [:f :m-k])
+                     [[:alui :cmp :t0 1] [:bcc :ne exhausted]
+                      [:ld :t0 :s0 (st :m-k)] [:alui :add :t0 1] [:st :t0 :s0 (st :m-k)]]
+                     (hd 29)
+                     [[:alui :cmp :t0 1] [:bcc :lt ::bad] [:alui :cmp :t0 16] [:bcc :hi ::bad]
+                      [:st :t0 :s0 (st :m-n)]
+                      [:label gr]]
+                     (sys :getrandom probe [:f :m-n] 0)
+                     (outcome 40 3 gr ::bad named)
+                     [[:ld :t1 :s0 (st :m-n)] [:alu :cmp :t0 :t1] [:bcc :ne ::bad]
+                      [:li :s4 0]
+                      [:label sl] [:ld :t0 :s0 (st :m-n)] [:alu :cmp :s4 :t0] [:bcc :hs sd]
+                      [:li :t1 probe] [:ldb :t2 :t1 :s4]]
+                     (hd 27 :t2)
+                     [[:li :t1 buf-c] [:ld :t2 :s0 (st :m-plen)] [:alu :add :t1 :t2] [:stb :t0 :t1 :s4]
+                      [:alui :add :s4 1] [:b sl]
+                      [:label sd]
+                      [:li :t1 buf-c] [:ld :t2 :s0 (st :m-plen)] [:alu :add :t2 :s4] [:li :t0 0] [:stb :t0 :t1 :t2]
+                      [:st :t2 :s0 (st :x1)]]
+                     (hd 30)
+                     [[:st :t0 :s0 (st :x2)]
+                      [:label mk]]
+                     (sys :mkdirat [:f :m-dfd] buf-c [:f :x2])
+                     (outcome 13 2 try exhausted)
+                     (sys :close [:f :m-dfd])
+                     ;; the answer: the admitted directory, "/", the new name
+                     [[:li :s3 buf-a] [:li :s1 buf-b] [:ld :s2 :s0 (st :len-a)]]
+                     (copy :s3 :s1 :s2)
+                     [[:alui :cmp :s2 1] [:bcc :eq noslash]
+                      [:li :t0 47] [:stb :t0 :s3 :s2] [:alui :add :s2 1]
+                      [:label noslash]
+                      [:mov :t2 :s3] [:alu :add :t2 :s2] [:li :t3 buf-c] [:ld :a1 :s0 (st :x1)]]
+                     (copy :t2 :t3 :a1)
+                     [[:alu :add :s2 :a1] [:li :s1 buf-a]]
+                     (intern) (finish)
+                     [[:label exhausted]]
+                     (sys :close [:f :m-dfd])
+                     [[:label empty]]
+                     (intern-label zero-label 0) (finish)
+                     (named-trap named entropy-msg)))
+           ;; 14 stat-nofollow: STAT of the final component ITSELF (O_PATH |
+           ;; O_NOFOLLOW opens a symlink as the link), "<mode&0777> <size>
+           ;; <blocks> <kind>", kind from op 16; "" when absent
+           (let [so (L "nopen") no (L "ns-no")]
+             (concat [[:label (forms 14)] [:label so]]
+                     (open-at [:f :rel-a] (+ o-path o-nofollow o-cloexec) 0)
+                     (outcome 14 0 so no)
+                     [[:st :t0 :s0 (st :fd)]]
+                     (sys :fstat [:f :fd] stat-buf)
+                     [[:st :t0 :s0 (st :x0)]]
+                     (sys :close [:f :fd])
+                     [[:ld :t0 :s0 (st :x0)]]
+                     (outcome 14 4 ::bad no)
+                     [[:li :t0 0] [:st :t0 :s0 (st :x2)]
+                      [:li :t1 stat-buf] [:ld :t0 :t1 stat-mode] [:shli :t0 32] [:shri :t0 32]
+                      [:st :t0 :s0 (st :x3)]]
+                     (hd 16 0 [:f :x3])
+                     [[:mov :t1 :t0]] (append-field true)
+                     [[:li :t1 stat-buf] [:ld :t1 :t1 48]] (append-field true)
+                     [[:li :t1 stat-buf] [:ld :t1 :t1 64]] (append-field true)
+                     (hd 16 2 [:f :x3])
+                     [[:mov :t1 :t0]] (append-field false)
+                     [[:li :s1 answer] [:ld :s2 :s0 (st :x2)]]
+                     (intern) (finish)
+                     [[:label no]] (intern-label zero-label 0) (finish)))))
         fs-app-data
         (let [tok-loop (L "tok") tok-next (L "tok-next") scan (L "scan") scan-no (L "scan-no")
               scan-done (L "scan-done") scan-hit (L "scan-hit") wfirst (L "wfirst") wf-done (L "wf-done")
               path-len (L "plen") path-read (L "pread") fail (L "fs-fail") exists-fail (L "ex-fail")
-              forms (into {} (map (fn [f] [f (L (str "form-" f))])) (range 12))
+              forms (into {} (map (fn [f] [f (L (str "form-" f))])) (range 15))
               cmpl (L "tcmp") matched (L "tmatch") dup (L "tdup")]
           (vec
            (concat
             ;; count each token's occurrences and first index (kexe_single_token
             ;; / memmem): tokens + 16k = count, tokens + 16k + 8 = first
             [[:ld :s2 :s0 (st :rp)] [:ld :s3 :s0 (st :rl)] [:li :s4 0]
-             [:label tok-loop] [:alui :cmp :s4 11] [:bcc :hs scan-done]
+             [:label tok-loop] [:alui :cmp :s4 n-tokens] [:bcc :hs scan-done]
              [:mov :t0 :s4] [:shli :t0 4] [:li :t1 tokens] [:alu :add :t1 :t0]
              [:li :t0 0] [:st :t0 :t1 0] [:li :t0 -1] [:st :t0 :t1 8]
              [:li :s1 0]]
@@ -1299,7 +1683,7 @@
                         [[:alui :cmp :s4 k] [:bcc :ne skip]
                          [:la :a1 (nth token-labels k)] [:li :a2 (count (nth fs-tokens k))]
                          [:label skip]]))
-                    (range 11))
+                    (range n-tokens))
             [[:label scan]
              [:mov :t0 :s1] [:alu :add :t0 :a2] [:alu :cmp :t0 :s3] [:bcc :hi tok-next]
              [:li :t0 0]
@@ -1316,7 +1700,7 @@
              [:label scan-done]
              ;; the presence mask and whether WRITE_SEP precedes APPEND_SEP
              [:li :s1 0] [:li :s4 0]
-             [:label scan-hit] [:alui :cmp :s4 11] [:bcc :hs wfirst]
+             [:label scan-hit] [:alui :cmp :s4 n-tokens] [:bcc :hs wfirst]
              [:mov :t0 :s4] [:shli :t0 4] [:li :t1 tokens] [:alu :add :t1 :t0] [:ld :t0 :t1 0]
              [:alui :cmp :t0 0] [:bcc :eq path-len]
              [:li :t2 1]]
@@ -1454,8 +1838,7 @@
                       (sys :close [:f :pfd])
                       [[:label no]]
                       (answer-bool zero-label)))
-            ;; the forms op 2 refused were trapped above
-            (mapcat (fn [f] [[:label (forms f)] [:b ::bad]]) [2 4 7]))))
+            (fs-forms-c3b forms))))
         fs-browse
         (let [bo (L "bopen") gd (L "dents") gd-done (L "dents-done") rec (L "rec") rec-next (L "rec-next")
               c1 (L "dcls1") cls (L "dcls") first? (L "first") sort-i (L "sort-i") sort-j (L "sort-j")
@@ -1565,7 +1948,325 @@
              [:mov :s4 :s1] [:not :s4] [:mov :ctx :s0]]
             (pair-new false :s4 :s2)
             (finish)
-            [[:label fail] [:b ::bad]])))]
+            [[:label fail] [:b ::bad]])))
+        ;; --- :entropy/draw 23 (C3, second half): a decimal count N (op 31:
+        ;; 1..256) -> 2N hex characters of getrandom(buf, N, 0). ENOSYS is a
+        ;; named trap: there is no /dev/urandom fallback.
+        entropy
+        (let [gl (L "gr") gd (L "gr-done") hl (L "hex") hx (L "hex-done") named (L "ent-named")]
+          (vec (concat
+                (parse-decimal)
+                [[:st :s1 :s0 (st :x0)]]
+                (hd 31 :s1)
+                [[:alui :cmp :t0 1] [:bcc :ne ::bad]
+                 ;; memory: N bytes in buf-b, 2N characters in buf-a
+                 [:ld :t0 :s0 (st :x0)] [:alui :cmp :t0 2048] [:bcc :hi ::bad]
+                 [:li :s2 0]
+                 [:label gl] [:ld :t0 :s0 (st :x0)] [:alu :cmp :s2 :t0] [:bcc :hs gd]
+                 [:li :s3 buf-b] [:alu :add :s3 :s2] [:mov :s4 :t0] [:alu :sub :s4 :s2]]
+                (sys :getrandom :s3 :s4 0)
+                (outcome 40 3 gl ::bad named)
+                [[:alui :cmp :t0 0] [:bcc :le ::bad]
+                 [:alu :add :s2 :t0] [:b gl]
+                 [:label gd]
+                 [:li :s3 0]
+                 [:label hl] [:ld :t0 :s0 (st :x0)] [:alu :cmp :s3 :t0] [:bcc :hs hx]
+                 [:li :t1 buf-b] [:ldb :t2 :t1 :s3] [:shri :t2 4]]
+                (hd 32 :t2)
+                [[:li :t1 buf-a] [:mov :t2 :s3] [:shli :t2 1] [:stb :t0 :t1 :t2]
+                 [:li :t1 buf-b] [:ldb :t2 :t1 :s3] [:alui :and :t2 15]]
+                (hd 32 :t2)
+                [[:li :t1 buf-a] [:mov :t2 :s3] [:shli :t2 1] [:alui :add :t2 1] [:stb :t0 :t1 :t2]
+                 [:alui :add :s3 1] [:b hl]
+                 [:label hx]
+                 [:li :s1 buf-a] [:ld :s2 :s0 (st :x0)] [:shli :s2 1]]
+                (intern) (finish)
+                (named-trap named entropy-msg))))
+        ;; --- :process/spawn 20 (C3, second half) ---------------------------
+        ;; "<program>[ARG_SEP<arg>]..." -> "<exit>\n<stdout>". Mechanism: the
+        ;; argv / envp arrays, three pipes (stdin at EOF, stdout captured, and
+        ;; a CLOEXEC status pipe that stays silent when execve succeeds),
+        ;; clone(SIGCHLD) -- a fork, no shared memory --, in the child dup3 /
+        ;; close_range(3, ~0, CLOSE_RANGE_CLOEXEC) / PR_SET_NO_NEW_PRIVS /
+        ;; fchdir(scope root) / execve, in the parent ppoll + read under the
+        ;; deadline, wait4, and kill(SIGKILL) when a budget is spent. Every
+        ;; decision -- the argv shape and budget, which sealed program runs,
+        ;; which variables pass, the output and time budgets, the exit field,
+        ;; what a child's failure is called -- is linux_static_handlers.kotoba
+        ;; ops 33..42.
+        spawn-handler
+        (let [lbl (fn [p] (L p))
+              refusal (into {} (map (fn [k] [k (lbl (str "sp-" (name k)))])) spawn-refusals)
+              names-size (- index names)
+              p1 (lbl "p1") p1nn (lbl "p1nn") p1c (lbl "p1c") p1hit (lbl "p1hit") p1nf (lbl "p1nf")
+              p1no (lbl "p1no") p1d (lbl "p1d")
+              p2 (lbl "p2") p2c (lbl "p2c") p2hit (lbl "p2hit") p2copy (lbl "p2copy") p2d (lbl "p2d")
+              hs (lbl "hs") hsy (lbl "hsy") hsd (lbl "hsd") have-prog (lbl "have-prog")
+              ew (lbl "env") ewn (lbl "env-next") ewd (lbl "env-done")
+              child (lbl "child") parent (lbl "parent") report (lbl "report")
+              fails (mapv (fn [k] (lbl (str "cfail" k))) (range 5)) no-chdir (lbl "no-chdir")
+              sr (lbl "status-read") exec-ok (lbl "exec-ok")
+              rl (lbl "out-loop") rd (lbl "out-read") eof (lbl "eof")
+              wl (lbl "reap") reaped (lbl "reaped") neg (lbl "exit-neg") digits (lbl "digits")
+              kill-time (lbl "kill-time") kill-out (lbl "kill-output")
+              reap-blocking (fn []
+                              (let [rw (lbl "reap-block")]
+                                (vec (concat [[:label rw]]
+                                             (sys :wait4 [:f :sp-pid] (+ spawn-io 24) 0 0)
+                                             (outcome 50 3 rw ::bad)))))
+              time-left (fn [kill]
+                          (vec (concat
+                                (sys :clock-gettime 1 (+ data (st :ts)))
+                                [[:alui :cmp :t0 0] [:bcc :ne ::bad]]
+                                (hd 10 2 [:f :ts] [:f :ts-nsec])
+                                [[:alui :cmp :t0 -1] [:bcc :eq ::bad]
+                                 [:ld :t1 :s0 (st :sp-start)] [:alu :sub :t0 :t1] [:st :t0 :s0 (st :x5)]]
+                                (hd 39 [:f :x5])
+                                [[:alui :cmp :t0 -1] [:bcc :eq kill]])))
+              timespec (fn [key]   ; [:f key] nanoseconds -> the timespec at spawn-io + 40
+                         (vec (concat (hd 41 0 [:f key]) [[:li :t1 spawn-io] [:st :t0 :t1 40]]
+                                      (hd 41 1 [:f key]) [[:li :t1 spawn-io] [:st :t0 :t1 48]])))
+              ;; compare the program at buf-a[0..plen) with LEN bytes at label +
+              ;; START; 1 / 0 -> [:f key]
+              compare-program (fn [label start len key]
+                                (let [done (lbl "cmp-done") l (lbl "cmp") yes (lbl "cmp-yes")]
+                                  [[:li :t2 0] [:ld :t0 :s0 (st :sp-plen)] [:alui :cmp :t0 len] [:bcc :ne done]
+                                   [:la :a1 label] [:alui :add :a1 start] [:li :t0 0]
+                                   [:label l] [:alui :cmp :t0 len] [:bcc :hs yes]
+                                   [:li :t1 buf-a] [:ldb :t1 :t1 :t0] [:ldb :t3 :a1 :t0] [:alu :cmp :t1 :t3] [:bcc :ne done]
+                                   [:alui :add :t0 1] [:b l]
+                                   [:label yes] [:li :t2 1]
+                                   [:label done] [:st :t2 :s0 (st key)]]))]
+          (vec
+           (concat
+            ;; A. pass 1: ARG_SEP count, a NUL anywhere, the program's length
+            [[:ld :s1 :s0 (st :rp)] [:ld :s2 :s0 (st :rl)]
+             [:li :t0 0] [:st :t0 :s0 (st :sp-count)] [:st :t0 :s0 (st :sp-nul)]
+             [:st :s2 :s0 (st :sp-plen)]
+             [:la :s4 arg-sep-label] [:li :s3 0]
+             [:label p1] [:alu :cmp :s3 :s2] [:bcc :hs p1d]
+             [:ldb :t0 :s1 :s3] [:alui :cmp :t0 0] [:bcc :ne p1nn] [:li :t0 1] [:st :t0 :s0 (st :sp-nul)]
+             [:label p1nn]
+             [:mov :t0 :s3] [:alui :add :t0 7] [:alu :cmp :t0 :s2] [:bcc :hi p1no]
+             [:li :t0 0]
+             [:label p1c] [:alui :cmp :t0 7] [:bcc :hs p1hit]
+             [:mov :t1 :s3] [:alu :add :t1 :t0] [:ldb :t1 :s1 :t1] [:ldb :t2 :s4 :t0] [:alu :cmp :t1 :t2] [:bcc :ne p1no]
+             [:alui :add :t0 1] [:b p1c]
+             [:label p1hit]
+             [:ld :t0 :s0 (st :sp-count)] [:alui :cmp :t0 0] [:bcc :ne p1nf] [:st :s3 :s0 (st :sp-plen)]
+             [:label p1nf] [:alui :add :t0 1] [:st :t0 :s0 (st :sp-count)]
+             [:alui :add :s3 7] [:b p1]
+             [:label p1no] [:alui :add :s3 1] [:b p1]
+             [:label p1d]
+             ;; the argv bytes with their NULs: rl - 7*count + count + 1
+             [:ld :t0 :s0 (st :sp-count)] [:mov :t1 :t0] [:shli :t1 1] [:alu :add :t1 :t0] [:shli :t1 1]
+             [:mov :t2 :s2] [:alu :sub :t2 :t1] [:alui :add :t2 1] [:st :t2 :s0 (st :x0)]]
+            (hd 33 [:f :sp-count] [:f :x0] [:f :sp-nul] [:f :sp-plen])
+            [[:alui :cmp :t0 -1] [:bcc :eq ::bad]
+             [:alui :cmp :t0 0] [:bcc :eq (refusal :argv-budget)]
+             ;; memory: whatever the decision admits, the arrays stay in their
+             ;; buffers (4,096 argv bytes, 500 pointers)
+             [:ld :t0 :s0 (st :x0)] [:alui :cmp :t0 4096] [:bcc :hi ::bad]
+             [:ld :t0 :s0 (st :sp-count)] [:alui :cmp :t0 500] [:bcc :hi ::bad]
+             ;; B. pass 2: the strings into buf-a, their addresses into buf-b
+             [:li :s3 0] [:li :s4 0]
+             [:li :t0 buf-a] [:li :t1 buf-b] [:st :t0 :t1 0]
+             [:li :t0 1] [:st :t0 :s0 (st :x1)]
+             [:label p2] [:alu :cmp :s3 :s2] [:bcc :hs p2d]
+             [:mov :t0 :s3] [:alui :add :t0 7] [:alu :cmp :t0 :s2] [:bcc :hi p2copy]
+             [:la :a1 arg-sep-label] [:li :t0 0]
+             [:label p2c] [:alui :cmp :t0 7] [:bcc :hs p2hit]
+             [:mov :t1 :s3] [:alu :add :t1 :t0] [:ldb :t1 :s1 :t1] [:ldb :t2 :a1 :t0] [:alu :cmp :t1 :t2] [:bcc :ne p2copy]
+             [:alui :add :t0 1] [:b p2c]
+             [:label p2hit]
+             [:li :t1 buf-a] [:li :t0 0] [:stb :t0 :t1 :s4] [:alui :add :s4 1]
+             [:ld :t0 :s0 (st :x1)] [:mov :t2 :t0] [:shli :t2 3] [:li :t1 buf-b] [:alu :add :t1 :t2]
+             [:li :t2 buf-a] [:alu :add :t2 :s4] [:st :t2 :t1 0]
+             [:alui :add :t0 1] [:st :t0 :s0 (st :x1)]
+             [:alui :add :s3 7] [:b p2]
+             [:label p2copy]
+             [:ldb :t0 :s1 :s3] [:li :t1 buf-a] [:stb :t0 :t1 :s4] [:alui :add :s4 1] [:alui :add :s3 1] [:b p2]
+             [:label p2d]
+             [:li :t1 buf-a] [:li :t0 0] [:stb :t0 :t1 :s4]
+             [:ld :t0 :s0 (st :x1)] [:shli :t0 3] [:li :t1 buf-b] [:alu :add :t1 :t0] [:li :t0 0] [:st :t0 :t1 0]
+             ;; C. the program: a '/' in its spelling, then each sealed one
+             [:li :t2 0] [:li :t0 0]
+             [:label hs] [:ld :t3 :s0 (st :sp-plen)] [:alu :cmp :t0 :t3] [:bcc :hs hsd]
+             [:li :t1 buf-a] [:ldb :t1 :t1 :t0] [:alui :cmp :t1 47] [:bcc :eq hsy]
+             [:alui :add :t0 1] [:b hs]
+             [:label hsy] [:li :t2 1]
+             [:label hsd] [:st :t2 :s0 (st :sp-slash)]]
+            (mapcat (fn [{:keys [label length base-start base-length]}]
+                      (let [next-k (lbl "next-program")]
+                        (concat (compare-program label 0 length :x2)
+                                (compare-program label base-start base-length :x3)
+                                (hd 34 [:f :sp-slash] [:f :x2] [:f :x3] lookup)
+                                [[:alui :cmp :t0 1] [:bcc :ne next-k]
+                                 [:la :t0 label] [:st :t0 :s0 (st :sp-prog)] [:b have-prog]
+                                 [:label next-k]])))
+                    programs)
+            (hd 35 [:f :sp-slash] lookup)
+            [[:alui :cmp :t0 2] [:bcc :eq (refusal :path-lookup-denied)]
+             [:b (refusal :program-not-granted)]
+             [:label have-prog]
+             ;; D. the child's environment: the granted names only (op 36)
+             [:li :t0 0] [:st :t0 :s0 (st :sp-envn)]
+             [:ld :s4 :s0 (st :envp)]
+             [:label ew] [:ld :s1 :s4 0] [:alui :cmp :s1 0] [:bcc :eq ewd]
+             [:li :t2 0]]
+            (mapcat (fn [{:keys [label length]}]
+                      (let [l (lbl "nm") eq (lbl "nm-eq") no (lbl "nm-no")]
+                        [[:li :t0 0] [:la :a1 label]
+                         [:label l] [:alui :cmp :t0 length] [:bcc :hs eq]
+                         [:ldb :t1 :s1 :t0] [:ldb :t3 :a1 :t0] [:alu :cmp :t1 :t3] [:bcc :ne no]
+                         [:alui :add :t0 1] [:b l]
+                         [:label eq] [:ldb :t1 :s1 :t0] [:alui :cmp :t1 61] [:bcc :ne no] [:li :t2 1]
+                         [:label no]]))
+                    env-names)
+            [[:st :t2 :s0 (st :x2)]]
+            (hd 36 [:f :x2] [:f :sp-envn])
+            [[:alui :cmp :t0 1] [:bcc :ne ewn]
+             [:ld :t0 :s0 (st :sp-envn)] [:alui :cmp :t0 500] [:bcc :hs ::bad]
+             [:mov :t1 :t0] [:shli :t1 3] [:li :t2 buf-c] [:alu :add :t2 :t1] [:st :s1 :t2 0]
+             [:alui :add :t0 1] [:st :t0 :s0 (st :sp-envn)]
+             [:label ewn] [:alui :add :s4 8] [:b ew]
+             [:label ewd]
+             [:ld :t0 :s0 (st :sp-envn)] [:shli :t0 3] [:li :t2 buf-c] [:alu :add :t2 :t0] [:li :t0 0] [:st :t0 :t2 0]
+             ;; E. three pipes, every end O_CLOEXEC
+             [:li :t0 0] [:li :t1 spawn-io]
+             [:st :t0 :t1 0] [:st :t0 :t1 8] [:st :t0 :t1 16] [:st :t0 :t1 24]]
+            (mapcat (fn [off] (concat (sys :pipe2 (+ spawn-io off) o-cloexec) (outcome 50 0 ::bad ::bad)))
+                    [0 8 16])
+            (mapcat (fn [[off lo hi]]
+                      [[:li :t1 spawn-io] [:ld :t0 :t1 off] [:mov :t2 :t0] [:shli :t2 32] [:shri :t2 32]
+                       [:st :t2 :s0 (st lo)] [:shri :t0 32] [:st :t0 :s0 (st hi)]])
+                    [[0 :sp-in-r :sp-in-w] [8 :sp-out-r :sp-out-w] [16 :sp-st-r :sp-st-w]])
+            ;; F. the deadline starts here
+            (sys :clock-gettime 1 (+ data (st :ts)))
+            [[:alui :cmp :t0 0] [:bcc :ne ::bad]]
+            (hd 10 2 [:f :ts] [:f :ts-nsec])
+            [[:alui :cmp :t0 -1] [:bcc :eq ::bad] [:st :t0 :s0 (st :sp-start)]]
+            ;; G. fork
+            (sys :clone sigchld 0 0 0 0)
+            [[:alui :cmp :t0 0] [:bcc :lt ::bad] [:bcc :eq child]
+             [:st :t0 :s0 (st :sp-pid)] [:b parent]
+             ;; H. the child: stdio, every other descriptor close-on-exec, no
+             ;; new privileges, the scope root as its directory, execve. A
+             ;; failure is written to the status pipe as step * 4096 + errno.
+             [:label child]]
+            (sys :dup3 [:f :sp-in-r] 0 0)
+            [[:alui :cmp :t0 0] [:bcc :lt (fails 0)]]
+            (sys :dup3 [:f :sp-out-w] 1 0)
+            [[:alui :cmp :t0 0] [:bcc :lt (fails 0)]]
+            (sys :close-range 3 4294967295 close-range-cloexec)
+            [[:alui :cmp :t0 0] [:bcc :lt (fails 1)]]
+            (sys :prctl pr-set-no-new-privs 1 0 0 0)
+            [[:alui :cmp :t0 0] [:bcc :lt (fails 2)]
+             [:ld :t0 :s0 (st :root-fd)] [:alui :cmp :t0 0] [:bcc :lt no-chdir]]
+            (sys :fchdir [:f :root-fd])
+            [[:alui :cmp :t0 0] [:bcc :lt (fails 3)]
+             [:label no-chdir]]
+            (sys :execve [:f :sp-prog] buf-b buf-c)
+            [[:b (fails 4)]]
+            (mapcat (fn [k] [[:label (fails k)] [:li :t1 k] [:b report]]) (range 5))
+            [[:label report]
+             [:neg :t0] [:shli :t1 12] [:alu :add :t1 :t0] [:li :t2 probe] [:st :t1 :t2 0]]
+            (sys :write [:f :sp-st-w] probe 8)
+            (sys :exit-group 127)
+            [[:trap]
+             ;; I. the parent
+             [:label parent]]
+            (mapcat (fn [k] (sys :close [:f k])) [:sp-in-r :sp-in-w :sp-out-w :sp-st-w])
+            [[:li :t0 0] [:li :t1 probe] [:st :t0 :t1 0]
+             [:label sr]]
+            (sys :read [:f :sp-st-r] probe 8)
+            (outcome 50 3 sr ::bad)
+            [[:st :t0 :s0 (st :x3)]]
+            (sys :close [:f :sp-st-r])
+            [[:ld :t0 :s0 (st :x3)] [:alui :cmp :t0 0] [:bcc :eq exec-ok]]
+            ;; the child failed before its program ran: reap it, name the step
+            (reap-blocking)
+            [[:li :t1 probe] [:ld :t0 :t1 0] [:shri :t0 12] [:st :t0 :s0 (st :x3)]]
+            (hd 42 [:f :x3])
+            [[:alui :cmp :t0 1] [:bcc :eq (refusal :exec-failed)]
+             [:alui :cmp :t0 2] [:bcc :eq (refusal :isolation-unavailable)]
+             [:b (refusal :setup-failed)]
+             [:label exec-ok]]
+            (hd 37 (dec names-size))
+            [[:alui :cmp :t0 0] [:bcc :lt ::bad] [:alui :cmp :t0 (dec names-size)] [:bcc :hi ::bad]
+             [:st :t0 :s0 (st :sp-limit)]
+             [:li :t0 0] [:st :t0 :s0 (st :sp-total)]
+             ;; pollfd {fd, POLLIN} at spawn-io + 32
+             [:ld :t0 :s0 (st :sp-out-r)] [:li :t1 (* pollin 4294967296)] [:alu :or :t0 :t1]
+             [:li :t1 spawn-io] [:st :t0 :t1 32]
+             [:label rl]]
+            (time-left kill-time)
+            [[:st :t0 :s0 (st :x4)]]
+            (timespec :x4)
+            (sys :ppoll (+ spawn-io 32) 1 (+ spawn-io 40) 0 8)
+            (outcome 50 3 rl ::bad)
+            [[:alui :cmp :t0 0] [:bcc :eq rl]
+             ;; readable or hung up: at most the budget plus one byte more
+             [:ld :s1 :s0 (st :sp-total)] [:li :s2 names] [:alu :add :s2 :s1]
+             [:ld :s3 :s0 (st :sp-limit)] [:alui :add :s3 1] [:alu :sub :s3 :s1]
+             [:label rd]]
+            (sys :read [:f :sp-out-r] :s2 :s3)
+            (outcome 50 3 rd ::bad)
+            [[:alui :cmp :t0 0] [:bcc :eq eof]
+             [:alu :add :s1 :t0] [:st :s1 :s0 (st :sp-total)]
+             [:ld :t1 :s0 (st :sp-limit)] [:alu :cmp :s1 :t1] [:bcc :hi kill-out]
+             [:b rl]
+             [:label eof]]
+            (sys :close [:f :sp-out-r])
+            ;; the child's exit, polled in slices under the same deadline
+            [[:label wl]]
+            (sys :wait4 [:f :sp-pid] (+ spawn-io 24) wnohang 0)
+            (outcome 50 3 wl ::bad)
+            [[:alui :cmp :t0 0] [:bcc :ne reaped]]
+            (time-left kill-time)
+            [[:st :t0 :s0 (st :x4)]]
+            (hd 40 [:f :x4])
+            [[:st :t0 :s0 (st :x4)]]
+            (timespec :x4)
+            (sys :ppoll 0 0 (+ spawn-io 40) 0 8)
+            (outcome 50 3 wl ::bad)
+            [[:b wl]
+             [:label reaped]
+             [:li :t1 spawn-io] [:ld :t0 :t1 24] [:shli :t0 32] [:shri :t0 32] [:st :t0 :s0 (st :x3)]]
+            (hd 38 [:f :x3])
+            [[:st :t0 :s0 (st :sp-exit)]
+             ;; the answer: the exit field, a newline, the captured bytes
+             [:ld :t1 :s0 (st :sp-exit)] [:alui :cmp :t1 0] [:bcc :lt neg]]
+            (itoa)
+            [[:b digits]
+             [:label neg] [:la :s1 minus-one-label] [:li :s2 2]
+             [:label digits]
+             [:st :s1 :s0 (st :x1)] [:st :s2 :s0 (st :sp-dlen)]
+             [:ld :t0 :s0 (st :sp-total)] [:alu :add :t0 :s2] [:alui :add :t0 1] [:st :t0 :s0 (st :x2)]]
+            (hd 6 [:f :pool-used] [:f :x2] [:f :bytes])
+            [[:alui :cmp :t0 0] [:bcc :eq ::trap-bytes]
+             [:ld :t0 :s0 (st :pool-used)] [:ld :t1 :s0 (st :x2)] [:alu :add :t0 :t1]
+             [:ld :t1 :s0 (st :bytes)] [:alu :cmp :t0 :t1] [:bcc :hi ::trap-bytes]
+             [:ld :s3 :s0 (st :pool-used)] [:ld :t2 :s0 (st :pool-base)] [:alu :add :t2 :s3]
+             [:ld :s1 :s0 (st :x1)] [:ld :s2 :s0 (st :sp-dlen)]]
+            (copy :t2 :s1 :s2)
+            [[:alu :add :t2 :s2] [:li :t0 10] [:li :t1 0] [:stb :t0 :t2 :t1] [:alui :add :t2 1]
+             [:li :s1 names] [:ld :s2 :s0 (st :sp-total)]]
+            (copy :t2 :s1 :s2)
+            [[:ld :s2 :s0 (st :x2)] [:mov :t0 :s3] [:alu :add :t0 :s2] [:st :t0 :s0 (st :pool-used)]
+             [:mov :s4 :s3] [:not :s4] [:mov :ctx :s0]]
+            (pair-new false :s4 :s2)
+            (finish)
+            ;; a budget spent: kill the child, reap it, trap by name
+            [[:label kill-time]]
+            (sys :kill [:f :sp-pid] sigkill)
+            (reap-blocking)
+            [[:b (refusal :timeout)]
+             [:label kill-out]]
+            (sys :kill [:f :sp-pid] sigkill)
+            (reap-blocking)
+            [[:b (refusal :output-budget)]]
+            (mapcat (fn [k] (named-trap (refusal k) (spawn-msgs k))) spawn-refusals))))]
     {:start
      (vec (concat
            [[:li :s0 data]
@@ -1583,9 +2284,28 @@
               [:label none] [:st :t1 :s0 (st :cwd-len)]])
            ;; the scope root, opened once (O_PATH: a directory to resolve under)
            (when scope
-             (concat (sys :openat at-fdcwd [:la root-label] (+ o-path o-directory o-cloexec) 0)
-                     (let [bad (L "no-root")]
-                       [[:alui :cmp :t0 0] [:bcc :lt bad] [:st :t0 :s0 (st :root-fd)] [:label bad]])))))
+             (let [bad (L "no-root") no-real (L "no-realpath") back (L "realpath-back")]
+               (concat (sys :openat at-fdcwd [:la root-label] (+ o-path o-directory o-cloexec) 0)
+                       [[:alui :cmp :t0 0] [:bcc :lt bad] [:st :t0 :s0 (st :root-fd)]
+                        [:li :t0 0] [:st :t0 :s0 (st :root-real-len)]]
+                       ;; the root as the kernel spells it (its realpath): hold
+                       ;; the working directory, fchdir to the root, getcwd,
+                       ;; fchdir back. No /proc needed. A step that fails
+                       ;; leaves only the sealed spelling; failing to return
+                       ;; to the working directory traps before main runs.
+                       (sys :openat at-fdcwd [:la dot-label] (+ o-path o-directory o-cloexec) 0)
+                       [[:alui :cmp :t0 0] [:bcc :lt no-real] [:st :t0 :s0 (st :x0)]]
+                       (sys :fchdir [:f :root-fd])
+                       [[:alui :cmp :t0 0] [:bcc :ne back]]
+                       (sys :getcwd root-real 4096)
+                       [[:alui :cmp :t0 1] [:bcc :le back]
+                        [:li :t2 root-real] [:li :t3 0] [:ldb :t3 :t2 :t3] [:alui :cmp :t3 47] [:bcc :ne back]
+                        [:alui :sub :t0 1] [:st :t0 :s0 (st :root-real-len)]
+                        [:label back]]
+                       (sys :fchdir [:f :x0])
+                       [[:alui :cmp :t0 0] [:bcc :ne ::bad]]
+                       (sys :close [:f :x0])
+                       [[:label no-real] [:label bad]])))))
      :routine
      (vec
       (concat
@@ -1601,7 +2321,7 @@
        (dcall ::c1-decide 1 [:f :rk] [:f :xk] 0 0)
        [[:alui :cmp :t0 1] [:bcc :ne ::bad]]
        (dcall ::c1-decide 0 [:f :id] [:f :rk] 0 0)
-       (hd 0 :t0)
+       (hd 0 :t0 [:f :id])
        [[:st :t0 :s0 (st :h)]
         [:alui :cmp :t0 0] [:bcc :ne ::tcc-have-handler]
         [:la :p1 no-handler-msg] [:li :t5 (get exit-codes slot-trap)] [:li :t4 no-handler-msg] [:b ::trap-exit]
@@ -1614,7 +2334,8 @@
        [[:st :s2 :s0 (st :rp)] [:st :s3 :s0 (st :rl)]]
        (mapcat (fn [[h l]] [[:ld :t0 :s0 (st :h)] [:alui :cmp :t0 h] [:bcc :eq l]])
                [[1 ::h-io-write] [2 ::h-io-write-error] [3 ::h-io-read] [4 ::h-cli-args]
-                [5 ::h-env-read] [6 ::h-clock] [7 ::h-fs-app-data] [8 ::h-fs-browse]])
+                [5 ::h-env-read] [6 ::h-clock] [7 ::h-fs-app-data] [8 ::h-fs-browse]
+                [9 ::h-entropy] [10 ::h-spawn]])
        [[:b ::bad]]
        [[:label ::h-io-write]] (io-write 1 30)
        [[:label ::h-io-write-error]] (io-write 2 30)
@@ -1624,6 +2345,8 @@
        [[:label ::h-clock]] clock
        [[:label ::h-fs-app-data]] fs-app-data
        [[:label ::h-fs-browse]] fs-browse
+       [[:label ::h-entropy]] entropy
+       [[:label ::h-spawn]] spawn-handler
        ;; every answer is a valid UTF-8 string (valid_typed_value, result kind)
        [[:label ::tcc-finish]
         [:mov :ctx :s0] [:ld :s1 :s0 (st :res)]]
@@ -1944,5 +2667,7 @@
         :imports [] :interpreter nil :dynamic nil
         ;; C3: what the image grants and the decision code it carries
         :grant (vec (:grant plan)) :fs-scope (:fs-scope plan)
+        ;; C3, second half: what :process/spawn may run (inert without wire 20)
+        :spawn (:spawn plan)
         :decision-code (mapv #(update % :address + text-offset) decision-regions)
         :bytes bytes}))))
