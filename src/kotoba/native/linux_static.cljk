@@ -465,6 +465,11 @@
                                 [e (num (:offset x))])))
                     exports)}))
 
+(def ^:private pure-ability-effects
+  "Row members that are abilities handled inside the program, not capability
+  calls (kotoba-lang lang/state-ability.edn, lang/abort-ability.edn)."
+  #{:state :abort})
+
 (defn- capability-plan
   "C3: what a program with capability effects is granted, and the code that
   decides for its handlers.
@@ -486,12 +491,22 @@
   (`:static-elf :capability-handlers`); one without is refused by name."
   [artifact profile overrides]
   (let [isa (get-in targets [(:target artifact) :isa])
+        ;; A pure ability (`:state`, `:abort`) is not a capability: the
+        ;; frontend lowered it to state passing / result values before KIR,
+        ;; its handler is code in the artifact, and it names no host
+        ;; authority -- so it needs no handler here and seals no grant bit
+        ;; (kotoba-verifier `pure-ability-effects`, the same set). :abort
+        ;; since 2026-09-26 (gap 4 of the selfhost foundation, superproject
+        ;; adr-2609242330); refused here by name until then, as :state was.
         effect-ids (into (sorted-set)
-                         (map (fn [e]
-                                (if (and (vector? e) (= :cap/call (first e)) (integer? (num (second e))))
-                                  (num (second e))
-                                  (throw (ex-info "a linux-static program declares an effect that is not a capability call"
-                                                  {:reason :effect-not-capability :effect e})))))
+                         (keep (fn [e]
+                                 (cond
+                                   (contains? pure-ability-effects e) nil
+                                   (and (vector? e) (= :cap/call (first e)) (integer? (num (second e))))
+                                   (num (second e))
+                                   :else
+                                   (throw (ex-info "a linux-static program declares an effect that is not a capability call"
+                                                   {:reason :effect-not-capability :effect e})))))
                          (:effects artifact))
         handled (into {} (map (fn [[k v]] [(num k) v]))
                       (get-in profile [:static-elf :capability-handlers :value]))
