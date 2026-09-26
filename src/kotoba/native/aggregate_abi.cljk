@@ -353,10 +353,21 @@
 
 (defn reject-unextracted-call!
   "The standalone expression producer invokes this for call-shaped values.
-  Calls are admitted only inside a validated GMIR v3 function module."
+  Calls are admitted only inside a validated GMIR v3 function module.
+
+  By the time a form reaches here every declared function is a known callee,
+  so the head is an OPERATION the native lowering has no case for, and the
+  message names it (2026-09-26, superproject adr-2609242330). Until then the
+  form rode only in ex-data, which the amu CLI drops: the selfhost scoreboard
+  carried a bare \"call-abi-not-admitted\" that was `min` in one module and
+  `vector-take` in another. The problem keyword and phase are unchanged."
   [form]
-  (reject! :call-abi-not-admitted
-           {:form form
-            :required (get-in contract [:extracted :call-requires])}))
+  (let [value {:form form
+               :required (get-in contract [:extracted :call-requires])}]
+    (if (and (seq? form) (symbol? (first form)))
+      (throw (ex-info (str "aggregate ABI rejected: call-abi-not-admitted: "
+                           "native has no lowering for the operation `" (first form) "`")
+                      {:phase :aggregate-abi :problem :call-abi-not-admitted :value value}))
+      (reject! :call-abi-not-admitted value))))
 
 (validate-contract! contract)

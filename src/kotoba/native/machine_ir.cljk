@@ -1290,6 +1290,40 @@
                    (list 'if (list 'pair-first tagged)
                          (list 'let [ok-binder payload] ok-body)
                          (list 'let [err-binder payload] err-body))))
+           ;; i64 `min` / `max` (2026-09-26, superproject adr-2609242330):
+           ;; a compare and a select over the two words, each operand
+           ;; evaluated once, left to right. Ties answer the left operand,
+           ;; which is the reference's `(reduce min xs)` -- on i64 words the
+           ;; two equal operands are the same value, so the choice is not
+           ;; observable. No NaN or signed zero exists at this type, which is
+           ;; why these are admitted while `f32-min` / `f32-max` are not.
+           (and (contains? '#{min max} op) (= 2 (count args)))
+           (let [left (gensym "min_max__"), right (gensym "min_max__")]
+             (list 'let [left (first args) right (second args)]
+                   (list 'if (list (if (= op 'min) '<= '>=) left right) left right)))
+           ;; `vector-take` (and its f64 twin): the first n items, the head
+           ;; mirror of `vector-drop`, and how the frontend spells `pop`.
+           ;; There was no lowering at all, so the head fell through to the
+           ;; call-shaped refusal ("aggregate ABI rejected:
+           ;; call-abi-not-admitted") -- measured 2026-09-26 on amu
+           ;; posix_path, whose `pop` is `(vector-take v (- (vector-count v) 1))`.
+           ;;
+           ;; The prefix is the `bytes-slice` slot's VIEW of [0, n): the same
+           ;; intern-without-copy that `vector-drop` answers for a suffix, over
+           ;; the one vector arena bytes and vectors share (ABI v11). The bound
+           ;; n in [0, count] is checked HERE, in emitted code, before the slot
+           ;; is reached, so an out-of-range take traps as a vector read out of
+           ;; range (the unnamed signal `vector-drop` gives) and never reports
+           ;; the slot's `bytes/slice-bounds`, which would name the wrong
+           ;; operation. The view aliases its parent, so `kotoba.native.affine`
+           ;; counts `vector-take` as consuming, beside `vector-drop`.
+           (and (contains? '#{vector-take vector-f64-take} op) (= 2 (count args)))
+           (let [items (gensym "vector__"), n (gensym "take__")]
+             (list 'let [items (first args) n (second args)]
+                   (list 'if (list 'if (list '< n 0) 0
+                                   (list '<= n (list 'vector-count items)))
+                         (list 'bytes-slice items 0 n)
+                         (list 'vector-at (list 'vector-new-empty) 0))))
            (contains? '#{vector-new vector-f64-new} op)
            (reduce (fn [items item] (list 'vector-conj items item))
                    (list 'vector-new-empty) args)

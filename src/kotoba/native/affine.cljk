@@ -68,7 +68,10 @@
   else. Admitting it as non-consuming would make the one operation that
   ALIASES the safe one."
   '#{vector-assoc vector-f64-assoc vector-conj vector-f64-conj
-     vector-drop vector-f64-drop})
+     vector-drop vector-f64-drop
+     ;; `vector-take` answers a view of a PREFIX (machine_ir lowers it onto
+     ;; the bytes-slice view), so it aliases for `vector-drop`'s reason.
+     vector-take vector-f64-take})
 
 (def reading
   "Operations that observe without consuming."
