@@ -533,16 +533,17 @@
                    kernel-dequant-dot-q6-k]]
       (is (pos? (count (code head))) (str head)))))
 
-(deftest the-family-is-seven-formats-and-three-of-them-emit
+(deftest the-family-is-eight-formats-and-four-of-them-emit
+  ;; dequant-ptq1: PTQ1_0 (ADR 0088) is the eighth, and the fourth to emit.
   (let [table @#'mir/x86-dequant-formats]
-    (is (= 7 (count table)))
-    (is (= 3 (count (filter :emitted? (vals table)))))
+    (is (= 8 (count table)))
+    (is (= 4 (count (filter :emitted? (vals table)))))
     (testing "and every stride is distinct"
       ;; Two formats with the same stride derive the same span from the same
       ;; count, and one of them reads the wrong bytes without tripping any
       ;; length check.
-      (is (= 7 (count (distinct (map :block-bytes (vals table)))))))
+      (is (= 8 (count (distinct (map :block-bytes (vals table)))))))
     (testing "every block is a whole number of eight-element groups"
-      ;; What makes the tail impossible, for all seven.
+      ;; What makes the tail impossible, for all eight.
       (doseq [[encoding {:keys [block-elements]}] table]
         (is (zero? (mod block-elements 8)) (str encoding))))))
