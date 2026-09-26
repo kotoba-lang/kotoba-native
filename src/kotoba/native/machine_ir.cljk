@@ -15,6 +15,7 @@
             [kotoba.native.aggregate-abi :as aggregate-abi]
             [kotoba.native.image-scratch :as image-scratch]
             [kotoba.native.interrupt-abi :as interrupt-abi]
+            [kotoba.native.document :as document]
             [kotoba.native.string-index :as string-index]
             [kotoba.native.string-search :as string-search]
             #?(:cljs [kotoba.kir.cljs-i64 :as i64])))
@@ -1310,10 +1311,22 @@
                                    (list '< index (list 'vector-count items)))
                          (list 'vector-at items index)
                          fallback)))
+           ;; `(name k)`: the text after the namespace's `/` when there is
+           ;; one (the first `/`, as Clojure's Symbol/intern splits it; `:/`
+           ;; is the name "/"), else after the `:`. Until 2026-09-26 this was
+           ;; everything after the `:`, so `(keyword-name :ns/n)` answered
+           ;; "ns/n" natively and "n" on the reference -- and the sealed
+           ;; oracle could not see it, because the verifier compares the
+           ;; oracle with itself, not with the code (measured while
+           ;; qualifying native documents, selfhost foundation gap 2).
            (and (= op 'keyword-name) (= 1 (count args)))
-           (let [subject (gensym "keyword__")]
-             (list 'let [subject (first args)]
-                   (list 'string-substring subject 1
+           (let [subject (gensym "keyword__") slash (gensym "slash__")]
+             (list 'let [subject (first args)
+                         slash (list 'string-find-byte subject 47 1)]
+                   (list 'string-substring subject
+                         (list 'if (list '< slash 0) 1
+                               (list 'if (list '= (list 'string-byte-length subject) 2) 1
+                                     (list '+ slash 1)))
                          (list 'string-byte-length subject))))
            (and (= op 'keyword-from-string) (= 1 (count args)))
            (list 'string-concat ":" (first args))
@@ -1331,12 +1344,13 @@
                           string-index-contains 2 string-index-get 2
                           string-index-assoc 3} op)))
            (normalize-surface-operations (string-index/lower op args))
-           ;; Native `:document` is a string-shaped pair handle over UTF-8
-           ;; EDN bytes. These casts are identity at the ABI; the host
-           ;; inject reads and interns the same pair.
-           (and (contains? '#{document-edn-read document-edn-print} op)
-                (= 1 (count args)))
-           (first args)
+           ;; Native `:document` is a string-shaped pair handle over its
+           ;; canonical UTF-8 EDN text (`kotoba.native.document`, gap 2 of
+           ;; the selfhost foundation): the EDN casts are identity at the ABI
+           ;; and every other operation is a rewrite onto the string slots
+           ;; and the document helpers `augment-functions` appends.
+           (contains? document/operations op)
+           (normalize-surface-operations (document/lower op args))
            :else form))))
    body))
 
