@@ -88,22 +88,26 @@
             ;; C3, second half
             :pread64 17 :fchmod 91 :fsync 74 :getrandom 318 :pipe2 293
             :clone 56 :dup3 292 :close-range 436 :prctl 157 :fchdir 81
-            :execve 59 :wait4 61 :kill 62 :ppoll 271}
+            :execve 59 :wait4 61 :kill 62 :ppoll 271
+            ;; the :fs/app-data OWNER form (2026-09-26)
+            :geteuid 107}
    :aarch64 {:write 64 :rt-sigaction 134 :sigaltstack 132 :exit-group 94
              :read 63 :close 57 :fstat 80 :getdents64 61 :getcwd 17 :openat 56
              :openat2 437 :mkdirat 34 :unlinkat 35 :renameat2 276
              :clock-gettime 113
              :pread64 67 :fchmod 52 :fsync 82 :getrandom 278 :pipe2 59
              :clone 220 :dup3 24 :close-range 436 :prctl 167 :fchdir 50
-             :execve 221 :wait4 260 :kill 129 :ppoll 73}})
+             :execve 221 :wait4 260 :kill 129 :ppoll 73
+             :geteuid 175}})
 
 ;; The open(2) flag bits that differ between the two ABIs, and where
-;; `struct stat` keeps st_mode (x86-64's own layout vs asm-generic). Mechanism:
-;; the numbers the kernel reads, not a choice. st_size, st_blocks and st_mtime
-;; sit at 48 / 64 / 88 in both.
+;; `struct stat` keeps st_mode and st_uid (x86-64's own layout vs
+;; asm-generic: x86-64 puts st_nlink as 8 bytes BEFORE st_mode, asm-generic
+;; as 4 bytes after it). Mechanism: the numbers the kernel reads, not a
+;; choice. st_size, st_blocks and st_mtime sit at 48 / 64 / 88 in both.
 (def ^:private isa-abi
-  {:x86_64 {:o-directory 65536 :o-nofollow 131072 :stat-mode 24}   ; 0200000 0400000
-   :aarch64 {:o-directory 16384 :o-nofollow 32768 :stat-mode 16}}) ; 040000 0100000
+  {:x86_64 {:o-directory 65536 :o-nofollow 131072 :stat-mode 24 :stat-uid 28}   ; 0200000 0400000
+   :aarch64 {:o-directory 16384 :o-nofollow 32768 :stat-mode 16 :stat-uid 24}}) ; 040000 0100000
 
 ;; SA_ONSTACK | SA_RESTORER. x86-64 refuses to deliver a signal to a handler
 ;; installed without SA_RESTORER (the frame's return address would be
@@ -917,12 +921,14 @@
 
 (def ^:private fs-tokens
   "The :fs/app-data request tokens, in the index order of
-  linux_static_handlers.kotoba op 1 (the loader's test order). The last three
-  are C3's proposed forms (kotoba-lang lang/capability-catalog.edn
-  :fs/app-data :forms), which the kexe loader does not answer yet."
+  linux_static_handlers.kotoba op 1 (the loader's test order). Token K is
+  form K+1. FSYNC, MKTEMP and NOFOLLOW were C3's proposals; OWNER_SEP (form
+  15, S5's proposal, 2026-09-26) is the last (kotoba-lang
+  lang/capability-catalog.edn :fs/app-data :forms). The kexe loader answers
+  every one of them from the same decisions."
   ["WRITE_SEP" "APPEND_SEP" "EXISTS_SEP" "RANGE_SEP" "STAT_SEP" "MTIME_SEP"
    "CHMOD_SEP" "MKDIR_SEP" "UNLINK_SEP" "RMDIR_SEP" "RENAME_SEP"
-   "FSYNC_SEP" "MKTEMP_SEP" "NOFOLLOW_SEP"])
+   "FSYNC_SEP" "MKTEMP_SEP" "NOFOLLOW_SEP" "OWNER_SEP"])
 
 (def ^:private unimplemented-forms
   "Forms op 2 answers 0 for, and the name their trap carries. None since the
@@ -966,7 +972,7 @@
   `layout` gives the bss regions; `message!` registers a text constant."
   [isa plan layout c message!]
   (let [sys-nr (get syscalls isa)
-        {:keys [o-directory o-nofollow stat-mode]} (get isa-abi isa)
+        {:keys [o-directory o-nofollow stat-mode stat-uid]} (get isa-abi isa)
         {:keys [o-wronly o-creat o-trunc o-cloexec o-path resolve at-fdcwd at-removedir
                 o-append o-rdonly sigchld sigkill wnohang pollin close-range-cloexec
                 pr-set-no-new-privs]} open-flags
@@ -1676,12 +1682,35 @@
                      [[:mov :t1 :t0]] (append-field false)
                      [[:li :s1 answer] [:ld :s2 :s0 (st :x2)]]
                      (intern) (finish)
+                     [[:label no]] (intern-label zero-label 0) (finish)))
+           ;; 15 owner (S5's proposal, 2026-09-26): the final component
+           ;; ITSELF, opened O_PATH | O_NOFOLLOW as stat-nofollow is, then
+           ;; "<st_uid> <geteuid()>"; "" when absent. The errno meaning is op
+           ;; 12 form 15. The static image has no seccomp filter; geteuid(2)
+           ;; cannot fail.
+           (let [oo (L "oopen") no (L "ow-no")]
+             (concat [[:label (forms 15)] [:label oo]]
+                     (open-at [:f :rel-a] (+ o-path o-nofollow o-cloexec) 0)
+                     (outcome 15 0 oo no)
+                     [[:st :t0 :s0 (st :fd)]]
+                     (sys :fstat [:f :fd] stat-buf)
+                     [[:st :t0 :s0 (st :x0)]]
+                     (sys :close [:f :fd])
+                     [[:ld :t0 :s0 (st :x0)]]
+                     (outcome 15 4 ::bad no)
+                     [[:li :t0 0] [:st :t0 :s0 (st :x2)]
+                      [:li :t1 stat-buf] [:ld :t1 :t1 stat-uid] [:shli :t1 32] [:shri :t1 32]]
+                     (append-field true)
+                     (sys :geteuid)
+                     [[:mov :t1 :t0]] (append-field false)
+                     [[:li :s1 answer] [:ld :s2 :s0 (st :x2)]]
+                     (intern) (finish)
                      [[:label no]] (intern-label zero-label 0) (finish)))))
         fs-app-data
         (let [tok-loop (L "tok") tok-next (L "tok-next") scan (L "scan") scan-no (L "scan-no")
               scan-done (L "scan-done") scan-hit (L "scan-hit") wfirst (L "wfirst") wf-done (L "wf-done")
               path-len (L "plen") path-read (L "pread") fail (L "fs-fail") exists-fail (L "ex-fail")
-              forms (into {} (map (fn [f] [f (L (str "form-" f))])) (range 15))
+              forms (into {} (map (fn [f] [f (L (str "form-" f))])) (range 16))
               cmpl (L "tcmp") matched (L "tmatch") dup (L "tdup")]
           (vec
            (concat
