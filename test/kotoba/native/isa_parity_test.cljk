@@ -422,7 +422,7 @@
         (is (instance? ExceptionInfo thrown)
             (str label " must reject with ex-info, got "
                  (some-> thrown type pr-str)))
-        (is (= "aggregate ABI rejected: call-abi-not-admitted"
+        (is (= "aggregate ABI rejected: call-abi-not-admitted: native has no lowering for the operation `no-such-operator`"
                (ex-message thrown)))
         (is (= :call-abi-not-admitted (:problem (ex-data thrown))))
         (is (= :aggregate-abi (:phase (ex-data thrown))))))))
