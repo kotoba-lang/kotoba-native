@@ -266,7 +266,15 @@
       (is (= "/" (:fs-scope (linux-static/package (art io-effects) profile (assoc opts :fs-scope "/"))))))
     (testing "an effect that is not a capability call"
       (is (= :effect-not-capability
-             (:reason (reason-of #(linux-static/package (art [[:abort 1]]) profile opts))))))))
+             (:reason (reason-of #(linux-static/package (art [[:abort 1]]) profile opts)))))
+      (is (= :effect-not-capability
+             (:reason (reason-of #(linux-static/package (art [:aborts]) profile opts))))
+          "a keyword that is not a pure ability"))
+    (testing "a pure ability (:abort, :state) needs no handler and seals no grant (2026-09-26)"
+      (let [image (linux-static/package (art (conj io-effects :abort :state)) profile opts)]
+        (is (= (:grant (linux-static/package (art io-effects) profile opts)) (:grant image)))
+        (is (= (:bytes (linux-static/package (art io-effects) profile opts)) (:bytes image))
+            "the image is the one the capability effects alone make")))))
 
 ;; C3, second half (2026-09-25): :process/spawn's grant is sealed from the
 ;; compile policy like the fs scope, and refused when it could be misread.
