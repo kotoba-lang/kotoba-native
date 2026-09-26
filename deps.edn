@@ -48,12 +48,16 @@
          ;; one row red for a defect that is not in this repository.
          ;; Advanced 2026-09-25, 1a81e2d7 -> 353dd5f3 (osaho main, ahead 64, forward only):
          ;; the bytes heads admitted on native (native-bytes-operations) and their reference semantics (context ABI v11, superproject adr-2609242330).
-         :git/sha "353dd5f30bf803528f355f3b8090413a71e51bc8"}
+         ;; Advanced 2026-09-26, 353dd5f3 -> 1bb61f3d (osaho main, forward only):
+         ;; kernel-dequant-dot-ptq1-0, PTQ1_0 in the fused dequant family (ADR 0088).
+         :git/sha "1bb61f3d5616dcf638915c24236669a1ece7250d"}
         io.github.kotoba-lang/kotoba-gmir
         {:git/url "https://github.com/kotoba-lang/kotoba-gmir.git"
          ;; Advanced 2026-09-25, cf39f7c1 -> 47763164 (kotoba-gmir main, ahead 4, forward only):
          ;; the four ABI v11 runtime arities (context ABI v11, superproject adr-2609242330).
-         :git/sha "47763164ceec7be14d67fc35ef619f71d383eab9"}
+         ;; Advanced 2026-09-26, 47763164 -> 8e0c3a23 (kotoba-gmir main, forward only):
+         ;; kernel-dequant-dot-ptq1-0, PTQ1_0 in the fused dequant family (ADR 0088).
+         :git/sha "8e0c3a23a54d761be65c93246c498821da149461"}
         ;; kotoba-mir 4bf67c0: call+loop uses the scanner (:call-live), the
         ;; conservative fallback colors frame slots from CFG liveness, and
         ;; pure integer SSA segments are scheduled per basic block after physical
@@ -142,7 +146,9 @@
          ;; literal's reason had stopped holding a few hours earlier.
          ;; Advanced 2026-09-25, 6d92aea9 -> 67a83d06 (kotoba-mir main, ahead 6, forward only):
          ;; offsets 352-376 (context ABI v11, superproject adr-2609242330).
-         :git/sha "67a83d0635e8502acab7f56cb6c4cf50f31de575"}
+         ;; Advanced 2026-09-26, 67a83d06 -> abb72f61 (kotoba-mir main, forward only):
+         ;; kernel-dequant-dot-ptq1-0, PTQ1_0 in the fused dequant family (ADR 0088).
+         :git/sha "abb72f61633c78780345559f1b877b34ef4a3c1a"}
         io.github.kotoba-lang/kotoba-codegen
         {:git/url "https://github.com/kotoba-lang/kotoba-codegen.git"
          ;;
@@ -158,7 +164,9 @@
          ;; than 7 (ADR measures from the instruction itself), and a maximum
          ;; of 0xfffff rather than a branch's 0xffffc (ADR's displacement is
          ;; in BYTES).
-         :git/sha "9a54c2496f8d185223ca89b1fc1817f4f9c5bf19"}
+         ;; Advanced 2026-09-26, 9a54c249 -> dabdc0b9 (kotoba-codegen main, forward only):
+         ;; kernel-dequant-dot-ptq1-0, PTQ1_0 in the fused dequant family (ADR 0088).
+         :git/sha "dabdc0b966412211a58db4c57b230b819b8193d7"}
         io.github.kotoba-lang/kotoba-object
         {:git/url "https://github.com/kotoba-lang/kotoba-object.git"
          :git/sha "9b53a444cfe5550af6b76eef494b4190b5e4e461"}

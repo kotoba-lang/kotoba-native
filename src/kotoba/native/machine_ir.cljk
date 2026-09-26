@@ -785,7 +785,9 @@
    'kernel-dequant-dot-iq4-xs [:gmir/kernel-dequant-dot-iq4-xs 65536 5]
    'kernel-dequant-dot-iq2-s [:gmir/kernel-dequant-dot-iq2-s 65536 5]
    'kernel-dequant-dot-iq3-xxs [:gmir/kernel-dequant-dot-iq3-xxs 65536 5]
-   'kernel-dequant-dot-iq3-s [:gmir/kernel-dequant-dot-iq3-s 65536 5]})
+   'kernel-dequant-dot-iq3-s [:gmir/kernel-dequant-dot-iq3-s 65536 5]
+   ;; dequant-ptq1: PTQ1_0 (kotoba-gmir ADR 0031, this repo's ADR 0088).
+   'kernel-dequant-dot-ptq1-0 [:gmir/kernel-dequant-dot-ptq1-0 65536 5]})
 
 (def ^:private kir-region-pair-ops
   "Every head whose operands are `base length second-base second-length
@@ -3489,7 +3491,12 @@
    ;; `(v << 28) >>> 28` is `v & 0xF`, and it costs a register this arm does
    ;; not have rather than an instruction it does.
    :vpslld-imm8    {:opcode 0x72 :map :0f   :pp :66   :l 256 :w 0 :extension 6}
-   :vpor           {:opcode 0xeb :map :0f   :pp :66   :l 256 :w 0}})
+   :vpor           {:opcode 0xeb :map :0f   :pp :66   :l 256 :w 0}
+   ;; dequant-ptq1: `vmovq xmm, r64` -- `:vmovd-from-gpr` with W1, the same
+   ;; opcode moving EIGHT bytes. PTQ1_0's last group takes its eight digits
+   ;; from two bytes at four different powers, which no load can gather, so
+   ;; they are assembled in a general register and moved across in one go.
+   :vmovq-from-gpr {:opcode 0x6e :map :0f   :pp :66   :l 128 :w 1}})
 
 (defn- x86-avx-form [instruction]
   (let [form (get x86-avx-forms instruction)]
@@ -5275,7 +5282,11 @@
    :x86-64/kernel-dequant-dot-iq3-xxs {:block-bytes 98 :block-elements 256
                                        :emitted? false}
    :x86-64/kernel-dequant-dot-iq3-s {:block-bytes 110 :block-elements 256
-                                     :emitted? false}})
+                                     :emitted? false}
+   ;; dequant-ptq1: emitted. A code is a base-3 digit, so there is no table
+   ;; to place -- see `x86-dequant-ptq1-0-groups` (ADR 0088).
+   :x86-64/kernel-dequant-dot-ptq1-0 {:block-bytes 28 :block-elements 128
+                                      :emitted? true}})
 
 (def ^:private x86-dequant-magic
   "2^112 as binary32: exponent field 112+127 = 239, mantissa zero.
@@ -5568,6 +5579,112 @@
               (x86-sse-rr 0xf3 0x58 (mod e 4) 4)))
            (range 8))))))
 
+;; ── dequant-ptq1: PTQ1_0's geometry (ADR 0088) ──────────────────────────────
+;;
+;; A 28-byte block: `qs[24]` at 0 holding five base-3 digits per byte, `qh[2]`
+;; at 24 holding four, then `d` as fp16 at 26. `dequantize_row_ptq1_0`
+;; (PrismML-Eng/llama.cpp @9a9394a8, `ggml/src/ggml-quants.c:2255`) writes
+;; three stages: qs[m] for digit n 0..4, m 0..15; qs[16+m] for n 0..4, m 0..7;
+;; qh[h] for n 0..3, h 0..1. Digit n of a byte is `((byte*3^n) & 255)*3 >> 8`
+;; and the weight is `(digit - 1) * d`.
+;;
+;; So fifteen of the sixteen eight-element groups read EIGHT CONSECUTIVE BYTES
+;; AT ONE DIGIT, which is a load and a widening. The sixteenth reads qh[0] and
+;; qh[1] alternately at digits 0,0,1,1,2,2,3,3, which no load can gather.
+
+(defn- ptq1-0-element
+  "Where element E of a PTQ1_0 block comes from: [byte-offset digit]."
+  [e]
+  (cond (< e 80) [(mod e 16) (quot e 16)]
+        (< e 120) [(+ 16 (mod (- e 80) 8)) (quot (- e 80) 8)]
+        :else [(+ 24 (mod (- e 120) 2)) (quot (- e 120) 2)]))
+
+(def ^:private x86-dequant-ptq1-0-groups
+  "Each of a PTQ1_0 block's sixteen eight-element groups. `:q-offset` and
+  `:digit` are set only where all eight lanes share a digit and read
+  consecutive bytes; the one group that does not is `:gathered? true`."
+  (mapv (fn [g]
+          (let [lanes (mapv #(ptq1-0-element (+ (* 8 g) %)) (range 8))
+                [[b0 n0]] lanes
+                uniform? (= lanes (mapv (fn [j] [(+ b0 j) n0]) (range 8)))]
+            (cond-> {:group g :x-offset (* 32 g) :lanes lanes}
+              uniform? (assoc :q-offset b0 :digit n0)
+              (not uniform?) (assoc :gathered? true))))
+        (range 16)))
+
+(def ^:private ptq1-0-powers [1 3 9 27 81])
+
+(defn- x86-ptq1-0-digit
+  "Digit N of the byte at OPERAND, in RAX, as an integer 0..2.
+  `((byte * 3^n) & 255) * 3 >> 8`, and every step is 64-bit on a value below
+  2^16, so none of them can wrap."
+  [operand n]
+  (vec (concat (x86-movzx-byte-mem :x86-64/rax operand)
+               (when (pos? n) (x86-imul-imm :x86-64/rax :x86-64/rax (nth ptq1-0-powers n)))
+               (x86-alu-imm 4 :x86-64/rax 255)
+               (x86-imul-imm :x86-64/rax :x86-64/rax 3)
+               (x86-shift-imm 5 :x86-64/rax 8))))
+
+(defn- x86-dequant-ptq1-0-group
+  "Eight PTQ1_0 elements into the accumulators. `y = (digit - 1) * d`, one
+  exact multiply, then `* x` and the add -- the operation order of every other
+  format.
+
+  VEX arm: d is broadcast in ymm3, 255 in ymm4, 1 in ymm5. `3t` is `4t - t`
+  (`vpslld` then `vpsubd`), so the digit extraction needs no integer multiply
+  form. The gathered group builds its eight digits as bytes in RDX and moves
+  them across with `vmovq`. Legacy arm: d is xmm6 (`work`), one element at a
+  time in RAX, element e into accumulator e mod 4."
+  [vex? pw px {:keys [x-offset lanes q-offset digit gathered?]}]
+  (let [times-three-mod (fn []
+                          (concat
+                           (x86-vex-rr (x86-avx-form :vpslld-imm8) {:vvvv 2 :rm 1 :imm8 2})
+                           (x86-vex-rr (x86-avx-form :vpsubd) {:reg 1 :vvvv 2 :rm 1})))]
+    (if vex?
+      (vec (concat
+            (if gathered?
+              (concat
+               (mapcat (fn [j [offset n]]
+                         (concat (x86-ptq1-0-digit {:base pw :disp offset} n)
+                                 (if (zero? j)
+                                   (x86-rr 0x89 :x86-64/rdx :x86-64/rax)
+                                   (concat (x86-shift-imm 4 :x86-64/rax (* 8 j))
+                                           (x86-rr 0x09 :x86-64/rdx :x86-64/rax)))))
+                       (range 8) lanes)
+               (x86-vex-rr (x86-avx-form :vmovq-from-gpr) {:reg 1 :rm :x86-64/rdx})
+               (x86-vex-rr (x86-avx-form :vpmovzxbd) {:reg 1 :rm 1}))
+              (concat
+               (x86-vex-rm (x86-avx-form :vpmovzxbd)
+                           {:reg 1 :operand {:base pw :disp q-offset}})
+               ;; t <- 3t mod 256, DIGIT times: byte * 3^n mod 256
+               (mapcat (fn [_]
+                         (concat (times-three-mod)
+                                 (x86-vex-rr (x86-avx-form :vpand) {:reg 1 :vvvv 1 :rm 4})))
+                       (range digit))
+               ;; then 3t >> 8
+               (times-three-mod)
+               (x86-vex-rr (x86-avx-form :vpsrld-imm8) {:vvvv 1 :rm 1 :imm8 8})))
+            (x86-vex-rr (x86-avx-form :vpsubd) {:reg 1 :vvvv 1 :rm 5})
+            (x86-vex-rr (x86-avx-form :vcvtdq2ps) {:reg 1 :rm 1})
+            (x86-vex-rr (x86-avx-form :vmulps) {:reg 1 :vvvv 1 :rm 3})
+            (x86-vex-rm (x86-avx-form :vmovups-load)
+                        {:reg 2 :operand {:base px :disp x-offset}})
+            (x86-vex-rr (x86-avx-form :vmulps) {:reg 1 :vvvv 1 :rm 2})
+            (x86-vex-rr (x86-avx-form :vextractf128) {:reg 1 :rm 2 :imm8 1})
+            (x86-vex-rr (x86-avx-form :vaddps-128) {:reg 0 :vvvv 0 :rm 1})
+            (x86-vex-rr (x86-avx-form :vaddps-128) {:reg 0 :vvvv 0 :rm 2})))
+      (vec (mapcat
+            (fn [e [offset n]]
+              (concat
+               (x86-ptq1-0-digit {:base pw :disp offset} n)
+               (x86-alu-imm 5 :x86-64/rax 1)
+               (x86-cvtsi2 0xf3 4 :x86-64/rax)
+               (x86-sse-rr 0xf3 0x59 4 6)
+               (x86-sse-rm 0xf3 0x10 5 {:base px :disp (+ x-offset (* 4 e))})
+               (x86-sse-rr 0xf3 0x59 4 5)
+               (x86-sse-rr 0xf3 0x58 (mod e 4) 4)))
+            (range 8) lanes)))))
+
 (defn- x86-kernel-dequant-dot
   [encoding instruction-index
    {:mir/keys [dst base length second-base second-length maximum] :as instruction}]
@@ -5645,12 +5762,22 @@
         ;; -32, which its codes are biased by; the others need nothing.
         arm-prologue
         (fn [vex?]
-          (if (and vex? (= encoding :x86-64/kernel-dequant-dot-q6-k))
+          (cond
+            (and vex? (= encoding :x86-64/kernel-dequant-dot-q6-k))
             (vec (concat
                   (x86-mov-imm :x86-64/rax 32)
                   (x86-vex-rr (x86-avx-form :vmovd-from-gpr) {:reg 5 :rm :x86-64/rax})
                   (x86-vex-rr (x86-avx-form :vpbroadcastd) {:reg 5 :rm 5})))
-            []))
+            ;; dequant-ptq1: the byte mask and the digit bias, broadcast once.
+            (and vex? (= encoding :x86-64/kernel-dequant-dot-ptq1-0))
+            (vec (concat
+                  (x86-mov-imm :x86-64/rax 255)
+                  (x86-vex-rr (x86-avx-form :vmovd-from-gpr) {:reg 4 :rm :x86-64/rax})
+                  (x86-vex-rr (x86-avx-form :vpbroadcastd) {:reg 4 :rm 4})
+                  (x86-mov-imm :x86-64/rax 1)
+                  (x86-vex-rr (x86-avx-form :vmovd-from-gpr) {:reg 5 :rm :x86-64/rax})
+                  (x86-vex-rr (x86-avx-form :vpbroadcastd) {:reg 5 :rm 5})))
+            :else []))
         ;; dequant-iq: ONE BLOCK, per arm. Q8_0's four groups are a loop and
         ;; the K-quants' thirty-two are unrolled; the difference is the
         ;; formats' and is written out above `x86-dequant-q4-k-groups`.
@@ -5714,6 +5841,22 @@
                     (mapcat (fn [geometry]
                               (x86-dequant-q6-k-group vex? pw px geometry))
                             x86-dequant-q6-k-groups)
+                    (x86-alu-imm 0 pw block-bytes)
+                    (x86-alu-imm 0 px element-span)
+                    (x86-alu-imm 5 remaining 1)))
+
+              ;; dequant-ptq1: one scale per block, at the END of it.
+              :x86-64/kernel-dequant-dot-ptq1-0
+              (vec (concat
+                    (half "" {:base pw :disp 26})
+                    (if vex?
+                      (concat
+                       (x86-vex-rr (x86-avx-form :vmovd-from-gpr) {:reg 3 :rm :x86-64/rax})
+                       (x86-vex-rr (x86-avx-form :vbroadcastss) {:reg 3 :rm 3}))
+                      (x86-gpr-to-xmm32 work :x86-64/rax))
+                    (mapcat (fn [geometry]
+                              (x86-dequant-ptq1-0-group vex? pw px geometry))
+                            x86-dequant-ptq1-0-groups)
                     (x86-alu-imm 0 pw block-bytes)
                     (x86-alu-imm 0 px element-span)
                     (x86-alu-imm 5 remaining 1))))))]
@@ -5859,7 +6002,10 @@
    :aarch64/kernel-dequant-dot-iq3-xxs {:block-bytes 98 :block-elements 256
                                         :emitted? false}
    :aarch64/kernel-dequant-dot-iq3-s {:block-bytes 110 :block-elements 256
-                                      :emitted? false}})
+                                      :emitted? false}
+   ;; dequant-ptq1: not emitted on this backend yet (ADR 0088). K16 is x86.
+   :aarch64/kernel-dequant-dot-ptq1-0 {:block-bytes 28 :block-elements 128
+                                       :emitted? false}})
 
 ;; MUL Xd, Xn, Xm -- MADD with XZR as the addend. The block count is already
 ;; bounded by `block-limit` before either product is formed, so neither can
@@ -7464,7 +7610,8 @@
      :aarch64/kernel-dequant-dot-iq4-xs
      :aarch64/kernel-dequant-dot-iq2-s
      :aarch64/kernel-dequant-dot-iq3-xxs
-     :aarch64/kernel-dequant-dot-iq3-s)
+     :aarch64/kernel-dequant-dot-iq3-s
+     :aarch64/kernel-dequant-dot-ptq1-0)
     (a64-kernel-dequant-dot encoding instruction-index instruction)
     (:aarch64/equal :aarch64/less-than :aarch64/greater-than
      :aarch64/less-or-equal :aarch64/greater-or-equal)
@@ -7687,7 +7834,8 @@
      :x86-64/kernel-dequant-dot-iq4-xs
      :x86-64/kernel-dequant-dot-iq2-s
      :x86-64/kernel-dequant-dot-iq3-xxs
-     :x86-64/kernel-dequant-dot-iq3-s)
+     :x86-64/kernel-dequant-dot-iq3-s
+     :x86-64/kernel-dequant-dot-ptq1-0)
     (x86-kernel-dequant-dot encoding instruction-index instruction)
     :x86-64/kernel-subregion (x86-kernel-subregion instruction-index instruction)
     (:x86-64/equal :x86-64/less-than :x86-64/greater-than
