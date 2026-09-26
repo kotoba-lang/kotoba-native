@@ -10,6 +10,7 @@
             [kotoba.native.machine-ir :as machine-ir]
             [kotoba.native.peephole :as peephole]
             [kotoba.native.keyword-equality :as keyword-equality]
+            [kotoba.native.document :as document]
             [kotoba.native.string-index :as string-index]
             [kotoba.native.string-search :as string-search]
             [kotoba.native.vector-region :as vector-region]
@@ -2335,7 +2336,8 @@
                 keyword-equality/rewrite-program
                 vector-region/rewrite-program
                 (update :functions #(-> % string-search/augment-functions
-                                           string-index/augment-functions))
+                                           string-index/augment-functions
+                                           document/augment-functions))
                 (#(if (:exports %) %
                       (assoc % :exports (mapv :name (:functions %))))))]
     (machine-ir/compile-kir-module
