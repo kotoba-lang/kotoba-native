@@ -3020,7 +3020,7 @@
                                           (:gmir/op instruction)))
                              (:gmir/instructions %))
                       (:gmir/functions module)))))
-         (catch js/Error _ false)))
+         (catch #?(:clj Exception :cljs js/Error) _ false)))
 
 ;; ── MC -> bytes ──────────────────────────────────────────────────────────────
 
