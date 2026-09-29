@@ -1167,7 +1167,11 @@
        (ascii-literal? (second form))))
 
 (defn- hex-of-bytes [bytes]
-  (apply str (map #(let [h (.toString (int %) 16)] (if (= 1 (count h)) (str "0" h) h)) bytes)))
+  (apply str
+         (map #(let [h #?(:clj (Integer/toHexString (int %))
+                          :cljs (.toString (int %) 16))]
+                 (if (= 1 (count h)) (str "0" h) h))
+              bytes)))
 
 (defn- literal-walk-window [n]
   (first (filter #(>= % n) (sort gmir/kernel-window-maxima))))
