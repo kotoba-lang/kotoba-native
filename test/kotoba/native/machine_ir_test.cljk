@@ -864,6 +864,24 @@
     (doseq [target [:x86-64 :aarch64]]
       (is (seq (:mc/functions (machine/compile-gmir target gmir))) target))))
 
+(deftest a-typed-list-built-at-run-time-lowers-to-the-word-arena
+  ;; `[:list T]` shares the word arena with `[:set T]`: new, conj (append) and
+  ;; nth lower to vector-conj / vector-at, so a list whose length is known only
+  ;; while the program runs compiles for both native targets. The same program
+  ;; ran to 1 on AArch64 (amu ADR 0354 / typed-list-conj).
+  (let [ints [:list :i64]
+        body (list 'let ['xs (list 'typed-list-conj ints
+                                   (list 'typed-list-conj ints (list 'typed-list-new ints) 7)
+                                   9)]
+                    (list '+ (list 'vector-count 'xs)
+                          (list 'typed-list-nth ints 'xs 1)))
+        module {:format :kotoba.kir/v4 :entry 'main :exports ['main]
+                :functions [{:name 'main :params [] :param-types []
+                             :result :i64 :body body}]}
+        gmir (machine/lower-kir-module module)]
+    (doseq [target [:x86-64 :aarch64]]
+      (is (seq (:mc/functions (machine/compile-gmir target gmir))) target))))
+
 (deftest capability-call-encoders-check-policy-before-the-host-call
   (let [x86-scalar (machine/compile-expression :x86-64 '[x] '(cap-call 7 x))
         x86-typed (machine/compile-expression

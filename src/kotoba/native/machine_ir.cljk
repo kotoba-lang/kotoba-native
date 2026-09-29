@@ -1338,6 +1338,18 @@
            (list 'vector-count (second args))
            (and (= op 'typed-set-nth) (= 3 (count args)))
            (list 'vector-at (second args) (nth args 2))
+           ;; `[:list T]` is the same word arena as a typed set: the items are
+           ;; words (i64s, string handles), appended at the end and read by
+           ;; index. `typed-list-conj` is what lets a program build a list whose
+           ;; length is known only while it runs; `vector-count` already walks
+           ;; the carrier, so no count head is needed.
+           (= op 'typed-list-new)
+           (reduce (fn [items item] (list 'vector-conj items item))
+                   (list 'vector-new-empty) (rest args))
+           (and (= op 'typed-list-conj) (= 3 (count args)))
+           (list 'vector-conj (second args) (nth args 2))
+           (and (= op 'typed-list-nth) (= 3 (count args)))
+           (list 'vector-at (second args) (nth args 2))
            (and (contains? '#{vector-get vector-f64-get} op)
                 (= 3 (count args)))
            (let [[items-form index-form fallback] args
