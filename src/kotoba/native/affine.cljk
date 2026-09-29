@@ -95,6 +95,10 @@
   that matters."
   '#{if cond case when when-not if-let when-let})
 
+(defn- symbol-set-contains? [items item]
+  #?(:kotoba (typed-set-contains [:set :symbol] items item)
+     :default (contains? items item)))
+
 (defn- sym-uses
   "How many times `target` can be used on the WORST SINGLE PATH through
   `form`.
@@ -105,7 +109,7 @@
   [form target]
   (cond
     (= form target) 1
-    (and (seq? form) (contains? branching (first form)) (< 2 (count form)))
+    (and (seq? form) (symbol-set-contains? branching (first form)) (< 2 (count form)))
     ;; The test runs on every path; the arms are alternatives. This does not
     ;; separate `cond`/`case` tests from their arms, which over-counts a test
     ;; and never under-counts an arm -- the safe direction.
@@ -121,13 +125,13 @@
 (defn- consuming-call?
   [form target]
   (and (seq? form)
-       (contains? consuming (first form))
+       (symbol-set-contains? consuming (first form))
        (= target (second form))))
 
 (defn- reading-call?
   [form target]
   (and (seq? form)
-       (contains? reading (first form))
+       (symbol-set-contains? reading (first form))
        (= target (second form))))
 
 (defn- position-ok?
