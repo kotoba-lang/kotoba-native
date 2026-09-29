@@ -210,7 +210,7 @@
        (let [pairs (vec (binding-pairs (second form)))
              body (drop 2 form)
              bound (set (map first pairs))]
-         (and (every? bound names)
+         (and (every? (fn [name] (symbol-set-contains? bound name)) names)
               ;; Every name in the thread is used at most once across all the
               ;; initialisers, only in vector-operation position, and linearly
               ;; in the body. A name read after the update that consumed it is
