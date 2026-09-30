@@ -204,6 +204,13 @@
                 (machine/compile-gmir :aarch64
                                       (machine/lower-kir-expression params body)))))))
 
+(defn- charged-body
+  "BODY as the production route compiles it: behind each constructor's one
+  unit of fuel (amu ADR 0353 floor :allocation-budget-native)."
+  [params body]
+  (-> {:functions [{:name 'main :params params :body body}]}
+      machine/charge-constructors :functions first :body))
+
 (deftest scalar-record-sroa-production-path-has-no-legacy-epilogue
   (let [params ['a]
         body '(let [r (if a
@@ -213,9 +220,10 @@
                    (record-get [:record :test/pair [[:x :i64] [:y :i64]]] r :y)))
         kir {:format :kotoba.kir/v4 :exports ['main]
              :functions [{:name 'main :params params :result :i64 :body body}]}
-        gmir (machine/lower-kir-expression params body)
-        x86-expression (machine/compile-expression :x86-64 params body)
-        arm-expression (machine/compile-expression :aarch64 params body)
+        charged (charged-body params body)
+        gmir (machine/lower-kir-expression params charged)
+        x86-expression (machine/compile-expression :x86-64 params charged)
+        arm-expression (machine/compile-expression :aarch64 params charged)
         x86-code (:code (x86/emit-program kir))
         arm-code (:code (arm/emit-program kir))]
     (is (= 2 (count (filter #(= :gmir/phi (:gmir/op %))
@@ -243,9 +251,10 @@
                                 [:flag payload (if payload 1 7)]]))
         kir {:format :kotoba.kir/v4 :exports ['main]
              :functions [{:name 'main :params params :result :i64 :body body}]}
-        gmir (machine/lower-kir-expression params body)
-        x86-expression (machine/compile-expression :x86-64 params body)
-        arm-expression (machine/compile-expression :aarch64 params body)
+        charged (charged-body params body)
+        gmir (machine/lower-kir-expression params charged)
+        x86-expression (machine/compile-expression :x86-64 params charged)
+        arm-expression (machine/compile-expression :aarch64 params charged)
         x86-code (:code (x86/emit-program kir))
         arm-artifact (arm/emit-program kir)
         arm-code (:code arm-artifact)

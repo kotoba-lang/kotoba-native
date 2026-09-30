@@ -1652,6 +1652,7 @@
   (let [kir (-> kir
                 keyword-equality/rewrite-program
                 vector-region/rewrite-program
+                machine-ir/charge-constructors
                 (update :functions #(-> % string-search/augment-functions
                                            string-index/augment-functions
                                            document/augment-functions))
