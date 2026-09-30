@@ -1534,6 +1534,33 @@
                    (nth (iterate (fn [handle] (list 'pair-second handle)) value)
                         index)))
 
+           ;; amu ADR 0353 floor :native-record-operations: an update is a
+           ;; fresh chain of the same record, every other field re-projected
+           ;; from the old one -- `hetero-vector-assoc`'s rewrite, over names.
+           ;; The operand is evaluated once, before the replacement, which is
+           ;; the reference's order.
+           (and (= op 'record-assoc) (= 4 (count args)))
+           (let [[type value field item] args
+                 fields (scalar-record-fields type)
+                 index (first (keep-indexed (fn [i [candidate _]]
+                                              (when (= candidate field) i))
+                                            fields))
+                 subject (gensym "record__"), replacement (gensym "record_item__")]
+             (when (or (nil? fields) (nil? index))
+               (reject! :record-boundary :invalid-update
+                        {:type type :field field}))
+             (list 'let [subject value replacement item]
+                   (reduce (fn [tail position]
+                             (list 'pair
+                                   (if (= position index)
+                                     replacement
+                                     (list 'pair-first
+                                           (nth (iterate (fn [handle] (list 'pair-second handle))
+                                                         subject)
+                                                position)))
+                                   tail))
+                           0 (reverse (range (count fields))))))
+
            :else form))))
    body))
 
@@ -2537,6 +2564,32 @@
                              {:form form :field field}))
                   [record-code (nth (:aggregate/values aggregate) field-index)])
 
+                ;; The slot bundle with one register replaced (amu ADR 0353
+                ;; floor :native-record-operations): nothing is allocated.
+                (and (seq? form) (= 'record-assoc (first form)) (= 5 (count form)))
+                (let [type (second form)
+                      fields (or (scalar-record-fields type)
+                                 (reject! :kir-to-gmir :unsupported-record-type
+                                          {:form form :type type}))
+                      [record-code aggregate] (value (nth form 2) env)
+                      field (nth form 3)
+                      field-index (first (keep-indexed
+                                          (fn [index [name _]]
+                                            (when (= name field) index))
+                                          fields))]
+                  (when-not (and (record-value? aggregate)
+                                 (= type (:aggregate/type aggregate)))
+                    (reject! :kir-to-gmir :record-type-mismatch
+                             {:form form :expected type :actual aggregate}))
+                  (when-not (some? field-index)
+                    (reject! :kir-to-gmir :unknown-record-field
+                             {:form form :field field}))
+                  (let [[item-code item] (value (nth form 4) env)]
+                    [(into (vec record-code) item-code)
+                     (record-value type
+                                   (assoc (:aggregate/values aggregate) field-index
+                                          (scalar-register! item form)))]))
+
                 (and (seq? form) (= 'variant-new (first form)) (= 4 (count form)))
                 (let [type (second form)
                       cases (or (scalar-variant-cases type)
@@ -2905,6 +2958,13 @@
                   (when (and fields (= type (shape (nth form 2) env))
                              (some #(= (nth form 3) (first %)) fields))
                     :scalar))
+
+                (and (seq? form) (= 'record-assoc (first form)) (= 5 (count form)))
+                (let [type (second form), fields (scalar-record-fields type)]
+                  (when (and fields (= type (shape (nth form 2) env))
+                             (some #(= (nth form 3) (first %)) fields)
+                             (= :scalar (shape (nth form 4) env)))
+                    type))
 
                 (and (seq? form) (= 'variant-new (first form)) (= 4 (count form)))
                 (let [type (second form), cases (scalar-variant-cases type)
