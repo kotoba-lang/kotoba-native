@@ -5,7 +5,7 @@
   lowers through closed GMIR/MIR/MC data; unknown operations, unsupported value
   shapes, use-before-definition, register exhaustion, and malformed labels fail
   closed before either ISA encoder."
-  {:kotoba/export [coalesce-program-moves compile-expression compile-gmir compile-kir-module counted-self-recur-plans encode-mc encode-mc-module entry-fuel-prefixes function-reenters-guest? hoist-program-consumers lower-kir-expression lower-kir-module lower-mc pilot-expression? pilot-module? signed-division-magic word-result-type?]}
+  {:kotoba/export [charge-constructors charged-constructors charges-written coalesce-program-moves compile-expression compile-gmir compile-kir-module counted-self-recur-plans encode-mc encode-mc-module entry-fuel-prefixes function-reenters-guest? hoist-program-consumers lower-kir-expression lower-kir-module lower-mc pilot-expression? pilot-module? signed-division-magic word-result-type?]}
   (:require [kotoba.bytes :as kbytes] [kotoba.lang.text :as str]
             [kotoba.lang.coll :as walk]
             [kotoba.gmir :as gmir]
@@ -906,6 +906,10 @@
 
 (def ^:private kir-runtime-ops
   {'pair :pair
+   ;; amu ADR 0353 floor :allocation-budget-native: the per-constructor fuel
+   ;; debit `charge-constructors` puts in front of every constructor. No KIR
+   ;; program names it; the frontend refuses the head.
+   'fuel-charge! :fuel-charge
    'pair-first :pair-first
    'pair-second :pair-second
    'kgraph-assert! :kgraph-assert!
@@ -1167,7 +1171,11 @@
        (ascii-literal? (second form))))
 
 (defn- hex-of-bytes [bytes]
-  (apply str (map #(let [h (.toString (int %) 16)] (if (= 1 (count h)) (str "0" h) h)) bytes)))
+  (apply str
+         (map #(let [h #?(:clj (Integer/toHexString (int %))
+                          :cljs (.toString (int %) 16))]
+                 (if (= 1 (count h)) (str "0" h) h))
+              bytes)))
 
 (defn- literal-walk-window [n]
   (first (filter #(>= % n) (sort gmir/kernel-window-maxima))))
@@ -3020,7 +3028,7 @@
                                           (:gmir/op instruction)))
                              (:gmir/instructions %))
                       (:gmir/functions module)))))
-         (catch js/Error _ false)))
+         (catch #?(:clj Exception :cljs js/Error) _ false)))
 
 ;; ── MC -> bytes ──────────────────────────────────────────────────────────────
 
@@ -6624,7 +6632,7 @@
 
 (def ^:private inline-runtime-operations
   #{:pair-first :pair-second :string-byte-length :vector-count :vector-at
-    :vector-assoc-in-place})
+    :vector-assoc-in-place :fuel-charge})
 
 (defn- a64-ldr-x16-context
   "ldr x16, [x7, #offset]"
@@ -6646,7 +6654,29 @@
         (a64-ldr-x16-context base-offset)
         (u32le 0x8b111210))))                                 ; add x16, x16, x17, lsl #4
 
+(declare a64-inline-handle-runtime)
+
+(defn- a64-fuel-charge
+  "The per-constructor fuel debit, the entry prefix's bytes with this
+  instruction's own label: ldr x16, [x7, #8]; subs x16, x16, #1; b.hs
+  present; brk #0; present: str x16, [x7, #8]. On exhaustion the counter
+  stays 0 and the loader reports budget/fuel, as for the entry charge."
+  [instruction-index]
+  (let [present (memory-label instruction-index "fuel-present")]
+    (vec (concat (u32le 0xf94004f0)
+                 (u32le 0xf1000610)
+                 [(layout/relative-branch :aarch64/b-hs-imm19 present)]
+                 (u32le 0xd4200000)
+                 [(layout/label present)]
+                 (u32le 0xf90004f0)))))
+
 (defn- a64-inline-runtime
+  [instruction-index runtime]
+  (if (= :fuel-charge runtime)
+    (a64-fuel-charge instruction-index)
+    (a64-inline-handle-runtime instruction-index runtime)))
+
+(defn- a64-inline-handle-runtime
   [instruction-index runtime]
   (let [trap (memory-label instruction-index "handle-trap")
         done (memory-label instruction-index "handle-done")
@@ -6706,7 +6736,28 @@
         [0x49 0xc1 0xe3 0x04]                                 ; shl r11, 4
         [0x4d 0x01 0xda])))                                   ; add r10, r11
 
+(declare x86-inline-handle-runtime)
+
+(defn- x86-fuel-charge
+  "The per-constructor fuel debit, the entry prefix's bytes with this
+  instruction's own label: dec qword [r9+8]; jns present; inc qword [r9+8];
+  ud2; present. The trap path puts the counter back to 0, so the loader
+  reports budget/fuel, as for the entry charge."
+  [instruction-index]
+  (let [present (memory-label instruction-index "fuel-present")]
+    (vec (concat [0x49 0xff 0x49 0x08]
+                 [(layout/relative-branch :x86-64/jns-rel8 present)]
+                 [0x49 0xff 0x41 0x08]
+                 [0x0f 0x0b]
+                 [(layout/label present)]))))
+
 (defn- x86-inline-runtime
+  [instruction-index runtime]
+  (if (= :fuel-charge runtime)
+    (x86-fuel-charge instruction-index)
+    (x86-inline-handle-runtime instruction-index runtime)))
+
+(defn- x86-inline-handle-runtime
   [instruction-index runtime]
   (let [trap (memory-label instruction-index "handle-trap")
         done (memory-label instruction-index "handle-done")
@@ -9642,9 +9693,62 @@
   #{:gmir/call :gmir/tail-call :gmir/runtime-call :gmir/capability-call})
 
 (defn function-reenters-guest?
-  "True when lowered instructions can invoke more guest or host work."
+  "True when lowered instructions can invoke more guest or host work. The
+  per-constructor fuel debit is a runtime call that does neither: it is the
+  charge, so it does not make a function pay an entry charge too."
   [instructions]
-  (boolean (some #(contains? guest-reentry-ops (:gmir/op %)) instructions)))
+  (boolean (some #(and (contains? guest-reentry-ops (:gmir/op %))
+                       (not= :fuel-charge (:gmir/runtime %)))
+                 instructions)))
+
+(def charged-constructors
+  "The reference's `cell-constructor-ops` (osaho kotoba.kir): every head
+  kotoba.kir debits one unit of fuel for, before it evaluates the operands
+  (amu ADR 0353 point 7). amu's native-constructors-charge-fuel-test pins
+  this set to the reference's."
+  '#{pair kgraph-assert! map-new map-assoc option-some result-ok result-err
+     result-ok-of result-err-of variant-new option-some-of option-none-of
+     hetero-vector-new hetero-vector-assoc typed-list-new typed-set-new
+     typed-set-conj typed-set-disj typed-map-new typed-map-assoc typed-map-dissoc
+     record-new record-assoc vector-new vector-conj vector-assoc vector-assoc!
+     bytes-slice bytes-concat bytes-from-vector-i64 vector-i64-from-bytes
+     vector-alloc vector-drop vector-take vector-f64-new vector-f64-conj
+     vector-f64-assoc vector-f64-drop vector-f64-take string-index-new
+     string-index-assoc disjoint-set-i64-new disjoint-set-i64-union
+     document-vector document-list document-set document-map})
+
+(defn charges-written
+  "KIR whose constructor charges are already written out as `(fuel-charge!)`,
+  which `charge-constructors` then leaves as it is. For a test that compares
+  a form with its hand-written lowering: a `record-new` costs one unit and
+  the pair chain it lowers to costs one per pair, so the hand-written form
+  must carry the source's charge, not its own."
+  [kir]
+  (vary-meta kir assoc ::charges-written true))
+
+(defn charge-constructors
+  "amu ADR 0353 floor :allocation-budget-native (ADR 0089). Put one unit of fuel in
+  front of every constructor of the program's own functions, as the
+  reference charges it: `(C args)` becomes `(do (fuel-charge!) (C args))`,
+  so the debit precedes the operands. Runs on the KIR the program names,
+  after `vector-region` (which charges the literals it keeps in locals
+  itself) and before the rewrites that lower one source constructor into
+  several (string-index) or into helper functions (document), so each
+  source constructor costs exactly one unit however it is lowered."
+  [kir]
+  (let [charge (fn charge [form]
+                 (cond
+                   (seq? form)
+                   (let [form (apply list (map charge form))]
+                     (if (contains? charged-constructors (first form))
+                       (list 'do (list 'fuel-charge!) form)
+                       form))
+                   (vector? form) (mapv charge form)
+                   (map? form) (into (empty form) (map (fn [[k v]] [(charge k) (charge v)])) form)
+                   :else form))]
+    (if (::charges-written (meta kir))
+      kir
+      (update kir :functions (fn [functions] (mapv #(update % :body charge) functions))))))
 
 (defn entry-fuel-prefixes
   "Production fuel map: only functions that can re-enter. TOKENS-FOR is

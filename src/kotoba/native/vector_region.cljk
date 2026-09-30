@@ -53,6 +53,13 @@
           candidate (symbol (str "kotoba$region$" label "$" n))]
       (if (contains? used candidate) (recur) candidate))))
 
+(defn- charge
+  "A literal kept in locals is still a constructor: it pays the one unit of
+  fuel the reference charges for it, before its items (amu ADR 0353 floor
+  :allocation-budget-native). A binding, so it precedes the items' own."
+  [state used]
+  [(fresh! state used "charge") (list 'fuel-charge!)])
+
 (declare rewrite*)
 (defn- select-form [items index fallback state used]
   (let [i (fresh! state used "index")
@@ -79,7 +86,8 @@
       (and literal-items
            (or (contains? counts op) (contains? ats op) (contains? gets op)))
       (let [slots (mapv (fn [_] (fresh! state used "item")) literal-items)
-            bindings (vec (mapcat vector slots (map #(rewrite* % state used) literal-items)))
+            bindings (into (charge state used)
+                           (mapcat vector slots (map #(rewrite* % state used) literal-items)))
             result (cond
                      (contains? counts op) (count slots)
                      (contains? ats op) (select-form slots index (list 'quot 1 0) state used)
@@ -101,8 +109,9 @@
                   (let [remainder (concat (map second (rest pairs)) body)]
                     (if (every? #(safe-uses? % name) remainder)
                       (let [slots (mapv (fn [_] (fresh! state used "item")) items)
-                            lowered (mapcat vector slots
-                                            (map #(rewrite-with-regions % active state used) items))]
+                            lowered (concat (charge state used)
+                                            (mapcat vector slots
+                                                    (map #(rewrite-with-regions % active state used) items)))]
                         (recur (rest pairs) (into out lowered)
                                (assoc active name slots)))
                       (recur (rest pairs)

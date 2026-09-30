@@ -36,9 +36,9 @@
         io.github.kotoba-lang/osaho {:git/url "https://github.com/kotoba-lang/osaho.git"
                                      :git/sha "1bb61f3d5616dcf638915c24236669a1ece7250d"}
         io.github.kotoba-lang/kotoba-gmir {:git/url "https://github.com/kotoba-lang/kotoba-gmir.git"
-                                           :git/sha "8e0c3a23a54d761be65c93246c498821da149461"}
+                                           :git/sha "6c3651f953eb255d9ca1f45622cd904f69499c83"}
         io.github.kotoba-lang/kotoba-mir {:git/url "https://github.com/kotoba-lang/kotoba-mir.git"
-                                          :git/sha "abb72f61633c78780345559f1b877b34ef4a3c1a"}
+                                          :git/sha "205f2a931a6c785c23e54bc7e0006c1982f5906a"}
         io.github.kotoba-lang/kotoba-codegen {:git/url "https://github.com/kotoba-lang/kotoba-codegen.git"
                                               :git/sha "dabdc0b966412211a58db4c57b230b819b8193d7"}
         io.github.kotoba-lang/kotoba-object {:git/url "https://github.com/kotoba-lang/kotoba-object.git"
