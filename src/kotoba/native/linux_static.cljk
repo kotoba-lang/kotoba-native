@@ -618,7 +618,8 @@
    ;; C3: the capability handlers' words. They lie past the 1,024 bytes of
    ;; the data page the file carries (the page itself is mapped whole and
    ;; zero-filled), so a pure program's image is unchanged by their existence.
-   (into {} (map-indexed (fn [i k] [k (+ 512 (* 8 i))]))
+   (#?(:kotoba (fn [ks] (zipmap ks (range 512 (+ 512 (* 8 512)) 8)))
+       :default (fn [ks] (into {} (map-indexed (fn [i k] [k (+ 512 (* 8 i))])) ks)))
          [:envp :cwd-len :root-fd :last-mono :carry-n :carry :dctx :dctx-fuel
           :ts :ts-nsec :how :how-mode :how-resolve
           :id :rk :xk :req :rp :rl :h :res :form :fd :pfd :want :start :room
