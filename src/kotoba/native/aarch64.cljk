@@ -63,7 +63,12 @@
 ;; the 32-bit instruction word is then exactly `u32le`'s already-safe
 ;; 32-bit-bounded case.
 (defn- load-constant-reg [rd value]
-  #?(:clj
+  #?(:kotoba
+     (vec (concat (movz rd (bit-and value 0xffff) 0)
+                  (movk rd (bit-and (unsigned-bit-shift-right value 16) 0xffff) 16)
+                  (movk rd (bit-and (unsigned-bit-shift-right value 32) 0xffff) 32)
+                  (movk rd (bit-and (unsigned-bit-shift-right value 48) 0xffff) 48)))
+     :clj
      (vec (concat (movz rd value 0) (movk rd (unsigned-bit-shift-right value 16) 16)
                   (movk rd (unsigned-bit-shift-right value 32) 32)
                   (movk rd (unsigned-bit-shift-right value 48) 48)))
@@ -649,7 +654,7 @@
   (let [counter (or (:mir-label-counter (meta env)) (atom -1))
         env (with-meta env (assoc (meta env) :mir-label-counter counter))
         allowed-label (fresh-label counter "cap-allowed")
-        cap-id #?(:clj cap-id :cljs (js/Number cap-id))
+        cap-id #?(:kotoba cap-id :clj cap-id :cljs (js/Number cap-id))
         word-offset (+ 16 (* 8 (quot cap-id 64)))
         bit-index (mod cap-id 64)]
     (vec (concat
@@ -668,7 +673,7 @@
   (let [counter (or (:mir-label-counter (meta env)) (atom -1))
         env (with-meta env (assoc (meta env) :mir-label-counter counter))
         allowed-label (fresh-label counter "typed-cap-allowed")
-        cap-id #?(:clj cap-id :cljs (js/Number cap-id))
+        cap-id #?(:kotoba cap-id :clj cap-id :cljs (js/Number cap-id))
         word-offset (+ 16 (* 8 (quot cap-id 64)))
         bit-index (mod cap-id 64)]
     (vec (concat

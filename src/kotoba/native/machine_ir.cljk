@@ -1088,7 +1088,8 @@
   encoders intentionally represent the bounded 0..255 capability namespace as
   ordinary host integers, so normalize only after proving the value fits."
   [value]
-  (let [value #?(:clj value
+  (let [value #?(:kotoba value
+                 :clj value
                  :cljs (if (i64/bigint-value? value) (js/Number value) value))]
     (when (and (integer? value) (<= 0 value 255)) value)))
 
@@ -1455,7 +1456,7 @@
   is a BigInt, which `nth` refuses; the index is bounded by 32 positions."
   [index]
   (when (gmir/i64-value? index)
-    #?(:clj (long index) :cljs (js/Number index))))
+    #?(:kotoba index :clj (long index) :cljs (js/Number index))))
 
 (defn- normalize-scalar-record-boundary
   "Lower admitted record parameters/results and nested records to the
@@ -3066,7 +3067,8 @@
 (defn- byte-value [n] (bit-and (unchecked-int n) 0xff))
 
 (defn- le64 [n]
-  #?(:clj (mapv #(byte-value (unsigned-bit-shift-right (long n) (* 8 %))) (range 8))
+  #?(:kotoba (mapv #(bit-and (unsigned-bit-shift-right n (* 8 %)) 0xff) (range 8))
+     :clj (mapv #(byte-value (unsigned-bit-shift-right (long n) (* 8 %))) (range 8))
      :cljs (let [u (js/BigInt.asUintN 64 (i64/->bigint n))
                  base (js/BigInt 256)]
              (loop [i 0, remaining u, out []]
@@ -4066,7 +4068,8 @@
                    :else :full))))
 
 (defn- x86-le32 [n]
-  #?(:clj (mapv #(bit-and (unsigned-bit-shift-right (long n) (* 8 %)) 0xff) (range 4))
+  #?(:kotoba (mapv #(bit-and (unsigned-bit-shift-right n (* 8 %)) 0xff) (range 4))
+     :clj (mapv #(bit-and (unsigned-bit-shift-right (long n) (* 8 %)) 0xff) (range 4))
      :cljs (let [u (js/BigInt.asUintN 32 (i64/->bigint n))
                  base (js/BigInt 256)]
              (loop [i 0 rem u out []]
@@ -4191,7 +4194,8 @@
                    (a64-register dst))))
 
 (defn- a64-constant-chunks [value]
-  #?(:clj (mapv #(bit-and (unsigned-bit-shift-right (long value) %) 0xffff)
+  #?(:kotoba (mapv #(bit-and (unsigned-bit-shift-right value %) 0xffff) [0 16 32 48])
+     :clj (mapv #(bit-and (unsigned-bit-shift-right (long value) %) 0xffff)
                  [0 16 32 48])
      :cljs (let [u (js/BigInt.asUintN 64 (i64/->bigint value))
                  base (js/BigInt 65536)
@@ -8404,7 +8408,8 @@
        ;; the reader reads the file and refuses the `:cljs` form by NAME later, in the
        ;; module that uses it. It changes nothing on clj/cljs: Clojure still picks
        ;; `:clj`, ClojureScript/nbb still picks `:cljs` (first match).
-       :immediate #?(:clj (int immediate) :cljs (js/Number immediate)
+       :immediate #?(:kotoba immediate
+                     :clj (int immediate) :cljs (js/Number immediate)
                      :default (js/Number immediate))
        :shift shift})))
 
