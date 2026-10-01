@@ -11,6 +11,7 @@
             [kotoba.native.keyword-equality :as keyword-equality]
             [kotoba.native.document :as document]
             [kotoba.native.string-index :as string-index]
+            [kotoba.native.typed-map :as typed-map]
             [kotoba.native.string-search :as string-search]
             [kotoba.native.vector-region :as vector-region]
             #?@(:cljs [[kotoba.kir.cljs-i64 :as i64]])))
@@ -1655,6 +1656,7 @@
                 machine-ir/charge-constructors
                 (update :functions #(-> % string-search/augment-functions
                                            string-index/augment-functions
+                                           typed-map/augment-functions
                                            document/augment-functions))
                 (#(if (:exports %) %
                       (assoc % :exports (mapv :name (:functions %))))))]

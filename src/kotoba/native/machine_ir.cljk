@@ -17,6 +17,7 @@
             [kotoba.native.interrupt-abi :as interrupt-abi]
             [kotoba.native.document :as document]
             [kotoba.native.string-index :as string-index]
+            [kotoba.native.typed-map :as typed-map]
             [kotoba.native.string-search :as string-search]
             #?(:cljs [kotoba.kir.cljs-i64 :as i64])))
 
@@ -1356,6 +1357,13 @@
                    (list 'vector-new-empty) (rest args))
            (and (= op 'typed-list-nth) (= 3 (count args)))
            (list 'vector-at (second args) (nth args 2))
+           ;; `[:map K V]` (amu ADR 0353 floor :native-hiccup-node): the
+           ;; same word arena, keys and values interleaved, searched by the
+           ;; helpers `kotoba.native.typed-map` appends.
+           (and (contains? typed-map/operations op)
+                (let [arity (get typed-map/operations op)]
+                  (if arity (= arity (count args)) (odd? (count args)))))
+           (normalize-surface-operations (typed-map/lower op args))
            (and (contains? '#{vector-get vector-f64-get} op)
                 (= 3 (count args)))
            (let [[items-form index-form fallback] args
