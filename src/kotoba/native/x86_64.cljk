@@ -1722,6 +1722,11 @@
             (emit-typed-cap-call cap-id 2 request env ctx)
             (= :result-i64 request-type result-type)
             (emit-typed-cap-call cap-id 3 request env ctx)
+            ;; fs/app-data-bytes (wire 35): :bytes -> :bytes (8), :string -> :bytes (9)
+            (= :bytes request-type result-type)
+            (emit-typed-cap-call cap-id 8 request env ctx)
+            (and (= :string request-type) (= :bytes result-type))
+            (emit-typed-cap-call cap-id 9 request env ctx)
             :else
             (throw (ex-info "native typed capability ABI does not support this boundary"
                             {:phase :x86-64 :request-type request-type

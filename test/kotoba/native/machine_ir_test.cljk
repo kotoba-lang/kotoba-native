@@ -4217,3 +4217,22 @@
         (is (= v (coalesce v)) "x0 was rewritten in between; the copy carries information"))
       (let [v [(mov :aarch64/x19 :aarch64/x0) call (mov :aarch64/x0 :aarch64/x19) call]]
         (is (= v (coalesce v)) "a call clobbers x0; the alias does not survive it")))))
+
+(deftest fs-bytes-contracts-lower-through-the-module-pipeline
+  ;; fs/app-data-bytes (wire 35): READ / RANGE is [:string :bytes] (typed kind 9) and
+  ;; WRITE / APPEND is [:bytes :bytes] (kind 8). Bytes are one-word vector-arena handles.
+  (doseq [[request-type request result-kind]
+          [[:string "/tmp/a" :string-bytes-v1]
+           [:bytes '(bytes-empty) :bytes-v1]]]
+    (let [body (list 'let ['b (list 'typed-cap-call 35 request-type :bytes request)]
+                     (list 'bytes-count 'b))
+          module {:format :kotoba.kir/v4 :entry 'main :exports ['main]
+                  :functions [{:name 'main :params [] :param-types []
+                               :result :i64 :body body}]}
+          gmir (machine/lower-kir-module module)
+          calls (filter #(= :gmir/capability-call (:gmir/op %))
+                        (get-in gmir [:gmir/functions 0 :gmir/instructions]))]
+      (is (= 1 (count calls)) request-type)
+      (is (= result-kind (:gmir/kind (first calls))) request-type)
+      (doseq [target [:x86-64 :aarch64]]
+        (is (seq (:mc/functions (machine/compile-gmir target gmir))) [request-type target])))))
