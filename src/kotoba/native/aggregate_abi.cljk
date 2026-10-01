@@ -578,7 +578,7 @@
 
 #?(:kotoba
    (defn- word-scalar? [f [:ref :form/r]] :bool
-     (kw-in? f "[:kotoba.form/set :i64 :bool :f32 :f64 :string :keyword :vector :vector-f64 :string-index]"))
+     (kw-in? f "[:kotoba.form/set :i64 :bool :f32 :f64 :string :keyword :vector :vector-i64 :vector-f64 :string-index :bytes]"))
    :default
    (defn scalar-record-type?
      "True for a named, non-empty record whose unique fields each occupy one
@@ -599,7 +599,7 @@
                        (count (distinct (map first (nth candidate 2)))))))
              (word-field-type? [field-type depth]
                (or (contains? #{:i64 :bool :f32 :f64 :string :keyword
-                                :vector :vector-f64 :string-index}
+                                :vector :vector-i64 :vector-f64 :string-index :bytes}
                               field-type)
                    (and (vector? field-type)
                         (contains? #{:option :result :list :set :map :ref}

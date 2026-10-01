@@ -1335,6 +1335,35 @@
                    (list 'vector-new-empty) (rest args))
            (and (= op 'typed-set-conj) (= 3 (count args)))
            (list 'vector-conj (second args) (nth args 2))
+           ;; `(record-assoc T r f v)` rebuilds the record: every other field
+           ;; is read back from R and F takes V. A record is a pair chain (or
+           ;; N scalar-replaced slots), so there is no in-place store to lower
+           ;; to; the rebuild is what the reference interpreter's `assoc` is.
+           ;; A symbol R is read in place (it is pure and may be a flattened
+           ;; local, which must not be forwarded through a second binding);
+           ;; any other R, and a V that is not a symbol/literal, is bound
+           ;; once, R first, so evaluation order is the reference's.
+           (and (= op 'record-assoc) (= 4 (count args))
+                (vector? (first args)) (= :record (first (first args))))
+           (let [[type value field replacement] args
+                 names (mapv first (nth type 2))
+                 _ (when-not (some #(= field %) names)
+                     (reject! :kir-to-gmir :unknown-record-field
+                              {:type type :field field}))
+                 holder (if (symbol? value) value (gensym "record__"))
+                 simple? (fn [x] (or (symbol? x) (integer? x) (string? x)
+                                     (keyword? x) (boolean? x)))
+                 fresh (if (simple? replacement) replacement (gensym "assoc__"))
+                 bindings (cond-> []
+                            (not (symbol? value)) (conj holder value)
+                            (not (simple? replacement)) (conj fresh replacement))
+                 built (apply list 'record-new type
+                              (map (fn [name]
+                                     (if (= name field)
+                                       fresh
+                                       (list 'record-get type holder name)))
+                                   names))]
+             (if (empty? bindings) built (list 'let bindings built)))
            (and (= op 'typed-set-count) (= 2 (count args)))
            (list 'vector-count (second args))
            (and (= op 'typed-set-nth) (= 3 (count args)))
@@ -1525,6 +1554,32 @@
                                                 position)))
                                    tail))
                            0 (reverse (range width)))))
+
+                      ;; `record-assoc` over pair-chain handles: rebuild the chain, reading
+           ;; every other field back from the operand (the same shape as
+           ;; `hetero-vector-assoc` above; the operand and the replacement are
+           ;; bound once, in the reference's order).
+           (and (= op 'record-assoc) (= 4 (count args)))
+           (let [[type value field replacement] args
+                 fields (scalar-record-fields type)
+                 index (first (keep-indexed (fn [i [candidate _]]
+                                              (when (= candidate field) i))
+                                            fields))
+                 subject (gensym "record__"), item (gensym "record_item__")]
+             (when (or (nil? fields) (nil? index))
+               (reject! :record-boundary :invalid-record-update
+                        {:type type :field field}))
+             (list 'let [subject value item replacement]
+                   (reduce (fn [tail position]
+                             (list 'pair
+                                   (if (= position index)
+                                     item
+                                     (list 'pair-first
+                                           (nth (iterate (fn [handle] (list 'pair-second handle))
+                                                         subject)
+                                                position)))
+                                   tail))
+                           0 (reverse (range (count fields))))))
 
            (and (= op 'record-get) (= 3 (count args)))
            (let [[type value field] args
