@@ -1346,6 +1346,16 @@
            (list 'vector-count (second args))
            (and (= op 'typed-set-nth) (= 3 (count args)))
            (list 'vector-at (second args) (nth args 2))
+           ;; `[:list T]` is the typed set's word arena (amu ADR 0353 floor
+           ;; :native-handles): the items are one-word handles -- i64s,
+           ;; strings, records -- read by index, and `vector-count` already
+           ;; walks the carrier, so no count head is needed. An index out of
+           ;; range traps as `vector-at` does, where the reference traps too.
+           (= op 'typed-list-new)
+           (reduce (fn [items item] (list 'vector-conj items item))
+                   (list 'vector-new-empty) (rest args))
+           (and (= op 'typed-list-nth) (= 3 (count args)))
+           (list 'vector-at (second args) (nth args 2))
            (and (contains? '#{vector-get vector-f64-get} op)
                 (= 3 (count args)))
            (let [[items-form index-form fallback] args
