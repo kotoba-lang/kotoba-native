@@ -1408,6 +1408,16 @@
                          (list 'string-byte-length subject))))
            (and (= op 'keyword-from-string) (= 1 (count args)))
            (list 'string-concat ":" (first args))
+           ;; `(document-symbol (symbol text))`: a symbol value is the text of its
+           ;; name and exists natively only to be wrapped into a document, whose
+           ;; helper (`kotoba$doc-symbol`) already refuses an empty name and every
+           ;; character the reader splits on. The wrapper is therefore dropped; the
+           ;; admission gates (`kotoba.kir`, `kotoba.verifier`) admit `symbol` in this
+           ;; one position and nowhere else.
+           (and (= op 'document-symbol) (= 1 (count args))
+                (seq? (first args)) (= 'symbol (first (first args)))
+                (= 2 (count (first args))))
+           (normalize-surface-operations (list 'document-symbol (second (first args))))
            (and (= op 'string-contains?) (= 2 (count args)))
            (normalize-surface-operations (string-search/lower-contains args))
            ;; `string-index-of` itself is a runtime operation (ABI v5) and
