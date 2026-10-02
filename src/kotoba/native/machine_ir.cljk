@@ -2395,7 +2395,7 @@
 #?(:kotoba nil ;; folded into the Kotoba twins under another name
    :default
 (defn- hex-of-bytes [bytes]
-  (apply str (map #(let [h (.toString (int %) 16)] (if (= 1 (count h)) (str "0" h) h)) bytes))))
+  (apply str (map #(let [h (Integer/toString (bit-and (int %) 0xff) 16)] (if (= 1 (count h)) (str "0" h) h)) bytes))))
 
 #?(:kotoba
    (defn- hex-digit [d :i64] :string (string-substring "0123456789abcdef" d (+ d 1))))
