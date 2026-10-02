@@ -692,19 +692,70 @@
 ;; independence; only the consumers move, and only next to something they
 ;; already had to wait for.
 
+#?(:kotoba
+   ;; ── hoist: Kotoba twins ──────────────────────────────────────────────────────
+   ;; A keyword (vreg / register) as a string-index key.
+   (defn- ktext [k [:ref :form/r]] :string
+     (if (form/is-keyword? k) (document-edn-print (document-keyword (form/keyword-value k))) "")))
+
+#?(:kotoba
+   (defn- vreg? [v [:ref :form/r]] :bool (gmir/vreg? v)))
+
+#?(:kotoba
+   ;; Tables keyed by vreg: a native string-index holds at most 128 entries, so a
+   ;; vreg -> i64 table is a vector-i64 indexed by the vreg's number (-1 = absent).
+   (defn- vreg-num [v [:ref :form/r]] :i64
+     (if (vreg? v)
+       (let [t (ktext v) n (string-byte-length t)]
+         (loop [i 18 acc 0] (if (>= i n) acc (recur (inc i) (+ (* acc 10) (- (string-code-point-at t i) 48))))))
+       -1)))
+
+#?(:kotoba
+   (defn- vt-new [] :vector-i64 (vector-new)))
+
+#?(:kotoba
+   (defn- vt-get [t :vector-i64 k [:ref :form/r] dflt :i64] :i64
+     (let [i (vreg-num k)]
+       (if (and (>= i 0) (< i (vector-count t)))
+         (let [x (vector-at t i)] (if (= x -1) dflt x))
+         dflt))))
+
+#?(:kotoba
+   (defn- vt-grow [t :vector-i64 n :i64] :vector-i64
+     (loop [u t] (if (>= (vector-count u) n) u (recur (vector-conj u -1))))))
+
+#?(:kotoba
+   (defn- vt-put [t :vector-i64 k [:ref :form/r] x :i64] :vector-i64
+     (let [i (vreg-num k)]
+       (if (< i 0) t (vector-assoc (vt-grow t (inc i)) i x)))))
+
+#?(:kotoba
+   (defn- vt-has? [t :vector-i64 k [:ref :form/r]] :bool (>= (vt-get t k -1) 0)))
+
+#?(:kotoba
+   (defn- hoist-source-keys [] [:list [:ref :form/r]]
+     (form/kids-of (form/edn-form "[:mir/src :mir/input :mir/left :mir/right :mir/addend :mir/test :mir/value]")))
+   :default
 (def ^:private hoist-source-keys
   ;; Mirrors kotoba.mir's instruction-sources for the operand kinds pure
   ;; integer instructions carry. Anything with other operand kinds is not
   ;; hoistable and is a barrier, so the wider list is unnecessary here.
-  [:mir/src :mir/input :mir/left :mir/right :mir/addend :mir/test :mir/value])
+  [:mir/src :mir/input :mir/left :mir/right :mir/addend :mir/test :mir/value]))
 
+#?(:kotoba
+   (defn- hoistable-ops [] [:ref :form/r]
+     (form/edn-form "#{:mir/add :mir/subtract :mir/multiply :mir/bit-and :mir/bit-or :mir/bit-xor :mir/shift-left :mir/shift-right-signed :mir/shift-right-unsigned}"))
+   :default
 (def ^:private hoistable-ops
   ;; Pure, non-trapping, register-only. Constants are crossable (below) but
   ;; not hoisted: they have no operands to be adjacent to.
   #{:mir/add :mir/subtract :mir/multiply
     :mir/bit-and :mir/bit-or :mir/bit-xor
-    :mir/shift-left :mir/shift-right-signed :mir/shift-right-unsigned})
+    :mir/shift-left :mir/shift-right-signed :mir/shift-right-unsigned}))
 
+#?(:kotoba
+   (defn- call-ops [] [:ref :form/r] (form/edn-form "#{:mir/call :mir/tail-call}"))
+   :default
 (def ^:private call-ops
   ;; Crossable ONLY under the last-other-use anchor below. A pure add whose
   ;; operands were both live across a call folds two live-across values into
@@ -712,8 +763,12 @@
   ;; (or one lazy-reload slot) instead of two. Measured 2026-09-07 on the
   ;; kernel_call fixture (amu iteration 148): peak live-across-call values 7 ->
   ;; 4, callee-saved registers 7 -> 5, 51 -> 46 instructions.
-  #{:mir/call :mir/tail-call})
+  #{:mir/call :mir/tail-call}))
 
+#?(:kotoba
+   (defn- crossable-ops [] [:ref :form/r]
+     (form/edn-form "#{:mir/add :mir/subtract :mir/multiply :mir/bit-and :mir/bit-or :mir/bit-xor :mir/shift-left :mir/shift-right-signed :mir/shift-right-unsigned :mir/constant :mir/quotient-constant :mir/equal :mir/less-than :mir/greater-than :mir/less-or-equal :mir/greater-or-equal}"))
+   :default
 (def ^:private crossable-ops
   ;; What a hoisted instruction may pass over on its way up. Everything else
   ;; -- labels, branches, loads, stores, returns, phi transport, and every
@@ -726,11 +781,44 @@
   ;; Nothing may rise above the last argument; it is a barrier.
   (into hoistable-ops #{:mir/constant :mir/quotient-constant
                         :mir/equal :mir/less-than :mir/greater-than
-                        :mir/less-or-equal :mir/greater-or-equal}))
+                        :mir/less-or-equal :mir/greater-or-equal})))
 
+#?(:kotoba
+   ;; (keep instruction hoist-source-keys): the present, non-nil values, in key order.
+   (defn- hoist-key-values [instruction [:ref :form/r]] [:list [:ref :form/r]]
+     (let [ks (hoist-source-keys) n (lcount ks)]
+       (loop [i 0 acc (lnone)]
+         (if (>= i n) acc
+           (let [v (form/form-get instruction (lget ks i))]
+             (recur (inc i) (if (form/is-nil? v) acc (lconj acc v)))))))))
+
+#?(:kotoba
+   (defn- only-vregs [xs [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (let [n (lcount xs)]
+       (loop [i 0 acc (lnone)]
+         (if (>= i n) acc (recur (inc i) (if (vreg? (lget xs i)) (lconj acc (lget xs i)) acc)))))))
+
+#?(:kotoba
+   (defn- hoist-register-operands [instruction [:ref :form/r]] [:list [:ref :form/r]]
+     (only-vregs (hoist-key-values instruction)))
+   :default
 (defn- hoist-register-operands [instruction]
-  (filter gmir/vreg? (keep instruction hoist-source-keys)))
+  (filter gmir/vreg? (keep instruction hoist-source-keys))))
 
+#?(:kotoba
+   (defn- incoming-values [incomings [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (let [n (lcount incomings)]
+       (loop [i 0 acc (lnone)]
+         (if (>= i n) acc (recur (inc i) (lconj acc (fget (lget incomings i) :mir/value))))))))
+
+#?(:kotoba
+   (defn- hoist-all-register-reads [instruction [:ref :form/r]] [:list [:ref :form/r]]
+     (let [args (fget instruction :mir/arguments)
+           incs (fget instruction :mir/incomings)]
+       (lcat (lcat (only-vregs (hoist-key-values instruction))
+                   (if (form/is-vec? args) (only-vregs (kids args)) (lnone)))
+             (if (form/is-vec? incs) (only-vregs (incoming-values (kids incs))) (lnone)))))
+   :default
 (defn- hoist-all-register-reads
   "EVERY vreg an instruction reads, including a call's `:mir/arguments` and a
    phi's `:mir/incomings`. Use counts and last-use positions must come from
@@ -744,16 +832,34 @@
           (when (vector? (:mir/arguments instruction))
             (filter gmir/vreg? (:mir/arguments instruction)))
           (when (vector? (:mir/incomings instruction))
-            (filter gmir/vreg? (map :mir/value (:mir/incomings instruction))))))
+            (filter gmir/vreg? (map :mir/value (:mir/incomings instruction)))))))
 
+#?(:kotoba
+   (defn- hoist-register-only? [instruction [:ref :form/r]] :bool
+     (let [vs (lcons (fget instruction :mir/dst) (hoist-key-values instruction))
+           n (lcount vs)]
+       (loop [i 0]
+         (if (>= i n) true
+           (let [v (lget vs i)]
+             (if (or (not (form/is-keyword? v)) (vreg? v)) (recur (inc i)) false))))))
+   :default
 (defn- hoist-register-only?
   "Every operand and the destination is a vreg or a plain literal. A physical
    register anywhere means select-target already pinned this instruction to a
    machine convention; leave it exactly where it is."
   [instruction]
   (every? (fn [v] (or (not (keyword? v)) (gmir/vreg? v)))
-          (cons (:mir/dst instruction) (keep instruction hoist-source-keys))))
+          (cons (:mir/dst instruction) (keep instruction hoist-source-keys)))))
 
+#?(:kotoba
+   (defn- lcons [x [:ref :form/r] xs [:list [:ref :form/r]]] [:list [:ref :form/r]] (form/cons-onto x xs)))
+
+#?(:kotoba
+   (defn- hoist-crossable? [instruction [:ref :form/r]] :bool
+     (or (and (fmember? (crossable-ops) (fget instruction :mir/op))
+              (hoist-register-only? instruction))
+         (fmember? (call-ops) (fget instruction :mir/op))))
+   :default
 (defn- hoist-crossable? [instruction]
   (or (and (contains? crossable-ops (:mir/op instruction))
            (hoist-register-only? instruction))
@@ -761,8 +867,22 @@
       ;; crossable because the anchor never places anything above an
       ;; operand's last OTHER use, so nothing a call reads or writes is
       ;; disturbed and no lifetime grows -- one shrinks.
-      (contains? call-ops (:mir/op instruction))))
+      (contains? call-ops (:mir/op instruction)))))
 
+#?(:kotoba
+   (defn- hoist-splits-fusion-pair? [out [:list [:ref :form/r]] position :i64 use-counts :vector-i64] :bool
+     (let [above (lget out (dec position))
+           below (lget out position)
+           product (fget above :mir/dst)]
+       (and (truthy? above) (truthy? below)
+            (kw? (fget above :mir/op) :mir/multiply)
+            (vreg? product)
+            (= 1 (vt-get use-counts product 0))
+            (or (and (kw? (fget below :mir/op) :mir/add)
+                     (or (feq product (fget below :mir/left)) (feq product (fget below :mir/right))))
+                (and (kw? (fget below :mir/op) :mir/subtract)
+                     (feq product (fget below :mir/right)))))))
+   :default
 (defn- hoist-splits-fusion-pair?
   "Would inserting at POSITION separate a multiply from the add/subtract that
    consumes its (single-use) product on the next line? The AArch64 selector
@@ -780,8 +900,115 @@
           (or (and (= :mir/add (:mir/op below))
                    (or (= product (:mir/left below)) (= product (:mir/right below))))
               (and (= :mir/subtract (:mir/op below))
-                   (= product (:mir/right below))))))))
+                   (= product (:mir/right below)))))))))
 
+#?(:kotoba
+   ;; use counts, last use and the use before it (distinct original indexes), over all register reads.
+   ;; One table per pass: a list of string indexes is not a native value.
+   (defn- hoist-use-table [instructions [:list [:ref :form/r]] which :i64] :vector-i64
+     (let [n (lcount instructions)]
+       (loop [i 0 t (vt-new) last (vt-new)]
+         (if (>= i n)
+           t
+           (let [reads (hoist-all-register-reads (lget instructions i))
+                 m (lcount reads)
+                 t' (loop [j 0 t t l last]
+                      (if (>= j m) t
+                        (let [v (lget reads j) old (vt-get l v -1)]
+                          (recur (inc j)
+                                 (cond (= which 0) (vt-put t v (+ 1 (vt-get t v 0)))
+                                       (= which 1) (vt-put t v i)
+                                       :else (if (and (>= old 0) (not (= old i))) (vt-put t v old) t))
+                                 (vt-put l v i)))))
+                 last' (loop [j 0 l last]
+                         (if (>= j m) l (recur (inc j) (vt-put l (lget reads j) i))))]
+             (recur (inc i) t' last')))))))
+
+#?(:kotoba
+   (defn- i64-index-of [xs [:list :i64] x :i64] :i64
+     (let [n (vector-count xs)]
+       (loop [i 0] (if (>= i n) -1 (if (= (typed-list-nth [:list :i64] xs i) x) i (recur (inc i))))))))
+
+#?(:kotoba
+   (defn- i64-insert [xs [:list :i64] pos :i64 x :i64] [:list :i64]
+     (let [n (vector-count xs)]
+       (loop [i 0 acc (typed-list-new [:list :i64])]
+         (if (> i n) acc
+           (recur (inc i)
+                  (cond (< i pos) (typed-list-conj [:list :i64] acc (typed-list-nth [:list :i64] xs i))
+                        (= i pos) (typed-list-conj [:list :i64] acc x)
+                        :else (typed-list-conj [:list :i64] acc (typed-list-nth [:list :i64] xs (dec i))))))))))
+
+#?(:kotoba
+   (defn- form-insert [xs [:list [:ref :form/r]] pos :i64 x [:ref :form/r]] [:list [:ref :form/r]]
+     (lcat (lconj (lslice xs 0 pos) x) (ldrop xs pos))))
+
+#?(:kotoba
+   ;; the latest OUT position among SRCS' definitions; -1 when one is undefined
+   (defn- hoist-max-def-pos [srcs [:list [:ref :form/r]] def-orig :vector-i64 out-orig [:list :i64]] :i64
+     (let [n (lcount srcs)]
+       (loop [i 0 best -1]
+         (if (>= i n) best
+           (let [o (vt-get def-orig (lget srcs i) -1)]
+             (recur (inc i) (if (< o 0) best (let [p (i64-index-of out-orig o)] (if (> p best) p best))))))))))
+
+#?(:kotoba
+   (defn- hoist-all-defined? [srcs [:list [:ref :form/r]] def-orig :vector-i64] :bool
+     (let [n (lcount srcs)]
+       (loop [i 0] (if (>= i n) true (if (vt-has? def-orig (lget srcs i)) (recur (inc i)) false))))))
+
+#?(:kotoba
+   (defn- hoist-all-killed? [srcs [:list [:ref :form/r]] orig-i :i64 last :vector-i64] :bool
+     (let [n (lcount srcs)]
+       (loop [i 0] (if (>= i n) true (if (= orig-i (vt-get last (lget srcs i) -2)) (recur (inc i)) false))))))
+
+#?(:kotoba
+   ;; the operands' last OTHER uses (the use before ORIG-I), in OUT coordinates
+   (defn- hoist-max-other-use [srcs [:list [:ref :form/r]] prev :vector-i64 out-orig [:list :i64]] :i64
+     (let [n (lcount srcs)]
+       (loop [i 0 best -1]
+         (if (>= i n) best
+           (let [o (vt-get prev (lget srcs i) -1)
+                 p (if (< o 0) -1 (i64-index-of out-orig o))]
+             (recur (inc i) (if (> p best) p best))))))))
+
+#?(:kotoba
+   (defn- hoist-consumers-to-producers [instructions [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (let [use-counts (hoist-use-table instructions 0)
+           last-use (hoist-use-table instructions 1)
+           prev-use (hoist-use-table instructions 2)
+           n (lcount instructions)]
+       (loop [orig-i 0 out (lnone) out-orig (typed-list-new [:list :i64]) def-orig (vt-new) last-barrier -1]
+         (if (>= orig-i n)
+           out
+           (let [ins (lget instructions orig-i)
+                 srcs (hoist-register-operands ins)
+                 dst (fget ins :mir/dst)
+                 hoistable? (and (fmember? (hoistable-ops) (fget ins :mir/op))
+                                 (hoist-register-only? ins)
+                                 (> (lcount srcs) 0)
+                                 (hoist-all-defined? srcs def-orig)
+                                 (hoist-all-killed? srcs orig-i last-use))
+                 target-pos (if hoistable?
+                              (let [pos (max (inc (hoist-max-def-pos srcs def-orig out-orig))
+                                             (max (inc (hoist-max-other-use srcs prev-use out-orig))
+                                                  (inc last-barrier)))]
+                                (if (hoist-splits-fusion-pair? out pos use-counts) (inc pos) pos))
+                              -1)
+                 append? (or (< target-pos 0) (>= target-pos (lcount out)))
+                 def-orig' (if (vreg? dst) (vt-put def-orig dst orig-i) def-orig)]
+             (if append?
+               (recur (inc orig-i)
+                      (lconj out ins)
+                      (typed-list-conj [:list :i64] out-orig orig-i)
+                      def-orig'
+                      (if (hoist-crossable? ins) last-barrier (lcount out)))
+               (recur (inc orig-i)
+                      (form-insert out target-pos ins)
+                      (i64-insert out-orig target-pos orig-i)
+                      def-orig'
+                      (if (>= last-barrier target-pos) (inc last-barrier) last-barrier))))))))
+   :default
 (defn- hoist-consumers-to-producers
   "One function's instruction vector, with pressure-killing pure instructions
    moved up beside their producers. See the header comment above."
@@ -849,8 +1076,25 @@
                   def-pos' (cond-> def-pos' (gmir/vreg? (:mir/dst ins)) (assoc (:mir/dst ins) target-pos))
                   orig->out' (assoc (into {} (map (fn [[o i]] [o (slide i)]) orig->out)) orig-i target-pos)
                   last-barrier' (if (>= last-barrier target-pos) (inc last-barrier) last-barrier)]
-              (recur (next remaining) out' def-pos' orig->out' last-barrier'))))))))
+              (recur (next remaining) out' def-pos' orig->out' last-barrier')))))))))
 
+#?(:kotoba
+   (defn- map-functions-instructions [fs [:list [:ref :form/r]] how :keyword] [:list [:ref :form/r]]
+     (let [n (lcount fs)]
+       (loop [i 0 acc (lnone)]
+         (if (>= i n) acc
+           (let [f (lget fs i)
+                 xs (kids (fget f :mir/instructions))]
+             (recur (inc i)
+                    (lconj acc (fassoc f :mir/instructions
+                                       (fvec (if (= how :hoist) (hoist-consumers-to-producers xs) (a64-coalesce-moves xs))))))))))))
+
+#?(:kotoba
+   (defn hoist-program-consumers [program [:ref :form/r]] [:ref :form/r]
+     (if (form/eq (fget program :mir/version) (intf 3))
+       (fassoc program :mir/functions (fvec (map-functions-instructions (kids (fget program :mir/functions)) :hoist)))
+       (fassoc program :mir/instructions (fvec (hoist-consumers-to-producers (kids (fget program :mir/instructions)))))))
+   :default
 (defn hoist-program-consumers
   "Apply `hoist-consumers-to-producers` to every function of a v3 MIR module,
    or to a flat program's instruction vector. Pure; safe to call before
@@ -859,7 +1103,7 @@
   (if (= 3 (:mir/version program))
     (update program :mir/functions
             (fn [fs] (mapv #(update % :mir/instructions hoist-consumers-to-producers) fs)))
-    (update program :mir/instructions hoist-consumers-to-producers)))
+    (update program :mir/instructions hoist-consumers-to-producers))))
 
 ;; ── post-allocation move coalescing (aarch64) ──────────────────────────────
 ;;
@@ -882,23 +1126,79 @@
   ;; x19+ survive calls and must be traced through them.
   (into #{} (map #(keyword "aarch64" (str "x" %))) (range 0 18)))
 
+#?(:kotoba
+   ;; ── coalesce: Kotoba twins ───────────────────────────────────────────────────
+   (defn- a64-caller-saved? [r [:ref :form/r]] :bool
+     (and (form/is-keyword? r)
+          (let [t (ktext r)]
+            (and (> (string-byte-length t) 10)
+                 (string=? (string-substring t 0 10) ":aarch64/x")
+                 (let [num (string-substring t 10 (string-byte-length t))
+                       k (string-byte-length num)]
+                   (and (>= k 1) (<= k 2)
+                        (loop [i 0] (if (>= i k) true (let [c (string-code-point-at num i)] (if (and (>= c 48) (<= c 57)) (recur (inc i)) false))))
+                        (or (= k 1) (not (= 48 (string-code-point-at num 0))))
+                        (< (decimal-of num) 18))))))))
+
+#?(:kotoba
+   (defn- decimal-of [s :string] :i64
+     (let [n (string-byte-length s)]
+       (loop [i 0 acc 0] (if (>= i n) acc (recur (inc i) (+ (* acc 10) (- (string-code-point-at s i) 48))))))))
+
+#?(:kotoba
+   (defn- coalescable-ops [] [:ref :form/r]
+     (form/edn-form "#{:mir/add :mir/subtract :mir/multiply :mir/bit-and :mir/bit-or :mir/bit-xor :mir/shift-left :mir/shift-right-signed :mir/shift-right-unsigned :mir/constant :mir/move}"))
+   :default
 (def ^:private coalescable-ops
   ;; Producers whose destination may be renamed to the copy's target. All
   ;; lower to a single instruction that reads every source before it writes,
   ;; so renaming is safe even when the target is one of the sources -- but the
   ;; rewrite below refuses that case anyway, to stay out of the way of the
   ;; multi-instruction lowerings (quotient, MADD fusion) it does not touch.
-  (into hoistable-ops #{:mir/constant :mir/move}))
+  (into hoistable-ops #{:mir/constant :mir/move})))
 
+#?(:kotoba
+   (defn- coalesce-transparent-ops [] [:ref :form/r]
+     (form/edn-form "#{:mir/add :mir/subtract :mir/multiply :mir/bit-and :mir/bit-or :mir/bit-xor :mir/shift-left :mir/shift-right-signed :mir/shift-right-unsigned :mir/constant :mir/quotient-constant :mir/equal :mir/less-than :mir/greater-than :mir/less-or-equal :mir/greater-or-equal :mir/move :mir/multiply-add :mir/multiply-subtract}"))
+   :default
 (def ^:private coalesce-transparent-ops
   ;; Ops the liveness scan may walk through. Anything else -- labels, jumps,
   ;; branches, recur/reentry, loads, stores, target-selected ops -- ends the
   ;; scan with "live": the conservative answer, which keeps the copy.
-  (into crossable-ops #{:mir/move :mir/multiply-add :mir/multiply-subtract}))
+  (into crossable-ops #{:mir/move :mir/multiply-add :mir/multiply-subtract})))
 
+#?(:kotoba
+   (defn- a64-register? [v [:ref :form/r]] :bool
+     (and (form/is-keyword? v)
+          (let [t (ktext v)] (and (> (string-byte-length t) 9) (string=? (string-substring t 0 9) ":aarch64/")))))
+   :default
 (defn- a64-register? [v]
-  (and (keyword? v) (= "aarch64" (namespace v))))
+  (and (keyword? v) (= "aarch64" (namespace v)))))
 
+#?(:kotoba
+   ;; vals of a map Form, in order
+   (defn- fvals [m [:ref :form/r]] [:list [:ref :form/r]]
+     (let [xs (kids m) n (lcount xs)]
+       (loop [j 1 acc (lnone)] (if (>= j n) acc (recur (+ j 2) (lconj acc (lget xs j))))))))
+
+#?(:kotoba
+   (defn- a64-read-values [v [:ref :form/r]] [:list [:ref :form/r]]
+     (cond (form/is-vec? v)
+           (let [xs (kids v) n (lcount xs)]
+             (loop [i 0 acc (lnone)]
+               (if (>= i n) acc
+                 (let [x (lget xs i)] (recur (inc i) (if (form/is-map? x) (lcat acc (fvals x)) (lconj acc x)))))))
+           (form/is-map? v) (fvals v)
+           :else (lone v))))
+
+#?(:kotoba
+   (defn- a64-registers-read [instruction [:ref :form/r]] [:list [:ref :form/r]]
+     (let [vs (fvals (form/dissoc-form (form/dissoc-form instruction (kf :mir/op)) (kf :mir/dst)))
+           n (lcount vs)]
+       (loop [i 0 acc (lnone)]
+         (if (>= i n) acc
+           (recur (inc i) (lcat acc (a64-register-only (a64-read-values (lget vs i)))))))))
+   :default
 (defn- a64-registers-read
   "Every aarch64 register an instruction reads: any register-valued field
    other than the destination, one level of vector (call arguments) and one
@@ -910,8 +1210,29 @@
        (mapcat (fn [v] (cond (vector? v) (mapcat (fn [x] (if (map? x) (vals x) [x])) v)
                              (map? v) (vals v)
                              :else [v])))
-       (filter a64-register?)))
+       (filter a64-register?))))
 
+#?(:kotoba
+   (defn- a64-register-only [xs [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (let [n (lcount xs)]
+       (loop [i 0 acc (lnone)] (if (>= i n) acc (recur (inc i) (if (a64-register? (lget xs i)) (lconj acc (lget xs i)) acc)))))))
+
+#?(:kotoba
+   (defn- a64-dead-after? [instructions [:list [:ref :form/r]] from :i64 reg [:ref :form/r]] :bool
+     (let [n (lcount instructions)]
+       (loop [i from]
+         (if (>= i n)
+           true
+           (let [ins (lget instructions i) op (fkw ins :mir/op)]
+             (cond
+               (lmember? (a64-registers-read ins) reg) false
+               (feq reg (fget ins :mir/dst)) true
+               (= op :mir/tail-call) true
+               (= op :mir/return) true
+               (= op :mir/call) (if (a64-caller-saved? reg) true (recur (inc i)))
+               (fmember? (coalesce-transparent-ops) (kf op)) (recur (inc i))
+               :else false))))))
+   :default
 (defn- a64-dead-after?
   "Is REG dead at index FROM, i.e. written or unreachable before any read?
    Walks only `coalesce-transparent-ops` plus calls and returns; a call kills a
@@ -929,8 +1250,49 @@
           (= :mir/return op) true
           (= :mir/call op) (if (contains? a64-caller-saved-registers reg) true (recur (inc i)))
           (contains? coalesce-transparent-ops op) (recur (inc i))
-          :else false)))))
+          :else false))))))
 
+#?(:kotoba
+   ;; alias: a map Form register -> register; forget drops every pair mentioning a register in REGS
+   (defn- alias-forget [alias [:ref :form/r] regs [:list [:ref :form/r]]] [:ref :form/r]
+     (let [xs (kids alias) n (lcount xs)]
+       (loop [j 0 acc (lnone)]
+         (if (>= (+ j 1) n) (fmap acc)
+           (let [a (lget xs j) b (lget xs (inc j))]
+             (recur (+ j 2) (if (or (lmember? regs a) (lmember? regs b)) acc (lconj (lconj acc a) b)))))))))
+
+#?(:kotoba
+   (defn- a64-coalesce-moves [instructions [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (let [n (lcount instructions)]
+       (loop [i 0 out (lnone) alias (fmap (lnone))]
+         (if (>= i n)
+           out
+           (let [ins (lget instructions i) op (fkw ins :mir/op) dst (fget ins :mir/dst) nxt (lget instructions (inc i))
+                 src (fget ins :mir/src)]
+             (cond
+               (and (= op :mir/move) (a64-register? dst) (a64-register? src)
+                    (or (feq src (form/form-get alias dst)) (feq dst (form/form-get alias src))))
+               (recur (inc i) out alias)
+
+               (and (fmember? (coalescable-ops) (kf op)) (a64-register? dst)
+                    (truthy? nxt) (kw? (fget nxt :mir/op) :mir/move) (feq dst (fget nxt :mir/src))
+                    (a64-register? (fget nxt :mir/dst)) (not (feq dst (fget nxt :mir/dst)))
+                    (not (lmember? (a64-registers-read ins) (fget nxt :mir/dst)))
+                    (a64-dead-after? instructions (+ i 2) dst))
+               (let [d (fget nxt :mir/dst)]
+                 (recur (+ i 2) (lconj out (fassoc ins :mir/dst d)) (alias-forget alias (lone d))))
+
+               :else
+               (let [alias' (cond
+                              (= op :mir/move)
+                              (if (and (a64-register? dst) (a64-register? src))
+                                (form/assoc-form (alias-forget alias (lone dst)) dst src)
+                                (alias-forget alias (lone dst)))
+                              (and (fmember? (coalesce-transparent-ops) (kf op)) (a64-register? dst))
+                              (alias-forget alias (lone dst))
+                              :else (fmap (lnone)))]
+                 (recur (inc i) (lconj out ins) alias'))))))))
+   :default
 (defn- a64-coalesce-moves
   "One forward pass over an allocated instruction vector.
 
@@ -974,8 +1336,14 @@
                            (and (contains? coalesce-transparent-ops op) (a64-register? dst))
                            (forget alias dst)
                            :else {})]
-              (recur (inc i) (conj out ins) alias'))))))))
+              (recur (inc i) (conj out ins) alias')))))))))
 
+#?(:kotoba
+   (defn coalesce-program-moves [program [:ref :form/r]] [:ref :form/r]
+     (if (form/eq (fget program :mir/version) (intf 3))
+       (fassoc program :mir/functions (fvec (map-functions-instructions (kids (fget program :mir/functions)) :coalesce)))
+       (fassoc program :mir/instructions (fvec (a64-coalesce-moves (kids (fget program :mir/instructions)))))))
+   :default
 (defn coalesce-program-moves
   "Apply `a64-coalesce-moves` to every function of an allocated v3 MIR module,
    or to a flat allocated program. Registers are physical here; run it after
@@ -984,15 +1352,33 @@
   (if (= 3 (:mir/version program))
     (update program :mir/functions
             (fn [fs] (mapv #(update % :mir/instructions a64-coalesce-moves) fs)))
-    (update program :mir/instructions a64-coalesce-moves)))
+    (update program :mir/instructions a64-coalesce-moves))))
 
+#?(:kotoba
+   (defn- mir-select-target [target :keyword program [:ref :form/r]] [:ref :form/r]
+     (let [r (mir/select-target-result (kf target) program)]
+       (if (fhas? r :problem) (reject-form! :mir (fkw r :problem) program) (fget r :program)))))
+
+#?(:kotoba
+   (defn- mir-allocate [program [:ref :form/r]] [:ref :form/r]
+     (let [r (mir/allocate-registers-result program)]
+       (if (fhas? r :problem) (reject-form! :mir (fkw r :problem) program) (fget r :program)))))
+
+#?(:kotoba
+   (defn compile-gmir [target :keyword program [:ref :form/r]] [:ref :form/r]
+     (let [selected (mir-select-target target program)
+           hoisted (hoist-program-consumers selected)
+           allocated (mir-allocate hoisted)
+           coalesced (if (= target :aarch64) (coalesce-program-moves allocated) allocated)]
+       (lower-mc coalesced)))
+   :default
 (defn compile-gmir [target program]
   (cond->> program
     true (mir/select-target target)
     true hoist-program-consumers
     true mir/allocate-registers
     (= :aarch64 target) coalesce-program-moves
-    true lower-mc))
+    true lower-mc)))
 
 ;; ── closed KIR expression -> GMIR pilot ─────────────────────────────────────
 
