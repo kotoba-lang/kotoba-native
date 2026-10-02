@@ -387,8 +387,8 @@ src/kotoba/native/machine_ir.cljk	encode-mc-module	127	real	1
 src/kotoba/native/machine_ir.cljk	encode-mc	17	real	0
 src/kotoba/native/machine_ir.cljk	guest-reentry-ops	5	folded	0
 src/kotoba/native/machine_ir.cljk	function-reenters-guest?	4	real	1
-src/kotoba/native/machine_ir.cljk	entry-fuel-prefixes	12	real	1
-src/kotoba/native/machine_ir.cljk	counted-self-recur-plans	8	real	1
+src/kotoba/native/machine_ir.cljk	entry-fuel-prefixes	12	real	0
+src/kotoba/native/machine_ir.cljk	counted-self-recur-plans	8	real	0
 src/kotoba/native/machine_ir.cljk	compile-kir-module	12	real	0
 src/kotoba/native/machine_ir.cljk	compile-expression	6	real	0
 src/kotoba/native/aarch64.cljk	utf8-bytes	3	nil	0

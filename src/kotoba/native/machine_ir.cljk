@@ -5,7 +5,7 @@
   lowers through closed GMIR/MIR/MC data; unknown operations, unsupported value
   shapes, use-before-definition, register exhaustion, and malformed labels fail
   closed before either ISA encoder."
-  {:kotoba/export #?(:kotoba [coalesce-program-moves compile-expression compile-gmir compile-kir-module counted-self-recur-plans encode-mc encode-mc-module entry-fuel-prefixes function-reenters-guest? hoist-program-consumers lower-kir-expression lower-kir-module lower-mc pilot-module? signed-division-magic word-result-type?] :default [coalesce-program-moves compile-expression compile-gmir compile-kir-module counted-self-recur-plans encode-mc encode-mc-module entry-fuel-prefixes function-reenters-guest? hoist-program-consumers lower-kir-expression lower-kir-module lower-mc pilot-expression? pilot-module? signed-division-magic word-result-type?])}
+  {:kotoba/export #?(:kotoba [coalesce-program-moves compile-expression compile-gmir compile-kir-module counted-self-recur-plans counted-self-recur-plans-of-gmir encode-mc encode-mc-module entry-fuel-prefixes entry-fuel-prefixes-of-gmir function-reenters-guest? hoist-program-consumers lower-kir-expression lower-kir-module lower-mc pilot-module? signed-division-magic word-result-type?] :default [coalesce-program-moves compile-expression compile-gmir compile-kir-module counted-self-recur-plans encode-mc encode-mc-module entry-fuel-prefixes function-reenters-guest? hoist-program-consumers lower-kir-expression lower-kir-module lower-mc pilot-expression? pilot-module? signed-division-magic word-result-type?])}
   #?(:kotoba (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
                                           [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]
                                  :form/rd [:record :form/rd [[:form [:ref :form/r]] [:pos :i64]]]
@@ -57,6 +57,21 @@
    (defn- fhas? [m [:ref :form/r] k :keyword] :bool (>= (kslot m k) 0)))
 
 #?(:kotoba
+   ;; the value at K without allocating a nil Form when K is absent
+   (defn- fval-at [m [:ref :form/r] j :i64] [:ref :form/r] (typed-list-nth [:list [:ref :form/r]] (form/kids-of m) (+ j 1))))
+
+#?(:kotoba
+   (defn- ftruthy? [m [:ref :form/r] k :keyword] :bool
+     (let [j (kslot m k)]
+       (and (>= j 0)
+            (let [v (fval-at m j)] (not (or (form/is-nil? v) (and (form/is-bool? v) (not (form/bool-value v))))))))))
+
+#?(:kotoba
+   (defn- fkw= [m [:ref :form/r] k :keyword kw :keyword] :bool
+     (let [j (kslot m k)]
+       (and (>= j 0) (let [v (fval-at m j)] (and (form/is-keyword? v) (= (form/keyword-value v) kw)))))))
+
+#?(:kotoba
    (defn- fassoc [m [:ref :form/r] k :keyword v [:ref :form/r]] [:ref :form/r]
      (form/assoc-form m (form/keyword-form k) v)))
 
@@ -64,7 +79,8 @@
    (defn- kw-of [f [:ref :form/r]] :keyword (if (form/is-keyword? f) (form/keyword-value f) :none)))
 
 #?(:kotoba
-   (defn- fkw [m [:ref :form/r] k :keyword] :keyword (kw-of (fget m k))))
+   (defn- fkw [m [:ref :form/r] k :keyword] :keyword
+     (let [j (kslot m k)] (if (< j 0) :none (kw-of (fval-at m j))))))
 
 #?(:kotoba
    (defn- fint [m [:ref :form/r] k :keyword] :i64 (form/int-value (fget m k))))
@@ -216,7 +232,7 @@
                            :mir/left (fget multiply :mir/left)
                            :mir/right (fget multiply :mir/right)
                            :mir/addend addend)]
-           (if (truthy? (fget multiply :mc/encoding))
+           (if (ftruthy? multiply :mc/encoding)
              (fassoc (fassoc fused :mc/op (kf :mc/instruction))
                      :mc/encoding (kf (if sub? :aarch64/multiply-subtract :aarch64/multiply-add)))
              (fassoc fused :mir/op (kf (if sub? :mir/multiply-subtract :mir/multiply-add)))))
@@ -444,7 +460,7 @@
            (fmap acc)
            (let [ins (lget instructions i)]
              (recur (inc i)
-                    (if (kw? (fget ins :mir/op) :mir/label)
+                    (if (fkw= ins :mir/op :mir/label)
                       (let [id (fget ins :mir/id)]
                         (if (form/form-has? (fmap acc) id)
                           (fmap-assoc-list acc id (intf i))
@@ -465,7 +481,7 @@
            out
            (let [producer (lget instructions index)
                  after-labels (loop [candidate (inc index)]
-                                (if (kw? (fget (lget instructions candidate) :mir/op) :mir/label)
+                                (if (fkw= (lget instructions candidate) :mir/op :mir/label)
                                   (recur (inc candidate))
                                   candidate))
                  move (lget instructions after-labels)
@@ -474,15 +490,15 @@
                  target-index (form/form-get labels (fget jump :mir/target))
                  direct? (a64-direct-result-op? (fkw producer :mir/op))
                  edge? (and direct?
-                            (kw? (fget move :mir/op) :mir/move)
+                            (fkw= move :mir/op :mir/move)
                             (feq source (fget move :mir/src))
-                            (kw? (fget jump :mir/op) :mir/jump)
+                            (fkw= jump :mir/op :mir/jump)
                             (truthy? target-index)
                             (not (a64-used-before-definition?
                                   (ldrop instructions (inc (form/int-value target-index))) source)))
                  return (lget instructions (inc index))
                  return? (and direct?
-                              (kw? (fget return :mir/op) :mir/return)
+                              (fkw= return :mir/op :mir/return)
                               (feq source (fget return :mir/value)))]
              (cond
                edge?
@@ -563,11 +579,11 @@
 
 #?(:kotoba
    (defn- layout-label-token? [token [:ref :form/r]] :bool
-     (and (form/is-map? token) (kw? (fget token :mir/op) :mir/label))))
+     (and (form/is-map? token) (fkw= token :mir/op :mir/label))))
 
 #?(:kotoba
    (defn- layout-relative-branch-token? [token [:ref :form/r]] :bool
-     (and (form/is-map? token) (kw? (fget token :mir/op) :mir/relative-branch))))
+     (and (form/is-map? token) (fkw= token :mir/op :mir/relative-branch))))
 
 #?(:kotoba
    (defn- mir-op-without [instruction [:ref :form/r]] [:list [:ref :form/r]]
@@ -643,7 +659,7 @@
            target (fkw program :mir/target)]
        (cond
          (not (mir-valid? program)) (reject-form! :mir :invalid-program program)
-         (not (kw? (fget program :mir/registers) :physical))
+         (not (fkw= program :mir/registers :physical))
          (reject-form! :mc :registers-not-allocated program)
          :else
          (mc-checked
@@ -917,12 +933,12 @@
            below (lget out position)
            product (fget above :mir/dst)]
        (and (truthy? above) (truthy? below)
-            (kw? (fget above :mir/op) :mir/multiply)
+            (fkw= above :mir/op :mir/multiply)
             (vreg? product)
             (= 1 (vt-get use-counts product 0))
-            (or (and (kw? (fget below :mir/op) :mir/add)
+            (or (and (fkw= below :mir/op :mir/add)
                      (or (feq product (fget below :mir/left)) (feq product (fget below :mir/right))))
-                (and (kw? (fget below :mir/op) :mir/subtract)
+                (and (fkw= below :mir/op :mir/subtract)
                      (feq product (fget below :mir/right)))))))
    :default
 (defn- hoist-splits-fusion-pair?
@@ -1322,7 +1338,7 @@
                (recur (inc i) out alias)
 
                (and (coalescable-op? op) (a64-register? dst)
-                    (truthy? nxt) (kw? (fget nxt :mir/op) :mir/move) (feq dst (fget nxt :mir/src))
+                    (truthy? nxt) (fkw= nxt :mir/op :mir/move) (feq dst (fget nxt :mir/src))
                     (a64-register? (fget nxt :mir/dst)) (not (feq dst (fget nxt :mir/dst)))
                     (not (lmember? (a64-registers-read ins) (fget nxt :mir/dst)))
                     (a64-dead-after? instructions (+ i 2) dst))
@@ -2410,7 +2426,7 @@
     (nth type 2))))
 
 #?(:kotoba
-   (defn- record-value? [value [:ref :form/r]] :bool (and (form/is-map? value) (kw? (fget value :aggregate/kind) :record)))
+   (defn- record-value? [value [:ref :form/r]] :bool (and (form/is-map? value) (fkw= value :aggregate/kind :record)))
    :default
 (defn- record-value? [value]
   (= :record (:aggregate/kind value))))
@@ -2471,7 +2487,7 @@
     (nth type 2))))
 
 #?(:kotoba
-   (defn- variant-value? [value [:ref :form/r]] :bool (and (form/is-map? value) (kw? (fget value :aggregate/kind) :variant)))
+   (defn- variant-value? [value [:ref :form/r]] :bool (and (form/is-map? value) (fkw= value :aggregate/kind :variant)))
    :default
 (defn- variant-value? [value]
   (= :variant (:aggregate/kind value))))
@@ -3686,7 +3702,7 @@
    ;; the constant a vreg is defined by, as an int Form, or nil
    (defn- const-i64 [instructions [:list [:ref :form/r]] defs :vector-i64 v [:ref :form/r]] [:ref :form/r]
      (let [d (gmir-def-of instructions defs v)]
-       (if (and (truthy? d) (kw? (fget d :gmir/op) :gmir/constant) (form/is-int? (fget d :gmir/value)))
+       (if (and (truthy? d) (fkw= d :gmir/op :gmir/constant) (form/is-int? (fget d :gmir/value)))
          (fget d :gmir/value)
          (nf))))
    :default
@@ -3701,7 +3717,7 @@
    ;; [base k] when v is base + constant k, else nil
    (defn- add-const-base [instructions [:list [:ref :form/r]] defs :vector-i64 v [:ref :form/r]] [:ref :form/r]
      (let [d (gmir-def-of instructions defs v)]
-       (if (and (truthy? d) (kw? (fget d :gmir/op) :gmir/add))
+       (if (and (truthy? d) (fkw= d :gmir/op :gmir/add))
          (let [left (fget d :gmir/left) right (fget d :gmir/right)
                lk (const-i64 instructions defs left) rk (const-i64 instructions defs right)]
            (cond (and (truthy? rk) (not (truthy? lk))) (form/vec2 left rk)
@@ -3797,7 +3813,7 @@
          (if (>= i n)
            (record-new [:ref :mi/lv] out (nf) next 0)
            (let [ins (lget instructions i)]
-             (if (not (kw? (fget ins :gmir/op) :gmir/multiply))
+             (if (not (fkw= ins :gmir/op :gmir/multiply))
                (recur (inc i) (lconj out ins) next)
                (let [left (fget ins :gmir/left) right (fget ins :gmir/right)
                      lk (const-i64 instructions defs left) rk (const-i64 instructions defs right)
@@ -3857,7 +3873,7 @@
          (if (>= i n)
            (record-new [:ref :mi/lv] out (nf) next 0)
            (let [ins (lget instructions i)]
-             (if (not (kw? (fget ins :gmir/op) :gmir/add))
+             (if (not (fkw= ins :gmir/op :gmir/add))
                (recur (inc i) (lconj out ins) next)
                (let [left (fget ins :gmir/left) right (fget ins :gmir/right)
                      lk (const-i64 instructions defs left) rk (const-i64 instructions defs right)
@@ -11349,7 +11365,7 @@
          (= encoding :aarch64/runtime-call) (a64-runtime-call instruction-index instruction)
          (= encoding :aarch64/capability-call) (a64-capability-call instruction)
          (= encoding :aarch64/return)
-         (lcat (if (kw? (fget instruction :mir/value) :aarch64/x0) (lnone) (a64-mov (kf :aarch64/x0) (fget instruction :mir/value)))
+         (lcat (if (fkw= instruction :mir/value :aarch64/x0) (lnone) (a64-mov (kf :aarch64/x0) (fget instruction :mir/value)))
                return-suffix)
          (= (a64-family encoding) :kernel-memory)
          (let [bits (* 8 (kernel-access-bytes encoding))
@@ -12120,9 +12136,9 @@
      (cond
        (layout-label-token? token) 0
        (layout-relative-branch-token? token) (branch-size (fkw token :mir/encoding))
-       (truthy? (fget token :native/data-content))
+       (ftruthy? token :native/data-content)
        (let [t (fkw token :native/data-target)] (cond (= t :x86-64) 10 (= t :aarch64) 16 :else -1))
-       (truthy? (fget token :native/rodata-content))
+       (ftruthy? token :native/rodata-content)
        (let [t (fkw token :native/rodata-target)] (cond (= t :x86-64) 7 (= t :aarch64) 4 :else -1))
        (and (form/is-int? token) (<= 0 (form/int-value token)) (<= (form/int-value token) 255)) 1
        :else -1))
@@ -12223,16 +12239,16 @@
            :else
            (let [size (size-of-token token)
                  encoded (cond
-                           (truthy? (fget token :native/data-content))
+                           (ftruthy? token :native/data-content)
                            (let [offset (form/int-value (form/form-get data-offsets (fget token :native/data-content)))]
-                             (if (kw? (fget token :native/data-target) :aarch64)
+                             (if (fkw= token :native/data-target :aarch64)
                                (a64-constant-fixed (fget token :native/data-dst) offset)
                                (reject-list! :mc-encode :x86-64-deferred token)))
-                           (truthy? (fget token :native/rodata-content))
+                           (ftruthy? token :native/rodata-content)
                            (let [offset (form/int-value (form/form-get literal-offsets
                                                                        (form/vec2 (fget token :native/rodata-encoding)
                                                                                   (fget token :native/rodata-content))))]
-                             (if (kw? (fget token :native/rodata-target) :aarch64)
+                             (if (fkw= token :native/rodata-target :aarch64)
                                (a64-adr (fget token :native/rodata-dst) (- offset position))
                                (reject-list! :mc-encode :x86-64-deferred token)))
                            :else (lone token))]
@@ -12512,7 +12528,7 @@
 
 #?(:kotoba
    (defn- a64-strength-reduce-cached-mersenne [instruction [:ref :form/r] cache [:list [:ref :form/r]]] [:ref :form/r]
-     (if (not (kw? (fget instruction :mc/encoding) :aarch64/multiply-subtract))
+     (if (not (fkw= instruction :mc/encoding :aarch64/multiply-subtract))
        instruction
        (let [left (fget instruction :mir/left) right (fget instruction :mir/right)
              lv (cache-value-of-register cache left) rv (cache-value-of-register cache right)
@@ -12548,7 +12564,7 @@
 
 #?(:kotoba
    (defn- msub-on? [instruction [:ref :form/r] register [:ref :form/r]] :bool
-     (and (kw? (fget instruction :mc/encoding) :aarch64/multiply-subtract)
+     (and (fkw= instruction :mc/encoding :aarch64/multiply-subtract)
           (or (feq (fget instruction :mir/left) register) (feq (fget instruction :mir/right) register)))))
 
 #?(:kotoba
@@ -12851,7 +12867,7 @@
                  consumer (lget instructions (inc i))
                  register (fget constant :mir/dst)
                  op (fkw consumer :mc/encoding)
-                 constant? (kw? (fget constant :mc/encoding) :aarch64/constant)
+                 constant? (fkw= constant :mc/encoding :aarch64/constant)
                  operand (cond (and (= op :aarch64/add) (feq register (fget consumer :mir/right))) (fget consumer :mir/left)
                                (and (= op :aarch64/add) (feq register (fget consumer :mir/left))) (fget consumer :mir/right)
                                (and (= op :aarch64/subtract) (feq register (fget consumer :mir/right))) (fget consumer :mir/left)
@@ -12915,7 +12931,7 @@
        (loop [i 0 acc (lnone)]
          (if (>= i n) acc
            (let [ins (lget instructions i)
-                 reduced? (truthy? (fget ins :native/a64-mersenne-shift))
+                 reduced? (ftruthy? ins :native/a64-mersenne-shift)
                  factor (fget ins :native/a64-mersenne-factor)
                  srcs (if reduced?
                         (a64-source-registers (form/dissoc-form (form/dissoc-form ins (kf :mir/left)) (kf :mir/right)))
@@ -13235,7 +13251,7 @@
        (loop [i 0 acc (lnone)]
          (if (>= i n) acc
            (let [ins (lget instructions i)]
-             (if (kw? (fget ins :mc/encoding) :aarch64/constant)
+             (if (fkw= ins :mc/encoding :aarch64/constant)
                (recur (inc i) (occurrence-add acc (fget ins :mir/value) i))
                (recur (inc i) acc))))))))
 
@@ -13291,7 +13307,7 @@
        (loop [i 0]
          (if (>= i n) true
            (let [ins (lget instructions i) enc (fget ins :mc/encoding)]
-             (if (and (kw? (fget ins :mc/op) :mc/instruction) (fmember? safe enc)
+             (if (and (fkw= ins :mc/op :mc/instruction) (fmember? safe enc)
                       (not (kw? enc :aarch64/call)) (not (kw? enc :aarch64/tail-call)))
                (recur (inc i)) false)))))))
 
@@ -13301,7 +13317,7 @@
        (loop [i 0 aliases (fmap (lnone)) loaded (lnone) out (lnone)]
          (if (>= i n) out
            (let [ins (lget instructions i) value (fget ins :mir/value)
-                 register (if (kw? (fget ins :mc/encoding) :aarch64/constant) (cache-register-of-value cache value) (nf))]
+                 register (if (fkw= ins :mc/encoding :aarch64/constant) (cache-register-of-value cache value) (nf))]
              (if (truthy? register)
                (recur (inc i) (form/assoc-form aliases (fget ins :mir/dst) register)
                       (if (lmember? loaded value) loaded (lconj loaded value))
@@ -13337,7 +13353,7 @@
        (if (>= i (lcount rewritten)) acc
          (let [ins (lget rewritten i) dst (fget ins :mir/dst)]
            (recur (inc i)
-                  (if (and (kw? (fget ins :mc/encoding) :aarch64/constant) (lmember? cache-registers dst) (not (lmember? used dst)))
+                  (if (and (fkw= ins :mc/encoding :aarch64/constant) (lmember? cache-registers dst) (not (lmember? used dst)))
                     acc (lconj acc ins))))))))
 
 #?(:kotoba
@@ -13566,9 +13582,9 @@
                parameters (fget reentry :mc/parameters)
                arguments (fget recur :mc/arguments)]
            (if (and (= ci (dec (lcount instructions)))
-                    (kw? (fget branch :mc/op) :mc/branch-nonzero)
-                    (kw? (fget return :mc/op) :mc/instruction)
-                    (kw? (fget return :mc/encoding) :aarch64/return)
+                    (fkw= branch :mc/op :mc/branch-nonzero)
+                    (fkw= return :mc/op :mc/instruction)
+                    (fkw= return :mc/encoding :aarch64/return)
                     (layout-label-token? body-label)
                     (feq (fget branch :mc/target) (fget body-label :mir/id))
                     (feq parameters arguments)
@@ -13650,7 +13666,7 @@
      (loop [i from]
        (if (>= i to) false
          (let [ins (lget instructions i) enc (fget ins :mc/encoding)]
-           (if (or (kw? (fget ins :mir/dst) :aarch64/x0)
+           (if (or (fkw= ins :mir/dst :aarch64/x0)
                    (kw? enc :aarch64/call) (kw? enc :aarch64/runtime-call) (kw? enc :aarch64/capability-call))
              true (recur (inc i))))))))
 
@@ -13672,13 +13688,13 @@
                  call (lget instructions li)
                  recur-index (form/int-value (fget bottom-test :recur-index))
                  recur (lget instructions recur-index)]
-             (if (and (kw? (fget constant :mc/op) :mc/instruction)
-                      (kw? (fget constant :mc/encoding) :aarch64/constant)
-                      (kw? (fget constant :mir/dst) :aarch64/x0)
-                      (kw? (fget call :mc/op) :mc/instruction)
-                      (kw? (fget call :mc/encoding) :aarch64/call)
+             (if (and (fkw= constant :mc/op :mc/instruction)
+                      (fkw= constant :mc/encoding :aarch64/constant)
+                      (fkw= constant :mir/dst :aarch64/x0)
+                      (fkw= call :mc/op :mc/instruction)
+                      (fkw= call :mc/encoding :aarch64/call)
                       (feq (fget call :mir/arguments) (fvec (lone (kf :aarch64/x0))))
-                      (kw? (fget call :mir/dst) :aarch64/x0)
+                      (fkw= call :mir/dst :aarch64/x0)
                       (lmember? identity-callees (fget call :mir/callee))
                       (not (fmember? (fget recur :mc/arguments) (kf :aarch64/x0)))
                       (not (x0-clobbered-between? instructions (inc li) recur-index)))
@@ -13797,7 +13813,7 @@
              tokens (it-step isa frame-bytes return-suffix tail-suffix callee-labels self-tail-prefix self-tail-body
                              bottom-test-exit bottom-test identity-hoist i instruction load-multiplier?)
              next-multiplier (cond (truthy? multiplier) multiplier
-                                   (and (kw? (fget instruction :mc/op) :mc/instruction) (a64-x16-preserving? encoding)) cached
+                                   (and (fkw= instruction :mc/op :mc/instruction) (a64-x16-preserving? encoding)) cached
                                    :else (nf))]
          (it-walk isa frame-bytes return-suffix tail-suffix callee-labels self-tail-prefix self-tail-body bottom-test-exit
                   bottom-test identity-hoist instructions (inc i) next-multiplier (lcat out tokens))))))
@@ -14866,14 +14882,18 @@
 #?(:kotoba
    ;; the host takes TOKENS-FOR, a function of the name; every caller answers the
    ;; same tokens for every name, so the Kotoba twin takes the tokens
-   (defn entry-fuel-prefixes [kir [:ref :form/r] tokens [:ref :form/r]] [:ref :form/r]
-     (let [fs (kids (fget (lower-kir-module kir) :gmir/functions)) n (lcount fs)]
+   (defn entry-fuel-prefixes-of-gmir [module [:ref :form/r] tokens [:ref :form/r]] [:ref :form/r]
+     (let [fs (kids (fget module :gmir/functions)) n (lcount fs)]
        (loop [i 0 acc (lnone)]
          (if (>= i n) (fmap acc)
            (let [f (lget fs i)]
              (recur (inc i) (if (function-reenters-guest? (fget f :gmir/instructions))
                               (lconj (lconj acc (fget f :gmir/name)) tokens)
-                              acc)))))))
+                              acc))))))))
+
+#?(:kotoba
+   (defn entry-fuel-prefixes [kir [:ref :form/r] tokens [:ref :form/r]] [:ref :form/r]
+     (entry-fuel-prefixes-of-gmir (lower-kir-module kir) tokens))
    :default
 (defn entry-fuel-prefixes
   "Production fuel map: only functions that can re-enter. TOKENS-FOR is
@@ -14889,9 +14909,15 @@
                 (:gmir/functions module))))))
 
 #?(:kotoba
+   ;; Kotoba-only: the plans from an already lowered module (the host lowers the KIR
+   ;; again for each of the three consumers; on the Kotoba route that triples the heap)
+   (defn counted-self-recur-plans-of-gmir [target :keyword module [:ref :form/r]] [:ref :form/r]
+     (let [r (mir/counted-self-recur-plans-result (mir-select-target target module))]
+       (if (fhas? r :problem) (reject-form! :mir (fkw r :problem) module) (fget r :plans)))))
+
+#?(:kotoba
    (defn counted-self-recur-plans [target :keyword kir [:ref :form/r]] [:ref :form/r]
-     (let [r (mir/counted-self-recur-plans-result (mir-select-target target (lower-kir-module kir)))]
-       (if (fhas? r :problem) (reject-form! :mir (fkw r :problem) kir) (fget r :plans))))
+     (counted-self-recur-plans-of-gmir target (lower-kir-module kir)))
    :default
 (defn counted-self-recur-plans
   "Prove exact pure counted self recurrence after target selection.  The

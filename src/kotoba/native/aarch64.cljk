@@ -269,9 +269,11 @@
                      (let [f (typed-list-nth [:list [:ref :form/r]] fs i)] (if (form/eq (fget f :mc/name) name) f (recur (inc i)))))))))
 
 #?(:kotoba
-   (defn- fuel-instrumentation [kir [:ref :form/r] mc [:ref :form/r]] [:ref :form/r]
-     (let [ordinary (unwrap! (machine-ir/entry-fuel-prefixes kir (form/form-vec (fuel-charge-tokens))) :entry-fuel-prefixes)
-           plans (unwrap! (machine-ir/counted-self-recur-plans :aarch64 kir) :counted-self-recur-plans)
+   ;; GMIR is the module emit-program already lowered: the host lowers the KIR again
+   ;; for each consumer, which on the Kotoba route triples the heap for nothing.
+   (defn- fuel-instrumentation [gmir [:ref :form/r] mc [:ref :form/r]] [:ref :form/r]
+     (let [ordinary (machine-ir/entry-fuel-prefixes-of-gmir gmir (form/form-vec (fuel-charge-tokens)))
+           plans (unwrap! (machine-ir/counted-self-recur-plans-of-gmir :aarch64 gmir) :counted-self-recur-plans)
            xs (form/kids-of plans)
            n (vector-count xs)]
        (loop [j 0 out ordinary]
@@ -1878,7 +1880,7 @@
            kir (if (truthy? (fget k2 :exports)) k2 (form/assoc-form k2 (kf :exports) (function-names (form/kids-of fs2))))
            gmir (unwrap! (machine-ir/lower-kir-module kir) :kir-to-gmir)
            mc (unwrap! (machine-ir/compile-gmir :aarch64 gmir) :mir)
-           prefixes (fuel-instrumentation kir mc)]
+           prefixes (fuel-instrumentation gmir mc)]
        (unwrap! (machine-ir/encode-mc-module mc prefixes (fget kir :exports)) :mc-encode)))
    :default
 (defn emit-program [kir]

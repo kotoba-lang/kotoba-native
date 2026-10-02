@@ -33,8 +33,8 @@ it (`#?(:kotoba <twin> :default <host>)`). Host maps, vectors and keywords are
 vreg number.
 
 Measured result: both files check OK on the native checker. machine_ir has 220
-of its 392 definitions with a real Kotoba body (5299 of 8592 host lines), 200 of
-them reachable from a differentially tested entry; 46 are folded into twins
+of its 392 definitions with a real Kotoba body (5299 of 8592 host lines), 198 of
+them (5073 lines) reachable from a differentially tested entry; 46 are folded into twins
 under other names (an EDN table that became a `case` predicate, a constant
 inlined at its one use); 126 are deferred (the x86-64 encoders and the legacy
 `pilot-expression?` gate). aarch64 has its production path real (`emit-program`
@@ -72,7 +72,10 @@ Specific choices, each forced by the Kotoba route as it is today:
   code never names them, and none reaches GMIR.
 * **Hot lookups allocate nothing.** Every Form is seven pairs and a vector and
   the native heap is not reclaimed, so keyword lookups scan kids without
-  building a key Form and op tables are `case` predicates.
+  building a key Form, op tables are `case` predicates, and the fuel
+  instrumentation reads the GMIR `emit-program` already lowered
+  (`entry-fuel-prefixes-of-gmir`, `counted-self-recur-plans-of-gmir`, Kotoba-only
+  exports) where the host lowers the KIR again for each consumer.
 
 ## Evidence
 
@@ -85,7 +88,7 @@ lang-conformance, bench) and 167 aiueos programs for aarch64-macos on the JVM.
 | entry | agree (bytes / data equal) | both refused | stub | arena | differ |
 |---|---|---|---|---|---|
 | `aarch64/emit-program`, amu corpus | 161 | 1 | 3 | 7 | 0 |
-| `aarch64/emit-program`, aiueos (kernel windows, subregions, ...) | 71 | 18 | 0 | 27 | 0 |
+| `aarch64/emit-program`, aiueos (kernel windows, subregions, ...) | 77 | 18 | 0 | 21 | 0 |
 | `lower-kir-expression` | 786 | 1 | 20 | 0 | 0 |
 | `lower-kir-module` | 160 | 1 | 2 | 0 | 0 |
 | `compile-gmir` / `hoist` / `coalesce` / `lower-mc` | 153 / 156 / 156 / 153 | | | | 0 |
@@ -98,7 +101,7 @@ are not natively linkable yet (they hold functions answering `:symbol`).
 
 ## Consequences and open walls (owners outside this repository)
 
-* **Memory.** A 28 KB KIR program needs about 4.2M vectors and 20M pairs on the
+* **Memory.** A 28 KB KIR program needs about 3.4M vectors and 16M pairs on the
   Kotoba route, mostly Form nodes (each leaf allocates an empty kids vector) in
   `kotoba.mir` select/allocate and the MC validators. Compiling the compiler
   itself needs memory reclamation or a lighter Form (amu track C3).
