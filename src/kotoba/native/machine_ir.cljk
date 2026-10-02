@@ -8,7 +8,9 @@
   {:kotoba/export [coalesce-program-moves compile-expression compile-gmir compile-kir-module counted-self-recur-plans encode-mc encode-mc-module entry-fuel-prefixes function-reenters-guest? hoist-program-consumers lower-kir-expression lower-kir-module lower-mc pilot-expression? pilot-module? signed-division-magic word-result-type?]}
   #?(:kotoba (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
                                           [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]
-                                 :form/rd [:record :form/rd [[:form [:ref :form/r]] [:pos :i64]]]}))
+                                 :form/rd [:record :form/rd [[:form [:ref :form/r]] [:pos :i64]]]
+                                 :mi/lv [:record :mi/lv [[:code [:list [:ref :form/r]]] [:value [:ref :form/r]]
+                                                         [:reg :i64] [:label :i64]]]}))
   (:require #?@(:kotoba [[kotoba.form :as form]])
             [kotoba.bytes :as kbytes] [kotoba.lang.text :as str]
             [kotoba.lang.coll :as walk]
@@ -1382,6 +1384,55 @@
 
 ;; ── closed KIR expression -> GMIR pilot ─────────────────────────────────────
 
+#?(:kotoba
+   ;; ── KIR -> GMIR: Kotoba twins ────────────────────────────────────────────────
+   ;; KIR is a Form here. The host's gensym'd binders are fixed names in the twin
+   ;; (`option__`, `record__`, ...): each generated `let` binds its name around
+   ;; code whose own references are to that binding, and user code never names
+   ;; them, so a nested expansion shadows rather than captures. They never reach
+   ;; GMIR, where every binder is a vreg.
+   (defn- sym? [f [:ref :form/r] name :string] :bool
+     (and (form/is-symbol? f) (string=? (form/symbol-value f) name))))
+
+#?(:kotoba
+   (defn- symf [name :string] [:ref :form/r] (form/symbol-form name)))
+
+#?(:kotoba
+   (defn- fnth [f [:ref :form/r] i :i64] [:ref :form/r] (form/nth-of f i)))
+
+#?(:kotoba
+   (defn- fcount [f [:ref :form/r]] :i64 (form/count-of f)))
+
+#?(:kotoba
+   (defn- head-is? [form [:ref :form/r] name :string] :bool
+     (and (form/is-seq? form) (> (form/count-of form) 0) (sym? (form/nth-of form 0) name))))
+
+#?(:kotoba
+   (defn- head-in? [form [:ref :form/r] table [:ref :form/r]] :bool
+     (and (form/is-seq? form) (> (form/count-of form) 0) (fmember? table (form/nth-of form 0)))))
+
+#?(:kotoba
+   (defn- tget [table [:ref :form/r] form [:ref :form/r]] [:ref :form/r]
+     (form/form-get table (form/nth-of form 0))))
+
+#?(:kotoba
+   (defn- lst [xs [:list [:ref :form/r]]] [:ref :form/r] (form/form-seq xs)))
+
+#?(:kotoba
+   (defn- let1 [name :string value [:ref :form/r] body [:ref :form/r]] [:ref :form/r]
+     (form/call2 "let" (form/vec2 (symf name) value) body)))
+
+#?(:kotoba
+   (defn- let2 [n1 :string v1 [:ref :form/r] n2 :string v2 [:ref :form/r] body [:ref :form/r]] [:ref :form/r]
+     (form/call2 "let" (form/vec4 (symf n1) v1 (symf n2) v2) body)))
+
+#?(:kotoba
+   (defn- if3 [t [:ref :form/r] a [:ref :form/r] b [:ref :form/r]] [:ref :form/r] (form/call3 "if" t a b)))
+
+#?(:kotoba
+   (defn- kir-binary-ops [] [:ref :form/r]
+     (form/edn-form "{+ :gmir/add - :gmir/subtract * :gmir/multiply quot :gmir/quotient bit-and :gmir/bit-and bit-or :gmir/bit-or bit-xor :gmir/bit-xor i64-shift-left :gmir/shift-left i64-shift-right :gmir/shift-right-signed u64-shift-right :gmir/shift-right-unsigned = :gmir/equal < :gmir/less-than > :gmir/greater-than <= :gmir/less-or-equal >= :gmir/greater-or-equal}"))
+   :default
 (def ^:private kir-binary-ops
   {'+ :gmir/add '- :gmir/subtract '* :gmir/multiply
    'quot :gmir/quotient 'bit-and :gmir/bit-and
@@ -1390,18 +1441,39 @@
    'i64-shift-right :gmir/shift-right-signed
    'u64-shift-right :gmir/shift-right-unsigned
    '= :gmir/equal '< :gmir/less-than '> :gmir/greater-than
-   '<= :gmir/less-or-equal '>= :gmir/greater-or-equal})
+   '<= :gmir/less-or-equal '>= :gmir/greater-or-equal}))
 
+#?(:kotoba
+   (defn- kir-predicate-ops [] [:ref :form/r]
+     (form/edn-form "{not :gmir/equal zero? :gmir/equal pos? :gmir/greater-than neg? :gmir/less-than}"))
+   :default
 (def ^:private kir-predicate-ops
   {'not :gmir/equal 'zero? :gmir/equal
-   'pos? :gmir/greater-than 'neg? :gmir/less-than})
+   'pos? :gmir/greater-than 'neg? :gmir/less-than}))
 
-(def ^:private kir-fold-ops '#{+ - * bit-and bit-or bit-xor})
-(def ^:private kir-comparison-ops '#{= < > <= >=})
-(def ^:private kir-word-unary-ops '#{bool-not bit-not i32-wrap u32-wrap})
+#?(:kotoba
+   (defn- kir-fold-ops [] [:ref :form/r] (form/edn-form "#{+ - * bit-and bit-or bit-xor}"))
+   :default
+(def ^:private kir-fold-ops '#{+ - * bit-and bit-or bit-xor}))
+#?(:kotoba
+   (defn- kir-comparison-ops [] [:ref :form/r] (form/edn-form "#{= < > <= >=}"))
+   :default
+(def ^:private kir-comparison-ops '#{= < > <= >=}))
+#?(:kotoba
+   (defn- kir-word-unary-ops [] [:ref :form/r] (form/edn-form "#{bool-not bit-not i32-wrap u32-wrap}"))
+   :default
+(def ^:private kir-word-unary-ops '#{bool-not bit-not i32-wrap u32-wrap}))
+#?(:kotoba
+   (defn- kir-i32-binary-ops [] [:ref :form/r]
+     (form/edn-form "#{i32-wrapping-add i32-wrapping-mul i32-xor i32-shift-left i32-shift-right u32-shift-right}"))
+   :default
 (def ^:private kir-i32-binary-ops
   '#{i32-wrapping-add i32-wrapping-mul i32-xor
-     i32-shift-left i32-shift-right u32-shift-right})
+     i32-shift-left i32-shift-right u32-shift-right}))
+#?(:kotoba
+   (defn- kir-f64-binary-ops [] [:ref :form/r]
+     (form/edn-form "{f64-add :gmir/f64-add f64-sub :gmir/f64-subtract f64-mul :gmir/f64-multiply f64-div :gmir/f64-divide f64-min :gmir/f64-min f64-max :gmir/f64-max f64-eq :gmir/f64-equal f64-lt :gmir/f64-less-than f64-le :gmir/f64-less-or-equal f64-gt :gmir/f64-greater-than f64-ge :gmir/f64-greater-or-equal f64-unordered :gmir/f64-unordered}"))
+   :default
 (def ^:private kir-f64-binary-ops
   {'f64-add :gmir/f64-add 'f64-sub :gmir/f64-subtract
    'f64-mul :gmir/f64-multiply 'f64-div :gmir/f64-divide
@@ -1409,15 +1481,21 @@
    'f64-eq :gmir/f64-equal 'f64-lt :gmir/f64-less-than
    'f64-le :gmir/f64-less-or-equal 'f64-gt :gmir/f64-greater-than
    'f64-ge :gmir/f64-greater-or-equal
-   'f64-unordered :gmir/f64-unordered})
+   'f64-unordered :gmir/f64-unordered}))
+#?(:kotoba
+   (defn- kir-f64-unary-ops [] [:ref :form/r] (form/edn-form "#{f64-from-bits f64-to-bits f64-abs f64-neg f64-sqrt}"))
+   :default
 (def ^:private kir-f64-unary-ops
-  '#{f64-from-bits f64-to-bits f64-abs f64-neg f64-sqrt})
+  '#{f64-from-bits f64-to-bits f64-abs f64-neg f64-sqrt}))
 ;; memwidth: 2^40 elements. Mirrors `kotoba.gmir/slice-item-limit` and
 ;; `kotoba.mir/slice-item-limit` -- an ADDRESS-SPACE bound rather than a window
 ;; profile, chosen so `length * 8` cannot wrap a 64-bit address computation.
 ;; Deliberately not derived from any vector arena bound: amu ADR 0285's
 ;; decision is that the bulk carrier does not travel through the arena.
-(def ^:private slice-item-limit 1099511627776)
+#?(:kotoba
+   (defn- slice-item-limit [] :i64 1099511627776)
+   :default
+(def ^:private slice-item-limit 1099511627776))
 
 
 ;; f32: binary32 (kotoba-lang docs/adr/ADR-kotoba-floating-point-on-native.md).
@@ -1440,25 +1518,40 @@
 ;; to travel kir -> sema -> gmir -> mir -> codegen -> verifier -> native, seven
 ;; repositories, and that is a slice of its own rather than a hygiene fix.
 ;; `kotoba.kir` still refuses them at admission for both backends.
+#?(:kotoba
+   (defn- kir-f32-binary-ops [] [:ref :form/r]
+     (form/edn-form "{f32-add :gmir/f32-add f32-sub :gmir/f32-subtract f32-mul :gmir/f32-multiply f32-div :gmir/f32-divide f32-eq :gmir/f32-equal f32-lt :gmir/f32-less-than f32-le :gmir/f32-less-or-equal f32-gt :gmir/f32-greater-than f32-ge :gmir/f32-greater-or-equal f32-unordered :gmir/f32-unordered}"))
+   :default
 (def ^:private kir-f32-binary-ops
   {'f32-add :gmir/f32-add 'f32-sub :gmir/f32-subtract
    'f32-mul :gmir/f32-multiply 'f32-div :gmir/f32-divide
    'f32-eq :gmir/f32-equal 'f32-lt :gmir/f32-less-than
    'f32-le :gmir/f32-less-or-equal 'f32-gt :gmir/f32-greater-than
    'f32-ge :gmir/f32-greater-or-equal
-   'f32-unordered :gmir/f32-unordered})
+   'f32-unordered :gmir/f32-unordered}))
 
+#?(:kotoba
+   (defn- kir-f32-unary-ops [] [:ref :form/r] (form/edn-form "#{f32-from-bits f32-to-bits f32-abs f32-neg f32-sqrt}"))
+   :default
 (def ^:private kir-f32-unary-ops
-  '#{f32-from-bits f32-to-bits f32-abs f32-neg f32-sqrt})
+  '#{f32-from-bits f32-to-bits f32-abs f32-neg f32-sqrt}))
 
 ;; Width conversions, all one-source/one-value. Only the four on which both
 ;; ISAs and the KIR oracle agree for EVERY input; the `-checked` and truncating
 ;; float-to-int families are refused at admission and are named in the ADR.
+#?(:kotoba
+   (defn- kir-f32-conversion-ops [] [:ref :form/r]
+     (form/edn-form "{f32-to-f64-exact :gmir/f32-to-f64 f64-to-f32-rounded :gmir/f64-to-f32 i64-to-f32-rounded :gmir/i64-to-f32 i64-to-f64-rounded :gmir/i64-to-f64}"))
+   :default
 (def ^:private kir-f32-conversion-ops
   {'f32-to-f64-exact :gmir/f32-to-f64
    'f64-to-f32-rounded :gmir/f64-to-f32
    'i64-to-f32-rounded :gmir/i64-to-f32
-   'i64-to-f64-rounded :gmir/i64-to-f64})
+   'i64-to-f64-rounded :gmir/i64-to-f64}))
+#?(:kotoba
+   (defn- kir-kernel-memory-ops [] [:ref :form/r]
+     (form/edn-form "{kernel-load-u8 [:gmir/kernel-load-u8 512] kernel-store-u8 [:gmir/kernel-store-u8 512] kernel-load-u8-4k [:gmir/kernel-load-u8 4096] kernel-store-u8-4k [:gmir/kernel-store-u8 4096] kernel-load-u8-16k [:gmir/kernel-load-u8 16384] kernel-store-u8-16k [:gmir/kernel-store-u8 16384] kernel-load-u8-64k [:gmir/kernel-load-u8 65536] kernel-store-u8-64k [:gmir/kernel-store-u8 65536] kernel-load-u16 [:gmir/kernel-load-u16 512] kernel-store-u16 [:gmir/kernel-store-u16 512] kernel-load-u16-4k [:gmir/kernel-load-u16 4096] kernel-store-u16-4k [:gmir/kernel-store-u16 4096] kernel-load-u16-16k [:gmir/kernel-load-u16 16384] kernel-store-u16-16k [:gmir/kernel-store-u16 16384] kernel-load-u16-64k [:gmir/kernel-load-u16 65536] kernel-store-u16-64k [:gmir/kernel-store-u16 65536] kernel-load-u32 [:gmir/kernel-load-u32 512] kernel-store-u32 [:gmir/kernel-store-u32 512] kernel-load-u32-4k [:gmir/kernel-load-u32 4096] kernel-store-u32-4k [:gmir/kernel-store-u32 4096] kernel-load-u32-16k [:gmir/kernel-load-u32 16384] kernel-store-u32-16k [:gmir/kernel-store-u32 16384] kernel-load-u32-64k [:gmir/kernel-load-u32 65536] kernel-store-u32-64k [:gmir/kernel-store-u32 65536] kernel-load-u64 [:gmir/kernel-load-u64 512] kernel-store-u64 [:gmir/kernel-store-u64 512] kernel-load-u64-4k [:gmir/kernel-load-u64 4096] kernel-store-u64-4k [:gmir/kernel-store-u64 4096] kernel-load-u64-16k [:gmir/kernel-load-u64 16384] kernel-store-u64-16k [:gmir/kernel-store-u64 16384] kernel-load-u64-64k [:gmir/kernel-load-u64 65536] kernel-store-u64-64k [:gmir/kernel-store-u64 65536] slice-load-u8 [:gmir/slice-load-u8 1099511627776] slice-store-u8 [:gmir/slice-store-u8 1099511627776] slice-load-u16 [:gmir/slice-load-u16 1099511627776] slice-store-u16 [:gmir/slice-store-u16 1099511627776] slice-load-u32 [:gmir/slice-load-u32 1099511627776] slice-store-u32 [:gmir/slice-store-u32 1099511627776] slice-load-u64 [:gmir/slice-load-u64 1099511627776] slice-store-u64 [:gmir/slice-store-u64 1099511627776] kernel-try-lock-u32 [:gmir/kernel-try-lock-u32 4096] kernel-unlock-u32 [:gmir/kernel-unlock-u32 4096]}"))
+   :default
 (def ^:private kir-kernel-memory-ops
   ;; memwidth: four transfer widths by four window tiers, plus the ADR 0285
   ;; slice family. The GMIR operation carries the width and `:gmir/maximum`
@@ -1509,14 +1602,18 @@
    ;; its callers declare lengths of both 512 and 4096. A 512 ceiling would
    ;; trap the 4096 ones on the length check before reaching the shared word.
    'kernel-try-lock-u32 [:gmir/kernel-try-lock-u32 4096]
-   'kernel-unlock-u32 [:gmir/kernel-unlock-u32 4096]})
+   'kernel-unlock-u32 [:gmir/kernel-unlock-u32 4096]}))
 
+#?(:kotoba
+   (defn- gmir-memory-store-ops [] [:ref :form/r]
+     (form/edn-form "#{:gmir/kernel-store-u8 :gmir/kernel-store-u16 :gmir/kernel-store-u32 :gmir/kernel-store-u64 :gmir/slice-store-u8 :gmir/slice-store-u16 :gmir/slice-store-u32 :gmir/slice-store-u64}"))
+   :default
 (def ^:private gmir-memory-store-ops
   "memwidth: derived from the table rather than written out beside it. Every
   store takes four operands and every load three."
   (into #{} (comp (filter #(str/includes? (name (first %)) "store"))
                   (map first))
-        (vals kir-kernel-memory-ops)))
+        (vals kir-kernel-memory-ops))))
 
 (def ^:private gmir-slice-ops
   (into #{} (comp (filter #(str/starts-with? (name (first %)) "slice-"))
@@ -1554,13 +1651,17 @@
 ;; lowering there is written around three-or-four.
 ;;
 ;; `[gmir-op maximum argument-count access-bits]`.
+#?(:kotoba
+   (defn- kir-kernel-atomic-ops [] [:ref :form/r]
+     (form/edn-form "{kernel-atomic-add-u32 [:gmir/kernel-atomic-add-u32 4096 4 32] kernel-atomic-add-u64 [:gmir/kernel-atomic-add-u64 4096 4 64] kernel-xchg-u32 [:gmir/kernel-xchg-u32 4096 4 32] kernel-xchg-u64 [:gmir/kernel-xchg-u64 4096 4 64] kernel-cmpxchg-u32 [:gmir/kernel-cmpxchg-u32 4096 5 32] kernel-cmpxchg-u64 [:gmir/kernel-cmpxchg-u64 4096 5 64]}"))
+   :default
 (def ^:private kir-kernel-atomic-ops
   {'kernel-atomic-add-u32 [:gmir/kernel-atomic-add-u32 4096 4 32]
    'kernel-atomic-add-u64 [:gmir/kernel-atomic-add-u64 4096 4 64]
    'kernel-xchg-u32       [:gmir/kernel-xchg-u32 4096 4 32]
    'kernel-xchg-u64       [:gmir/kernel-xchg-u64 4096 4 64]
    'kernel-cmpxchg-u32    [:gmir/kernel-cmpxchg-u32 4096 5 32]
-   'kernel-cmpxchg-u64    [:gmir/kernel-cmpxchg-u64 4096 5 64]})
+   'kernel-cmpxchg-u64    [:gmir/kernel-cmpxchg-u64 4096 5 64]}))
 ;; sysops: end
 
 ;; simd: the f32 dot product (kotoba-gmir ADR 0010). Its own table because its
@@ -1594,13 +1695,21 @@
    ;; dequant-ptq1: PTQ1_0 (kotoba-gmir ADR 0031, this repo's ADR 0088).
    'kernel-dequant-dot-ptq1-0 [:gmir/kernel-dequant-dot-ptq1-0 65536 5]})
 
+#?(:kotoba
+   (defn- kir-region-pair-ops [] [:ref :form/r]
+     (form/edn-form "{kernel-dot-f32 [:gmir/kernel-dot-f32 65536 5] kernel-dequant-dot-q8-0 [:gmir/kernel-dequant-dot-q8-0 65536 5] kernel-dequant-dot-q4-k [:gmir/kernel-dequant-dot-q4-k 65536 5] kernel-dequant-dot-q6-k [:gmir/kernel-dequant-dot-q6-k 65536 5] kernel-dequant-dot-iq4-xs [:gmir/kernel-dequant-dot-iq4-xs 65536 5] kernel-dequant-dot-iq2-s [:gmir/kernel-dequant-dot-iq2-s 65536 5] kernel-dequant-dot-iq3-xxs [:gmir/kernel-dequant-dot-iq3-xxs 65536 5] kernel-dequant-dot-iq3-s [:gmir/kernel-dequant-dot-iq3-s 65536 5] kernel-dequant-dot-ptq1-0 [:gmir/kernel-dequant-dot-ptq1-0 65536 5]}"))
+   :default
 (def ^:private kir-region-pair-ops
   "Every head whose operands are `base length second-base second-length
   count`. One table, so the pilot has one clause for the shape rather than
   one per family -- and so adding a format cannot forget the `shape` arm."
-  (merge kir-kernel-dot-f32-ops kir-kernel-dequant-dot-ops))
+  (merge kir-kernel-dot-f32-ops kir-kernel-dequant-dot-ops)))
 ;; dequant: end
 
+#?(:kotoba
+   (defn- kir-x86-privileged-ops [] [:ref :form/r]
+     (form/edn-form "{kernel-boot-info :boot-info kernel-read-cr0 :read-cr0 kernel-write-cr0 :write-cr0 kernel-read-cr2 :read-cr2 kernel-read-cr3 :read-cr3 kernel-write-cr3 :write-cr3 kernel-invlpg :invlpg kernel-read-cs :read-cs kernel-page-fault-handler-address :page-fault-handler-address kernel-rt-timer-handler-address :rt-timer-handler-address kernel-page-fault-recovery-handler-address :page-fault-recovery-handler-address kernel-configure-page-fault-recovery :configure-page-fault-recovery kernel-double-fault-handler-address :double-fault-handler-address kernel-undefined-opcode-handler-address :undefined-opcode-handler-address kernel-configure-double-fault-ist :configure-double-fault-ist kernel-load-gdt-tss :load-gdt-tss kernel-load-idt :load-idt kernel-probe-guard-write :probe-guard-write kernel-probe-text-write :probe-text-write kernel-probe-nx-execute :probe-nx-execute kernel-probe-recoverable-guard-write :probe-recoverable-guard-write kernel-probe-double-fault :probe-double-fault kernel-cli :cli kernel-sti :sti kernel-hlt :hlt kernel-pause :pause kernel-out-u8 :out-u8 kernel-out-u32 :out-u32 kernel-in-u8 :in-u8 kernel-in-u32 :in-u32 kernel-read-msr :read-msr kernel-write-msr :write-msr kernel-cpuid-eax :cpuid-eax kernel-cpuid-ebx :cpuid-ebx kernel-cpuid-ecx :cpuid-ecx kernel-cpuid-edx :cpuid-edx kernel-xgetbv :xgetbv kernel-read-cr4 :read-cr4 kernel-write-cr4 :write-cr4 kernel-xsetbv :xsetbv kernel-fence-load :fence-load kernel-fence-store :fence-store kernel-fence-full :fence-full kernel-rdtsc :rdtsc kernel-rdtscp :rdtscp kernel-swapgs :swapgs kernel-system-table :system-table kernel-load-ptr :load-ptr kernel-uefi-call2 :uefi-call2 kernel-jump-to :jump-to kernel-uefi-call4 :uefi-call4 kernel-uefi-call6 :uefi-call6 kernel-isr-entry-address :isr-entry-address kernel-scratch-region :scratch-region kernel-uefi-alloc-region :uefi-alloc-region}"))
+   :default
 (def ^:private kir-x86-privileged-ops
   {'kernel-boot-info :boot-info
    'kernel-read-cr0 :read-cr0
@@ -1686,15 +1795,19 @@
    ;; here to bound. What it produces is the base a later window is declared
    ;; over, and that window is bounded by kotoba-sema against the page count
    ;; this call passes.
-   'kernel-uefi-alloc-region :uefi-alloc-region})
+   'kernel-uefi-alloc-region :uefi-alloc-region}))
 
 ;; boot-lit: the literal heads. NOT in the table above, because a privileged
 ;; action's operands are registers and these take a piece of the source text.
 ;; The value here is the `kotoba.gmir` encoding the head names.
+#?(:kotoba
+   (defn- kir-rodata-address-ops [] [:ref :form/r]
+     (form/edn-form "{ucs2 :utf-16le-nul guid :guid-mixed-endian bytes-literal :hex-bytes}"))
+   :default
 (def ^:private kir-rodata-address-ops
   '{ucs2 :utf-16le-nul
     guid :guid-mixed-endian
-    bytes-literal :hex-bytes})
+    bytes-literal :hex-bytes}))
 
 ;; `bytes-literal-length` produces a count rather than an address, so it
 ;; lowers to a plain constant and never reaches the pool. It is here rather
@@ -1709,6 +1822,10 @@
 ;; time this lowering is done with them.
 (def ^:private kir-function-address-op 'kernel-function-address)
 
+#?(:kotoba
+   (defn- kir-runtime-ops [] [:ref :form/r]
+     (form/edn-form "{pair :pair pair-first :pair-first pair-second :pair-second kgraph-assert! :kgraph-assert! kgraph-get :kgraph-get kgraph-count :kgraph-count kgraph-entity-at :kgraph-entity-at string-byte-length :string-byte-length string=? :string=? string-concat :string-concat string-substring :string-substring string-code-point-at :string-code-point-at vector-new-empty :vector-new-empty vector-conj :vector-conj vector-count :vector-count vector-at :vector-at vector-assoc :vector-assoc vector-drop :vector-drop vector-f64-new :vector-new-empty vector-f64-conj :vector-conj vector-f64-count :vector-count vector-f64-at :vector-at vector-f64-assoc :vector-assoc vector-f64-drop :vector-drop vector-alloc :vector-alloc vector-assoc! :vector-assoc-in-place string-index-of :string-index-of string-compare :string-compare string-fold-ascii :string-fold-ascii string-find-blank :string-find-blank string-skip-blank :string-skip-blank string-index-of-from :string-index-of-from string-compare-lines :string-compare-lines string-find-byte :string-find-byte string-append-range :string-append-range bytes-empty :vector-new-empty bytes-count :vector-count bytes-at :vector-at string-from-utf8 :string-from-utf8 bytes-from-vector-i64 :bytes-from-vector vector-i64-from-bytes :bytes-from-vector bytes-slice :bytes-slice bytes-concat :bytes-concat}"))
+   :default
 (def ^:private kir-runtime-ops
   {'pair :pair
    'pair-first :pair-first
@@ -1790,91 +1907,161 @@
    ;; a view would let `vector-assoc!` on the result write into the bytes.
    'vector-i64-from-bytes :bytes-from-vector
    'bytes-slice :bytes-slice
-   'bytes-concat :bytes-concat})
+   'bytes-concat :bytes-concat}))
 
+#?(:kotoba
+   ;; The four native provider contracts, as Form type descriptors (the host's
+   ;; native-*-type defs). A [:set T] stays a vector form here as on the host.
+   (defn- native-clock-request-type [] [:ref :form/r] (form/edn-form "[:variant :kotoba.clock/request [[:wall :bool] [:monotonic :bool]]]"))
+   :default
 (def ^:private native-clock-request-type
-  [:variant :kotoba.clock/request [[:wall :bool] [:monotonic :bool]]])
+  [:variant :kotoba.clock/request [[:wall :bool] [:monotonic :bool]]]))
 
+#?(:kotoba
+   (defn- native-clock-wall-type [] [:ref :form/r] (form/edn-form "[:record :kotoba.clock/wall [[:unix-millis :i64] [:observation-sequence :i64]]]"))
+   :default
 (def ^:private native-clock-wall-type
   [:record :kotoba.clock/wall
-   [[:unix-millis :i64] [:observation-sequence :i64]]])
+   [[:unix-millis :i64] [:observation-sequence :i64]]]))
 
+#?(:kotoba
+   (defn- native-clock-monotonic-type [] [:ref :form/r] (form/edn-form "[:record :kotoba.clock/monotonic [[:nanos :i64] [:observation-sequence :i64]]]"))
+   :default
 (def ^:private native-clock-monotonic-type
   [:record :kotoba.clock/monotonic
-   [[:nanos :i64] [:observation-sequence :i64]]])
+   [[:nanos :i64] [:observation-sequence :i64]]]))
 
+#?(:kotoba
+   (defn- native-clock-error-type [] [:ref :form/r] (form/edn-form "[:record :kotoba.clock/error [[:code :keyword] [:message :string]]]"))
+   :default
 (def ^:private native-clock-error-type
-  [:record :kotoba.clock/error [[:code :keyword] [:message :string]]])
+  [:record :kotoba.clock/error [[:code :keyword] [:message :string]]]))
 
+#?(:kotoba
+   (defn- native-clock-result-type [] [:ref :form/r]
+     (form/edn-form "[:variant :kotoba.clock/result [[:wall [:record :kotoba.clock/wall [[:unix-millis :i64] [:observation-sequence :i64]]]] [:monotonic [:record :kotoba.clock/monotonic [[:nanos :i64] [:observation-sequence :i64]]]] [:error [:record :kotoba.clock/error [[:code :keyword] [:message :string]]]]]]"))
+   :default
 (def ^:private native-clock-result-type
   [:variant :kotoba.clock/result
    [[:wall native-clock-wall-type]
     [:monotonic native-clock-monotonic-type]
-    [:error native-clock-error-type]]])
+    [:error native-clock-error-type]]]))
 
+#?(:kotoba
+   (defn- native-dataspace-assert-type [] [:ref :form/r] (form/edn-form "[:record :kotoba.dataspace/assert [[:assertion :document] [:facet :i64]]]"))
+   :default
 (def ^:private native-dataspace-assert-type
   [:record :kotoba.dataspace/assert
-   [[:assertion :document] [:facet :i64]]])
+   [[:assertion :document] [:facet :i64]]]))
 
+#?(:kotoba
+   (defn- native-dataspace-retract-type [] [:ref :form/r] (form/edn-form "[:record :kotoba.dataspace/retract [[:assertion :document] [:facet :i64]]]"))
+   :default
 (def ^:private native-dataspace-retract-type
   [:record :kotoba.dataspace/retract
-   [[:assertion :document] [:facet :i64]]])
+   [[:assertion :document] [:facet :i64]]]))
 
+#?(:kotoba
+   (defn- native-dataspace-observe-type [] [:ref :form/r] (form/edn-form "[:record :kotoba.dataspace/observe [[:pattern :document] [:facet :i64]]]"))
+   :default
 (def ^:private native-dataspace-observe-type
   [:record :kotoba.dataspace/observe
-   [[:pattern :document] [:facet :i64]]])
+   [[:pattern :document] [:facet :i64]]]))
 
+#?(:kotoba
+   (defn- native-dataspace-request-type [] [:ref :form/r]
+     (form/edn-form "[:variant :kotoba.dataspace/request [[:assert [:record :kotoba.dataspace/assert [[:assertion :document] [:facet :i64]]]] [:retract [:record :kotoba.dataspace/retract [[:assertion :document] [:facet :i64]]]] [:observe [:record :kotoba.dataspace/observe [[:pattern :document] [:facet :i64]]]] [:facet-enter :bool] [:facet-leave :i64]]]"))
+   :default
 (def ^:private native-dataspace-request-type
   [:variant :kotoba.dataspace/request
    [[:assert native-dataspace-assert-type]
     [:retract native-dataspace-retract-type]
     [:observe native-dataspace-observe-type]
     [:facet-enter :bool]
-    [:facet-leave :i64]]])
+    [:facet-leave :i64]]]))
 
+#?(:kotoba
+   (defn- native-dataspace-asserted-type [] [:ref :form/r] (form/edn-form "[:record :kotoba.dataspace/asserted [[:count :i64] [:notices :document]]]"))
+   :default
 (def ^:private native-dataspace-asserted-type
   [:record :kotoba.dataspace/asserted
-   [[:count :i64] [:notices :document]]])
+   [[:count :i64] [:notices :document]]]))
 
+#?(:kotoba
+   (defn- native-dataspace-retracted-type [] [:ref :form/r] (form/edn-form "[:record :kotoba.dataspace/retracted [[:count :i64]]]"))
+   :default
 (def ^:private native-dataspace-retracted-type
-  [:record :kotoba.dataspace/retracted [[:count :i64]]])
+  [:record :kotoba.dataspace/retracted [[:count :i64]]]))
 
+#?(:kotoba
+   (defn- native-dataspace-matches-type [] [:ref :form/r] (form/edn-form "[:record :kotoba.dataspace/matches [[:bindings :document] [:notices :document]]]"))
+   :default
 (def ^:private native-dataspace-matches-type
   [:record :kotoba.dataspace/matches
-   [[:bindings :document] [:notices :document]]])
+   [[:bindings :document] [:notices :document]]]))
 
+#?(:kotoba
+   (defn- native-dataspace-facet-type [] [:ref :form/r] (form/edn-form "[:record :kotoba.dataspace/facet [[:id :i64]]]"))
+   :default
 (def ^:private native-dataspace-facet-type
-  [:record :kotoba.dataspace/facet [[:id :i64]]])
+  [:record :kotoba.dataspace/facet [[:id :i64]]]))
 
+#?(:kotoba
+   (defn- native-dataspace-error-type [] [:ref :form/r] (form/edn-form "[:record :kotoba.dataspace/error [[:code :keyword] [:message :string]]]"))
+   :default
 (def ^:private native-dataspace-error-type
   [:record :kotoba.dataspace/error
-   [[:code :keyword] [:message :string]]])
+   [[:code :keyword] [:message :string]]]))
 
+#?(:kotoba
+   (defn- native-dataspace-result-type [] [:ref :form/r]
+     (form/edn-form "[:variant :kotoba.dataspace/result [[:asserted [:record :kotoba.dataspace/asserted [[:count :i64] [:notices :document]]]] [:retracted [:record :kotoba.dataspace/retracted [[:count :i64]]]] [:matches [:record :kotoba.dataspace/matches [[:bindings :document] [:notices :document]]]] [:facet [:record :kotoba.dataspace/facet [[:id :i64]]]] [:error [:record :kotoba.dataspace/error [[:code :keyword] [:message :string]]]]]]"))
+   :default
 (def ^:private native-dataspace-result-type
   [:variant :kotoba.dataspace/result
    [[:asserted native-dataspace-asserted-type]
     [:retracted native-dataspace-retracted-type]
     [:matches native-dataspace-matches-type]
     [:facet native-dataspace-facet-type]
-    [:error native-dataspace-error-type]]])
+    [:error native-dataspace-error-type]]]))
 
 (def ^:private native-ui-parent-type [:option :keyword])
+#?(:kotoba
+   (defn- native-ui-node-type [] [:ref :form/r] (form/edn-form "[:record :kotoba.ui/node [[:id :keyword] [:parent [:option :keyword]] [:kind :keyword] [:text :string]]]"))
+   :default
 (def ^:private native-ui-node-type
   [:record :kotoba.ui/node
    [[:id :keyword] [:parent native-ui-parent-type]
-    [:kind :keyword] [:text :string]]])
+    [:kind :keyword] [:text :string]]]))
 (def ^:private native-ui-node-set-type [:set native-ui-node-type])
+#?(:kotoba
+   (defn- native-ui-commit-request-type [] [:ref :form/r]
+     (form/edn-form "[:record :kotoba.ui/commit-request [[:base-revision :i64] [:nodes [:set [:record :kotoba.ui/node [[:id :keyword] [:parent [:option :keyword]] [:kind :keyword] [:text :string]]]]]]]"))
+   :default
 (def ^:private native-ui-commit-request-type
   [:record :kotoba.ui/commit-request
-   [[:base-revision :i64] [:nodes native-ui-node-set-type]]])
+   [[:base-revision :i64] [:nodes native-ui-node-set-type]]]))
+#?(:kotoba
+   (defn- native-ui-commit-result-type [] [:ref :form/r] (form/edn-form "[:record :kotoba.ui/commit-result [[:revision :i64] [:node-count :i64]]]"))
+   :default
 (def ^:private native-ui-commit-result-type
-  [:record :kotoba.ui/commit-result [[:revision :i64] [:node-count :i64]]])
+  [:record :kotoba.ui/commit-result [[:revision :i64] [:node-count :i64]]]))
+#?(:kotoba
+   (defn- native-ui-event-request-type [] [:ref :form/r] (form/edn-form "[:record :kotoba.ui/event-request [[:after-revision :i64]]]"))
+   :default
 (def ^:private native-ui-event-request-type
-  [:record :kotoba.ui/event-request [[:after-revision :i64]]])
+  [:record :kotoba.ui/event-request [[:after-revision :i64]]]))
+#?(:kotoba
+   (defn- native-ui-event-type [] [:ref :form/r] (form/edn-form "[:record :kotoba.ui/event [[:revision :i64] [:target :keyword] [:kind :keyword] [:value :string]]]"))
+   :default
 (def ^:private native-ui-event-type
   [:record :kotoba.ui/event
-   [[:revision :i64] [:target :keyword] [:kind :keyword] [:value :string]]])
-(def ^:private native-ui-event-result-type [:option native-ui-event-type])
+   [[:revision :i64] [:target :keyword] [:kind :keyword] [:value :string]]]))
+#?(:kotoba
+   (defn- native-ui-event-result-type [] [:ref :form/r]
+     (form/edn-form "[:option [:record :kotoba.ui/event [[:revision :i64] [:target :keyword] [:kind :keyword] [:value :string]]]]"))
+   :default
+(def ^:private native-ui-event-result-type [:option native-ui-event-type]))
 
 (def ^:private typed-capability-kinds
   {[:i64 :i64] :i64
@@ -1889,6 +2076,30 @@
    [:bytes :bytes] :bytes-v1
    [:string :bytes] :string-bytes-v1})
 
+#?(:kotoba
+   ;; typed-capability-kinds: [request result] -> kind, or :none
+   (defn- typed-capability-kind [request [:ref :form/r] result [:ref :form/r]] :keyword
+     (let []
+       (cond
+         (and (kw? request :i64) (kw? result :i64)) :i64
+         (and (kw? request :string) (kw? result :string)) :string
+         (and (kw? request :option-i64) (kw? result :option-i64)) :option-i64
+         (and (kw? request :result-i64) (kw? result :result-i64)) :result-i64
+         (and (feq request (native-clock-request-type)) (feq result (native-clock-result-type))) :clock-v1
+         (and (feq request (native-dataspace-request-type)) (feq result (native-dataspace-result-type))) :dataspace-v1
+         (and (feq request (native-ui-commit-request-type)) (feq result (native-ui-commit-result-type))) :ui-commit-v1
+         (and (feq request (native-ui-event-request-type)) (feq result (native-ui-event-result-type))) :ui-event-v1
+         (and (kw? request :bytes) (kw? result :bytes)) :bytes-v1
+         (and (kw? request :string) (kw? result :bytes)) :string-bytes-v1
+         :else :none))))
+
+#?(:kotoba
+   ;; capability-id: the id as an i64 in 0..255, or -1
+   (defn- capability-id [value [:ref :form/r]] :i64
+     (if (and (form/is-int? value) (<= 0 (form/int-value value)) (<= (form/int-value value) 255))
+       (form/int-value value)
+       -1))
+   :default
 (defn- capability-id
   "Return the closed host representation of an admitted capability id.
 
@@ -1899,11 +2110,26 @@
   (let [value #?(:kotoba value
                  :clj value
                  :cljs (if (i64/bigint-value? value) (js/Number value) value))]
-    (when (and (integer? value) (<= 0 value 255)) value)))
+    (when (and (integer? value) (<= 0 value 255)) value))))
 
+#?(:kotoba
+   (defn- valid-capability-id? [value [:ref :form/r]] :bool (>= (capability-id value) 0))
+   :default
 (defn- valid-capability-id? [value]
-  (some? (capability-id value)))
+  (some? (capability-id value))))
 
+#?(:kotoba
+   (defn word-result-type? [type [:ref :form/r]] :bool
+     (or (form/is-nil? type)
+         (and (form/is-keyword? type)
+              (let [k (form/keyword-value type)]
+                (or (= k :i64) (= k :bool) (= k :f32) (= k :f64) (= k :string) (= k :keyword)
+                    (= k :document) (= k :option-i64) (= k :result-i64) (= k :vector-i64)
+                    (= k :vector-f64) (= k :string-index) (= k :bytes))))
+         (and (form/is-vec? type) (> (form/count-of type) 0)
+              (let [h (form/nth-of type 0)]
+                (or (kw? h :option) (kw? h :result) (kw? h :list) (kw? h :set) (kw? h :map) (kw? h :ref))))))
+   :default
 (defn word-result-type?
   "True for result descriptors represented by one native word. Escaping
   records and variants retain their explicit aggregate ABI boundary.
@@ -1934,13 +2160,20 @@
                    :bytes} type)
       (and (vector? type)
            (contains? #{:option :result :list :set :map :ref}
-                      (first type)))))
+                      (first type))))))
 
+#?(:kotoba
+   (defn- scalar-literal? [form [:ref :form/r]] :bool (or (form/is-bool? form) (form/is-int? form)))
+   :default
 (defn- scalar-literal? [form]
-  (or (boolean? form) (gmir/i64-value? form)))
+  (or (boolean? form) (gmir/i64-value? form))))
 
+#?(:kotoba
+   (defn- scalar-literal [form [:ref :form/r]] :i64
+     (if (form/is-bool? form) (if (form/bool-value form) 1 0) (form/int-value form)))
+   :default
 (defn- scalar-literal [form]
-  (if (boolean? form) (if form 1 0) form))
+  (if (boolean? form) (if form 1 0) form)))
 
 (defn- utf8-bytes [content]
   (mapv #(bit-and (int %) 0xff)
@@ -1968,33 +2201,89 @@
 ;; and the loader's `checked_string_code_point_at` both raise). Non-ASCII
 ;; literals and computed strings keep the runtime call; a kernel object
 ;; cannot use those, and the target's admission is where that is refused.
+#?(:kotoba
+   ;; ASCII: every code point is one byte
+   (defn- ascii-literal? [form [:ref :form/r]] :bool
+     (and (form/is-string? form)
+          (let [s (form/string-value form)] (= (string-length s) (string-byte-length s)))))
+   :default
 (defn- ascii-literal? [form]
-  (and (string? form) (every? #(< % 0x80) (utf8-bytes form))))
+  (and (string? form) (every? #(< % 0x80) (utf8-bytes form)))))
 
+#?(:kotoba
+   (defn- literal-walk-form? [form [:ref :form/r]] :bool
+     (and (head-is? form "string-code-point-at") (= 3 (fcount form)) (ascii-literal? (fnth form 1))))
+   :default
 (defn- literal-walk-form? [form]
   (and (seq? form) (= 'string-code-point-at (first form)) (= 3 (count form))
-       (ascii-literal? (second form))))
+       (ascii-literal? (second form)))))
 
 (defn- hex-of-bytes [bytes]
   (apply str (map #(let [h (.toString (int %) 16)] (if (= 1 (count h)) (str "0" h) h)) bytes)))
 
-(defn- literal-walk-window [n]
-  (first (filter #(>= % n) (sort gmir/kernel-window-maxima))))
+#?(:kotoba
+   (defn- hex-digit [d :i64] :string (string-substring "0123456789abcdef" d (+ d 1))))
 
+#?(:kotoba
+   ;; hex of an ASCII string's bytes
+   (defn- hex-of-ascii [s :string] :string
+     (let [n (string-byte-length s)]
+       (loop [i 0 out ""]
+         (if (>= i n) out
+           (let [c (string-code-point-at s i)]
+             (recur (inc i) (string-concat out (string-concat (hex-digit (quot c 16)) (hex-digit (rem c 16)))))))))))
+
+#?(:kotoba
+   ;; the smallest kernel window holding N bytes, or -1
+   (defn- literal-walk-window [n :i64] :i64
+     (cond (<= n 512) 512 (<= n 4096) 4096 (<= n 16384) 16384 (<= n 65536) 65536 :else -1))
+   :default
+(defn- literal-walk-window [n]
+  (first (filter #(>= % n) (sort gmir/kernel-window-maxima)))))
+
+#?(:kotoba
+   (defn- scalar-record-fields [type [:ref :form/r]] [:ref :form/r]
+     (if (aggregate-abi/scalar-record-type? type) (form/nth-of type 2) (nf)))
+   :default
 (defn- scalar-record-fields [type]
   (when (aggregate-abi/scalar-record-type? type)
-    (nth type 2)))
+    (nth type 2))))
 
+#?(:kotoba
+   (defn- record-value? [value [:ref :form/r]] :bool (and (form/is-map? value) (kw? (fget value :aggregate/kind) :record)))
+   :default
 (defn- record-value? [value]
-  (= :record (:aggregate/kind value)))
+  (= :record (:aggregate/kind value))))
 
+#?(:kotoba
+   (defn- record-value [type [:ref :form/r] values [:list [:ref :form/r]]] [:ref :form/r]
+     (map3 :aggregate/kind (kf :record) :aggregate/type type :aggregate/values (fvec values)))
+   :default
 (defn- record-value [type values]
-  {:aggregate/kind :record :aggregate/type type :aggregate/values (vec values)})
+  {:aggregate/kind :record :aggregate/type type :aggregate/values (vec values)}))
 
+#?(:kotoba
+   (defn- scalar-variant-cases [type [:ref :form/r]] [:ref :form/r]
+     (if (aggregate-abi/scalar-variant-type? type) (form/nth-of type 2) (nf)))
+   :default
 (defn- scalar-variant-cases [type]
   (when (aggregate-abi/scalar-variant-type? type)
-    (nth type 2)))
+    (nth type 2))))
 
+#?(:kotoba
+   (defn- provider-record-fields [type [:ref :form/r]] [:ref :form/r]
+     (if (or (feq type (native-clock-wall-type)) (feq type (native-clock-monotonic-type))
+             (feq type (native-clock-error-type))
+             (feq type (native-dataspace-assert-type)) (feq type (native-dataspace-retract-type))
+             (feq type (native-dataspace-observe-type)) (feq type (native-dataspace-asserted-type))
+             (feq type (native-dataspace-retracted-type)) (feq type (native-dataspace-matches-type))
+             (feq type (native-dataspace-facet-type)) (feq type (native-dataspace-error-type))
+             (feq type (native-ui-node-type)) (feq type (native-ui-commit-request-type))
+             (feq type (native-ui-commit-result-type)) (feq type (native-ui-event-request-type))
+             (feq type (native-ui-event-type)))
+       (form/nth-of type 2)
+       (nf)))
+   :default
 (defn- provider-record-fields [type]
   (when (contains? #{native-clock-wall-type native-clock-monotonic-type
                      native-clock-error-type
@@ -2006,26 +2295,252 @@
                      native-ui-commit-result-type native-ui-event-request-type
                      native-ui-event-type}
                    type)
-    (nth type 2)))
+    (nth type 2))))
 
+#?(:kotoba
+   (defn- provider-variant-cases [type [:ref :form/r]] [:ref :form/r]
+     (if (or (feq type (native-clock-request-type)) (feq type (native-clock-result-type))
+             (feq type (native-dataspace-request-type)) (feq type (native-dataspace-result-type)))
+       (form/nth-of type 2)
+       (nf)))
+   :default
 (defn- provider-variant-cases [type]
   (when (contains? #{native-clock-request-type native-clock-result-type
                      native-dataspace-request-type native-dataspace-result-type}
                    type)
-    (nth type 2)))
+    (nth type 2))))
 
+#?(:kotoba
+   (defn- variant-value? [value [:ref :form/r]] :bool (and (form/is-map? value) (kw? (fget value :aggregate/kind) :variant)))
+   :default
 (defn- variant-value? [value]
-  (= :variant (:aggregate/kind value)))
+  (= :variant (:aggregate/kind value))))
 
+#?(:kotoba
+   (defn- variant-value [type [:ref :form/r] tag [:ref :form/r] payload [:ref :form/r]] [:ref :form/r]
+     (map4 :aggregate/kind (kf :variant) :aggregate/type type :variant/tag tag :variant/payload payload))
+   :default
 (defn- variant-value [type tag payload]
   {:aggregate/kind :variant :aggregate/type type
-   :variant/tag tag :variant/payload payload})
+   :variant/tag tag :variant/payload payload}))
 
+#?(:kotoba
+   ;; ── lower-kir-expression ──
+   (defn- reject-lv! [phase :keyword problem :keyword instruction [:ref :form/r] st [:ref :mi/lv]] [:ref :mi/lv]
+     (do (reject! phase problem instruction) st)))
+
+#?(:kotoba
+   ;; The host's letfn shares two atoms (vreg and label counters); here every
+   ;; lowering takes the counters in a :mi/lv record and answers a :mi/lv with
+   ;; its code, its value (a vreg, or a record/variant aggregate map) and the
+   ;; advanced counters. Allocation order is the host's, so vreg and label
+   ;; numbers agree.
+   (defn- lv [code [:list [:ref :form/r]] value [:ref :form/r] reg :i64 label :i64] [:ref :mi/lv]
+     (record-new [:ref :mi/lv] code value reg label)))
+
+#?(:kotoba
+   (defn- lv-code [r [:ref :mi/lv]] [:list [:ref :form/r]] (record-get [:ref :mi/lv] r :code)))
+
+#?(:kotoba
+   (defn- lv-val [r [:ref :mi/lv]] [:ref :form/r] (record-get [:ref :mi/lv] r :value)))
+
+#?(:kotoba
+   (defn- lv-reg [r [:ref :mi/lv]] :i64 (record-get [:ref :mi/lv] r :reg)))
+
+#?(:kotoba
+   (defn- lv-label [r [:ref :mi/lv]] :i64 (record-get [:ref :mi/lv] r :label)))
+
+#?(:kotoba
+   (defn- lv-next [st [:ref :mi/lv]] [:ref :form/r] (vreg-form (inc (lv-reg st)))))
+
+#?(:kotoba
+   (defn- label-form [stem :string n :i64] [:ref :form/r]
+     (kf (keyword-from-string (string-concat "kotoba.gmir.label/" (string-concat stem (string-concat "-" (string-from-i64 n))))))))
+
+#?(:kotoba
+   (defn- gm2 [op :keyword k1 :keyword v1 [:ref :form/r]] [:ref :form/r] (map2 :gmir/op (kf op) k1 v1)))
+
+#?(:kotoba
+   (defn- gm3 [op :keyword k1 :keyword v1 [:ref :form/r] k2 :keyword v2 [:ref :form/r]] [:ref :form/r]
+     (map3 :gmir/op (kf op) k1 v1 k2 v2)))
+
+#?(:kotoba
+   (defn- gm4 [op :keyword k1 :keyword v1 [:ref :form/r] k2 :keyword v2 [:ref :form/r] k3 :keyword v3 [:ref :form/r]] [:ref :form/r]
+     (map4 :gmir/op (kf op) k1 v1 k2 v2 k3 v3)))
+
+#?(:kotoba
+   (defn- scalar-register! [value [:ref :form/r] form [:ref :form/r]] [:ref :form/r]
+     (if (vreg? value) value (reject-form! :kir-to-gmir :scalar-value-required form)))
+   :default
 (defn- scalar-register! [value form]
   (if (gmir/vreg? value)
     value
-    (reject! :kir-to-gmir :scalar-value-required {:form form :value value})))
+    (reject! :kir-to-gmir :scalar-value-required {:form form :value value}))))
 
+#?(:kotoba
+   ;; the index of the [name _] pair named NAME among PAIRS' kids, or -1
+   (defn- pair-index [pairs [:ref :form/r] name [:ref :form/r]] :i64
+     (let [xs (kids pairs) n (lcount xs)]
+       (loop [i 0] (if (>= i n) -1 (if (feq (form/nth-of (lget xs i) 0) name) i (recur (inc i))))))))
+
+#?(:kotoba
+   (defn- firsts [pairs [:ref :form/r]] [:ref :form/r]
+     (let [xs (kids pairs) n (lcount xs)]
+       (loop [i 0 acc (lnone)] (if (>= i n) (fvec acc) (recur (inc i) (lconj acc (form/nth-of (lget xs i) 0))))))))
+
+#?(:kotoba
+   ;; ── normalize-surface-operations ──
+   (defn- nso-reduce-conj [items [:list [:ref :form/r]] from :i64] [:ref :form/r]
+     (let [n (lcount items)]
+       (loop [i from acc (form/call0 "vector-new-empty")]
+         (if (>= i n) acc (recur (inc i) (form/call2 "vector-conj" acc (lget items i))))))))
+
+#?(:kotoba
+   (defn- simple-kir? [x [:ref :form/r]] :bool
+     (or (form/is-symbol? x) (form/is-int? x) (form/is-string? x) (form/is-keyword? x) (form/is-bool? x))))
+
+#?(:kotoba
+   (defn- nso-record-assoc [args [:list [:ref :form/r]]] [:ref :form/r]
+     (let [type (lget args 0) value (lget args 1) field (lget args 2) replacement (lget args 3)
+           names (firsts (form/nth-of type 2))]
+       (if (not (fmember? names field))
+         (reject-form! :kir-to-gmir :unknown-record-field type)
+         (let [holder (if (form/is-symbol? value) value (symf "record__"))
+               fresh (if (simple-kir? replacement) replacement (symf "assoc__"))
+               b1 (if (form/is-symbol? value) (lnone) (lconj (lone holder) value))
+               bindings (if (simple-kir? replacement) b1 (lconj (lconj b1 fresh) replacement))
+               ns (kids names) n (lcount ns)
+               built (lst (loop [i 0 acc (form/two-forms (symf "record-new") type)]
+                            (if (>= i n) acc
+                              (let [name (lget ns i)]
+                                (recur (inc i) (lconj acc (if (feq name field) fresh
+                                                            (form/call3 "record-get" type holder name))))))))]
+           (if (= 0 (lcount bindings)) built (form/call2 "let" (fvec bindings) built)))))))
+
+#?(:kotoba
+   (defn- nso-string-index-arity [op [:ref :form/r]] :i64
+     (cond (sym? op "string-index-new") 0 (sym? op "string-index-count") 1
+           (sym? op "string-index-contains") 2 (sym? op "string-index-get") 2
+           (sym? op "string-index-assoc") 3 :else -1)))
+
+#?(:kotoba
+   (defn- nso-step [form [:ref :form/r]] [:ref :form/r]
+     (let [op (fnth form 0)
+           args (form/rest-list form)
+           n (lcount args)
+           a0 (lget args 0) a1 (lget args 1) a2 (lget args 2)
+           argsf (lst args)]
+       (cond
+         (and (sym? op "option-some") (= n 1)) (form/call2 "pair" (intf 1) a0)
+         (and (sym? op "option-none") (= n 0)) (form/call2 "pair" (intf 0) (intf 0))
+         (and (sym? op "option-some?") (= n 1)) (form/call1 "pair-first" a0)
+         (and (sym? op "option-value") (= n 2))
+         (let1 "option__" a0 (if3 (form/call1 "pair-first" (symf "option__")) (form/call1 "pair-second" (symf "option__")) a1))
+         (and (sym? op "option-some-of") (= n 2)) (form/call2 "pair" (intf 1) a1)
+         (and (sym? op "option-none-of") (= n 1)) (form/call2 "pair" (intf 0) (intf 0))
+         (and (sym? op "option-some?-of") (= n 2)) (form/call1 "pair-first" a1)
+         (and (sym? op "option-value-of") (= n 3))
+         (let1 "option__" a1 (if3 (form/call1 "pair-first" (symf "option__")) (form/call1 "pair-second" (symf "option__")) a2))
+         (and (sym? op "option-match") (= n 5) (form/is-symbol? (lget args 3)))
+         (let1 "option__" a1 (if3 (form/call1 "pair-first" (symf "option__"))
+                                  (let1 (form/symbol-value (lget args 3)) (form/call1 "pair-second" (symf "option__")) (lget args 4))
+                                  a2))
+         (and (sym? op "result-ok") (= n 1)) (form/call2 "pair" (intf 1) a0)
+         (and (sym? op "result-err") (= n 1)) (form/call2 "pair" (intf 0) a0)
+         (and (sym? op "result-ok?") (= n 1)) (form/call1 "pair-first" a0)
+         (and (or (sym? op "result-value") (sym? op "result-error")) (= n 2))
+         (let1 "result__" a0 (if (sym? op "result-value")
+                               (if3 (form/call1 "pair-first" (symf "result__")) (form/call1 "pair-second" (symf "result__")) a1)
+                               (if3 (form/call1 "pair-first" (symf "result__")) a1 (form/call1 "pair-second" (symf "result__")))))
+         (and (or (sym? op "result-ok-of") (sym? op "result-err-of")) (= n 2))
+         (form/call2 "pair" (intf (if (sym? op "result-ok-of") 1 0)) a1)
+         (and (sym? op "result-ok?-of") (= n 2)) (form/call1 "pair-first" a1)
+         (and (or (sym? op "result-value-of") (sym? op "result-error-of")) (= n 3))
+         (let1 "result__" a1 (if (sym? op "result-value-of")
+                               (if3 (form/call1 "pair-first" (symf "result__")) (form/call1 "pair-second" (symf "result__")) a2)
+                               (if3 (form/call1 "pair-first" (symf "result__")) a2 (form/call1 "pair-second" (symf "result__")))))
+         (and (sym? op "result-match-of") (= n 6) (form/is-symbol? (lget args 2)) (form/is-symbol? (lget args 4)))
+         (let1 "result__" a1 (if3 (form/call1 "pair-first" (symf "result__"))
+                                  (let1 (form/symbol-value (lget args 2)) (form/call1 "pair-second" (symf "result__")) (lget args 3))
+                                  (let1 (form/symbol-value (lget args 4)) (form/call1 "pair-second" (symf "result__")) (lget args 5))))
+         (and (or (sym? op "min") (sym? op "max")) (= n 2))
+         (let2 "min_max__l" a0 "min_max__r" a1
+               (if3 (form/call2 (if (sym? op "min") "<=" ">=") (symf "min_max__l") (symf "min_max__r"))
+                    (symf "min_max__l") (symf "min_max__r")))
+         (and (or (sym? op "vector-take") (sym? op "vector-f64-take")) (= n 2))
+         (let2 "vector__" a0 "take__" a1
+               (if3 (if3 (form/call2 "<" (symf "take__") (intf 0)) (intf 0)
+                         (form/call2 "<=" (symf "take__") (form/call1 "vector-count" (symf "vector__"))))
+                    (form/call3 "bytes-slice" (symf "vector__") (intf 0) (symf "take__"))
+                    (form/call2 "vector-at" (form/call0 "vector-new-empty") (intf 0))))
+         (or (sym? op "vector-new") (sym? op "vector-f64-new")) (nso-reduce-conj args 0)
+         (sym? op "typed-set-new") (nso-reduce-conj args 1)
+         (and (sym? op "typed-set-conj") (= n 3)) (form/call2 "vector-conj" a1 a2)
+         (and (sym? op "record-assoc") (= n 4) (form/is-vec? a0) (kw? (fnth a0 0) :record))
+         (nso-record-assoc args)
+         (and (sym? op "typed-set-count") (= n 2)) (form/call1 "vector-count" a1)
+         (and (sym? op "typed-set-nth") (= n 3)) (form/call2 "vector-at" a1 a2)
+         (sym? op "typed-list-new") (nso-reduce-conj args 1)
+         (and (sym? op "typed-list-conj") (= n 3)) (form/call2 "vector-conj" a1 a2)
+         (and (sym? op "typed-list-nth") (= n 3)) (form/call2 "vector-at" a1 a2)
+         (and (or (sym? op "vector-get") (sym? op "vector-f64-get")) (= n 3))
+         (let2 "vector__" a0 "index__" a1
+               (if3 (if3 (form/call2 "<" (symf "index__") (intf 0)) (intf 0)
+                         (form/call2 "<" (symf "index__") (form/call1 "vector-count" (symf "vector__"))))
+                    (form/call2 "vector-at" (symf "vector__") (symf "index__"))
+                    a2))
+         (and (sym? op "keyword-name") (= n 1))
+         (let2 "keyword__" a0 "slash__" (form/call3 "string-find-byte" (symf "keyword__") (intf 47) (intf 1))
+               (form/call3 "string-substring" (symf "keyword__")
+                           (if3 (form/call2 "<" (symf "slash__") (intf 0)) (intf 1)
+                                (if3 (form/call2 "=" (form/call1 "string-byte-length" (symf "keyword__")) (intf 2)) (intf 1)
+                                     (form/call2 "+" (symf "slash__") (intf 1))))
+                           (form/call1 "string-byte-length" (symf "keyword__"))))
+         (and (sym? op "keyword-from-string") (= n 1)) (form/call2 "string-concat" (form/string-form ":") a0)
+         (and (sym? op "document-symbol") (= n 1) (head-is? a0 "symbol") (= 2 (fcount a0)))
+         (nso (form/call1 "document-symbol" (fnth a0 1)))
+         (and (sym? op "string-contains?") (= n 2)) (nso (string-search/lower-contains argsf))
+         (and (sym? op "string-replace-all") (= n 3)) (nso (string-search/lower-replace-all argsf))
+         (and (>= (nso-string-index-arity op) 0) (= n (nso-string-index-arity op)))
+         (nso (string-index-lower op argsf))
+         (fmember? (document/operations) op) (nso (document-lower op argsf))
+         :else form))))
+
+#?(:kotoba
+   ;; string-index/lower and document/lower abort in their module; across the
+   ;; boundary they are [:result Form :document] values (track C4).
+   (defn- string-index-lower [op [:ref :form/r] args [:ref :form/r]] [:ref :form/r]
+     (let [r (string-index/lower op args)
+           ok (result-match-of [:result [:ref :form/r] :document] r v true e false)]
+       (if ok
+         (result-match-of [:result [:ref :form/r] :document] r v v e (form/nil-form))
+         (reject-form! :kir-to-gmir :string-index-lowering args)))))
+
+#?(:kotoba
+   (defn- document-lower [op [:ref :form/r] args [:ref :form/r]] [:ref :form/r]
+     (let [r (document/lower op args)
+           ok (result-match-of [:result [:ref :form/r] :document] r v true e false)]
+       (if ok
+         (result-match-of [:result [:ref :form/r] :document] r v v e (form/nil-form))
+         (reject-form! :kir-to-gmir :document-lowering args)))))
+
+#?(:kotoba
+   ;; postwalk: children first, then the step on a seq
+   (defn- nso-kids [xs [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (lcount xs)) acc (nso-kids xs (inc i) (lconj acc (nso (lget xs i)))))))
+
+#?(:kotoba
+   (defn- nso [f [:ref :form/r]] [:ref :form/r]
+     (cond (form/is-seq? f) (let [g (form/form-seq (nso-kids (kids f) 0 (lnone)))]
+                              (if (> (form/count-of g) 0) (nso-step g) g))
+           (form/is-vec? f) (form/form-vec (nso-kids (kids f) 0 (lnone)))
+           (form/is-map? f) (form/form-map (nso-kids (kids f) 0 (lnone)))
+           (form/is-set? f) (form/form-set (nso-kids (kids f) 0 (lnone)))
+           :else f)))
+
+#?(:kotoba
+   (defn- normalize-surface-operations [body [:ref :form/r]] [:ref :form/r] (nso body))
+   :default
 (defn- normalize-surface-operations
   "Expand composite surface forms into the closed runtime/control subset.
   Generated lets preserve exact-once evaluation of reused operands."
@@ -2248,8 +2763,157 @@
            (contains? document/operations op)
            (normalize-surface-operations (document/lower op args))
            :else form))))
-   body))
+   body)))
 
+#?(:kotoba
+   ;; ── boundary normalizations ──
+   (defn- pair-chain [values [:list [:ref :form/r]]] [:ref :form/r]
+     (loop [i (dec (lcount values)) tail (intf 0)]
+       (if (< i 0) tail (recur (dec i) (form/call2 "pair" (lget values i) tail))))))
+
+#?(:kotoba
+   (defn- pair-seconds [value [:ref :form/r] n :i64] [:ref :form/r]
+     (loop [i 0 h value] (if (>= i n) h (recur (inc i) (form/call1 "pair-second" h))))))
+
+#?(:kotoba
+   (defn- pair-chain-assoc [subject [:ref :form/r] width :i64 index :i64 item [:ref :form/r]] [:ref :form/r]
+     (loop [position (dec width) tail (intf 0)]
+       (if (< position 0) tail
+         (recur (dec position)
+                (form/call2 "pair" (if (= position index) item (form/call1 "pair-first" (pair-seconds subject position))) tail))))))
+
+#?(:kotoba
+   ;; the shared variant dispatch: (if (= (pair-first t) i) (let [b (pair-second t)] body) ...) over BRANCHES
+   (defn- variant-dispatch [tag-name :string branches [:list [:ref :form/r]]] [:ref :form/r]
+     (loop [i (dec (lcount branches)) fallback (form/call2 "quot" (intf 1) (intf 0))]
+       (if (< i 0) fallback
+         (let [b (lget branches i)]
+           (recur (dec i)
+                  (if3 (form/call2 "=" (form/call1 "pair-first" (symf tag-name)) (intf i))
+                       (let1 (form/symbol-value (fnth b 1)) (form/call1 "pair-second" (symf tag-name)) (fnth b 2))
+                       fallback)))))))
+
+#?(:kotoba
+   (defn- valid-branches? [cases [:ref :form/r] branches [:ref :form/r]] :bool
+     (and (truthy? cases) (form/is-vec? branches)
+          (feq (firsts cases) (firsts branches))
+          (let [bs (kids branches) n (lcount bs)]
+            (loop [i 0]
+              (if (>= i n) true
+                (let [b (lget bs i)]
+                  (if (and (form/is-vec? b) (= 3 (fcount b)) (form/is-symbol? (fnth b 1))) (recur (inc i)) false))))))))
+
+#?(:kotoba
+   (defn- nsvb-step [form [:ref :form/r]] [:ref :form/r]
+     (let [op (fnth form 0) args (form/rest-list form) n (lcount args)]
+       (cond
+         (and (sym? op "variant-new") (= n 3))
+         (let [type (lget args 0) tag (lget args 1) payload (lget args 2)
+               cases (scalar-variant-cases type)
+               ordinal (if (truthy? cases) (pair-index cases tag) -1)]
+           (if (or (not (truthy? cases)) (< ordinal 0))
+             (reject-form! :variant-boundary :invalid-constructor type)
+             (form/call2 "pair" (intf ordinal) payload)))
+         (and (sym? op "variant-match") (= n 3))
+         (let [type (lget args 0) value (lget args 1) branches (lget args 2)
+               cases (scalar-variant-cases type)]
+           (if (not (valid-branches? cases branches))
+             (reject-form! :variant-boundary :invalid-dispatch type)
+             (let1 "variant__" value (variant-dispatch "variant__" (kids branches)))))
+         :else form))))
+
+#?(:kotoba
+   (defn- nrb-index [index [:ref :form/r] width :i64] :i64
+     (if (and (form/is-int? index) (<= 0 (form/int-value index)) (< (form/int-value index) width)) (form/int-value index) -1)))
+
+#?(:kotoba
+   (defn- nsrb-step [form [:ref :form/r]] [:ref :form/r]
+     (let [op (fnth form 0) args (form/rest-list form) n (lcount args)
+           a0 (lget args 0)]
+       (cond
+         (and (sym? op "record-new") (<= 2 n))
+         (let [fields (scalar-record-fields a0) values (ldrop args 1)]
+           (if (not (and (truthy? fields) (= (fcount fields) (lcount values))))
+             (reject-form! :record-boundary :invalid-constructor a0)
+             (pair-chain values)))
+         (and (sym? op "hetero-vector-new") (aggregate-abi/hetero-vector-type? a0))
+         (let [values (ldrop args 1)]
+           (if (not (= (fcount (fnth a0 1)) (lcount values)))
+             (reject-form! :record-boundary :invalid-hetero-vector a0)
+             (pair-chain values)))
+         (and (sym? op "hetero-vector-at") (= n 3) (aggregate-abi/hetero-vector-type? a0))
+         (let [index (nrb-index (lget args 2) (fcount (fnth a0 1)))]
+           (if (< index 0)
+             (reject-form! :record-boundary :invalid-hetero-vector-index a0)
+             (form/call1 "pair-first" (pair-seconds (lget args 1) index))))
+         (and (sym? op "hetero-vector-count") (= n 2) (aggregate-abi/hetero-vector-type? a0))
+         (let1 "hvec__" (lget args 1) (intf (fcount (fnth a0 1))))
+         (and (sym? op "hetero-vector-assoc") (= n 4) (aggregate-abi/hetero-vector-type? a0))
+         (let [width (fcount (fnth a0 1)) index (nrb-index (lget args 2) width)]
+           (if (< index 0)
+             (reject-form! :record-boundary :invalid-hetero-vector-index a0)
+             (let2 "hvec__" (lget args 1) "hvec_item__" (lget args 3)
+                   (pair-chain-assoc (symf "hvec__") width index (symf "hvec_item__")))))
+         (and (sym? op "record-assoc") (= n 4))
+         (let [fields (scalar-record-fields a0)
+               index (if (truthy? fields) (pair-index fields (lget args 2)) -1)]
+           (if (< index 0)
+             (reject-form! :record-boundary :invalid-record-update a0)
+             (let2 "record__" (lget args 1) "record_item__" (lget args 3)
+                   (pair-chain-assoc (symf "record__") (fcount fields) index (symf "record_item__")))))
+         (and (sym? op "record-get") (= n 3))
+         (let [fields (scalar-record-fields a0)
+               index (if (truthy? fields) (pair-index fields (lget args 2)) -1)]
+           (if (< index 0)
+             (reject-form! :record-boundary :invalid-projection a0)
+             (form/call1 "pair-first" (pair-seconds (lget args 1) index))))
+         :else form))))
+
+#?(:kotoba
+   (defn- npb-step [form [:ref :form/r]] [:ref :form/r]
+     (let [op (fnth form 0) args (form/rest-list form) n (lcount args)
+           a0 (lget args 0)]
+       (cond
+         (and (sym? op "record-new") (<= 2 n) (truthy? (provider-record-fields a0)))
+         (let [fields (provider-record-fields a0) values (ldrop args 1)]
+           (if (not (= (fcount fields) (lcount values)))
+             (reject-form! :provider-boundary :invalid-record-constructor a0)
+             (pair-chain values)))
+         (and (sym? op "record-get") (= n 3) (truthy? (provider-record-fields a0)))
+         (let [index (pair-index (provider-record-fields a0) (lget args 2))]
+           (if (< index 0)
+             (reject-form! :provider-boundary :invalid-record-projection a0)
+             (form/call1 "pair-first" (pair-seconds (lget args 1) index))))
+         (and (sym? op "variant-new") (= n 3) (truthy? (provider-variant-cases a0)))
+         (let [ordinal (pair-index (provider-variant-cases a0) (lget args 1))]
+           (if (< ordinal 0)
+             (reject-form! :provider-boundary :invalid-variant-constructor a0)
+             (form/call2 "pair" (intf ordinal) (lget args 2))))
+         (and (sym? op "variant-match") (= n 3) (truthy? (provider-variant-cases a0)))
+         (let [cases (provider-variant-cases a0) branches (lget args 2)]
+           (if (not (valid-branches? cases branches))
+             (reject-form! :provider-boundary :invalid-variant-dispatch a0)
+             (let1 "provider_variant__" (lget args 1) (variant-dispatch "provider_variant__" (kids branches)))))
+         :else form))))
+
+#?(:kotoba
+   ;; a postwalk applying one of the three steps (1 variant, 2 record, 3 provider) to every seq
+   (defn- bw-kids [xs [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]] which :i64] [:list [:ref :form/r]]
+     (if (>= i (lcount xs)) acc (bw-kids xs (inc i) (lconj acc (bw (lget xs i) which)) which))))
+
+#?(:kotoba
+   (defn- bw [f [:ref :form/r] which :i64] [:ref :form/r]
+     (cond (form/is-seq? f) (let [g (form/form-seq (bw-kids (kids f) 0 (lnone) which))]
+                              (if (= 0 (form/count-of g)) g
+                                (cond (= which 1) (nsvb-step g) (= which 2) (nsrb-step g) :else (npb-step g))))
+           (form/is-vec? f) (form/form-vec (bw-kids (kids f) 0 (lnone) which))
+           (form/is-map? f) (form/form-map (bw-kids (kids f) 0 (lnone) which))
+           (form/is-set? f) (form/form-set (bw-kids (kids f) 0 (lnone) which))
+           :else f)))
+
+#?(:kotoba
+   (defn- normalize-scalar-variant-boundary [body [:ref :form/r]] [:ref :form/r] (bw body 1))
+   :default
 (defn- normalize-scalar-variant-boundary
   "Lower the admitted scalar variant boundary to the existing one-word pair
   handle. This is used only for a module that declares a variant parameter or
@@ -2296,7 +2960,7 @@
                (list 'let [tagged value] dispatch)))
 
            :else form))))
-   body))
+   body)))
 
 (defn- host-index
   "A literal position as a host integer, or nil. Under nbb every guest literal
@@ -2305,6 +2969,9 @@
   (when (gmir/i64-value? index)
     #?(:kotoba index :clj (long index) :cljs (js/Number index))))
 
+#?(:kotoba
+   (defn- normalize-scalar-record-boundary [body [:ref :form/r]] [:ref :form/r] (bw body 2))
+   :default
 (defn- normalize-scalar-record-boundary
   "Lower admitted record parameters/results and nested records to the
   declaration-order pair-chain handle. Post-order rewriting makes every inner
@@ -2413,8 +3080,11 @@
                         index)))
 
            :else form))))
-   body))
+   body)))
 
+#?(:kotoba
+   (defn- normalize-provider-boundary [body [:ref :form/r]] [:ref :form/r] (bw body 3))
+   :default
 (defn- normalize-provider-boundary
   "Lower the sealed clock provider's nested variant/record values to pair
   handles. This path is selected only by an exact typed-cap-call contract; it
@@ -2486,19 +3156,92 @@
                (list 'let [tagged value] dispatch)))
 
            :else form))))
-   body))
+   body)))
 
+#?(:kotoba
+   ;; ── module-level predicates ──
+   (defn- scalar-boundary-type? [type [:ref :form/r]] :bool
+     (or (word-result-type? type)
+         (aggregate-abi/scalar-record-type? type)
+         (aggregate-abi/scalar-variant-type? type)
+         (aggregate-abi/hetero-vector-type? type)))
+   :default
 (defn- scalar-boundary-type? [type]
   (or (word-result-type? type)
       (aggregate-abi/scalar-record-type? type)
       (aggregate-abi/scalar-variant-type? type)
-      (aggregate-abi/hetero-vector-type? type)))
+      (aggregate-abi/hetero-vector-type? type))))
 
+#?(:kotoba
+   ;; param types (or :i64 per param) ++ [result], or nil when the counts disagree
+   (defn- function-boundary-types [function [:ref :form/r]] [:ref :form/r]
+     (let [params (fget function :params)
+           given (fget function :param-types)
+           types (if (truthy? given) (kids given)
+                   (loop [i 0 acc (lnone)] (if (>= i (fcount params)) acc (recur (inc i) (lconj acc (kf :i64))))))]
+       (if (= (fcount params) (lcount types))
+         (fvec (lconj types (fget function :result)))
+         (nf))))
+   :default
 (defn- function-boundary-types [{:keys [params param-types result]}]
   (let [types (or param-types (vec (repeat (count params) :i64)))]
     (when (= (count params) (count types))
-      (conj (vec types) result))))
+      (conj (vec types) result)))))
 
+#?(:kotoba
+   ;; every node of a Form tree, preorder (tree-seq coll? seq: map entries are not nodes here,
+   ;; and no predicate below can match a two-item [k v] entry)
+   (defn- tree-nodes [f [:ref :form/r] acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (let [acc' (lconj acc f)]
+       (if (or (form/is-seq? f) (form/is-vec? f) (form/is-map? f) (form/is-set? f))
+         (let [xs (kids f) n (lcount xs)]
+           (loop [i 0 a acc'] (if (>= i n) a (recur (inc i) (tree-nodes (lget xs i) a)))))
+         acc'))))
+
+#?(:kotoba
+   (defn- any-node? [nodes [:list [:ref :form/r]] which :i64] :bool
+     (let [n (lcount nodes)]
+       (loop [i 0]
+         (if (>= i n) false
+           (let [x (lget nodes i)
+                 hit (cond (= which 0) (aggregate-abi/aggregate-payload-variant-type? x)
+                           (= which 1) (aggregate-abi/nested-record-type? x)
+                           (= which 2) (and (form/is-seq? x) (> (fcount x) 0)
+                                            (let [h (fnth x 0)]
+                                              (or (sym? h "hetero-vector-new") (sym? h "hetero-vector-at")
+                                                  (sym? h "hetero-vector-count") (sym? h "hetero-vector-assoc"))))
+                           :else (and (head-is? x "typed-cap-call") (= 5 (fcount x))
+                                      (let [kind (typed-capability-kind (fnth x 2) (fnth x 3))
+                                            id (fnth x 1)]
+                                        (or (and (= kind :clock-v1) (form/is-int? id) (= 7 (form/int-value id)))
+                                            (and (= kind :dataspace-v1) (form/is-int? id) (= 24 (form/int-value id)))
+                                            (and (= kind :ui-commit-v1) (form/is-int? id) (= 9 (form/int-value id)))
+                                            (and (= kind :ui-event-v1) (form/is-int? id) (= 10 (form/int-value id)))))))]
+             (if hit true (recur (inc i)))))))))
+
+#?(:kotoba
+   (defn- some-boundary-type? [functions [:list [:ref :form/r]] which :i64 record-types [:ref :form/r]] :bool
+     (let [n (lcount functions)]
+       (loop [i 0]
+         (if (>= i n) false
+           (let [types (function-boundary-types (lget functions i))
+                 ts (kids types) m (lcount ts)
+                 hit (loop [j 0]
+                       (if (>= j m) false
+                         (let [t (lget ts j)]
+                           (if (if (= which 0)
+                                 (aggregate-abi/scalar-variant-type? t)
+                                 (or (aggregate-abi/scalar-record-type? t)
+                                     (and (form/is-vec? t) (kw? (fnth t 0) :ref)
+                                          (form/form-has? record-types (fnth t 1)))))
+                             true (recur (inc j))))))]
+             (if hit true (recur (inc i)))))))))
+
+#?(:kotoba
+   (defn- variant-boundary-module? [functions [:list [:ref :form/r]]] :bool
+     (or (some-boundary-type? functions 0 (fmap (lnone)))
+         (any-node? (tree-nodes (fvec functions) (lnone)) 0)))
+   :default
 (defn- variant-boundary-module? [functions]
   (boolean
    (or
@@ -2511,8 +3254,21 @@
     ;; a pair-chain handle. Select the boxed normalization even when the
     ;; variant itself does not cross a function boundary.
     (some aggregate-abi/aggregate-payload-variant-type?
-          (tree-seq coll? seq functions)))))
+          (tree-seq coll? seq functions))))))
 
+#?(:kotoba
+   (defn- module-record-types [functions [:list [:ref :form/r]]] [:ref :form/r]
+     (let [nodes (tree-nodes (fvec functions) (lnone)) n (lcount nodes)]
+       (loop [i 0 types (fmap (lnone))]
+         (if (>= i n) types
+           (let [t (lget nodes i)]
+             (if (aggregate-abi/scalar-record-type? t)
+               (let [name (fnth t 1) existing (form/form-get types name)]
+                 (cond (form/is-nil? existing) (recur (inc i) (form/assoc-form types name t))
+                       (feq existing t) (recur (inc i) types)
+                       :else (do (trap!) types)))
+               (recur (inc i) types)))))))
+   :default
 (defn- module-record-types [functions]
   (reduce
    (fn [types type]
@@ -2525,8 +3281,16 @@
          (assoc types name type))))
    {}
    (filter aggregate-abi/scalar-record-type?
-           (tree-seq coll? seq functions))))
+           (tree-seq coll? seq functions)))))
 
+#?(:kotoba
+   (defn- record-boundary-module? [functions [:list [:ref :form/r]] record-types [:ref :form/r]] :bool
+     (let [nodes (tree-nodes (fvec functions) (lnone))]
+       (or (some-boundary-type? functions 1 record-types)
+           (any-node? nodes 1)
+           (any-node? nodes 0)
+           (any-node? nodes 2))))
+   :default
 (defn- record-boundary-module?
   ([functions] (record-boundary-module? functions (module-record-types functions)))
   ([functions record-types]
@@ -2553,8 +3317,12 @@
      (some #(and (seq? %) (contains? '#{hetero-vector-new hetero-vector-at
                                         hetero-vector-count hetero-vector-assoc}
                                       (first %)))
-           (tree-seq coll? seq functions))))))
+           (tree-seq coll? seq functions)))))))
 
+#?(:kotoba
+   (defn- provider-boundary-module? [functions [:list [:ref :form/r]]] :bool
+     (any-node? (tree-nodes (fvec functions) (lnone)) 3))
+   :default
 (defn- provider-boundary-module? [functions]
   (boolean
    (some (fn [form]
@@ -2566,8 +3334,19 @@
                       (and (= :dataspace-v1 kind) (= 24 (second form)))
                       (and (= :ui-commit-v1 kind) (= 9 (second form)))
                       (and (= :ui-event-v1 kind) (= 10 (second form)))))))
-         (tree-seq coll? seq functions))))
+         (tree-seq coll? seq functions)))))
 
+#?(:kotoba
+   ;; the record types BODY can return in tail position, as a list (duplicates kept)
+   (defn- tail-constructed-record-types [body [:ref :form/r]] [:list [:ref :form/r]]
+     (cond
+       (not (form/is-seq? body)) (lnone)
+       (head-is? body "record-new") (let [t (fnth body 1)] (if (aggregate-abi/scalar-record-type? t) (lone t) (lnone)))
+       (head-is? body "let") (tail-constructed-record-types (fnth body 2))
+       (head-is? body "do") (tail-constructed-record-types (form/last-of body))
+       (head-is? body "if") (lcat (tail-constructed-record-types (fnth body 2)) (tail-constructed-record-types (fnth body 3)))
+       :else (lnone)))
+   :default
 (defn- tail-constructed-record-types
   "Record type descriptors a body can actually RETURN.
 
@@ -2589,7 +3368,7 @@
         (= op 'do) (tail-constructed-record-types (last body))
         (= op 'if) (into (tail-constructed-record-types (nth body 2 nil))
                          (tail-constructed-record-types (nth body 3 nil)))
-        :else #{}))))
+        :else #{})))))
 
 (defn- validate-record-reference-results! [functions]
   (doseq [{:keys [name result body]} functions
@@ -2607,6 +3386,24 @@
   #?(:clj (unchecked-add (long a) (long b))
      :cljs (i64/wrap-i64 (+ (i64/->bigint a) (i64/->bigint b)))))
 
+#?(:kotoba
+   ;; the first function whose ref result disagrees with a tail-constructed record, or nil
+   (defn- record-reference-mismatch [functions [:list [:ref :form/r]]] [:ref :form/r]
+     (let [n (lcount functions)]
+       (loop [i 0]
+         (if (>= i n) (nf)
+           (let [f (lget functions i) result (fget f :result)]
+             (if (and (form/is-vec? result) (kw? (fnth result 0) :ref)
+                      (let [ts (tail-constructed-record-types (fget f :body)) m (lcount ts)]
+                        (loop [j 0] (if (>= j m) false (if (feq (fnth result 1) (fnth (lget ts j) 1)) (recur (inc j)) true)))))
+               f
+               (recur (inc i)))))))))
+
+#?(:kotoba
+   ;; ── GMIR post-passes (rewrite-offset-multiplies) ──
+   (defn- gmir-source-keys [] [:list [:ref :form/r]]
+     (form/kids-of (form/edn-form "[:gmir/test :gmir/value :gmir/src :gmir/input :gmir/left :gmir/right :gmir/addend :gmir/base :gmir/length :gmir/index :gmir/stored :gmir/expected :gmir/second-base :gmir/second-length :gmir/count :gmir/offset :gmir/size :gmir/arguments]")))
+   :default
 (def ^:private gmir-source-keys
   ;; sysops: `:gmir/expected` is here because leaving it out DELETED the
   ;; instruction's comparand. `dce-gmir` below drops a `:gmir/constant` whose
@@ -2639,7 +3436,7 @@
    :gmir/addend :gmir/base :gmir/length :gmir/index :gmir/stored
    :gmir/expected
    :gmir/second-base :gmir/second-length :gmir/count
-   :gmir/offset :gmir/size :gmir/arguments])
+   :gmir/offset :gmir/size :gmir/arguments]))
 
 (def ^:private gmir-block-boundary
   #{:gmir/label :gmir/branch-zero :gmir/jump})
@@ -2649,6 +3446,30 @@
   ;; trapping ops stay even when their dst is unread (ordered `do`).
   #{:gmir/constant :gmir/add})
 
+#?(:kotoba
+   (defn- gmir-block-boundary? [op [:ref :form/r]] :bool
+     (or (kw? op :gmir/label) (kw? op :gmir/branch-zero) (kw? op :gmir/jump))))
+
+#?(:kotoba
+   (defn- gmir-dce-op? [op [:ref :form/r]] :bool (or (kw? op :gmir/constant) (kw? op :gmir/add))))
+
+#?(:kotoba
+   (defn- gmir-direct-sources [instruction [:ref :form/r]] [:list [:ref :form/r]]
+     (let [ks (gmir-source-keys) n (lcount ks)]
+       (loop [i 0 acc (lnone)]
+         (if (>= i n) acc
+           (let [v (form/form-get instruction (lget ks i))]
+             (recur (inc i) (cond (form/is-vec? v) (lcat acc (only-vregs (kids v)))
+                                  (vreg? v) (lconj acc v)
+                                  :else acc))))))))
+
+#?(:kotoba
+   (defn- gmir-source-registers [instruction [:ref :form/r]] [:list [:ref :form/r]]
+     (let [incs (kids (fget instruction :gmir/incomings)) m (lcount incs)]
+       (loop [j 0 acc (gmir-direct-sources instruction)]
+         (if (>= j m) acc
+           (let [v (fget (lget incs j) :gmir/value)] (recur (inc j) (if (vreg? v) (lconj acc v) acc)))))))
+   :default
 (defn- gmir-source-registers [instruction]
   (concat
    (mapcat (fn [key]
@@ -2660,21 +3481,54 @@
    (keep (fn [incoming]
            (when (gmir/vreg? (:gmir/value incoming))
              (:gmir/value incoming)))
-         (:gmir/incomings instruction))))
+         (:gmir/incomings instruction)))))
 
+#?(:kotoba
+   ;; defs: vreg number -> index of its (last) defining instruction
+   (defn- gmir-defs [instructions [:list [:ref :form/r]]] :vector-i64
+     (let [n (lcount instructions)]
+       (loop [i 0 t (vt-new)]
+         (if (>= i n) t
+           (let [dst (fget (lget instructions i) :gmir/dst)]
+             (recur (inc i) (if (vreg? dst) (vt-put t dst i) t)))))))
+   :default
 (defn- gmir-defs [instructions]
   (into {} (keep (fn [instruction]
                    (when-let [dst (:gmir/dst instruction)]
                      [dst instruction]))
-                 instructions)))
+                 instructions))))
 
+#?(:kotoba
+   (defn- gmir-def-of [instructions [:list [:ref :form/r]] defs :vector-i64 v [:ref :form/r]] [:ref :form/r]
+     (let [i (vt-get defs v -1)] (if (< i 0) (nf) (lget instructions i)))))
+
+#?(:kotoba
+   ;; the constant a vreg is defined by, as an int Form, or nil
+   (defn- const-i64 [instructions [:list [:ref :form/r]] defs :vector-i64 v [:ref :form/r]] [:ref :form/r]
+     (let [d (gmir-def-of instructions defs v)]
+       (if (and (truthy? d) (kw? (fget d :gmir/op) :gmir/constant) (form/is-int? (fget d :gmir/value)))
+         (fget d :gmir/value)
+         (nf))))
+   :default
 (defn- const-i64 [defs v]
   (let [instruction (get defs v)]
     (when (and instruction
                (= :gmir/constant (:gmir/op instruction))
                (gmir/i64-value? (:gmir/value instruction)))
-      (:gmir/value instruction))))
+      (:gmir/value instruction)))))
 
+#?(:kotoba
+   ;; [base k] when v is base + constant k, else nil
+   (defn- add-const-base [instructions [:list [:ref :form/r]] defs :vector-i64 v [:ref :form/r]] [:ref :form/r]
+     (let [d (gmir-def-of instructions defs v)]
+       (if (and (truthy? d) (kw? (fget d :gmir/op) :gmir/add))
+         (let [left (fget d :gmir/left) right (fget d :gmir/right)
+               lk (const-i64 instructions defs left) rk (const-i64 instructions defs right)]
+           (cond (and (truthy? rk) (not (truthy? lk))) (form/vec2 left rk)
+                 (and (truthy? lk) (not (truthy? rk))) (form/vec2 right lk)
+                 :else (nf)))
+         (nf))))
+   :default
 (defn- add-const-base [defs v]
   (let [instruction (get defs v)]
     (when (and instruction (= :gmir/add (:gmir/op instruction)))
@@ -2684,8 +3538,43 @@
             right-k (const-i64 defs right)]
         (cond (and (some? right-k) (nil? left-k)) [left right-k]
               (and (some? left-k) (nil? right-k)) [right left-k]
-              :else nil)))))
+              :else nil))))))
 
+#?(:kotoba
+   (defn- alias-rename [aliases :vector-i64 v [:ref :form/r]] [:ref :form/r]
+     (let [a (vt-get aliases v -1)] (if (< a 0) v (vreg-form a)))))
+
+#?(:kotoba
+   (defn- rename-maybe [aliases :vector-i64 v [:ref :form/r]] [:ref :form/r]
+     (cond (form/is-vec? v) (let [xs (kids v) n (lcount xs)]
+                              (loop [i 0 acc (lnone)] (if (>= i n) (fvec acc) (recur (inc i) (lconj acc (alias-rename aliases (lget xs i)))))))
+           (vreg? v) (alias-rename aliases v)
+           :else v)))
+
+#?(:kotoba
+   (defn- remap-direct-sources [instruction [:ref :form/r] aliases :vector-i64] [:ref :form/r]
+     (let [ks (gmir-source-keys) n (lcount ks)]
+       (loop [i 0 out instruction]
+         (if (>= i n) out
+           (let [k (lget ks i)]
+             (recur (inc i) (if (form/form-has? out k)
+                              (form/assoc-form out k (rename-maybe aliases (form/form-get out k)))
+                              out))))))))
+
+#?(:kotoba
+   (defn- remap-incomings [incs [:list [:ref :form/r]] aliases :vector-i64] [:ref :form/r]
+     (let [m (lcount incs)]
+       (fvec (loop [j 0 acc (lnone)]
+               (if (>= j m) acc
+                 (let [inc' (lget incs j) v (fget inc' :gmir/value)]
+                   (recur (inc j) (lconj acc (if (vreg? v) (fassoc inc' :gmir/value (alias-rename aliases v)) inc'))))))))))
+
+#?(:kotoba
+   (defn- remap-gmir-sources [instruction [:ref :form/r] aliases :vector-i64] [:ref :form/r]
+     (let [renamed (remap-direct-sources instruction aliases)
+           incs (fget instruction :gmir/incomings)]
+       (if (truthy? incs) (fassoc renamed :gmir/incomings (remap-incomings (kids incs) aliases)) renamed)))
+   :default
 (defn- remap-gmir-sources [instruction aliases]
   (let [rename (fn [v] (get aliases v v))
         rename-maybe (fn [v]
@@ -2705,8 +3594,50 @@
                         (if (gmir/vreg? (:gmir/value incoming))
                           (update incoming :gmir/value rename)
                           incoming))
-                      incomings))))))
+                      incomings)))))))
 
+#?(:kotoba
+   (defn- vreg-form [n :i64] [:ref :form/r]
+     (kf (keyword-from-string (string-concat "kotoba.gmir.vreg/" (string-from-i64 n))))))
+
+#?(:kotoba
+   (defn- g3 [op :keyword dst [:ref :form/r] left [:ref :form/r] right [:ref :form/r]] [:ref :form/r]
+     (map4 :gmir/op (kf op) :gmir/dst dst :gmir/left left :gmir/right right)))
+
+#?(:kotoba
+   (defn- gconst [dst [:ref :form/r] value [:ref :form/r]] [:ref :form/r]
+     (map3 :gmir/op (kf :gmir/constant) :gmir/dst dst :gmir/value value)))
+
+#?(:kotoba
+   ;; instructions ++ the next free vreg number (in :value as an int), via :mi/lv
+   (defn- distribute-const-offset-multiplies [instructions [:list [:ref :form/r]] next :i64] [:ref :mi/lv]
+     (let [defs (gmir-defs instructions) n (lcount instructions)]
+       (loop [i 0 out (lnone) next next]
+         (if (>= i n)
+           (record-new [:ref :mi/lv] out (nf) next 0)
+           (let [ins (lget instructions i)]
+             (if (not (kw? (fget ins :gmir/op) :gmir/multiply))
+               (recur (inc i) (lconj out ins) next)
+               (let [left (fget ins :gmir/left) right (fget ins :gmir/right)
+                     lk (const-i64 instructions defs left) rk (const-i64 instructions defs right)
+                     ;; [base k c c-reg] or nil
+                     offset (cond (and (truthy? rk) (not (truthy? lk)))
+                                  (let [b (add-const-base instructions defs left)]
+                                    (if (truthy? b) (form/vec4 (fnth b 0) (fnth b 1) rk right) (nf)))
+                                  (and (truthy? lk) (not (truthy? rk)))
+                                  (let [b (add-const-base instructions defs right)]
+                                    (if (truthy? b) (form/vec4 (fnth b 0) (fnth b 1) lk left) (nf)))
+                                  :else (nf))]
+                 (if (not (truthy? offset))
+                   (recur (inc i) (lconj out ins) next)
+                   (let [product (vreg-form next) folded (vreg-form (+ next 1))
+                         kc (* (form/int-value (fnth offset 1)) (form/int-value (fnth offset 2)))]
+                     (recur (inc i)
+                            (lconj (lconj (lconj out (g3 :gmir/multiply product (fnth offset 0) (fnth offset 3)))
+                                          (gconst folded (intf kc)))
+                                   (g3 :gmir/add (fget ins :gmir/dst) product folded))
+                            (+ next 2)))))))))))
+   :default
 (defn- distribute-const-offset-multiplies [instructions next-reg]
   (let [defs (gmir-defs instructions)]
     (vec
@@ -2736,8 +3667,32 @@
                  {:gmir/op :gmir/constant :gmir/dst folded :gmir/value kC}
                  {:gmir/op :gmir/add :gmir/dst (:gmir/dst instruction)
                   :gmir/left product :gmir/right folded}])))))
-      instructions))))
+      instructions)))))
 
+#?(:kotoba
+   (defn- fold-add-of-add-const [instructions [:list [:ref :form/r]] next :i64] [:ref :mi/lv]
+     (let [defs (gmir-defs instructions) n (lcount instructions)]
+       (loop [i 0 out (lnone) next next]
+         (if (>= i n)
+           (record-new [:ref :mi/lv] out (nf) next 0)
+           (let [ins (lget instructions i)]
+             (if (not (kw? (fget ins :gmir/op) :gmir/add))
+               (recur (inc i) (lconj out ins) next)
+               (let [left (fget ins :gmir/left) right (fget ins :gmir/right)
+                     lk (const-i64 instructions defs left) rk (const-i64 instructions defs right)
+                     inner (cond (truthy? rk) (add-const-base instructions defs left)
+                                 (truthy? lk) (add-const-base instructions defs right)
+                                 :else (nf))
+                     outer-k (if (truthy? rk) rk lk)]
+                 (if (not (and (truthy? inner) (truthy? outer-k)))
+                   (recur (inc i) (lconj out ins) next)
+                   (let [folded (vreg-form next)
+                         sum (+ (form/int-value (fnth inner 1)) (form/int-value outer-k))]
+                     (recur (inc i)
+                            (lconj (lconj out (gconst folded (intf sum)))
+                                   (g3 :gmir/add (fget ins :gmir/dst) (fnth inner 0) folded))
+                            (+ next 1)))))))))))
+   :default
 (defn- fold-add-of-add-const [instructions next-reg]
   (let [defs (gmir-defs instructions)]
     (vec
@@ -2760,7 +3715,7 @@
                 [{:gmir/op :gmir/constant :gmir/dst folded :gmir/value sum}
                  {:gmir/op :gmir/add :gmir/dst (:gmir/dst instruction)
                   :gmir/left (first inner) :gmir/right folded}])))))
-      instructions))))
+      instructions)))))
 
 (defn- const-key
   "An i64 constant in a form that can sit inside a map KEY on both hosts.
@@ -2784,6 +3739,28 @@
   [value]
   (str value))
 
+#?(:kotoba
+   (defn- gvn-const-multiplies [instructions [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (let [defs (gmir-defs instructions) n (lcount instructions)
+           kept (loop [i 0 mul-by (fmap (lnone)) aliases (vt-new) out (lnone)]
+                  (if (>= i n)
+                    (record-new [:ref :mi/lv] out (nf) 0 0)
+                    (let [ins (lget instructions i) op (fget ins :gmir/op)]
+                      (cond
+                        (gmir-block-boundary? op) (recur (inc i) (fmap (lnone)) aliases (lconj out ins))
+                        (not (kw? op :gmir/multiply)) (recur (inc i) mul-by aliases (lconj out ins))
+                        :else
+                        (let [left (fget ins :gmir/left) right (fget ins :gmir/right)
+                              lk (const-i64 instructions defs left) rk (const-i64 instructions defs right)
+                              key (cond (truthy? rk) (form/vec2 left rk) (truthy? lk) (form/vec2 right lk) :else (nf))]
+                          (if (not (truthy? key))
+                            (recur (inc i) mul-by aliases (lconj out ins))
+                            (let [canonical (form/form-get mul-by key)]
+                              (if (truthy? canonical)
+                                (recur (inc i) mul-by (vt-put aliases (fget ins :gmir/dst) (vreg-num canonical)) out)
+                                (recur (inc i) (form/assoc-form mul-by key (fget ins :gmir/dst)) aliases (lconj out ins))))))))))]
+       (gvn-remap (record-get [:ref :mi/lv] kept :code) (gvn-aliases instructions defs))))
+   :default
 (defn- gvn-const-multiplies [instructions]
   (loop [remaining instructions
          mul-by {}
@@ -2819,8 +3796,52 @@
                 (recur (next remaining)
                        (assoc mul-by key (:gmir/dst instruction))
                        aliases
-                       (conj out instruction))))))))))
+                       (conj out instruction)))))))))))
 
+#?(:kotoba
+   ;; the aliases gvn-const-multiplies records, recomputed (a list of tables is not a native value)
+   (defn- gvn-aliases [instructions [:list [:ref :form/r]] defs :vector-i64] :vector-i64
+     (let [n (lcount instructions)]
+       (loop [i 0 mul-by (fmap (lnone)) aliases (vt-new)]
+         (if (>= i n) aliases
+           (let [ins (lget instructions i) op (fget ins :gmir/op)]
+             (cond
+               (gmir-block-boundary? op) (recur (inc i) (fmap (lnone)) aliases)
+               (not (kw? op :gmir/multiply)) (recur (inc i) mul-by aliases)
+               :else
+               (let [left (fget ins :gmir/left) right (fget ins :gmir/right)
+                     lk (const-i64 instructions defs left) rk (const-i64 instructions defs right)
+                     key (cond (truthy? rk) (form/vec2 left rk) (truthy? lk) (form/vec2 right lk) :else (nf))]
+                 (if (not (truthy? key))
+                   (recur (inc i) mul-by aliases)
+                   (let [canonical (form/form-get mul-by key)]
+                     (if (truthy? canonical)
+                       (recur (inc i) mul-by (vt-put aliases (fget ins :gmir/dst) (vreg-num canonical)))
+                       (recur (inc i) (form/assoc-form mul-by key (fget ins :gmir/dst)) aliases))))))))))))
+
+#?(:kotoba
+   (defn- gvn-remap [out [:list [:ref :form/r]] aliases :vector-i64] [:list [:ref :form/r]]
+     (let [n (lcount out)]
+       (loop [i 0 acc (lnone)] (if (>= i n) acc (recur (inc i) (lconj acc (remap-gmir-sources (lget out i) aliases))))))))
+
+#?(:kotoba
+   (defn- dce-used [instructions [:list [:ref :form/r]]] :vector-i64
+     (let [n (lcount instructions)]
+       (loop [i 0 used (vt-new)]
+         (if (>= i n) used
+           (let [srcs (gmir-source-registers (lget instructions i)) m (lcount srcs)]
+             (recur (inc i) (loop [j 0 u used] (if (>= j m) u (recur (inc j) (vt-put u (lget srcs j) 1)))))))))))
+
+#?(:kotoba
+   (defn- dce-gmir [instructions [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (let [used (dce-used instructions) n (lcount instructions)
+           kept (loop [i 0 acc (lnone)]
+                  (if (>= i n) acc
+                    (let [ins (lget instructions i)]
+                      (recur (inc i) (if (or (not (gmir-dce-op? (fget ins :gmir/op))) (vt-has? used (fget ins :gmir/dst)))
+                                       (lconj acc ins) acc)))))]
+       (if (= (lcount kept) n) kept (dce-gmir kept))))
+   :default
 (defn- dce-gmir [instructions]
   (loop [current (vec instructions)]
     (let [used (set (mapcat gmir-source-registers current))
@@ -2828,8 +3849,19 @@
                           (or (not (contains? gmir-dce-ops (:gmir/op instruction)))
                               (contains? used (:gmir/dst instruction))))
                         current)]
-      (if (= kept current) kept (recur kept)))))
+      (if (= kept current) kept (recur kept))))))
 
+#?(:kotoba
+   (defn- rewrite-offset-multiplies [instructions [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (let [n (lcount instructions)
+           max-index (loop [i 0 m -1]
+                       (if (>= i n) m
+                         (let [dst (fget (lget instructions i) :gmir/dst)]
+                           (recur (inc i) (if (vreg? dst) (max m (vreg-num dst)) m)))))
+           d (distribute-const-offset-multiplies instructions (inc max-index))
+           f (fold-add-of-add-const (record-get [:ref :mi/lv] d :code) (record-get [:ref :mi/lv] d :reg))]
+       (dce-gmir (gvn-const-multiplies (record-get [:ref :mi/lv] f :code)))))
+   :default
 (defn- rewrite-offset-multiplies
   "LLVM's first-round trick on `(n+k)*C+1`: distribute a constant offset
   through the multiply, fold the now-constant addend, and reuse `n*C`.
@@ -2849,8 +3881,670 @@
         (distribute-const-offset-multiplies next-reg)
         (fold-add-of-add-const next-reg)
         gvn-const-multiplies
-        dce-gmir)))
+        dce-gmir))))
 
+#?(:kotoba
+   ;; a constant into a fresh vreg
+   (defn- lk-const [literal [:ref :form/r] st [:ref :mi/lv]] [:ref :mi/lv]
+     (let [dst (lv-next st)]
+       (lv (lone (gm3 :gmir/constant :gmir/dst dst :gmir/value literal)) dst (inc (lv-reg st)) (lv-label st)))))
+
+#?(:kotoba
+   (defn- lk-string-literal [content :string st [:ref :mi/lv]] [:ref :mi/lv]
+     (let [r (lv-reg st)
+           address (vreg-form (+ r 1)) length (vreg-form (+ r 2)) dst (vreg-form (+ r 3))]
+       (lv (lconj (lconj (lone (gm3 :gmir/data-address :gmir/dst address :gmir/content (form/string-form content)))
+                         (gm3 :gmir/constant :gmir/dst length :gmir/value (intf (string-byte-length content))))
+                  (gm4 :gmir/runtime-call :gmir/dst dst :gmir/runtime (kf :pair) :gmir/arguments (form/vec2 address length)))
+           dst (+ r 3) (lv-label st)))))
+
+#?(:kotoba
+   ;; binary op over two lowered operands (L then R), dst allocated after both
+   (defn- lk-binary [op :keyword l [:ref :mi/lv] r [:ref :mi/lv] form [:ref :form/r]] [:ref :mi/lv]
+     (let [left (scalar-register! (lv-val l) form)
+           right (scalar-register! (lv-val r) form)
+           dst (lv-next r)]
+       (lv (lconj (lcat (lv-code l) (lv-code r)) (g3 op dst left right)) dst (inc (lv-reg r)) (lv-label r)))))
+
+#?(:kotoba
+   (defn- lk-signed-i32 [x [:ref :mi/lv] form [:ref :form/r]] [:ref :mi/lv]
+     (let [c (lk-const (intf 32) x)
+           count-register (lv-val c)
+           shifted (lv-next c)
+           dst (vreg-form (+ 2 (lv-reg c)))
+           source (scalar-register! (lv-val x) form)]
+       (lv (lconj (lconj (lcat (lv-code x) (lv-code c)) (g3 :gmir/shift-left shifted source count-register))
+                  (g3 :gmir/shift-right-signed dst shifted count-register))
+           dst (+ 2 (lv-reg c)) (lv-label c)))))
+
+#?(:kotoba
+   (defn- lk-unsigned-i32 [x [:ref :mi/lv] form [:ref :form/r]] [:ref :mi/lv]
+     (let [m (lk-const (intf 4294967295) x)
+           dst (lv-next m)
+           source (scalar-register! (lv-val x) form)]
+       (lv (lconj (lcat (lv-code x) (lv-code m)) (g3 :gmir/bit-and dst source (lv-val m)))
+           dst (inc (lv-reg m)) (lv-label m)))))
+
+#?(:kotoba
+   (defn- phi2 [dst [:ref :form/r] then-exit [:ref :form/r] then-v [:ref :form/r] else-exit [:ref :form/r] else-v [:ref :form/r]] [:ref :form/r]
+     (gm3 :gmir/phi :gmir/dst dst
+          :gmir/incomings (form/vec2 (map2 :gmir/predecessor then-exit :gmir/value then-v)
+                                     (map2 :gmir/predecessor else-exit :gmir/value else-v)))))
+
+#?(:kotoba
+   (defn- fresh-vregs [from :i64 n :i64] [:list [:ref :form/r]]
+     (loop [i 0 acc (lnone)] (if (>= i n) acc (recur (inc i) (lconj acc (vreg-form (+ from i))))))))
+
+#?(:kotoba
+   (defn- merge-phis [dsts [:list [:ref :form/r]] tv [:list [:ref :form/r]] ev [:list [:ref :form/r]]
+                      then-exit [:ref :form/r] else-exit [:ref :form/r]] [:list [:ref :form/r]]
+     (let [n (lcount dsts)]
+       (loop [i 0 acc (lnone)]
+         (if (>= i n) acc
+           (recur (inc i) (lconj acc (phi2 (lget dsts i) then-exit (lget tv i) else-exit (lget ev i)))))))))
+
+#?(:kotoba
+   (defn- lk-merge [then-value [:ref :form/r] else-value [:ref :form/r] then-exit [:ref :form/r] else-exit [:ref :form/r]
+                    form [:ref :form/r] st [:ref :mi/lv]] [:ref :mi/lv]
+     (cond
+       (and (vreg? then-value) (vreg? else-value))
+       (let [dst (lv-next st)]
+         (lv (lone (phi2 dst then-exit then-value else-exit else-value)) dst (inc (lv-reg st)) (lv-label st)))
+       (and (record-value? then-value) (record-value? else-value)
+            (feq (fget then-value :aggregate/type) (fget else-value :aggregate/type)))
+       (let [tv (kids (fget then-value :aggregate/values)) ev (kids (fget else-value :aggregate/values))
+             n (lcount tv) r (lv-reg st)]
+         (if (not (= n (lcount ev)))
+           (reject-lv! :kir-to-gmir :record-value-width-mismatch form st)
+           (let [dsts (fresh-vregs (+ r 1) n)
+                 phis (merge-phis dsts tv ev then-exit else-exit)]
+             (lv phis (record-value (fget then-value :aggregate/type) dsts) (+ r n) (lv-label st)))))
+       (and (variant-value? then-value) (variant-value? else-value)
+            (feq (fget then-value :aggregate/type) (fget else-value :aggregate/type)))
+       (let [r (lv-reg st) tag-dst (vreg-form (+ r 1)) payload-dst (vreg-form (+ r 2))]
+         (lv (lconj (lone (phi2 tag-dst then-exit (fget then-value :variant/tag) else-exit (fget else-value :variant/tag)))
+                    (phi2 payload-dst then-exit (fget then-value :variant/payload) else-exit (fget else-value :variant/payload)))
+             (variant-value (fget then-value :aggregate/type) tag-dst payload-dst) (+ r 2) (lv-label st)))
+       :else (reject-lv! :kir-to-gmir :branch-value-shape-mismatch form st))))
+
+#?(:kotoba
+   ;; every form of FORMS lowered in order: :code concatenated, :value the vector of values
+   (defn- lk-all [forms [:list [:ref :form/r]] i :i64 env [:ref :form/r] sigs [:ref :form/r]
+                  st [:ref :mi/lv] acc [:list [:ref :form/r]]] [:ref :mi/lv]
+     (if (>= i (lcount forms))
+       (lv (lv-code st) (fvec acc) (lv-reg st) (lv-label st))
+       (let [r (lk-value (lget forms i) env sigs (lv (lnone) (nf) (lv-reg st) (lv-label st)))]
+         (lk-all forms (inc i) env sigs (lv (lcat (lv-code st) (lv-code r)) (nf) (lv-reg r) (lv-label r))
+                 (lconj acc (lv-val r)))))))
+
+#?(:kotoba
+   (defn- lk-forms [forms [:list [:ref :form/r]] env [:ref :form/r] sigs [:ref :form/r] st [:ref :mi/lv]] [:ref :mi/lv]
+     (lk-all forms 0 env sigs (lv (lnone) (nf) (lv-reg st) (lv-label st)) (lnone))))
+
+#?(:kotoba
+   ;; every value a scalar register (recursion: a refusal may not sit before a recur)
+   (defn- lk-registers [values [:list [:ref :form/r]] i :i64 form [:ref :form/r] acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (lcount values)) acc
+       (lk-registers values (inc i) form (lconj acc (scalar-register! (lget values i) form))))))
+
+#?(:kotoba
+   (defn- lk-regs [r [:ref :mi/lv] form [:ref :form/r]] [:list [:ref :form/r]]
+     (lk-registers (kids (lv-val r)) 0 form (lnone))))
+
+#?(:kotoba
+   (defn- lk-with-dst [r [:ref :mi/lv] instruction-of-dst [:ref :form/r]] [:ref :mi/lv]
+     ;; INSTRUCTION-OF-DST already names (lv-next r) as its dst
+     (lv (lconj (lv-code r) instruction-of-dst) (lv-next r) (inc (lv-reg r)) (lv-label r))))
+
+#?(:kotoba
+   (defn- fresh-st [st [:ref :mi/lv]] [:ref :mi/lv] (lv (lnone) (nf) (lv-reg st) (lv-label st))))
+
+#?(:kotoba
+   (defn- lk-fold [form [:ref :form/r] env [:ref :form/r] sigs [:ref :form/r] st [:ref :mi/lv]] [:ref :mi/lv]
+     (let [op (fnth form 0)
+           operands (if (and (sym? op "-") (= 2 (fcount form)))
+                      (form/two-forms (intf 0) (fnth form 1))
+                      (form/rest-list form))
+           lowered (lk-each operands 0 env sigs st (typed-list-new [:list [:ref :mi/lv]]))
+           n (lcount operands)
+           gop (kw-of (tget (kir-binary-ops) form))]
+       (lk-fold-reduce lowered 1 n gop form (lv (lv-code (lget-lv lowered 0)) (scalar-register! (lv-val (lget-lv lowered 0)) form)
+                                                (lv-reg (lget-lv lowered (dec n))) (lv-label (lget-lv lowered (dec n))))))))
+
+#?(:kotoba
+   ;; each operand's own :mi/lv, in order (the reduce needs them apart), as a list of 1-field forms is not
+   ;; possible: :mi/lv lists are typed lists of records
+   (defn- lget-lv [xs [:list [:ref :mi/lv]] i :i64] [:ref :mi/lv] (typed-list-nth [:list [:ref :mi/lv]] xs i)))
+
+#?(:kotoba
+   (defn- lk-each [forms [:list [:ref :form/r]] i :i64 env [:ref :form/r] sigs [:ref :form/r] st [:ref :mi/lv]
+                   acc [:list [:ref :mi/lv]]] [:list [:ref :mi/lv]]
+     (if (>= i (lcount forms)) acc
+       (let [r (lk-value (lget forms i) env sigs (fresh-st st))]
+         (lk-each forms (inc i) env sigs r (typed-list-conj [:list [:ref :mi/lv]] acc r))))))
+
+#?(:kotoba
+   (defn- lk-fold-reduce [lowered [:list [:ref :mi/lv]] i :i64 n :i64 gop :keyword form [:ref :form/r] acc [:ref :mi/lv]] [:ref :mi/lv]
+     (if (>= i n) acc
+       (let [rl (lget-lv lowered i)
+             right (scalar-register! (lv-val rl) form)
+             dst (lv-next acc)]
+         (lk-fold-reduce lowered (inc i) n gop form
+                         (lv (lconj (lcat (lv-code acc) (lv-code rl)) (g3 gop dst (lv-val acc) right)) dst (inc (lv-reg acc)) (lv-label acc)))))))
+
+#?(:kotoba
+   (defn- lk-compare-pairs [gop :keyword registers [:list [:ref :form/r]] r0 :i64] [:list [:ref :form/r]]
+     ;; comparison dsts r0+1 .. r0+(n-1)
+     (let [n (lcount registers)]
+       (loop [i 0 acc (lnone)]
+         (if (>= (+ i 1) n) acc
+           (recur (inc i) (lconj acc (g3 gop (vreg-form (+ r0 1 i)) (lget registers i) (lget registers (inc i))))))))))
+
+#?(:kotoba
+   (defn- lk-compare-and [code [:list [:ref :form/r]] i :i64 m :i64 r0 :i64 left [:ref :form/r] reg :i64 label :i64] [:ref :mi/lv]
+     (if (>= i m)
+       (lv code left reg label)
+       (let [dst (vreg-form (inc reg))]
+         (lk-compare-and (lconj code (g3 :gmir/bit-and dst left (vreg-form (+ r0 1 i)))) (inc i) m r0 dst (inc reg) label)))))
+
+#?(:kotoba
+   (defn- lk-compare-chain [form [:ref :form/r] env [:ref :form/r] sigs [:ref :form/r] st [:ref :mi/lv]] [:ref :mi/lv]
+     (let [gop (kw-of (tget (kir-binary-ops) form))
+           all (lk-forms (form/rest-list form) env sigs st)
+           registers (lk-regs all form)
+           r0 (lv-reg all)
+           cmp (lk-compare-pairs gop registers r0)
+           m (lcount cmp)]
+       (lk-compare-and (lcat (lv-code all) cmp) 1 m r0 (vreg-form (+ r0 1)) (+ r0 m) (lv-label all)))))
+
+#?(:kotoba
+   (defn- lk-memory [form [:ref :form/r] env [:ref :form/r] sigs [:ref :form/r] st [:ref :mi/lv]] [:ref :mi/lv]
+     (let [spec (tget (kir-kernel-memory-ops) form)
+           op (kw-of (fnth spec 0)) maximum (fnth spec 1)
+           all (lk-forms (form/rest-list form) env sigs st)
+           operands (lk-regs all form)
+           n (lcount operands)
+           dst (lv-next all)]
+       (if (not (= n (if (fmember? (gmir-memory-store-ops) (kf op)) 4 3)))
+         (reject-lv! :kir-to-gmir :kernel-memory-arity form all)
+         (let [base (map4 :gmir/op (kf op) :gmir/dst dst :gmir/base (lget operands 0) :gmir/length (lget operands 1))
+               ins (fassoc (fassoc base :gmir/index (lget operands 2)) :gmir/maximum maximum)]
+           (lk-with-dst all (if (= n 4) (fassoc ins :gmir/stored (lget operands 3)) ins)))))))
+
+#?(:kotoba
+   (defn- lk-atomic [form [:ref :form/r] env [:ref :form/r] sigs [:ref :form/r] st [:ref :mi/lv]] [:ref :mi/lv]
+     (let [spec (tget (kir-kernel-atomic-ops) form)
+           op (kw-of (fnth spec 0)) maximum (fnth spec 1) arity (form/int-value (fnth spec 2))]
+       (if (not (= arity (dec (fcount form))))
+         (reject-lv! :kir-to-gmir :kernel-atomic-arity form st)
+         (let [all (lk-forms (form/rest-list form) env sigs st)
+               operands (lk-regs all form)
+               dst (lv-next all)
+               base (fassoc (fassoc (map4 :gmir/op (kf op) :gmir/dst dst :gmir/base (lget operands 0) :gmir/length (lget operands 1))
+                                    :gmir/index (lget operands 2))
+                            :gmir/maximum maximum)]
+           (lk-with-dst all (cond (= arity 4) (fassoc base :gmir/stored (lget operands 3))
+                                  (= arity 5) (fassoc (fassoc base :gmir/expected (lget operands 3)) :gmir/stored (lget operands 4))
+                                  :else base)))))))
+
+#?(:kotoba
+   (defn- lk-region-pair [form [:ref :form/r] env [:ref :form/r] sigs [:ref :form/r] st [:ref :mi/lv]] [:ref :mi/lv]
+     (let [spec (tget (kir-region-pair-ops) form)
+           op (kw-of (fnth spec 0)) maximum (fnth spec 1) arity (form/int-value (fnth spec 2))]
+       (if (not (= arity (dec (fcount form))))
+         (reject-lv! :kir-to-gmir :kernel-dot-arity form st)
+         (let [all (lk-forms (form/rest-list form) env sigs st)
+               o (lk-regs all form)
+               dst (lv-next all)]
+           (lk-with-dst all (fassoc (fassoc (fassoc (fassoc (map4 :gmir/op (kf op) :gmir/dst dst :gmir/base (lget o 0) :gmir/length (lget o 1))
+                                                            :gmir/second-base (lget o 2))
+                                                    :gmir/second-length (lget o 3))
+                                            :gmir/count (lget o 4))
+                                    :gmir/maximum maximum)))))))
+
+#?(:kotoba
+   (defn- lk-runtime [form [:ref :form/r] env [:ref :form/r] sigs [:ref :form/r] st [:ref :mi/lv]] [:ref :mi/lv]
+     (let [runtime (tget (kir-runtime-ops) form)
+           expected (form/form-get (gmir/runtime-operation-arities) runtime)
+           all (lk-forms (form/rest-list form) env sigs st)
+           registers (lk-regs all form)
+           dst (lv-next all)]
+       (if (not (and (form/is-int? expected) (= (form/int-value expected) (dec (fcount form)))))
+         (reject-lv! :kir-to-gmir :runtime-call-arity form all)
+         (lk-with-dst all (gm4 :gmir/runtime-call :gmir/dst dst :gmir/runtime runtime :gmir/arguments (fvec registers)))))))
+
+#?(:kotoba
+   (defn- lk-privileged [form [:ref :form/r] env [:ref :form/r] sigs [:ref :form/r] st [:ref :mi/lv]] [:ref :mi/lv]
+     (let [action (tget (kir-x86-privileged-ops) form)
+           expected (form/form-get (gmir/x86-privileged-action-arities) action)
+           all (lk-forms (form/rest-list form) env sigs st)
+           registers (lk-regs all form)
+           dst (lv-next all)]
+       (if (not (and (form/is-int? expected) (= (form/int-value expected) (dec (fcount form)))))
+         (reject-lv! :kir-to-gmir :x86-privileged-arity form all)
+         (lk-with-dst all (gm4 :gmir/x86-privileged :gmir/dst dst :gmir/action action :gmir/arguments (fvec registers)))))))
+
+#?(:kotoba
+   (defn- lk-literal-walk [form [:ref :form/r] env [:ref :form/r] sigs [:ref :form/r] st [:ref :mi/lv]] [:ref :mi/lv]
+     (let [content (form/string-value (fnth form 1))
+           n (string-byte-length content)
+           maximum (literal-walk-window n)
+           ix (lk-value (fnth form 2) env sigs (fresh-st st))
+           index (scalar-register! (lv-val ix) form)
+           r (lv-reg ix)
+           address (vreg-form (+ r 1)) length (vreg-form (+ r 2)) dst (vreg-form (+ r 3))]
+       (if (< maximum 0)
+         (reject-lv! :kir-to-gmir :literal-walk-too-long form ix)
+         (lv (lconj (lconj (lconj (lv-code ix)
+                                  (gm4 :gmir/rodata-address :gmir/dst address :gmir/content (form/string-form (hex-of-ascii content))
+                                       :gmir/rodata-encoding (kf :hex-bytes)))
+                           (gm3 :gmir/constant :gmir/dst length :gmir/value (intf n)))
+                    (fassoc (fassoc (map4 :gmir/op (kf :gmir/kernel-load-u8) :gmir/dst dst :gmir/base address :gmir/length length)
+                                    :gmir/index index)
+                            :gmir/maximum (intf maximum)))
+             dst (+ r 3) (lv-label ix))))))
+
+#?(:kotoba
+   (defn- lk-record-new [form [:ref :form/r] env [:ref :form/r] sigs [:ref :form/r] st [:ref :mi/lv]] [:ref :mi/lv]
+     (let [type (fnth form 1)
+           fields (scalar-record-fields type)
+           field-forms (ldrop (kids form) 2)]
+       (cond
+         (not (truthy? fields)) (reject-lv! :kir-to-gmir :unsupported-record-type form st)
+         (not (= (fcount fields) (lcount field-forms))) (reject-lv! :kir-to-gmir :record-field-count-mismatch form st)
+         :else (let [all (lk-forms field-forms env sigs st)]
+                 (lv (lv-code all) (record-value type (lk-regs all form)) (lv-reg all) (lv-label all)))))))
+
+#?(:kotoba
+   (defn- lk-record-get [form [:ref :form/r] env [:ref :form/r] sigs [:ref :form/r] st [:ref :mi/lv]] [:ref :mi/lv]
+     (let [type (fnth form 1)
+           fields (scalar-record-fields type)]
+       (if (not (truthy? fields))
+         (reject-lv! :kir-to-gmir :unsupported-record-type form st)
+         (let [r (lk-value (fnth form 2) env sigs (fresh-st st))
+               aggregate (lv-val r)
+               field-index (pair-index fields (fnth form 3))]
+           (cond
+             (not (and (record-value? aggregate) (feq type (fget aggregate :aggregate/type))))
+             (reject-lv! :kir-to-gmir :record-type-mismatch form r)
+             (< field-index 0) (reject-lv! :kir-to-gmir :unknown-record-field form r)
+             :else (lv (lv-code r) (form/nth-of (fget aggregate :aggregate/values) field-index) (lv-reg r) (lv-label r))))))))
+
+#?(:kotoba
+   (defn- lk-variant-new [form [:ref :form/r] env [:ref :form/r] sigs [:ref :form/r] st [:ref :mi/lv]] [:ref :mi/lv]
+     (let [type (fnth form 1)
+           cases (scalar-variant-cases type)]
+       (if (not (truthy? cases))
+         (reject-lv! :kir-to-gmir :unsupported-variant-type form st)
+         (let [ordinal (pair-index cases (fnth form 2))]
+           (if (< ordinal 0)
+             (reject-lv! :kir-to-gmir :unknown-variant-case form st)
+             (let [tag-register (lv-next st)
+                   p (lk-value (fnth form 3) env sigs (lv (lnone) (nf) (inc (lv-reg st)) (lv-label st)))
+                   payload (scalar-register! (lv-val p) form)]
+               (lv (lcat (lone (gm3 :gmir/constant :gmir/dst tag-register :gmir/value (intf ordinal))) (lv-code p))
+                   (variant-value type tag-register payload) (lv-reg p) (lv-label p)))))))))
+
+#?(:kotoba
+   (defn- variant-branches-valid? [cases [:ref :form/r] branches [:ref :form/r]] :bool
+     (and (form/is-vec? branches)
+          (= (fcount cases) (fcount branches))
+          (let [bs (kids branches) n (lcount bs)]
+            (loop [i 0]
+              (if (>= i n) true
+                (let [b (lget bs i)]
+                  (if (and (form/is-vec? b) (= 3 (fcount b)) (form/is-keyword? (fnth b 0)) (form/is-symbol? (fnth b 1)))
+                    (recur (inc i)) false)))))
+          (feq (firsts cases) (firsts branches)))))
+
+#?(:kotoba
+   (defn- lk-variant-match [form [:ref :form/r] env [:ref :form/r] sigs [:ref :form/r] st [:ref :mi/lv]] [:ref :mi/lv]
+     (let [type (fnth form 1)
+           cases (scalar-variant-cases type)
+           branches (fnth form 3)]
+       (cond
+         (not (truthy? cases)) (reject-lv! :kir-to-gmir :unsupported-variant-type form st)
+         (not (variant-branches-valid? cases branches)) (reject-lv! :kir-to-gmir :invalid-variant-branches form st)
+         :else
+         (let [v (lk-value (fnth form 2) env sigs (fresh-st st))
+               aggregate (lv-val v)]
+           (if (not (and (variant-value? aggregate) (feq type (fget aggregate :aggregate/type))))
+             (reject-lv! :kir-to-gmir :variant-type-mismatch form v)
+             (let [match-env (form/assoc-form (form/assoc-form env (symf "$variant-tag") (form/vec2 (kf :local) (fget aggregate :variant/tag)))
+                                              (symf "$variant-payload") (form/vec2 (kf :local) (fget aggregate :variant/payload)))
+                   bs (kids branches) n (lcount bs)
+                   last-b (lget bs (dec n))
+                   dispatch (loop [i (- n 2) fallback (let1 (form/symbol-value (fnth last-b 1)) (symf "$variant-payload") (fnth last-b 2))]
+                              (if (< i 0) fallback
+                                (let [b (lget bs i)]
+                                  (recur (dec i)
+                                         (if3 (form/call2 "=" (symf "$variant-tag") (intf i))
+                                              (let1 (form/symbol-value (fnth b 1)) (symf "$variant-payload") (fnth b 2))
+                                              fallback)))))
+                   d (lk-value dispatch match-env sigs (fresh-st v))]
+               (lv (lcat (lv-code v) (lv-code d)) (lv-val d) (lv-reg d) (lv-label d)))))))))
+
+#?(:kotoba
+   (defn- lk-if [form [:ref :form/r] env [:ref :form/r] sigs [:ref :form/r] st [:ref :mi/lv]] [:ref :mi/lv]
+     (let [t (lk-value (fnth form 1) env sigs (fresh-st st))
+           test (scalar-register! (lv-val t) form)
+           l (lv-label t)
+           then-label (label-form "value-if-then" (+ l 1))
+           then-exit (label-form "value-if-then-exit" (+ l 2))
+           else-label (label-form "value-if-else" (+ l 3))
+           else-exit (label-form "value-if-else-exit" (+ l 4))
+           join-label (label-form "value-if-join" (+ l 5))
+           a (lk-value (fnth form 2) env sigs (lv (lnone) (nf) (lv-reg t) (+ l 5)))
+           b (lk-value (fnth form 3) env sigs (fresh-st a))
+           m (lk-merge (lv-val a) (lv-val b) then-exit else-exit form (fresh-st b))]
+       (lv (lcat (lcat (lcat (lcat (lv-code t)
+                                   (form/two-forms (gm3 :gmir/branch-zero :gmir/test test :gmir/target else-label)
+                                                   (gm2 :gmir/label :gmir/id then-label)))
+                             (lcat (lv-code a)
+                                   (form/three-forms (gm2 :gmir/label :gmir/id then-exit)
+                                                     (gm2 :gmir/jump :gmir/target join-label)
+                                                     (gm2 :gmir/label :gmir/id else-label))))
+                       (lcat (lv-code b)
+                             (form/three-forms (gm2 :gmir/label :gmir/id else-exit)
+                                               (gm2 :gmir/jump :gmir/target join-label)
+                                               (gm2 :gmir/label :gmir/id join-label))))
+                 (lv-code m))
+           (lv-val m) (lv-reg m) (lv-label m)))))
+
+#?(:kotoba
+   ;; let bindings: code and the bound env (in :value), counters advanced
+   (defn- lk-bind [pairs [:list [:ref :form/r]] i :i64 env [:ref :form/r] sigs [:ref :form/r] st [:ref :mi/lv] form [:ref :form/r]] [:ref :mi/lv]
+     (if (>= (+ i 1) (lcount pairs))
+       (lv (lv-code st) env (lv-reg st) (lv-label st))
+       (let [bnd (lget pairs i)]
+         (if (not (form/is-symbol? bnd))
+           (reject-lv! :kir-to-gmir :invalid-binding form st)
+           (let [r (lk-value (lget pairs (inc i)) env sigs (fresh-st st))]
+             (lk-bind pairs (+ i 2) (form/assoc-form env bnd (form/vec2 (kf :local) (lv-val r))) sigs
+                      (lv (lcat (lv-code st) (lv-code r)) (nf) (lv-reg r) (lv-label r)) form)))))))
+
+#?(:kotoba
+   (defn- let-form? [form [:ref :form/r]] :bool
+     (and (head-is? form "let") (= 3 (fcount form)) (form/is-vec? (fnth form 1)) (= 0 (rem (fcount (fnth form 1)) 2)))))
+
+#?(:kotoba
+   (defn- lk-call [form [:ref :form/r] env [:ref :form/r] sigs [:ref :form/r] st [:ref :mi/lv]] [:ref :mi/lv]
+     (let [callee (fnth form 0)
+           expected (form/form-get sigs callee)]
+       (if (not (= (form/int-value expected) (dec (fcount form))))
+         (reject-lv! :kir-to-gmir :call-arity-mismatch form st)
+         (let [all (lk-forms (form/rest-list form) env sigs st)
+               registers (lk-regs all form)
+               dst (lv-next all)]
+           (lk-with-dst all (gm4 :gmir/call :gmir/dst dst :gmir/callee callee :gmir/arguments (fvec registers))))))))
+
+#?(:kotoba
+   (defn- lk-value [form [:ref :form/r] env [:ref :form/r] sigs [:ref :form/r] st [:ref :mi/lv]] [:ref :mi/lv]
+     (let [n (fcount form)]
+       (cond
+         (scalar-literal? form) (lk-const (intf (scalar-literal form)) st)
+         (form/is-string? form) (lk-string-literal (form/string-value form) st)
+         (form/is-keyword? form) (lk-string-literal (ktext form) st)
+         (form/is-symbol? form)
+         (let [entry (form/form-get env form)]
+           (cond (form/is-nil? entry) (reject-lv! :kir-to-gmir :unknown-parameter form st)
+                 (kw? (fnth entry 0) :local) (lv (lnone) (fnth entry 1) (lv-reg st) (lv-label st))
+                 :else (let [dst (lv-next st)]
+                         (lv (lone (gm3 :gmir/argument :gmir/dst dst :gmir/index (fnth entry 1))) dst (inc (lv-reg st)) (lv-label st)))))
+         (not (form/is-seq? form)) (reject-lv! :kir-to-gmir :unsupported-value form st)
+         (and (head-in? form (kir-fold-ops)) (or (> n 3) (and (head-is? form "-") (= n 2))))
+         (lk-fold form env sigs st)
+         (and (head-in? form (kir-comparison-ops)) (> n 3)) (lk-compare-chain form env sigs st)
+         (and (head-in? form (kir-binary-ops)) (= n 3))
+         (let [a (lk-value (fnth form 1) env sigs (fresh-st st))
+               b (lk-value (fnth form 2) env sigs (fresh-st a))]
+           (lk-binary (kw-of (tget (kir-binary-ops) form)) a b form))
+         (and (head-in? form (kir-predicate-ops)) (= n 2))
+         (let [a (lk-value (fnth form 1) env sigs (fresh-st st))
+               operand (scalar-register! (lv-val a) form)
+               zero (lv-next a) dst (vreg-form (+ 2 (lv-reg a)))]
+           (lv (lconj (lconj (lv-code a) (gm3 :gmir/constant :gmir/dst zero :gmir/value (intf 0)))
+                      (g3 (kw-of (tget (kir-predicate-ops) form)) dst operand zero))
+               dst (+ 2 (lv-reg a)) (lv-label a)))
+         (and (head-in? form (kir-word-unary-ops)) (= n 2))
+         (let [a (lk-value (fnth form 1) env sigs (fresh-st st))
+               op (fnth form 0)]
+           (cond (sym? op "bool-not") (lk-binary :gmir/equal a (lk-const (intf 0) (fresh-st a)) form)
+                 (sym? op "bit-not") (lk-binary :gmir/bit-xor a (lk-const (intf -1) (fresh-st a)) form)
+                 (sym? op "i32-wrap") (lk-signed-i32 a form)
+                 :else (lk-unsigned-i32 a form)))
+         (and (head-in? form (kir-i32-binary-ops)) (= n 3))
+         (let [op (fnth form 0)
+               a (lk-value (fnth form 1) env sigs (fresh-st st))
+               b (lk-value (fnth form 2) env sigs (fresh-st a))]
+           (cond (sym? op "i32-wrapping-add") (lk-signed-i32 (lk-binary :gmir/add a b form) form)
+                 (sym? op "i32-wrapping-mul") (lk-signed-i32 (lk-binary :gmir/multiply a b form) form)
+                 (sym? op "i32-xor") (lk-signed-i32 (lk-binary :gmir/bit-xor a b form) form)
+                 (sym? op "i32-shift-left") (lk-signed-i32 (lk-binary :gmir/shift-left a b form) form)
+                 (sym? op "i32-shift-right") (lk-i32-shift a b form :gmir/shift-right-signed)
+                 :else (lk-i32-shift a b form :gmir/shift-right-unsigned)))
+         (and (head-in? form (kir-f64-binary-ops)) (= n 3))
+         (let [a (lk-value (fnth form 1) env sigs (fresh-st st))
+               b (lk-value (fnth form 2) env sigs (fresh-st a))]
+           (lk-binary (kw-of (tget (kir-f64-binary-ops) form)) a b form))
+         (and (head-in? form (kir-f64-unary-ops)) (= n 2))
+         (let [a (lk-value (fnth form 1) env sigs (fresh-st st)) op (fnth form 0)]
+           (cond (or (sym? op "f64-from-bits") (sym? op "f64-to-bits")) a
+                 (sym? op "f64-abs") (lk-binary :gmir/bit-and a (lk-const (intf 9223372036854775807) (fresh-st a)) form)
+                 (sym? op "f64-neg") (lk-binary :gmir/bit-xor a (lk-const (intf (- -9223372036854775807 1)) (fresh-st a)) form)
+                 :else (lk-sqrt a form :gmir/f64-sqrt)))
+         (and (head-in? form (kir-f32-binary-ops)) (= n 3))
+         (let [a (lk-value (fnth form 1) env sigs (fresh-st st))
+               b (lk-value (fnth form 2) env sigs (fresh-st a))]
+           (lk-binary (kw-of (tget (kir-f32-binary-ops) form)) a b form))
+         (and (head-in? form (kir-f32-unary-ops)) (= n 2))
+         (let [a (lk-value (fnth form 1) env sigs (fresh-st st)) op (fnth form 0)]
+           (cond (sym? op "f32-to-bits") a
+                 (sym? op "f32-from-bits") (lk-signed-i32 a form)
+                 (sym? op "f32-abs") (lk-binary :gmir/bit-and a (lk-const (intf 2147483647) (fresh-st a)) form)
+                 (sym? op "f32-neg") (lk-binary :gmir/bit-xor a (lk-const (intf -2147483648) (fresh-st a)) form)
+                 :else (lk-sqrt a form :gmir/f32-sqrt)))
+         (and (head-in? form (kir-f32-conversion-ops)) (= n 2))
+         (let [a (lk-value (fnth form 1) env sigs (fresh-st st))]
+           (lk-with-dst a (gm3 (kw-of (tget (kir-f32-conversion-ops) form)) :gmir/dst (lv-next a)
+                               :gmir/input (scalar-register! (lv-val a) form))))
+         (and (head-in? form (kir-kernel-memory-ops)) (or (= n 4) (= n 5))) (lk-memory form env sigs st)
+         (head-in? form (kir-kernel-atomic-ops)) (lk-atomic form env sigs st)
+         (head-in? form (kir-region-pair-ops)) (lk-region-pair form env sigs st)
+         (and (head-is? form "kernel-subregion") (= n 5))
+         (let [all (lk-forms (form/rest-list form) env sigs st)
+               o (lk-regs all form)
+               dst (lv-next all)]
+           (lk-with-dst all (fassoc (fassoc (map4 :gmir/op (kf :gmir/kernel-subregion) :gmir/dst dst :gmir/base (lget o 0) :gmir/length (lget o 1))
+                                            :gmir/offset (lget o 2))
+                                    :gmir/size (lget o 3))))
+         (head-in? form (kir-rodata-address-ops))
+         (let [encoding (tget (kir-rodata-address-ops) form)
+               content (fnth form 1)
+               dst (lv-next st)]
+           (cond (not (= 2 n)) (reject-lv! :kir-to-gmir :rodata-literal-arity form st)
+                 (not (gmir/rodata-content? encoding content)) (reject-lv! :kir-to-gmir :rodata-literal-malformed form st)
+                 :else (lv (lone (gm4 :gmir/rodata-address :gmir/dst dst :gmir/content content :gmir/rodata-encoding encoding))
+                           dst (inc (lv-reg st)) (lv-label st))))
+         (head-is? form "bytes-literal-length")
+         (let [content (fnth form 1)
+               dst (lv-next st)]
+           (if (not (and (= 2 n) (gmir/rodata-content? (kf :hex-bytes) content)))
+             (reject-lv! :kir-to-gmir :rodata-literal-malformed form st)
+             (lv (lone (gm3 :gmir/constant :gmir/dst dst :gmir/value (intf (quot (string-byte-length (form/string-value content)) 2))))
+                 dst (inc (lv-reg st)) (lv-label st))))
+         (head-is? form "kernel-function-address")
+         (let [name (fnth form 1)
+               dst (lv-next st)]
+           (if (not (and (= 2 n) (form/is-symbol? name) (< (string-find-byte (form/symbol-value name) 47 0) 0)))
+             (reject-lv! :kir-to-gmir :function-address-name form st)
+             (lv (lone (gm3 :gmir/function-address :gmir/dst dst :gmir/function name)) dst (inc (lv-reg st)) (lv-label st))))
+         (head-in? form (kir-x86-privileged-ops)) (lk-privileged form env sigs st)
+         (literal-walk-form? form) (lk-literal-walk form env sigs st)
+         (head-in? form (kir-runtime-ops)) (lk-runtime form env sigs st)
+         (and (head-is? form "cap-call") (= n 3))
+         (let [capability (capability-id (fnth form 1))
+               a (lk-value (fnth form 2) env sigs (fresh-st st))]
+           (if (< capability 0)
+             (reject-lv! :kir-to-gmir :invalid-capability-id form a)
+             (lk-with-dst a (fassoc (gm4 :gmir/capability-call :gmir/dst (lv-next a) :gmir/capability (intf capability) :gmir/kind (kf :i64))
+                                    :gmir/arguments (form/vec2 (scalar-register! (lv-val a) form) (nf))))))
+         (and (head-is? form "typed-cap-call") (= n 5))
+         (let [capability (capability-id (fnth form 1))
+               kind (typed-capability-kind (fnth form 2) (fnth form 3))
+               a (lk-value (fnth form 4) env sigs (fresh-st st))]
+           (if (or (< capability 0) (= kind :none))
+             (reject-lv! :kir-to-gmir :invalid-typed-capability-call form a)
+             (lk-with-dst a (fassoc (gm4 :gmir/capability-call :gmir/dst (lv-next a) :gmir/capability (intf capability) :gmir/kind (kf kind))
+                                    :gmir/arguments (fvec (lone (scalar-register! (lv-val a) form)))))))
+         (and (head-is? form "record-new") (<= 2 n)) (lk-record-new form env sigs st)
+         (and (head-is? form "record-get") (= n 4)) (lk-record-get form env sigs st)
+         (and (head-is? form "variant-new") (= n 4)) (lk-variant-new form env sigs st)
+         (and (head-is? form "variant-match") (= n 4)) (lk-variant-match form env sigs st)
+         (and (head-is? form "if") (= n 4)) (lk-if form env sigs st)
+         (let-form? form)
+         (let [b (lk-bind (kids (fnth form 1)) 0 env sigs (fresh-st st) form)
+               body (lk-value (fnth form 2) (lv-val b) sigs (fresh-st b))]
+           (lv (lcat (lv-code b) (lv-code body)) (lv-val body) (lv-reg body) (lv-label body)))
+         (and (head-is? form "do") (> n 1))
+         (let [all (lk-each (form/rest-list form) 0 env sigs (fresh-st st) (typed-list-new [:list [:ref :mi/lv]]))
+               m (vector-count all)
+               code (loop [i 0 acc (lnone)] (if (>= i m) acc (recur (inc i) (lcat acc (lv-code (lget-lv all i))))))
+               final (lget-lv all (dec m))]
+           (lv code (lv-val final) (lv-reg final) (lv-label final)))
+         (and (head-is? form "arena-scope") (= n 2))
+         (let [body (lk-value (fnth form 1) env sigs (fresh-st st))
+               enter (lv-next body) leave (vreg-form (+ 2 (lv-reg body)))]
+           (lv (lconj (lcat (lone (gm4 :gmir/runtime-call :gmir/dst enter :gmir/runtime (kf :arena-enter) :gmir/arguments (fvec (lnone))))
+                            (lv-code body))
+                      (gm4 :gmir/runtime-call :gmir/dst leave :gmir/runtime (kf :arena-leave) :gmir/arguments (fvec (lnone))))
+               (lv-val body) (+ 2 (lv-reg body)) (lv-label body)))
+         (form/form-has? sigs (fnth form 0)) (lk-call form env sigs st)
+         (form/is-symbol? (fnth form 0)) (reject-lv! :aggregate-abi :call-abi-not-admitted form st)
+         :else (reject-lv! :kir-to-gmir :unsupported-value form st)))))
+
+#?(:kotoba
+   (defn- lk-i32-shift [a [:ref :mi/lv] b [:ref :mi/lv] form [:ref :form/r] op :keyword] [:ref :mi/lv]
+     ;; the host lowers both operands first, then wraps the LEFT one (its constant follows B's code)
+     (let [w (if (= op :gmir/shift-right-signed)
+               (lk-signed-i32 (lv (lv-code a) (lv-val a) (lv-reg b) (lv-label b)) form)
+               (lk-unsigned-i32 (lv (lv-code a) (lv-val a) (lv-reg b) (lv-label b)) form))]
+       (lk-binary op w (lv (lv-code b) (lv-val b) (lv-reg w) (lv-label w)) form))))
+
+#?(:kotoba
+   (defn- lk-sqrt [a [:ref :mi/lv] form [:ref :form/r] op :keyword] [:ref :mi/lv]
+     (lk-with-dst a (gm3 op :gmir/dst (lv-next a) :gmir/input (scalar-register! (lv-val a) form)))))
+
+#?(:kotoba
+   ;; tail position: the code ends in return / tail-call
+   (defn- lk-do-prefix [forms [:list [:ref :form/r]] i :i64 n :i64 env [:ref :form/r] sigs [:ref :form/r] st [:ref :mi/lv]] [:ref :mi/lv]
+     (if (>= i n) st
+       (let [r (lk-value (lget forms i) env sigs (fresh-st st))]
+         (lk-do-prefix forms (inc i) n env sigs (lv (lcat (lv-code st) (lv-code r)) (nf) (lv-reg r) (lv-label r)))))))
+
+#?(:kotoba
+   (defn- lk-then [prefix [:ref :mi/lv] r [:ref :mi/lv]] [:ref :mi/lv]
+     (lv (lcat (lv-code prefix) (lv-code r)) (lv-val r) (lv-reg r) (lv-label r))))
+
+#?(:kotoba
+   (defn- lk-tail-call-code [form [:ref :form/r] all [:ref :mi/lv] nparams :i64] [:ref :mi/lv]
+     (let [callee (fnth form 0)
+           nargs (dec (fcount form))
+           registers (fvec (lk-regs all form))
+           dst (lv-next all)]
+       (if (and (> nargs 5) (> nargs nparams))
+         (lv (lconj (lconj (lv-code all) (gm4 :gmir/call :gmir/dst dst :gmir/callee callee :gmir/arguments registers))
+                    (gm2 :gmir/return :gmir/value dst))
+             (nf) (inc (lv-reg all)) (lv-label all))
+         (lv (lconj (lv-code all) (gm3 :gmir/tail-call :gmir/callee callee :gmir/arguments registers))
+             (nf) (lv-reg all) (lv-label all))))))
+
+#?(:kotoba
+   (defn- lk-tail-call [form [:ref :form/r] env [:ref :form/r] sigs [:ref :form/r] nparams :i64 st [:ref :mi/lv]] [:ref :mi/lv]
+     (if (not (= (form/int-value (form/form-get sigs (fnth form 0))) (dec (fcount form))))
+       (reject-lv! :kir-to-gmir :call-arity-mismatch form st)
+       (lk-tail-call-code form (lk-forms (form/rest-list form) env sigs st) nparams))))
+
+#?(:kotoba
+   (defn- lk-tail [form [:ref :form/r] env [:ref :form/r] sigs [:ref :form/r] nparams :i64 st [:ref :mi/lv]] [:ref :mi/lv]
+     (let [n (fcount form)]
+       (cond
+         (and (head-is? form "do") (> n 1))
+         (let [exprs (form/rest-list form)
+               m (lcount exprs)
+               prefix (lk-do-prefix exprs 0 (dec m) env sigs (fresh-st st))]
+           (lk-then prefix (lk-tail (lget exprs (dec m)) env sigs nparams (fresh-st prefix))))
+         (and (head-is? form "if") (= n 4))
+         (let [t (lk-value (fnth form 1) env sigs (fresh-st st))
+               test (scalar-register! (lv-val t) form)
+               else-label (label-form "if-else" (inc (lv-label t)))
+               a (lk-tail (fnth form 2) env sigs nparams (lv (lnone) (nf) (lv-reg t) (inc (lv-label t))))
+               b (lk-tail (fnth form 3) env sigs nparams (fresh-st a))]
+           (lv (lcat (lcat (lconj (lv-code t) (gm3 :gmir/branch-zero :gmir/test test :gmir/target else-label))
+                           (lv-code a))
+                     (lcat (lone (gm2 :gmir/label :gmir/id else-label)) (lv-code b)))
+               (nf) (lv-reg b) (lv-label b)))
+         (let-form? form)
+         (let [b (lk-bind (kids (fnth form 1)) 0 env sigs (fresh-st st) form)
+               body (lk-tail (fnth form 2) (lv-val b) sigs nparams (fresh-st b))]
+           (lk-then b body))
+         (and (form/is-seq? form) (> n 0) (form/form-has? sigs (fnth form 0)))
+         (lk-tail-call form env sigs nparams st)
+         :else
+         (let [r (lk-value form env sigs (fresh-st st))
+               result (scalar-register! (lv-val r) form)]
+           (lv (lconj (lv-code r) (gm2 :gmir/return :gmir/value result)) (nf) (lv-reg r) (lv-label r)))))))
+
+#?(:kotoba
+   (defn- distinct-symbols? [params [:ref :form/r]] :bool
+     (let [xs (kids params) n (lcount xs)]
+       (loop [i 0]
+         (if (>= i n) true
+           (let [x (lget xs i)]
+             (if (and (form/is-symbol? x) (not (lmember? (lslice xs 0 i) x))) (recur (inc i)) false)))))))
+
+#?(:kotoba
+   (defn- valid-signatures? [sigs [:ref :form/r]] :bool
+     (let [xs (kids sigs) n (lcount xs)]
+       (loop [j 0]
+         (if (>= (+ j 1) n) true
+           (let [k (lget xs j) v (lget xs (inc j))]
+             (if (and (gmir/function-id? k) (form/is-int? v) (<= 0 (form/int-value v)) (<= (form/int-value v) (gmir/max-arity)))
+               (recur (+ j 2)) false)))))))
+
+#?(:kotoba
+   (defn- any-op? [instructions [:list [:ref :form/r]] a :keyword b :keyword] :bool
+     (let [n (lcount instructions)]
+       (loop [i 0]
+         (if (>= i n) false
+           (let [op (fget (lget instructions i) :gmir/op)]
+             (if (or (kw? op a) (kw? op b)) true (recur (inc i)))))))))
+
+#?(:kotoba
+   (defn- parameter-env [params [:list [:ref :form/r]]] [:ref :form/r]
+     (let [n (lcount params)]
+       (loop [i 0 env (fmap (lnone))]
+         (if (>= i n) env (recur (inc i) (form/assoc-form env (lget params i) (form/vec2 (kf :local) (vreg-form i)))))))))
+
+#?(:kotoba
+   (defn- parameter-code [n :i64] [:list [:ref :form/r]]
+     (loop [i 0 acc (lnone)]
+       (if (>= i n) acc (recur (inc i) (lconj acc (gm3 :gmir/argument :gmir/dst (vreg-form i) :gmir/index (intf i))))))))
+
+#?(:kotoba
+   (defn lower-kir-expression [params [:ref :form/r] body0 [:ref :form/r] signatures [:ref :form/r]] [:ref :form/r]
+     (if (not (and (form/is-vec? params) (distinct-symbols? params)
+                   (form/is-map? signatures) (valid-signatures? signatures)))
+       (reject-form! :kir-to-gmir :invalid-parameters params)
+       (let [body (normalize-surface-operations body0)
+             ps (kids params) n (lcount ps)
+             t (lk-tail body (parameter-env ps) signatures n (lv (lnone) (nf) (dec n) -1))
+             instructions (rewrite-offset-multiplies (lcat (parameter-code n) (lv-code t)))]
+         (map2 :gmir/version (intf (cond (any-op? instructions :gmir/call :gmir/tail-call) 3
+                                         (any-op? instructions :gmir/phi :gmir/phi) 2
+                                         :else 1))
+               :gmir/instructions (fvec instructions)))))
+   :default
 (defn lower-kir-expression
   "Lower a closed pure tail-expression subset to GMIR.
 
@@ -3630,7 +5324,7 @@
                                             (:gmir/op %)) instructions) 3
                          (some #(= :gmir/phi (:gmir/op %)) instructions) 2
                          :else 1)
-         :gmir/instructions instructions})))))
+         :gmir/instructions instructions}))))))
 
 (defn pilot-expression?
   "True only for the deliberately bounded production migration slice.
@@ -3839,6 +5533,93 @@
          (every? symbol? params)
          (= :scalar (shape body (zipmap params (repeat :scalar))))))))
 
+#?(:kotoba
+   (defn- gmir-valid? [p [:ref :form/r]] :bool
+     (result-match-of [:result [:ref :form/r] :document] (gmir/validate! p) v true e false)))
+
+#?(:kotoba
+   (defn- function-ok? [f [:ref :form/r]] :bool
+     (and (form/is-map? f)
+          (gmir/function-id? (fget f :name))
+          (form/is-vec? (fget f :params))
+          (let [types (function-boundary-types f)]
+            (and (truthy? types)
+                 (let [ts (kids types) n (lcount ts)]
+                   (loop [i 0] (if (>= i n) true (if (scalar-boundary-type? (lget ts i)) (recur (inc i)) false)))))))))
+
+#?(:kotoba
+   (defn- all-functions-ok? [fs [:list [:ref :form/r]]] :bool
+     (let [n (lcount fs)] (loop [i 0] (if (>= i n) true (if (function-ok? (lget fs i)) (recur (inc i)) false))))))
+
+#?(:kotoba
+   (defn- all-function-ids? [xs [:list [:ref :form/r]]] :bool
+     (let [n (lcount xs)] (loop [i 0] (if (>= i n) true (if (gmir/function-id? (lget xs i)) (recur (inc i)) false))))))
+
+#?(:kotoba
+   (defn- all-distinct? [xs [:list [:ref :form/r]]] :bool
+     (let [n (lcount xs)] (loop [i 0] (if (>= i n) true (if (lmember? (lslice xs 0 i) (lget xs i)) false (recur (inc i))))))))
+
+#?(:kotoba
+   (defn- module-signatures [fs [:list [:ref :form/r]]] [:ref :form/r]
+     (let [n (lcount fs)]
+       (loop [i 0 acc (fmap (lnone))]
+         (if (>= i n) acc
+           (let [f (lget fs i)] (recur (inc i) (form/assoc-form acc (fget f :name) (intf (fcount (fget f :params)))))))))))
+
+#?(:kotoba
+   ;; one function's GMIR: the boundary normalizations its module selects, then the lowering
+   (defn- lower-module-function [f [:ref :form/r] signatures [:ref :form/r] provider? :bool record? :bool variant? :bool] [:ref :form/r]
+     (let [b0 (fget f :body)
+           b1 (if provider? (normalize-provider-boundary b0) b0)
+           b2 (if record? (normalize-scalar-record-boundary b1) b1)
+           b3 (if variant? (normalize-scalar-variant-boundary b2) b2)
+           lowered (lower-kir-expression (fget f :params) b3 signatures)]
+       (map3 :gmir/name (fget f :name) :gmir/arity (intf (fcount (fget f :params)))
+             :gmir/instructions (fget lowered :gmir/instructions)))))
+
+#?(:kotoba
+   (defn- lower-module-functions [fs [:list [:ref :form/r]] i :i64 signatures [:ref :form/r] provider? :bool record? :bool variant? :bool
+                                  acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (lcount fs)) acc
+       (lower-module-functions fs (inc i) signatures provider? record? variant?
+                               (lconj acc (lower-module-function (lget fs i) signatures provider? record? variant?))))))
+
+#?(:kotoba
+   (defn- function-names [fs [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (let [n (lcount fs)] (loop [i 0 acc (lnone)] (if (>= i n) acc (recur (inc i) (lconj acc (fget (lget fs i) :name))))))))
+
+#?(:kotoba
+   (defn- all-signed? [xs [:list [:ref :form/r]] signatures [:ref :form/r]] :bool
+     (let [n (lcount xs)] (loop [i 0] (if (>= i n) true (if (form/form-has? signatures (lget xs i)) (recur (inc i)) false))))))
+
+#?(:kotoba
+   (defn lower-kir-module [kir [:ref :form/r]] [:ref :form/r]
+     (let [functions (fget kir :functions)
+           exports (fget kir :exports)
+           fs (kids functions)
+           xs (kids exports)
+           record-types (module-record-types fs)]
+       (cond
+         (truthy? (record-reference-mismatch fs)) (reject-form! :record-boundary :result-schema-mismatch kir)
+         (not (and (form/is-vec? functions) (> (lcount fs) 0)
+                   (form/is-vec? exports) (> (lcount xs) 0)
+                   (all-distinct? xs) (all-function-ids? xs)
+                   (all-functions-ok? fs)))
+         (reject-form! :kir-to-gmir :unsupported-function-module kir)
+         :else
+         (let [signatures (module-signatures fs)
+               names (function-names fs)
+               entry (lget xs 0)]
+           (if (not (and (all-distinct? names) (all-signed? xs signatures)))
+             (reject-form! :kir-to-gmir :invalid-function-module kir)
+             (let [module (map3 :gmir/version (intf 3) :gmir/entry entry
+                                :gmir/functions (fvec (lower-module-functions fs 0 signatures
+                                                                              (provider-boundary-module? fs)
+                                                                              (record-boundary-module? fs record-types)
+                                                                              (variant-boundary-module? fs)
+                                                                              (lnone))))]
+               (if (gmir-valid? module) module (reject-form! :gmir :invalid-program module))))))))
+   :default
 (defn lower-kir-module
   "Lower a closed multi-function KIR module to GMIR v3. The first export owns
   the GMIR entry identity; all requested exports are retained by final native
@@ -3883,7 +5664,7 @@
                   {:gmir/name name
                    :gmir/arity (count params)
                    :gmir/instructions (:gmir/instructions lowered)}))
-              functions)}))))
+              functions)})))))
 
 (defn pilot-module?
   "True when a checked KIR module can use the extracted scalar-call pipeline.
