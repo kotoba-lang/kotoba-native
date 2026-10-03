@@ -76,8 +76,12 @@
   (let [plan (abi/record-boundary-plan nested-record)]
     (is (= :recursive-word-handles (:boundary/field-representation plan)))
     (is (= 32 (:boundary/max-nesting-depth plan))))
-  (doseq [type [[:record :test/empty []]
-                [:record :test/duplicate [[:x :i64] [:x :bool]]]
+  ;; The record with no fields is `{}` passed as an options map (amu ADR 0353
+  ;; floor :options-map-argument): the empty pair chain, still one word.
+  (is (= :admitted
+         (:boundary/extracted-admission
+          (abi/record-boundary-plan [:record :test/empty []]))))
+  (doseq [type [[:record :test/duplicate [[:x :i64] [:x :bool]]]
                 [:variant :test/v [[:x :i64]]]]]
     (is (thrown? #?(:clj ExceptionInfo :cljs ExceptionInfo)
                  (abi/record-boundary-plan type)) type)))

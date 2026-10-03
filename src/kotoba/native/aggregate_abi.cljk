@@ -77,8 +77,9 @@
 (declare handle-aggregate-type? payload-word-type?)
 
 (defn scalar-record-type?
-  "True for a named, non-empty record whose unique fields each occupy one
-  native word. A nested record occupies one word through its pair-chain handle;
+  "True for a named record whose unique fields each occupy one native word.
+  The record with no fields is `{}` passed as an options map (amu ADR 0353
+  floor :options-map-argument): the empty pair chain, 0. A nested record occupies one word through its pair-chain handle;
   nesting is bounded so adversarial schemas fail closed during admission."
   [type]
   (letfn [(record-type? [candidate depth]
@@ -86,7 +87,7 @@
                  (vector? candidate) (= 3 (count candidate))
                  (= :record (first candidate))
                  (keyword? (second candidate))
-                 (vector? (nth candidate 2)) (seq (nth candidate 2))
+                 (vector? (nth candidate 2))
                  (every? #(and (vector? %) (= 2 (count %))
                                (keyword? (first %))
                                (word-field-type? (second %) (inc depth)))

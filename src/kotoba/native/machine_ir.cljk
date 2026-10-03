@@ -1482,7 +1482,9 @@
        form
        (let [op (first form), args (rest form)]
          (cond
-           (and (= op 'record-new) (<= 2 (count args)))
+           ;; `(seq args)`: a record with no fields is the empty chain, 0
+           ;; (amu ADR 0353 floor :options-map-argument).
+           (and (= op 'record-new) (seq args))
            (let [[type & values] args, fields (scalar-record-fields type)]
              (when-not (and fields (= (count fields) (count values)))
                (reject! :record-boundary :invalid-constructor
