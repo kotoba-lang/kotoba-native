@@ -69,6 +69,7 @@
             [kotoba.native.store-result-test]
             [kotoba.native.uefi-boundary-test]
             [kotoba.native.vector-boundary-spelling-test]
+            [kotoba.native.option-record-payload-test]
             [kotoba.native.vector-test]
             [kotoba.native-test]))
 
@@ -85,7 +86,7 @@
     kotoba.native.fuel64-test kotoba.native.interrupt-abi-test kotoba.native.isa-parity-test
     kotoba.native.keyword-equality-test kotoba.native.layout-test kotoba.native.machine-ir-test
     kotoba.native.rodata-literal-test kotoba.native.source-control-bytes-test kotoba.native.stack-arguments-test kotoba.native.store-result-test
-    kotoba.native.uefi-boundary-test kotoba.native.vector-boundary-spelling-test kotoba.native.vector-test
+    kotoba.native.uefi-boundary-test kotoba.native.vector-boundary-spelling-test kotoba.native.option-record-payload-test kotoba.native.vector-test
     kotoba.native-test])
 
 ;; deftest name -> the one reason it is red on this host. Every entry is the
