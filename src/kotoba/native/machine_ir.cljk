@@ -194,15 +194,14 @@
    (defn- trap! [] :i64 (vector-at (vector-i64) 0)))
 
 #?(:kotoba
-   ;; Imported aborting functions reach this module as [:result T :document] values
-   ;; (abort does not cross a module boundary yet, track C4); these read the verdict
-   ;; so the caller aborts locally with its own error type.
+   ;; An imported aborting function aborts in this module too (ADR 0363); these
+   ;; catch its verdict so the caller aborts locally with its own error type.
    (defn- mir-valid? [p [:ref :form/r]] :bool
-     (result-match-of [:result [:ref :form/r] :document] (mir/validate! p) v true e false)))
+     (try (do (mir/validate! p) true) (catch e false))))
 
 #?(:kotoba
    (defn- mc-valid? [p [:ref :form/r]] :bool
-     (result-match-of [:result [:ref :form/r] :document] (mc/validate! p) v true e false)))
+     (try (do (mc/validate! p) true) (catch e false))))
 
 #?(:kotoba
    (defn- reject-list! [phase :keyword problem :keyword instruction [:ref :form/r]] [:list [:ref :form/r]]
@@ -800,7 +799,7 @@
        -1)))
 
 #?(:kotoba
-   (defn- vt-new [] :vector-i64 (vector-new)))
+   (defn- vt-new [] :vector-i64 (vector-alloc 0)))
 
 #?(:kotoba
    (defn- vt-get [t :vector-i64 k [:ref :form/r] dflt :i64] :i64
@@ -970,7 +969,7 @@
            t
            (let [reads (hoist-all-register-reads (lget instructions i))
                  m (lcount reads)
-                 t' (loop [j 0 t t l last]
+                 t-p (loop [j 0 t t l last]
                       (if (>= j m) t
                         (let [v (lget reads j) old (vt-get l v -1)]
                           (recur (inc j)
@@ -978,9 +977,9 @@
                                        (= which 1) (vt-put t v i)
                                        :else (if (and (>= old 0) (not (= old i))) (vt-put t v old) t))
                                  (vt-put l v i)))))
-                 last' (loop [j 0 l last]
+                 last-p (loop [j 0 l last]
                          (if (>= j m) l (recur (inc j) (vt-put l (lget reads j) i))))]
-             (recur (inc i) t' last')))))))
+             (recur (inc i) t-p last-p)))))))
 
 #?(:kotoba
    (defn- i64-index-of [xs [:list :i64] x :i64] :i64
@@ -1054,17 +1053,17 @@
                                 (if (hoist-splits-fusion-pair? out pos use-counts) (inc pos) pos))
                               -1)
                  append? (or (< target-pos 0) (>= target-pos (lcount out)))
-                 def-orig' (if (vreg? dst) (vt-put def-orig dst orig-i) def-orig)]
+                 def-orig-p (if (vreg? dst) (vt-put def-orig dst orig-i) def-orig)]
              (if append?
                (recur (inc orig-i)
                       (lconj out ins)
                       (typed-list-conj [:list :i64] out-orig orig-i)
-                      def-orig'
+                      def-orig-p
                       (if (hoist-crossable? ins) last-barrier (lcount out)))
                (recur (inc orig-i)
                       (form-insert out target-pos ins)
                       (i64-insert out-orig target-pos orig-i)
-                      def-orig'
+                      def-orig-p
                       (if (>= last-barrier target-pos) (inc last-barrier) last-barrier))))))))
    :default
 (defn- hoist-consumers-to-producers
@@ -1129,12 +1128,12 @@
                    (assoc orig->out orig-i (count out))
                    (if (hoist-crossable? ins) last-barrier (count out)))
             (let [slide (fn [i] (if (>= i target-pos) (inc i) i))
-                  out' (into (conj (subvec out 0 target-pos) ins) (subvec out target-pos))
-                  def-pos' (into {} (map (fn [[v i]] [v (slide i)]) def-pos))
-                  def-pos' (cond-> def-pos' (gmir/vreg? (:mir/dst ins)) (assoc (:mir/dst ins) target-pos))
-                  orig->out' (assoc (into {} (map (fn [[o i]] [o (slide i)]) orig->out)) orig-i target-pos)
-                  last-barrier' (if (>= last-barrier target-pos) (inc last-barrier) last-barrier)]
-              (recur (next remaining) out' def-pos' orig->out' last-barrier')))))))))
+                  out-p (into (conj (subvec out 0 target-pos) ins) (subvec out target-pos))
+                  def-pos-p (into {} (map (fn [[v i]] [v (slide i)]) def-pos))
+                  def-pos-p (cond-> def-pos-p (gmir/vreg? (:mir/dst ins)) (assoc (:mir/dst ins) target-pos))
+                  orig->out-p (assoc (into {} (map (fn [[o i]] [o (slide i)]) orig->out)) orig-i target-pos)
+                  last-barrier-p (if (>= last-barrier target-pos) (inc last-barrier) last-barrier)]
+              (recur (next remaining) out-p def-pos-p orig->out-p last-barrier-p)))))))))
 
 #?(:kotoba
    (defn- map-functions-instructions [fs [:list [:ref :form/r]] how :keyword] [:list [:ref :form/r]]
@@ -1346,7 +1345,7 @@
                  (recur (+ i 2) (lconj out (fassoc ins :mir/dst d)) (alias-forget alias (lone d))))
 
                :else
-               (let [alias' (cond
+               (let [alias-p (cond
                               (= op :mir/move)
                               (if (and (a64-register? dst) (a64-register? src))
                                 (form/assoc-form (alias-forget alias (lone dst)) dst src)
@@ -1354,7 +1353,7 @@
                               (and (coalesce-transparent-op? op) (a64-register? dst))
                               (alias-forget alias (lone dst))
                               :else (fmap (lnone)))]
-                 (recur (inc i) (lconj out ins) alias'))))))))
+                 (recur (inc i) (lconj out ins) alias-p))))))))
    :default
 (defn- a64-coalesce-moves
   "One forward pass over an allocated instruction vector.
@@ -1391,7 +1390,7 @@
               (recur (+ i 2) (conj out (assoc ins :mir/dst d)) (forget alias d)))
 
             :else
-            (let [alias' (cond
+            (let [alias-p (cond
                            (= :mir/move op)
                            (if (and (a64-register? dst) (a64-register? (:mir/src ins)))
                              (assoc (forget alias dst) dst (:mir/src ins))
@@ -1399,7 +1398,7 @@
                            (and (contains? coalesce-transparent-ops op) (a64-register? dst))
                            (forget alias dst)
                            :else {})]
-              (recur (inc i) (conj out ins) alias')))))))))
+              (recur (inc i) (conj out ins) alias-p)))))))))
 
 #?(:kotoba
    (defn coalesce-program-moves [program [:ref :form/r]] [:ref :form/r]
@@ -1549,8 +1548,8 @@
    (defn- kir-memory-head? [h :keyword] :bool
      (let [n (keyword-name h)]
        (or (and (>= (string-byte-length n) 7) (string=? (string-substring n 0 7) "kernel-")
-                (or (string-contains? n "-load-u") (string-contains? n "-store-u"))
-                (not (string-contains? n "atomic")))
+                (or (>= (string-index-of n "-load-u") 0) (>= (string-index-of n "-store-u") 0))
+                (not (>= (string-index-of n "atomic") 0)))
            (and (>= (string-byte-length n) 6) (string=? (string-substring n 0 6) "slice-"))
            (= h :kernel-try-lock-u32) (= h :kernel-unlock-u32)))))
 
@@ -2678,27 +2677,21 @@
          (and (sym? op "string-replace-all") (= n 3)) (nso (string-search/lower-replace-all (lst args)))
          (and (>= (nso-string-index-arity op) 0) (= n (nso-string-index-arity op)))
          (nso (string-index-lower op (lst args)))
-         (and (form/is-symbol? op) (string-contains? (form/symbol-value op) "document-") (fmember? (document/operations) op))
+         (and (form/is-symbol? op) (>= (string-index-of (form/symbol-value op) "document-") 0) (fmember? (document/operations) op))
          (nso (document-lower op (lst args)))
          :else form))))
 
 #?(:kotoba
-   ;; string-index/lower and document/lower abort in their module; across the
-   ;; boundary they are [:result Form :document] values (track C4).
+   ;; string-index/lower and document/lower abort across the module boundary
+   ;; (ADR 0363); the lowering refusal is this module's own.
    (defn- string-index-lower [op [:ref :form/r] args [:ref :form/r]] [:ref :form/r]
-     (let [r (string-index/lower op args)
-           ok (result-match-of [:result [:ref :form/r] :document] r v true e false)]
-       (if ok
-         (result-match-of [:result [:ref :form/r] :document] r v v e (form/nil-form))
-         (reject-form! :kir-to-gmir :string-index-lowering args)))))
+     (try (string-index/lower op args)
+          (catch e (reject-form! :kir-to-gmir :string-index-lowering args)))))
 
 #?(:kotoba
    (defn- document-lower [op [:ref :form/r] args [:ref :form/r]] [:ref :form/r]
-     (let [r (document/lower op args)
-           ok (result-match-of [:result [:ref :form/r] :document] r v true e false)]
-       (if ok
-         (result-match-of [:result [:ref :form/r] :document] r v v e (form/nil-form))
-         (reject-form! :kir-to-gmir :document-lowering args)))))
+     (try (document/lower op args)
+          (catch e (reject-form! :kir-to-gmir :document-lowering args)))))
 
 #?(:kotoba
    ;; postwalk: children first, then the step on a seq
@@ -3370,11 +3363,11 @@
    ;; every node of a Form tree, preorder (tree-seq coll? seq: map entries are not nodes here,
    ;; and no predicate below can match a two-item [k v] entry)
    (defn- tree-nodes [f [:ref :form/r] acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
-     (let [acc' (lconj acc f)]
+     (let [acc-p (lconj acc f)]
        (if (or (form/is-seq? f) (form/is-vec? f) (form/is-map? f) (form/is-set? f))
          (let [xs (kids f) n (lcount xs)]
-           (loop [i 0 a acc'] (if (>= i n) a (recur (inc i) (tree-nodes (lget xs i) a)))))
-         acc'))))
+           (loop [i 0 a acc-p] (if (>= i n) a (recur (inc i) (tree-nodes (lget xs i) a)))))
+         acc-p))))
 
 #?(:kotoba
    (defn- any-node? [nodes [:list [:ref :form/r]] which :i64] :bool
@@ -3763,8 +3756,8 @@
      (let [m (lcount incs)]
        (fvec (loop [j 0 acc (lnone)]
                (if (>= j m) acc
-                 (let [inc' (lget incs j) v (fget inc' :gmir/value)]
-                   (recur (inc j) (lconj acc (if (vreg? v) (fassoc inc' :gmir/value (alias-rename aliases v)) inc'))))))))))
+                 (let [inc-p (lget incs j) v (fget inc-p :gmir/value)]
+                   (recur (inc j) (lconj acc (if (vreg? v) (fassoc inc-p :gmir/value (alias-rename aliases v)) inc-p))))))))))
 
 #?(:kotoba
    (defn- remap-gmir-sources [instruction [:ref :form/r] aliases :vector-i64] [:ref :form/r]
@@ -4548,8 +4541,8 @@
            (lk-with-dst a (gm3 (kir-f32-conversion-op h) :gmir/dst (lv-next a)
                                :gmir/input (scalar-register! (lv-val a) form))))
          (and (kir-memory-head? h) (head-in? form (kir-kernel-memory-ops)) (or (= n 4) (= n 5))) (lk-memory form env sigs st)
-         (and (string-contains? (keyword-name h) "kernel-") (head-in? form (kir-kernel-atomic-ops))) (lk-atomic form env sigs st)
-         (and (string-contains? (keyword-name h) "kernel-d") (head-in? form (kir-region-pair-ops))) (lk-region-pair form env sigs st)
+         (and (>= (string-index-of (keyword-name h) "kernel-") 0) (head-in? form (kir-kernel-atomic-ops))) (lk-atomic form env sigs st)
+         (and (>= (string-index-of (keyword-name h) "kernel-d") 0) (head-in? form (kir-region-pair-ops))) (lk-region-pair form env sigs st)
          (and (head-is? form "kernel-subregion") (= n 5))
          (let [all (lk-forms (form/rest-list form) env sigs st)
                o (lk-regs all form)
@@ -4578,7 +4571,7 @@
            (if (not (and (= 2 n) (form/is-symbol? name) (< (string-find-byte (form/symbol-value name) 47 0) 0)))
              (reject-lv! :kir-to-gmir :function-address-name form st)
              (lv (lone (gm3 :gmir/function-address :gmir/dst dst :gmir/function name)) dst (inc (lv-reg st)) (lv-label st))))
-         (and (string-contains? (keyword-name h) "kernel-") (head-in? form (kir-x86-privileged-ops))) (lk-privileged form env sigs st)
+         (and (>= (string-index-of (keyword-name h) "kernel-") 0) (head-in? form (kir-x86-privileged-ops))) (lk-privileged form env sigs st)
          (literal-walk-form? form) (lk-literal-walk form env sigs st)
          (not (= (kir-runtime-op h) :none)) (lk-runtime form env sigs st)
          (and (head-is? form "cap-call") (= n 3))
@@ -5735,7 +5728,7 @@
 
 #?(:kotoba
    (defn- gmir-valid? [p [:ref :form/r]] :bool
-     (result-match-of [:result [:ref :form/r] :document] (gmir/validate! p) v true e false)))
+     (try (do (gmir/validate! p) true) (catch e false))))
 
 #?(:kotoba
    (defn- function-ok? [f [:ref :form/r]] :bool
@@ -6054,7 +6047,7 @@
    ;; unsigned a / b and a mod b, b != 0, by long division
    (defn- udivmod [a :i64 b :i64] :vector-i64
      (loop [i 63 q 0 r 0]
-       (if (< i 0) (vector-new q r)
+       (if (< i 0) (vector-conj (vector-conj (vector-alloc 0) q) r)
          (let [r1 (bit-or (shl r 1) (bit-and (ushr a i) 1))
                ;; r < b <= 2^64-1 so 2r+1 may wrap: the wrapped case is >= b by construction
                over? (or (< r 0) (uge r1 b))]
@@ -6070,15 +6063,19 @@
    ;; [multiplier shift add-numerator? subtract-numerator?] (booleans as 0/1), or empty for 0 and +/-1
    (defn signed-division-magic [divisor :i64] :vector-i64
      (if (or (= divisor 0) (= divisor 1) (= divisor -1))
-       (vector-new)
+       (vector-alloc 0)
        (let [two63 -9223372036854775808
              neg? (< divisor 0)
              ad (if neg? (- 0 divisor) divisor)
              t (+ two63 (if neg? 1 0))
              anc (- (- t 1) (umod t ad))
              q1 (udiv two63 anc)
-             q2 (udiv two63 ad)]
-         (loop [power 63 q1 q1 r1 (- two63 (* q1 anc)) q2 q2 r2 (- two63 (* q2 ad))]
+             q2 (udiv two63 ad)
+             ;; the remainders' initial values, outside the loop: a loop init that names
+             ;; an earlier binding of the same loop is refused by the seed (E2111)
+             r10 (- two63 (* q1 anc))
+             r20 (- two63 (* q2 ad))]
+         (loop [power 63 q1 q1 r1 r10 q2 q2 r2 r20]
            (let [p (inc power)
                  dq1 (* 2 q1) dr1 (* 2 r1)
                  take1 (or (< r1 0) (uge dr1 anc))
@@ -6093,9 +6090,7 @@
                (recur p nq1 nr1 nq2 nr2)
                (let [m0 (+ nq2 1)
                      m (if neg? (- 0 m0) m0)]
-                 (vector-new m (- p 64)
-                             (if (and (not neg?) (< m 0)) 1 0)
-                             (if (and neg? (>= m 0)) 1 0)))))))))
+                 (vector-conj (vector-conj (vector-conj (vector-conj (vector-alloc 0) m) (- p 64)) (if (and (not neg?) (< m 0)) 1 0)) (if (and neg? (>= m 0)) 1 0)))))))))
    :default
 (defn signed-division-magic
   "Return the exact signed reciprocal multiplier and post-shift for DIVISOR.
@@ -7303,8 +7298,7 @@
 #?(:kotoba
    ;; the four u16 chunks of an i64, low lane first
    (defn- a64-constant-chunks [value :i64] :vector-i64
-     (vector-new (bit-and value 65535) (bit-and (ushr value 16) 65535)
-                 (bit-and (ushr value 32) 65535) (bit-and (ushr value 48) 65535)))
+     (vector-conj (vector-conj (vector-conj (vector-conj (vector-alloc 0) (bit-and value 65535)) (bit-and (ushr value 16) 65535)) (bit-and (ushr value 32) 65535)) (bit-and (ushr value 48) 65535)))
    :default
 (defn- a64-constant-chunks [value]
   #?(:kotoba (mapv #(bit-and (unsigned-bit-shift-right value %) 0xffff) [0 16 32 48])
@@ -7360,15 +7354,14 @@
              transitions (a64-element-transitions chunks width)
              start (a64-element-start chunks width)]
          (if (and (< 0 ones) (< ones width) (= 2 transitions) (>= start 0))
-           (vector-new (if (= width 64) 1 0) (fmod (- width start) width)
-                       (bit-or (bit-and (- (* 2 width)) 63) (dec ones)))
-           (vector-new)))
-       (vector-new))))
+           (vector-conj (vector-conj (vector-conj (vector-alloc 0) (if (= width 64) 1 0)) (fmod (- width start) width)) (bit-or (bit-and (- (* 2 width)) 63) (dec ones)))
+           (vector-alloc 0)))
+       (vector-alloc 0))))
 
 #?(:kotoba
    (defn- a64-logical-immediate-fields [chunks :vector-i64] :vector-i64
      (loop [w 2]
-       (if (> w 64) (vector-new)
+       (if (> w 64) (vector-alloc 0)
          (let [r (a64-logical-width chunks w)]
            (if (> (vector-count r) 0) r (recur (* w 2)))))))
    :default
@@ -7436,21 +7429,20 @@
 
 #?(:kotoba
    (defn- vassoc4 [v :vector-i64 i :i64 x :i64] :vector-i64
-     (vector-new (if (= i 0) x (vector-at v 0)) (if (= i 1) x (vector-at v 1))
-                 (if (= i 2) x (vector-at v 2)) (if (= i 3) x (vector-at v 3)))))
+     (vector-conj (vector-conj (vector-conj (vector-conj (vector-alloc 0) (if (= i 0) x (vector-at v 0))) (if (= i 1) x (vector-at v 1))) (if (= i 2) x (vector-at v 2))) (if (= i 3) x (vector-at v 3)))))
 
 #?(:kotoba
    ;; a one-lane-patched logical seed: [n immr imms lane] or empty
    (defn- a64-logical-seed-plan [chunks :vector-i64] :vector-i64
      (loop [k 0]
-       (if (>= k 8) (vector-new)
+       (if (>= k 8) (vector-alloc 0)
          (let [replacement (if (< k 4) 0 65535)
                lane (rem k 4)
                r (if (not (= replacement (vector-at chunks lane)))
                    (a64-logical-immediate-fields (vassoc4 chunks lane replacement))
-                   (vector-new))]
+                   (vector-alloc 0))]
            (if (> (vector-count r) 0)
-             (vector-new (vector-at r 0) (vector-at r 1) (vector-at r 2) lane)
+             (vector-conj (vector-conj (vector-conj (vector-conj (vector-alloc 0) (vector-at r 0)) (vector-at r 1)) (vector-at r 2)) lane)
              (recur (inc k)))))))
    :default
 (defn- a64-logical-seed-plan [chunks]
@@ -7510,7 +7502,7 @@
 
 #?(:kotoba
    (defn- lanes-not [chunks :vector-i64 x :i64] :vector-i64
-     (loop [i 0 acc (vector-new)] (if (>= i 4) acc (recur (inc i) (if (= (vector-at chunks i) x) acc (vector-conj acc i)))))))
+     (loop [i 0 acc (vector-alloc 0)] (if (>= i 4) acc (recur (inc i) (if (= (vector-at chunks i) x) acc (vector-conj acc i)))))))
 
 #?(:kotoba
    (defn- a64-constant [dst [:ref :form/r] value :i64] [:list [:ref :form/r]]
@@ -9555,15 +9547,15 @@
    ;; [block-bytes block-elements emitted?(0/1)] or empty
    (defn- a64-dequant-format [encoding :keyword] :vector-i64
      (case encoding
-       :aarch64/kernel-dequant-dot-q8-0 (vector-new 34 32 1)
-       :aarch64/kernel-dequant-dot-q4-k (vector-new 144 256 0)
-       :aarch64/kernel-dequant-dot-q6-k (vector-new 210 256 0)
-       :aarch64/kernel-dequant-dot-iq4-xs (vector-new 136 256 0)
-       :aarch64/kernel-dequant-dot-iq2-s (vector-new 82 256 0)
-       :aarch64/kernel-dequant-dot-iq3-xxs (vector-new 98 256 0)
-       :aarch64/kernel-dequant-dot-iq3-s (vector-new 110 256 0)
-       :aarch64/kernel-dequant-dot-ptq1-0 (vector-new 28 128 0)
-       (vector-new))))
+       :aarch64/kernel-dequant-dot-q8-0 (vector-conj (vector-conj (vector-conj (vector-alloc 0) 34) 32) 1)
+       :aarch64/kernel-dequant-dot-q4-k (vector-conj (vector-conj (vector-conj (vector-alloc 0) 144) 256) 0)
+       :aarch64/kernel-dequant-dot-q6-k (vector-conj (vector-conj (vector-conj (vector-alloc 0) 210) 256) 0)
+       :aarch64/kernel-dequant-dot-iq4-xs (vector-conj (vector-conj (vector-conj (vector-alloc 0) 136) 256) 0)
+       :aarch64/kernel-dequant-dot-iq2-s (vector-conj (vector-conj (vector-conj (vector-alloc 0) 82) 256) 0)
+       :aarch64/kernel-dequant-dot-iq3-xxs (vector-conj (vector-conj (vector-conj (vector-alloc 0) 98) 256) 0)
+       :aarch64/kernel-dequant-dot-iq3-s (vector-conj (vector-conj (vector-conj (vector-alloc 0) 110) 256) 0)
+       :aarch64/kernel-dequant-dot-ptq1-0 (vector-conj (vector-conj (vector-conj (vector-alloc 0) 28) 128) 0)
+       (vector-alloc 0))))
 
 #?(:kotoba
    (defn- a64-dequant-fp16 [packed [:ref :form/r] disp :i64 sign [:ref :form/r] significand [:ref :form/r] work :i64 magic :i64
@@ -11369,14 +11361,14 @@
                return-suffix)
          (= (a64-family encoding) :kernel-memory)
          (let [bits (* 8 (kernel-access-bytes encoding))
-               store? (string-contains? (keyword-name encoding) "store")
+               store? (>= (string-index-of (keyword-name encoding) "store") 0)
                op (keyword-ns-name "gmir" encoding)]
            (a64-kernel-memory instruction-index bits store?
                               (and (> bits 8) (not (unaligned-access? op (fget instruction :mir/maximum))))
                               instruction))
          (= (a64-family encoding) :slice-memory)
          (a64-slice-memory instruction-index (* 8 (kernel-access-bytes encoding))
-                           (string-contains? (keyword-name encoding) "store") instruction)
+                           (>= (string-index-of (keyword-name encoding) "store") 0) instruction)
          (= encoding :aarch64/kernel-try-lock-u32) (a64-kernel-lock instruction-index 0 1 instruction)
          (= encoding :aarch64/kernel-unlock-u32) (a64-kernel-lock instruction-index 1 0 instruction)
          (= encoding :aarch64/kernel-atomic-add-u32) (a64-kernel-atomic instruction-index :add 32 instruction)
@@ -12290,7 +12282,7 @@
          (if (>= i n) (form/vec2 offsets (fvec bytes))
            (let [key (lget literals i)
                  r (gmir/rodata-bytes (fnth key 0) (fnth key 1))
-                 encoded (option-value-of [:option :vector-i64] r (vector-new -1))]
+                 encoded (option-value-of [:option :vector-i64] r (vector-conj (vector-alloc 0) -1))]
              (if (and (= 1 (vector-count encoded)) (= -1 (vector-at encoded 0)))
                (do (trap!) (form/vec2 offsets (fvec bytes)))
                (let [next-offset (align-to (+ offset (vector-count encoded)) (gmir/rodata-alignment))
@@ -12584,7 +12576,7 @@
    (defn- msub-ordinals [instructions [:list [:ref :form/r]] factor [:ref :form/r]] :vector-i64
      ;; position -> ordinal, -1 for not an msub on FACTOR
      (let [n (lcount instructions)]
-       (loop [i 0 k 0 acc (vector-new)]
+       (loop [i 0 k 0 acc (vector-alloc 0)]
          (if (>= i n) acc
            (if (msub-on? (lget instructions i) factor)
              (recur (inc i) (inc k) (vector-conj acc k))
@@ -12687,13 +12679,13 @@
            (let [ins (lget instructions i)
                  source-tags (union-tags tags (a64-source-registers ins))
                  ordinal (vector-at ords i)
-                 reaches' (if (>= ordinal 0) (form/assoc-form reaches (intf ordinal) (fset source-tags)) reaches)
+                 reaches-p (if (>= ordinal 0) (form/assoc-form reaches (intf ordinal) (fset source-tags)) reaches)
                  dst (fget ins :mir/dst)
                  carried (if (>= ordinal 0) (lcat-distinct source-tags (lone (intf ordinal))) source-tags)
-                 tags' (if (truthy? dst)
+                 tags-p (if (truthy? dst)
                          (if (> (lcount carried) 0) (form/assoc-form tags dst (fset carried)) (form/dissoc-form tags dst))
                          tags)]
-             (recur (inc i) tags' reaches')))))))
+             (recur (inc i) tags-p reaches-p)))))))
 
 #?(:kotoba
    (defn- readers-of [instructions [:list [:ref :form/r]] register [:ref :form/r]] :i64
@@ -12805,14 +12797,14 @@
    ;; [op immediate shift] where op 1 = :add, 2 = :subtract; empty when no immediate form
    (defn- a64-add-sub-immediate [op :keyword value :i64] :vector-i64
      (if (= value (- -9223372036854775807 1))
-       (vector-new)
+       (vector-alloc 0)
        (let [negative? (< value 0)
              magnitude (if negative? (- 0 value) value)
-             plan (cond (<= magnitude 4095) (vector-new magnitude 0)
-                        (and (= 0 (rem magnitude 4096)) (<= (quot magnitude 4096) 4095)) (vector-new (quot magnitude 4096) 1)
-                        :else (vector-new))]
+             plan (cond (<= magnitude 4095) (vector-conj (vector-conj (vector-alloc 0) magnitude) 0)
+                        (and (= 0 (rem magnitude 4096)) (<= (quot magnitude 4096) 4095)) (vector-conj (vector-conj (vector-alloc 0) (quot magnitude 4096)) 1)
+                        :else (vector-alloc 0))]
          (if (= 0 (vector-count plan)) plan
-           (vector-new (if (= (= op :aarch64/add) (not negative?)) 1 2) (vector-at plan 0) (vector-at plan 1))))))
+           (vector-conj (vector-conj (vector-conj (vector-alloc 0) (if (= (= op :aarch64/add) (not negative?)) 1 2)) (vector-at plan 0)) (vector-at plan 1))))))
    :default
 (defn- a64-add-sub-immediate [op value]
   (let [value (->wide value)
@@ -12874,7 +12866,7 @@
                                :else (nf))
                  selected (if (and constant? (truthy? operand) (= 1 (uses-before-redefinition instructions (inc i) register)))
                             (a64-add-sub-immediate op (fint constant :mir/value))
-                            (vector-new))]
+                            (vector-alloc 0))]
              (if (> (vector-count selected) 0)
                (recur (+ i 2)
                       (lconj out (fassoc (fassoc (fassoc (fassoc consumer :mir/left operand)
@@ -13564,7 +13556,7 @@
 #?(:kotoba
    (defn- index-where-op [instructions [:list [:ref :form/r]] op :keyword] :vector-i64
      (let [n (lcount instructions)]
-       (loop [i 0 acc (vector-new)] (if (>= i n) acc (recur (inc i) (if (kw? (fget (lget instructions i) :mc/op) op) (vector-conj acc i) acc)))))))
+       (loop [i 0 acc (vector-alloc 0)] (if (>= i n) acc (recur (inc i) (if (kw? (fget (lget instructions i) :mc/op) op) (vector-conj acc i) acc)))))))
 
 #?(:kotoba
    ;; {:recur-index :branch-index :test :body :return-index :return} or nil
@@ -13807,7 +13799,7 @@
        out
        (let [instruction (lget instructions i)
              encoding (fget instruction :mc/encoding)
-             magic (if (kw? encoding :aarch64/quotient-constant) (signed-division-magic (fint instruction :mir/divisor)) (vector-new))
+             magic (if (kw? encoding :aarch64/quotient-constant) (signed-division-magic (fint instruction :mir/divisor)) (vector-alloc 0))
              multiplier (if (> (vector-count magic) 0) (intf (vector-at magic 0)) (nf))
              load-multiplier? (not (feq multiplier cached))
              tokens (it-step isa frame-bytes return-suffix tail-suffix callee-labels self-tail-prefix self-tail-body
@@ -14643,7 +14635,7 @@
 #?(:kotoba
    (defn- function-offsets [functions [:list [:ref :form/r]] labels [:ref :form/r] callee-labels [:ref :form/r]] :vector-i64
      (let [n (lcount functions)]
-       (loop [i 0 acc (vector-new)]
+       (loop [i 0 acc (vector-alloc 0)]
          (if (>= i n) acc
            (recur (inc i) (vector-conj acc (form/int-value (form/form-get labels (form/form-get callee-labels (fget (lget functions i) :mc/name)))))))))))
 

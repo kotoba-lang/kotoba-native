@@ -60,22 +60,14 @@
    (defn- kw? [f [:ref :form/r] k :keyword] :bool (and (form/is-keyword? f) (= (form/keyword-value f) k))))
 
 #?(:kotoba
-   ;; Imported aborting functions are [:result Form :document] values here (abort
-   ;; does not cross a module boundary yet, track C4): read the verdict, abort locally.
+   ;; An imported aborting function aborts here too (ADR 0363): each call site
+   ;; catches it and aborts with this module's own problem keyword.
    (defn- reject! [problem :keyword] :i64
      (throw (ex-info (string-concat "aarch64 emission rejected: " (keyword-name problem)) {:phase :ir :problem problem}))))
 
 #?(:kotoba
-   (defn- r-ok? [r [:result [:ref :form/r] :document]] :bool
-     (result-match-of [:result [:ref :form/r] :document] r v true e false)))
-
-#?(:kotoba
-   (defn- r-val [r [:result [:ref :form/r] :document]] [:ref :form/r]
-     (result-match-of [:result [:ref :form/r] :document] r v v e (form/nil-form))))
-
-#?(:kotoba
-   (defn- unwrap! [r [:result [:ref :form/r] :document] problem :keyword] [:ref :form/r]
-     (if (r-ok? r) (r-val r) (do (reject! problem) (form/nil-form)))))
+   (defn- reject-form! [problem :keyword] [:ref :form/r]
+     (do (reject! problem) (form/nil-form))))
 
 #?(:kotoba
    (defn- u32le [word :i64] [:list [:ref :form/r]]
@@ -195,7 +187,7 @@
           (insn 0xf90004f0))))
 
 #?(:kotoba
-   (defn- argument-registers [] :vector-i64 (vector-new 0 1 2 3 4))
+   (defn- argument-registers [] :vector-i64 (vector-conj (vector-conj (vector-conj (vector-conj (vector-conj (vector-alloc 0) 0) 1) 2) 3) 4))
    :default
 (def ^:private argument-registers [0 1 2 3 4]))
 
@@ -273,7 +265,7 @@
    ;; for each consumer, which on the Kotoba route triples the heap for nothing.
    (defn- fuel-instrumentation [gmir [:ref :form/r] mc [:ref :form/r]] [:ref :form/r]
      (let [ordinary (machine-ir/entry-fuel-prefixes-of-gmir gmir (form/form-vec (fuel-charge-tokens)))
-           plans (unwrap! (machine-ir/counted-self-recur-plans-of-gmir :aarch64 gmir) :counted-self-recur-plans)
+           plans (try (machine-ir/counted-self-recur-plans-of-gmir :aarch64 gmir) (catch e (reject-form! :counted-self-recur-plans)))
            xs (form/kids-of plans)
            n (vector-count xs)]
        (loop [j 0 out ordinary]
@@ -1048,8 +1040,8 @@
       (loop [fs field-exprs fns field-names i 0 dd d e env code [] fm {}]
         (if (seq fs)
           (let [child (symbol (str name "-" i))
-                [c e' dd'] (expand-binding child (first fs) e depth dd)]
-            (recur (next fs) (next fns) (inc i) dd' e' (concat code c)
+                [c e-p dd-p] (expand-binding child (first fs) e depth dd)]
+            (recur (next fs) (next fns) (inc i) dd-p e-p (concat code c)
                    (assoc fm (first fns) child)))
           [code (assoc e name {:record-type type :record-fields fm}) dd])))
     [(concat (emit-expr value env d) (save-x0))
@@ -1075,8 +1067,8 @@
   (let [pairs (partition 2 bindings)]
     (loop [remaining pairs d depth env env code []]
       (if-let [[name value] (first remaining)]
-        (let [[c env' d'] (expand-binding name value env depth d)]
-          (recur (next remaining) d' env' (concat code c)))
+        (let [[c env-p d-p] (expand-binding name value env depth d)]
+          (recur (next remaining) d-p env-p (concat code c)))
         (let [body-code (emit-expr body env d)]
           (vec (concat code body-code (pop-n (- d depth))))))))))
 
@@ -1873,15 +1865,15 @@
 #?(:kotoba
    (defn emit-program [kir0 [:ref :form/r]] [:ref :form/r]
      (let [k1 (vector-region/rewrite-program (keyword-equality/rewrite-program kir0))
-           fs (unwrap! (string-search/augment-functions (fget k1 :functions)) :string-search-helpers)
-           fs1 (unwrap! (string-index/augment-functions fs) :string-index-helpers)
-           fs2 (unwrap! (document/augment-functions fs1) :document-helpers)
+           fs (try (string-search/augment-functions (fget k1 :functions)) (catch e (reject-form! :string-search-helpers)))
+           fs1 (try (string-index/augment-functions fs) (catch e (reject-form! :string-index-helpers)))
+           fs2 (try (document/augment-functions fs1) (catch e (reject-form! :document-helpers)))
            k2 (form/assoc-form k1 (kf :functions) fs2)
            kir (if (truthy? (fget k2 :exports)) k2 (form/assoc-form k2 (kf :exports) (function-names (form/kids-of fs2))))
-           gmir (unwrap! (machine-ir/lower-kir-module kir) :kir-to-gmir)
-           mc (unwrap! (machine-ir/compile-gmir :aarch64 gmir) :mir)
+           gmir (try (machine-ir/lower-kir-module kir) (catch e (reject-form! :kir-to-gmir)))
+           mc (try (machine-ir/compile-gmir :aarch64 gmir) (catch e (reject-form! :mir)))
            prefixes (fuel-instrumentation gmir mc)]
-       (unwrap! (machine-ir/encode-mc-module mc prefixes (fget kir :exports)) :mc-encode)))
+       (try (machine-ir/encode-mc-module mc prefixes (fget kir :exports)) (catch e (reject-form! :mc-encode)))))
    :default
 (defn emit-program [kir]
   (let [kir (-> kir
