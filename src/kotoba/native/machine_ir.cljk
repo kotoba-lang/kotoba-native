@@ -1715,6 +1715,14 @@
      ;; the enclosing tag/payload pair is constructed.
      (some aggregate-abi/aggregate-payload-variant-type?
            (tree-seq coll? seq functions))
+     ;; So is the record an `[:option R]` holds (amu ADR 0353 floor
+     ;; :native-option-record): the option is pair(present, payload), and its
+     ;; payload is one word, so `option-value-of`'s two arms -- the payload
+     ;; and the record fallback -- meet as one handle, not a handle and a
+     ;; scalar-replaced bundle.
+     (some #(and (vector? %) (= :option (first %)) (= 2 (count %))
+                 (aggregate-abi/scalar-record-type? (second %)))
+           (tree-seq coll? seq functions))
      ;; ABI v8: a heterogeneous vector has no SROA form at all; it is only
      ;; ever the pair chain this normalization builds.
      (some #(and (seq? %) (contains? '#{hetero-vector-new hetero-vector-at
