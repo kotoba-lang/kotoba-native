@@ -94,8 +94,13 @@
                  (= (count (nth candidate 2))
                     (count (distinct (map first (nth candidate 2)))))))
           (word-field-type? [field-type depth]
+            ;; `:vector-i64` is how kotoba.kir spells the i64 vector handle.
+            ;; This listed `:vector`, which nothing produces (see
+            ;; `machine-ir/word-result-type?`), so a record holding a
+            ;; selection [start end] was refused here (amu ADR 0353 floor
+            ;; :native-vector-field).
             (or (contains? #{:i64 :bool :f32 :f64 :string :keyword
-                             :vector :vector-f64 :string-index}
+                             :vector-i64 :vector-f64 :string-index}
                            field-type)
                 (and (vector? field-type)
                      (contains? #{:option :result :list :set :map :ref}
@@ -133,7 +138,7 @@
   reference, or a record / variant / heterogeneous-vector handle."
   [type depth]
   (or (contains? #{:i64 :bool :f32 :f64 :string :keyword
-                   :vector :vector-f64 :string-index} type)
+                   :vector-i64 :vector-f64 :string-index} type)
       ;; A reference names a schema, so it must name one: qualified, the same
       ;; rule a record or variant's own name obeys.
       (and (vector? type) (= :ref (first type)) (= 2 (count type))
