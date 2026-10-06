@@ -1357,6 +1357,10 @@
                    (list 'vector-new-empty) (rest args))
            (and (= op 'typed-list-nth) (= 3 (count args)))
            (list 'vector-at (second args) (nth args 2))
+           ;; The list builder (amu ADR 0353 floor :empty-vector-field): conj
+           ;; onto the same arena, appended at the end as the reference does.
+           (and (= op 'typed-list-conj) (= 3 (count args)))
+           (list 'vector-conj (second args) (nth args 2))
            ;; `[:map K V]` (amu ADR 0353 floor :native-hiccup-node): the
            ;; same word arena, keys and values interleaved, searched by the
            ;; helpers `kotoba.native.typed-map` appends.
@@ -9796,7 +9800,7 @@
   this set to the reference's."
   '#{pair kgraph-assert! map-new map-assoc option-some result-ok result-err
      result-ok-of result-err-of variant-new option-some-of option-none-of
-     hetero-vector-new hetero-vector-assoc typed-list-new typed-set-new
+     hetero-vector-new hetero-vector-assoc typed-list-new typed-list-conj typed-set-new
      typed-set-conj typed-set-disj typed-map-new typed-map-assoc typed-map-dissoc
      record-new record-assoc vector-new vector-conj vector-assoc vector-assoc!
      bytes-slice bytes-concat bytes-from-vector-i64 vector-i64-from-bytes
