@@ -23,6 +23,12 @@
 
 (def ^:private m '(document-map :b (document-i64 2) :a (document-string "x")))
 (def ^:private v '(document-vector (document-i64 1) (document-keyword :k)))
+(def ^:private b '(bytes-from-vector-i64 (vector-new 0 255 16)))
+;; CIDv1 raw sha2-256 of the empty string, in binary
+(def ^:private cid
+  (list 'bytes-from-vector-i64
+        (cons 'vector-new [1 85 18 32 227 176 196 66 152 252 28 20 154 251 244 200 153 111
+                           185 36 39 174 65 228 100 155 147 76 164 149 153 27 120 82 184 85])))
 
 (def ^:private cases
   [[:document '(document-null)]
@@ -55,7 +61,12 @@
    [[:option :keyword] '(document-keyword-value (document-keyword :k))]
    [[:option :bool] '(document-bool-value (document-bool true))]
    [[:option :i64] '(document-i64-value (document-i64 3))]
-   [:string (list 'document-edn-print m)]])
+   [:string (list 'document-edn-print m)]
+   ;; :bytes and :link (root ADR-2610092310 S4)
+   [:document (list 'document-bytes b)]
+   [[:option :bytes] (list 'document-bytes-value (list 'document-bytes b))]
+   [[:option :document] (list 'document-link cid)]
+   [[:option :bytes] (list 'document-link-value (list 'document-bytes b))]])
 
 (deftest every-admitted-operation-lowers-on-both-isas
   (is (= (count cases)
@@ -79,9 +90,15 @@
     (is (identical? plain (document/augment-functions plain)))
     (is (identical? casts (document/augment-functions casts))
         "the EDN casts are the identity and need no helper")
-    (is (= (inc (count document/helper-names)) (count with)))
-    (is (= document/helper-names (set (map :name (rest with)))))
-    (is (= with (document/augment-functions with))))
+    (is (< (inc (count (rest with))) (inc (count document/helper-names)))
+        "the :bytes / :link helpers join only a program that names one of the four")
+    (is (every? document/helper-names (map :name (rest with))))
+    (is (= with (document/augment-functions with)))
+    (let [all (document/augment-functions
+               (:functions (program :document (list 'document-bytes b))))]
+      (is (= (inc (count document/helper-names)) (count all)))
+      (is (= document/helper-names (set (map :name (rest all)))))
+      (is (= all (document/augment-functions all)))))
   (is (thrown-with-msg?
        #?(:clj ExceptionInfo :cljs ExceptionInfo)
        #"collides with a native document helper"
