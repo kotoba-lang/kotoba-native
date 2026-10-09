@@ -20,6 +20,19 @@
   Canonical text makes structural equality `string=?`: two documents are
   equal exactly when their canonical texts are.
 
+  The IPLD Data Model's bytes and link (root ADR-2610092310 S4) are the two
+  EDN tagged literals the reference prints: `#kotoba/bytes \"<lowercase hex>\"`
+  and `#kotoba/cid \"b<lowercase unpadded base32 of the binary CIDv1>\"`.
+  `document-bytes` / `document-link` write them from a `:bytes` handle (a
+  vector-arena handle on native); `document-link` answers none unless the
+  bytes are one binary CIDv1 (osaho `cidv1-binary-items?`, re-derived as
+  `kotoba$doc-cidv1?`); the two value readers read the text back into a
+  `:bytes`. Their canonical bytes (`x<len>:` / `c<len>:` then the payload)
+  are re-derived with the payload in an order-preserving spelling -- the hex
+  itself, and the base32 digits respelled `0`..`O` -- which orders exactly as
+  the raw payload does, because two canonical byte strings can first differ
+  inside a payload only at one offset of two payloads of one tag and length.
+
   ## Order
 
   Map keys that are both keywords compare by their text, set items and every
@@ -91,8 +104,13 @@
              (if (= c 91) (kotoba$doc-seq-end s (+ i 1))
                  (if (= c 40) (kotoba$doc-seq-end s (+ i 1))
                      (if (= c 123) (kotoba$doc-seq-end s (+ i 1))
-                         (if (= c 35) (kotoba$doc-seq-end s (+ i 2))
-                             (kotoba$doc-token-end s i))))))))
+                         (if (= c 35)
+                           (if (= (string-code-point-at s (+ i 1)) 123)
+                             (kotoba$doc-seq-end s (+ i 2))
+                             ;; `#kotoba/bytes \"<hex>\"` / `#kotoba/cid \"b<base32>\"`:
+                             ;; neither payload alphabet has a quote or a backslash
+                             (+ (string-find-byte s 34 (+ (string-find-byte s 34 i) 1)) 1))
+                           (kotoba$doc-token-end s i))))))))
    (h 'kotoba$doc-open '[d] [:string] :i64
       '(if (= (string-code-point-at d 0) 35) 2 1))
    ;; offset of item K at or after I, or -1 when the container closes first
@@ -161,20 +179,27 @@
                  0))))))
    ;; the kind of the form d[i, e):
    ;; 0 null 1 bool 2 i64 3 f64 4 string 5 keyword 6 symbol
-   ;; 7 vector 8 list 9 set 10 map
+   ;; 7 vector 8 list 9 set 10 map 11 bytes 12 link
+   ;; (bytes and link, root ADR-2610092310, are scalars numbered after the
+   ;; containers so every existing 7..10 container range stays as it was)
    (h 'kotoba$doc-kind-at '[d i e] [:string :i64 :i64] :i64
       '(let [c (string-code-point-at d i)]
          (if (= c 34) 4
              (if (= c 58) 5
                  (if (= c 91) 7
                      (if (= c 40) 8
-                         (if (= c 35) 9
+                         (if (= c 35)
+                           (if (= (string-code-point-at d (+ i 1)) 123) 9
+                               ;; `#kotoba/` is 8 bytes: then `b`ytes or `c`id
+                               (if (= (string-code-point-at d (+ i 8)) 98) 11 12))
                              (if (= c 123) 10
                                  (if (kotoba$doc-region=? d i e "nil" 0) 0
                                      (if (kotoba$doc-region=? d i e "true" 0) 1
                                          (if (kotoba$doc-region=? d i e "false" 0) 1
                                              (let [k (kotoba$doc-number-kind d i e)]
                                                (if (= k 0) 6 k)))))))))))))
+   (h 'kotoba$doc-scalar? '[k] [:i64] :bool
+      '(if (< k 7) true (> k 10)))
    (h 'kotoba$doc-kind '[d] [:string] :i64
       '(kotoba$doc-kind-at d 0 (string-byte-length d)))
    (h 'kotoba$doc-require '[d lo hi] [:string :i64 :i64] :string
@@ -303,7 +328,7 @@
    ;; levels of the form at I (a scalar is one)
    (h 'kotoba$doc-depth-at '[d i] [:string :i64] :i64
       '(let [k (kotoba$doc-kind-at d i (kotoba$doc-end d i))]
-         (if (< k 7) 1
+         (if (kotoba$doc-scalar? k) 1
              (+ 1 (kotoba$doc-depth-items d (+ i (if (= k 9) 2 1)) 0 (= k 10) (= k 10))))))
    (h 'kotoba$doc-nodes-items '[d i n map? key?] [:string :i64 :i64 :bool :bool] :i64
       '(let [c (string-code-point-at d i)]
@@ -316,12 +341,12 @@
                                            (if map? (bool-not key?) false)))))))
    (h 'kotoba$doc-nodes-at '[d i] [:string :i64] :i64
       '(let [k (kotoba$doc-kind-at d i (kotoba$doc-end d i))]
-         (if (< k 7) 1
+         (if (kotoba$doc-scalar? k) 1
              (+ 1 (kotoba$doc-nodes-items d (+ i (if (= k 9) 2 1)) 0 (= k 10) (= k 10))))))
    ;; D itself when it is within the reference's bounds, else a trap
    (h 'kotoba$doc-bounded '[d] [:string] :string
       '(let [k (kotoba$doc-kind d)]
-         (if (< k 7) d
+         (if (kotoba$doc-scalar? k) d
              (if (> (if (= k 10) (quot (kotoba$doc-forms d) 2) (kotoba$doc-forms d)) 32)
                (kotoba$doc-trap)
                (if (> (kotoba$doc-depth-at d 0) 9)
@@ -362,6 +387,8 @@
                                                           (kotoba$doc-unescape-from "" d (+ i 1) (- e 1)))
                              (if (= k 5) (kotoba$doc-len-range acc "k" d i e)
                                  (if (= k 6) (kotoba$doc-len-range acc "y" d i e)
+                                     (if (= k 11) (kotoba$doc-canon-bytes acc d i e)
+                                     (if (= k 12) (kotoba$doc-canon-link acc d i e)
                                      (let [open (+ i (if (= k 9) 2 1))
                                            forms (kotoba$doc-count-from d open 0)
                                            head (string-concat
@@ -371,7 +398,43 @@
                                                                                   (if (= k 9) "e" "m"))))
                                                   (kotoba$doc-dec (if (= k 10) (quot forms 2) forms)))
                                                  ":")]
-                                       (kotoba$doc-canon-items head d open (= k 10) (= k 10))))))))))))
+                                       (kotoba$doc-canon-items head d open (= k 10) (= k 10))))))))))))))
+   ;; bytes: `x<length>:` then the payload. Two canonical byte strings can
+   ;; first differ inside an x / c payload only at the same offset of payloads
+   ;; of the same tag and length (the encoding is length-prefixed), so any
+   ;; order-preserving fixed-width spelling of the payload orders exactly as
+   ;; the raw bytes do. Lowercase hex is one, and it is the EDN text already.
+   (h 'kotoba$doc-canon-bytes '[acc d i e] [:string :string :i64 :i64] :string
+      '(let [q (+ (string-find-byte d 34 i) 1)]
+         (string-append-range
+          (string-concat (string-concat (string-concat acc "x")
+                                        (kotoba$doc-dec (quot (- (- e 1) q) 2)))
+                         ":")
+          d q (- e 1))))
+   ;; base32 digit value: a..z are 0..25, 2..7 are 26..31
+   (h 'kotoba$doc-b32-value '[c] [:i64] :i64
+      '(if (>= c 97) (- c 97) (- c 24)))
+   ;; V from K on: the base32 digits d[i, e) respelled `0`..`O` (code points
+   ;; 48 + value), an order-preserving alphabet -- MSB-first 5-bit groups of
+   ;; equally long byte strings order as the bytes do. Written into one
+   ;; vector-alloc'd run and made text once (`string-from-utf8`), so a link's
+   ;; canonical bytes cost its length in the string pool, not its square.
+   (h 'kotoba$doc-b32-ordered-into '[v k d i e] [:vector-i64 :i64 :string :i64 :i64] :vector-i64
+      '(if (>= i e) v
+           (kotoba$doc-b32-ordered-into
+            (vector-assoc! v k (+ 48 (kotoba$doc-b32-value (string-code-point-at d i))))
+            (+ k 1) d (+ i 1) e)))
+   ;; link: `c<length>:` then the binary CID, from `#kotoba/cid \"b<base32>\"`
+   (h 'kotoba$doc-canon-link '[acc d i e] [:string :string :i64 :i64] :string
+      '(let [q (+ (string-find-byte d 34 i) 2)
+             n (- (- e 1) q)]
+         (string-concat
+          (string-concat (string-concat (string-concat acc "c")
+                                        (kotoba$doc-dec (quot (* 5 n) 8)))
+                         ":")
+          (string-from-utf8
+           (bytes-from-vector-i64
+            (kotoba$doc-b32-ordered-into (vector-alloc n) 0 d q (- e 1)))))))
    (h 'kotoba$doc-canon '[d] [:string] :string '(kotoba$doc-canon-at "" d 0))
    (h 'kotoba$doc-compare '[a b] [:string :string] :i64
       '(string-compare (kotoba$doc-canon a) (kotoba$doc-canon b)))
@@ -534,7 +597,128 @@
    (h 'kotoba$doc-vector-sort '[v] [:string] :string
       '(kotoba$doc-sort-from "[]" v 1))])
 
-(def helper-names (set (map :name helpers)))
+;; The :bytes and :link constructors and readers (root ADR-2610092310 S4).
+;; Appended only when a body names one of the four operations, so a document
+;; program that does not keeps the helpers (and the code) it had; they are the
+;; only helpers that touch a `:bytes` handle (a vector-arena handle on native).
+(def ^:private bytes-helpers
+  [(h 'kotoba$doc-pow2 '[n] [:i64] :i64
+      '(if (<= n 0) 1 (* 2 (kotoba$doc-pow2 (- n 1)))))
+   ;; Text is written as code points into one vector-alloc'd run and made a
+   ;; string once, so a payload costs its length in the string pool (an
+   ;; append per digit would cost its square).
+   (h 'kotoba$doc-text-of '[v] [:vector-i64] :string
+      '(string-from-utf8 (bytes-from-vector-i64 v)))
+   (h 'kotoba$doc-hex-digit '[n] [:i64] :i64 '(if (< n 10) (+ n 48) (+ n 87)))
+   ;; V with the lowercase hex of B[I, end) at 2I on
+   (h 'kotoba$doc-hex-into '[v b i] [:vector-i64 :bytes :i64] :vector-i64
+      '(if (>= i (bytes-count b)) v
+           (let [x (bytes-at b i)
+                 hi (quot x 16)]
+             (kotoba$doc-hex-into
+              (vector-assoc! (vector-assoc! v (* 2 i) (kotoba$doc-hex-digit hi))
+                             (+ (* 2 i) 1) (kotoba$doc-hex-digit (- x (* hi 16))))
+              b (+ i 1)))))
+   ;; the reference's bytes-value-byte-limit, then the EDN text
+   (h 'kotoba$doc-bytes '[b] [:bytes] :string
+      '(if (> (bytes-count b) 65536) (kotoba$doc-trap)
+           (if (= (bytes-count b) 0) "#kotoba/bytes \"\""
+               (string-concat
+                (string-concat "#kotoba/bytes \""
+                               (kotoba$doc-text-of
+                                (kotoba$doc-hex-into (vector-alloc (* 2 (bytes-count b))) b 0)))
+                "\""))))
+   ;; V with the bytes the hex digits d[i, e) spell, from K on
+   (h 'kotoba$doc-unhex-into '[v k d i e] [:vector-i64 :i64 :string :i64 :i64] :vector-i64
+      '(if (>= i e) v
+           (kotoba$doc-unhex-into
+            (vector-assoc! v k (+ (* 16 (kotoba$doc-hex (string-code-point-at d i)))
+                                  (kotoba$doc-hex (string-code-point-at d (+ i 1)))))
+            (+ k 1) d (+ i 2) e)))
+   (h 'kotoba$doc-bytes-payload '[d] [:string] :bytes
+      '(let [q (+ (string-find-byte d 34 0) 1)
+             e (- (string-byte-length d) 1)]
+         (if (>= q e) (bytes-empty)
+             (bytes-from-vector-i64
+              (kotoba$doc-unhex-into (vector-alloc (quot (- e q) 2)) 0 d q e)))))
+   ;; ── CIDv1 (osaho kotoba.kir.value/cidv1-binary-items?) ──
+   ;; the end of the minimal unsigned LEB128 varint that starts at I, or -1
+   ;; when it is truncated, longer than 9 bytes, or not minimal
+   (h 'kotoba$doc-varint-end '[b i j] [:bytes :i64 :i64] :i64
+      '(if (>= j (bytes-count b)) -1
+           (if (>= (- j i) 9) -1
+               (let [x (bytes-at b j)]
+                 (if (< x 128)
+                   (if (if (= x 0) (> j i) false) -1 (+ j 1))
+                   (kotoba$doc-varint-end b i (+ j 1)))))))
+   ;; the value of the varint B[I, E); at most 63 bits, so it never wraps
+   (h 'kotoba$doc-varint-value '[b i e mult acc] [:bytes :i64 :i64 :i64 :i64] :i64
+      '(if (>= i e) acc
+           (let [x (bytes-at b i)
+                 acc (+ acc (* mult (if (< x 128) x (- x 128))))]
+             (if (>= (+ i 1) e) acc
+                 (kotoba$doc-varint-value b (+ i 1) e (* mult 128) acc)))))
+   ;; version 1 (a minimal varint 1 is the one byte 1), codec, multihash code,
+   ;; digest length, exactly that many digest bytes, at most 128 bytes in all
+   (h 'kotoba$doc-cidv1? '[b] [:bytes] :bool
+      '(let [n (bytes-count b)]
+         (if (> n 128) false
+             (if (< n 1) false
+                 (if (= (bytes-at b 0) 1)
+                   (let [i1 (kotoba$doc-varint-end b 1 1)]
+                     (if (< i1 0) false
+                         (let [i2 (kotoba$doc-varint-end b i1 i1)]
+                           (if (< i2 0) false
+                               (let [i3 (kotoba$doc-varint-end b i2 i2)]
+                                 (if (< i3 0) false
+                                     (= (kotoba$doc-varint-value b i2 i3 1 0) (- n i3))))))))
+                   false)))))
+   (h 'kotoba$doc-b32-digit '[x] [:i64] :i64 '(if (< x 26) (+ x 97) (+ x 24)))
+   ;; V from K on: the lowercase unpadded base32 of B from I; BUF holds the
+   ;; BITS (< 13) not yet written
+   (h 'kotoba$doc-b32-into '[v k b i buf bits] [:vector-i64 :i64 :bytes :i64 :i64 :i64] :vector-i64
+      '(if (>= bits 5)
+         (let [p (kotoba$doc-pow2 (- bits 5))
+               x (quot buf p)]
+           (kotoba$doc-b32-into (vector-assoc! v k (kotoba$doc-b32-digit x)) (+ k 1)
+                                b i (- buf (* x p)) (- bits 5)))
+         (if (< i (bytes-count b))
+           (kotoba$doc-b32-into v k b (+ i 1) (+ (* buf 256) (bytes-at b i)) (+ bits 8))
+           (if (> bits 0)
+             (vector-assoc! v k (kotoba$doc-b32-digit (* buf (kotoba$doc-pow2 (- 5 bits)))))
+             v))))
+   (h 'kotoba$doc-link '[b] [:bytes] [:option :document]
+      '(if (kotoba$doc-cidv1? b)
+         (option-some-of [:option :document]
+                         (string-concat
+                          (string-concat "#kotoba/cid \"b"
+                                         (kotoba$doc-text-of
+                                          (kotoba$doc-b32-into
+                                           (vector-alloc (quot (+ (* 8 (bytes-count b)) 4) 5))
+                                           0 b 0 0 0)))
+                          "\""))
+         (option-none-of [:option :document])))
+   ;; V from K on: the bytes the base32 digits d[i, e) spell; the trailing
+   ;; bits of canonical base32 are zero and are dropped
+   (h 'kotoba$doc-unb32-into '[v k d i e buf bits] [:vector-i64 :i64 :string :i64 :i64 :i64 :i64] :vector-i64
+      '(if (>= bits 8)
+         (let [p (kotoba$doc-pow2 (- bits 8))
+               x (quot buf p)]
+           (kotoba$doc-unb32-into (vector-assoc! v k x) (+ k 1) d i e (- buf (* x p)) (- bits 8)))
+         (if (>= i e) v
+             (kotoba$doc-unb32-into v k d (+ i 1) e
+                                    (+ (* buf 32) (kotoba$doc-b32-value (string-code-point-at d i)))
+                                    (+ bits 5)))))
+   (h 'kotoba$doc-link-payload '[d] [:string] :bytes
+      '(let [q (+ (string-find-byte d 34 0) 2)
+             e (- (string-byte-length d) 1)]
+         (bytes-from-vector-i64
+          (kotoba$doc-unb32-into (vector-alloc (quot (* 5 (- e q)) 8)) 0 d q e 0 0))))])
+
+(def ^:private bytes-operations
+  '#{document-bytes document-bytes-value document-link document-link-value})
+
+(def helper-names (set (map :name (concat helpers bytes-helpers))))
 
 ;; The control characters 0..31, one byte each: what a `\u00XX` escape in a
 ;; canonical string reads back as.
@@ -557,10 +741,11 @@
      document-vector-drop document-vector-remove document-vector-sort
      document-assoc document-dissoc document-merge document-string-value
      document-keyword-value document-symbol-value document-bool-value
-     document-i64-value document-edn-print document-edn-read})
+     document-i64-value document-edn-print document-edn-read
+     document-bytes document-bytes-value document-link document-link-value})
 
 (def ^:private kind-keywords
-  [:null :bool :i64 :f64 :string :keyword :symbol :vector :list :set :map])
+  [:null :bool :i64 :f64 :string :keyword :symbol :vector :list :set :map :bytes :link])
 
 (defn- require-kind [form lo hi]
   (list 'kotoba$doc-require form lo hi))
@@ -572,12 +757,14 @@
             (list 'string-concat open (first items))
             (concat (mapcat (fn [item] [" " item]) (rest items)) [close]))))
 
-(defn- value-of [kind form payload]
-  (let [d (gensym "document__")]
-    (list 'let [d form]
-          (list 'if (list '= (list 'kotoba$doc-kind d) kind)
-                (list 'option-some-of [:option (nth kind-keywords kind)] (payload d))
-                (list 'option-none-of [:option (nth kind-keywords kind)])))))
+(defn- value-of
+  ([kind form payload] (value-of kind form payload (nth kind-keywords kind)))
+  ([kind form payload value-type]
+   (let [d (gensym "document__")]
+     (list 'let [d form]
+           (list 'if (list '= (list 'kotoba$doc-kind d) kind)
+                 (list 'option-some-of [:option value-type] (payload d))
+                 (list 'option-none-of [:option value-type]))))))
 
 (defn lower
   "Rewrite one document operation onto the string slots and the helpers."
@@ -605,7 +792,7 @@
                     (list 'let [k (list 'kotoba$doc-kind (first args))]
                           (reduce (fn [acc index]
                                     (list 'if (list '= k index) (nth kind-keywords index) acc))
-                                  :map (range 9 -1 -1))))
+                                  :map (concat [12 11] (range 9 -1 -1)))))
     document-equal? (list 'string=? (first args) (second args))
     document-set-contains? (list 'kotoba$doc-set-contains
                                  (require-kind (first args) 9 9) (second args) 2)
@@ -635,6 +822,12 @@
     document-symbol-value (value-of 6 (first args) identity)
     document-bool-value (value-of 1 (first args) (fn [d] (list 'string=? d "true")))
     document-i64-value (value-of 2 (first args) (fn [d] (list 'kotoba$doc-parse-i64 d)))
+    ;; :bytes and :link (root ADR-2610092310): the EDN tagged literals
+    ;; `#kotoba/bytes \"<hex>\"` and `#kotoba/cid \"b<base32>\"`.
+    document-bytes (list 'kotoba$doc-bytes (first args))
+    document-bytes-value (value-of 11 (first args) (fn [d] (list 'kotoba$doc-bytes-payload d)) :bytes)
+    document-link (list 'kotoba$doc-link (first args))
+    document-link-value (value-of 12 (first args) (fn [d] (list 'kotoba$doc-link-payload d)) :bytes)
     ;; Identity at the ABI: the native document IS its canonical EDN text.
     (document-edn-print document-edn-read) (first args)
     (throw (ex-info "unknown native document operation" {:phase :native :operation op}))))
@@ -657,6 +850,13 @@
     (vector? form) (mapv substitute-control form)
     :else form))
 
+(defn- uses-bytes? [form]
+  (cond
+    (seq? form) (or (contains? bytes-operations (first form))
+                    (boolean (some uses-bytes? (rest form))))
+    (vector? form) (boolean (some uses-bytes? form))
+    :else false))
+
 (defn augment-functions
   "FUNCTIONS plus the document helpers, exactly when a body uses a document
   operation this lowering answers. A program that does not is returned
@@ -667,7 +867,10 @@
   (if-not (some #(uses? (:body %)) functions)
     functions
     (let [declared (into {} (map (juxt :name identity)) functions)
-          wanted (mapv #(update % :body substitute-control) helpers)
+          wanted (mapv #(update % :body substitute-control)
+                       (if (some #(uses-bytes? (:body %)) functions)
+                         (concat helpers bytes-helpers)
+                         helpers))
           clashes (filter (fn [helper]
                             (when-let [existing (get declared (:name helper))]
                               (not= existing helper)))
