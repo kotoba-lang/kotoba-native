@@ -59,7 +59,9 @@
          ;; kernel-dequant-dot-ptq1-0, PTQ1_0 in the fused dequant family (ADR 0088).
          ;; Advanced 2026-09-30, 8e0c3a23 -> 6c3651f9 (kotoba-gmir main, forward only):
          ;; the :fuel-charge runtime arity (amu ADR 0353 floor :allocation-budget-native).
-         :git/sha "6c3651f953eb255d9ca1f45622cd904f69499c83"}
+         ;; Advanced 2026-10-09, 6c3651f9 -> 54ac95b7 (kotoba-gmir main, ahead 2, behind 0):
+         ;; the :gas-charge runtime arity (superproject adr-2610092340 D12).
+         :git/sha "54ac95b7aff5c8d3b4e69525048969a422fe0d82"}
         ;; kotoba-mir 4bf67c0: call+loop uses the scanner (:call-live), the
         ;; conservative fallback colors frame slots from CFG liveness, and
         ;; pure integer SSA segments are scheduled per basic block after physical
@@ -153,7 +155,11 @@
          ;; Advanced 2026-09-30, abb72f61 -> 205f2a93 (kotoba-mir main, forward only):
          ;; :fuel-charge at the context's fuel word (amu ADR 0353 floor
          ;; :allocation-budget-native).
-         :git/sha "205f2a931a6c785c23e54bc7e0006c1982f5906a"}
+         ;; Advanced 2026-10-09, 205f2a93 -> 63d6e441 (kotoba-mir main, ahead 4, behind 0):
+         ;; :gas-charge at the context's gas word 384, context ABI v12
+         ;; (superproject adr-2610092340 D12); also carries 4bd4d58's
+         ;; counted-self-recur-plan host-number comparison.
+         :git/sha "63d6e441d4f630a45f533ad50f9e70890c4a9aee"}
         io.github.kotoba-lang/kotoba-codegen
         {:git/url "https://github.com/kotoba-lang/kotoba-codegen.git"
          ;;

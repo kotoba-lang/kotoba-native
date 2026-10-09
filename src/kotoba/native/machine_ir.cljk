@@ -5,7 +5,7 @@
   lowers through closed GMIR/MIR/MC data; unknown operations, unsupported value
   shapes, use-before-definition, register exhaustion, and malformed labels fail
   closed before either ISA encoder."
-  {:kotoba/export [charge-constructors charged-constructors charges-written coalesce-program-moves compile-expression compile-gmir compile-kir-module counted-self-recur-plans encode-mc encode-mc-module entry-fuel-prefixes function-reenters-guest? hoist-program-consumers lower-kir-expression lower-kir-module lower-mc pilot-expression? pilot-module? signed-division-magic word-result-type?]}
+  {:kotoba/export [charge-constructors charge-gas charged-constructors charges-written coalesce-program-moves compile-expression compile-gmir compile-kir-module counted-self-recur-plans encode-mc encode-mc-module entry-fuel-prefixes function-reenters-guest? hoist-program-consumers lower-kir-expression lower-kir-module lower-mc pilot-expression? pilot-module? signed-division-magic word-result-type?]}
   (:require [kotoba.bytes :as kbytes] [kotoba.lang.text :as str]
             [kotoba.lang.coll :as walk]
             [kotoba.gmir :as gmir]
@@ -911,6 +911,10 @@
    ;; debit `charge-constructors` puts in front of every constructor. No KIR
    ;; program names it; the frontend refuses the head.
    'fuel-charge! :fuel-charge
+   ;; superproject adr-2610092340 D12: the per-form consensus gas debit
+   ;; `charge-gas` puts in front of every application form when the KIR names
+   ;; a `:gas-schedule`. No KIR program names it either.
+   'gas-charge! :gas-charge
    'pair-first :pair-first
    'pair-second :pair-second
    'kgraph-assert! :kgraph-assert!
@@ -6724,7 +6728,7 @@
 
 (def ^:private inline-runtime-operations
   #{:pair-first :pair-second :string-byte-length :vector-count :vector-at
-    :vector-assoc-in-place :fuel-charge})
+    :vector-assoc-in-place :fuel-charge :gas-charge})
 
 (defn- a64-ldr-x16-context
   "ldr x16, [x7, #offset]"
@@ -6762,10 +6766,46 @@
                  [(layout/label present)]
                  (u32le 0xf90004f0)))))
 
+(defn- a64-gas-charge
+  "The per-form consensus gas debit (superproject adr-2610092340 D12) on the
+  context's gas word, 384 (ABI v12):
+
+    ldr x16, [x7]; cmp x16, #12; b.ne trap        ; refuse a pre-v12 host
+    ldr x16, [x7, #384]; subs x16, x16, #1; b.hs present
+    str x16, [x7, #384]                           ; exhausted: leave 2^64-1
+    trap: brk #0
+    present: str x16, [x7, #384]
+
+  The version test is not decoration. 384 is past v11's last slot, and every
+  v11 loader keeps HOST state there (the POSIX loader's `code_base`, the
+  Windows loader's `pair_used`) -- a loader learns no ABI version from the
+  code it runs, so without this a gas-metered program on an older loader
+  would decrement the host's own bookkeeping. It traps instead, unnamed.
+  Exhaustion STORES the wrapped counter before it traps: a gas word left at 0
+  would be indistinguishable from a run that spent its gas exactly, and the
+  loader reports budget/gas only for the sentinel."
+  [instruction-index]
+  (let [present (memory-label instruction-index "gas-present")
+        trap (memory-label instruction-index "gas-trap")
+        store (u32le (bit-or 0xf9000000 (bit-shift-left (quot 384 8) 10)
+                             (bit-shift-left 7 5) 16))]
+    (vec (concat (u32le 0xf94000f0)                               ; ldr x16, [x7]
+                 (u32le 0xf100321f)                               ; cmp x16, #12
+                 [(layout/relative-branch :aarch64/b-ne-imm19 trap)]
+                 (a64-ldr-x16-context 384)
+                 (u32le 0xf1000610)
+                 [(layout/relative-branch :aarch64/b-hs-imm19 present)]
+                 store
+                 [(layout/label trap)]
+                 (u32le 0xd4200000)
+                 [(layout/label present)]
+                 store))))
+
 (defn- a64-inline-runtime
   [instruction-index runtime]
-  (if (= :fuel-charge runtime)
-    (a64-fuel-charge instruction-index)
+  (case runtime
+    :fuel-charge (a64-fuel-charge instruction-index)
+    :gas-charge (a64-gas-charge instruction-index)
     (a64-inline-handle-runtime instruction-index runtime)))
 
 (defn- a64-inline-handle-runtime
@@ -6843,10 +6883,31 @@
                  [0x0f 0x0b]
                  [(layout/label present)]))))
 
+(defn- x86-gas-charge
+  "The per-form consensus gas debit (superproject adr-2610092340 D12) on the
+  context's gas word, 384 (ABI v12): cmp qword [r9], 12; jne trap;
+  dec qword [r9+384]; jns present; trap: ud2; present. 384 is past disp8, so
+  that ModRM byte is mod=10 with a disp32. The version test refuses a pre-v12
+  host, whose 384 is host state (see `a64-gas-charge`). Unlike fuel the trap
+  path does NOT put the counter back: it is left at 2^64 - 1, the sentinel
+  the loader reports as budget/gas (0 would be a run that spent its gas
+  exactly)."
+  [instruction-index]
+  (let [present (memory-label instruction-index "gas-present")
+        trap (memory-label instruction-index "gas-trap")]
+    (vec (concat [0x49 0x83 0x39 0x0c]
+                 [(layout/relative-branch :x86-64/jne-rel8 trap)]
+                 [0x49 0xff 0x89 0x80 0x01 0x00 0x00]
+                 [(layout/relative-branch :x86-64/jns-rel8 present)]
+                 [(layout/label trap)]
+                 [0x0f 0x0b]
+                 [(layout/label present)]))))
+
 (defn- x86-inline-runtime
   [instruction-index runtime]
-  (if (= :fuel-charge runtime)
-    (x86-fuel-charge instruction-index)
+  (case runtime
+    :fuel-charge (x86-fuel-charge instruction-index)
+    :gas-charge (x86-gas-charge instruction-index)
     (x86-inline-handle-runtime instruction-index runtime)))
 
 (defn- x86-inline-handle-runtime
@@ -9790,7 +9851,10 @@
   charge, so it does not make a function pay an entry charge too."
   [instructions]
   (boolean (some #(and (contains? guest-reentry-ops (:gmir/op %))
-                       (not= :fuel-charge (:gmir/runtime %)))
+                       ;; The consensus gas debit is a charge too: a function
+                       ;; must not start paying an entry FUEL charge because
+                       ;; it is metered for gas.
+                       (not (contains? #{:fuel-charge :gas-charge} (:gmir/runtime %))))
                  instructions)))
 
 (def charged-constructors
@@ -9841,6 +9905,53 @@
     (if (::charges-written (meta kir))
       kir
       (update kir :functions (fn [functions] (mapv #(update % :body charge) functions))))))
+
+(defn- valid-gas-schedule? [schedule]
+  (let [pos-int? (fn [x] (and (integer? x) (pos? x)))]
+    (and (map? schedule) (keyword? (:gas-schedule/id schedule))
+         (pos-int? (:default schedule)) (pos-int? (:call schedule))
+         (map? (:weights schedule))
+         (every? (fn [[k v]] (and (symbol? k) (integer? v) (not (neg? v))))
+                 (:weights schedule)))))
+
+(defn charge-gas
+  "Consensus gas (superproject adr-2610092340 D12). When the KIR names a
+  `:gas-schedule`, put the weight of every application form in front of it as
+  that many `(gas-charge!)` units: `(op args)` becomes
+  `(do (gas-charge!) ... (op args))`, so the debit precedes the operands, as
+  the reference charges it (osaho `kotoba.kir/execute-metered`: one debit per
+  evaluated application form; a module function call weighs `:call`, any
+  other head its listed weight or `:default`). Runs FIRST, on the source KIR,
+  so the forms charged are the ones the reference evaluates, not the ones
+  later rewrites lower them into. A weight is emitted as that many unit
+  debits; schedule v0-draft weighs every form 1, and an immediate-weight
+  debit can replace the repetition when a schedule needs it. Without a
+  schedule the KIR is returned as it is, so an unmetered program's bytes do
+  not move."
+  [kir]
+  (if-let [schedule (:gas-schedule kir)]
+    (do
+      (when-not (valid-gas-schedule? schedule)
+        (throw (ex-info "gas schedule refused" {:phase :native :reason :gas-schedule})))
+      (let [functions (set (map :name (:functions kir)))
+            weight (fn [op] (if (contains? functions op)
+                              (:call schedule)
+                              (get (:weights schedule) op (:default schedule))))
+            charge (fn charge [form]
+                     (cond
+                       (seq? form)
+                       (let [form (apply list (map charge form))
+                             w (weight (first form))]
+                         (if (pos? w)
+                           (apply list 'do (concat (repeat w (list 'gas-charge!)) [form]))
+                           form))
+                       (vector? form) (mapv charge form)
+                       (map? form) (into (empty form) (map (fn [[k v]] [(charge k) (charge v)])) form)
+                       :else form))]
+        (-> kir
+            (dissoc :gas-schedule)
+            (update :functions (fn [fs] (mapv #(update % :body charge) fs))))))
+    kir))
 
 (defn entry-fuel-prefixes
   "Production fuel map: only functions that can re-enter. TOKENS-FOR is

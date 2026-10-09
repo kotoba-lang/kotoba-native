@@ -1651,6 +1651,7 @@
 
 (defn emit-program [kir]
   (let [kir (-> kir
+                machine-ir/charge-gas
                 keyword-equality/rewrite-program
                 vector-region/rewrite-program
                 machine-ir/charge-constructors
