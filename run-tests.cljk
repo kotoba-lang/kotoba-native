@@ -50,6 +50,7 @@
             ;; the 22 that were JVM-only until 2026-09-18
             [kotoba.native.aggregate-abi-test]
             [kotoba.native.context-slots-test]
+            [kotoba.native.gas-charge-test]
             [kotoba.native.dequant-fusion-test]
             [kotoba.native.dequant-kquant-test]
             [kotoba.native.elf64-test]
@@ -80,7 +81,7 @@
     kotoba.native.inline-handle-ops-test kotoba.native.range-slots-test kotoba.native.bytes-slots-test kotoba.native.macho-test kotoba.native.linux-static-test
     kotoba.native.affine-test kotoba.native.elf64-portable-test kotoba.native.aggregate-abi-portable-test
     kotoba.native.recursive-adt-test
-    kotoba.native.aggregate-abi-test kotoba.native.context-slots-test kotoba.native.dequant-fusion-test
+    kotoba.native.aggregate-abi-test kotoba.native.context-slots-test kotoba.native.gas-charge-test kotoba.native.dequant-fusion-test
     kotoba.native.dequant-kquant-test kotoba.native.elf64-test kotoba.native.elf64-twin-parity-test
     kotoba.native.f32-test kotoba.native.false-argument-test kotoba.native.firmware-store-test
     kotoba.native.fuel64-test kotoba.native.interrupt-abi-test kotoba.native.isa-parity-test
