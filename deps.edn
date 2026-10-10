@@ -61,7 +61,9 @@
          ;; the :fuel-charge runtime arity (amu ADR 0353 floor :allocation-budget-native).
          ;; Advanced 2026-10-09, 6c3651f9 -> 54ac95b7 (kotoba-gmir main, ahead 2, behind 0):
          ;; the :gas-charge runtime arity (superproject adr-2610092340 D12).
-         :git/sha "54ac95b7aff5c8d3b4e69525048969a422fe0d82"}
+         ;; Advanced 2026-10-10, 54ac95b7 -> a891d432 (kotoba-gmir main, behind 0):
+         ;; :gas-charge takes the form's weight (kotoba-gmir#40).
+         :git/sha "a891d4328132058d31756935a8a1d51630526fcc"}
         ;; kotoba-mir 4bf67c0: call+loop uses the scanner (:call-live), the
         ;; conservative fallback colors frame slots from CFG liveness, and
         ;; pure integer SSA segments are scheduled per basic block after physical
@@ -159,7 +161,9 @@
          ;; :gas-charge at the context's gas word 384, context ABI v12
          ;; (superproject adr-2610092340 D12); also carries 4bd4d58's
          ;; counted-self-recur-plan host-number comparison.
-         :git/sha "63d6e441d4f630a45f533ad50f9e70890c4a9aee"}
+         ;; Advanced 2026-10-10, 63d6e441 -> 02dc802a (kotoba-mir main, behind 0):
+         ;; the gas-word test passes :gas-charge its weight (kotoba-mir#74).
+         :git/sha "02dc802a152ae3572f489482b6edfd2e476291f4"}
         io.github.kotoba-lang/kotoba-codegen
         {:git/url "https://github.com/kotoba-lang/kotoba-codegen.git"
          ;;

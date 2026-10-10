@@ -24,19 +24,19 @@
 (defn- subvector-count [haystack needle]
   (count (filter #(= needle (vec %)) (partition (count needle) 1 haystack))))
 
-(def x86-gas-debit [0x49 0xff 0x89 0x80 0x01 0x00 0x00]) ; dec qword [r9+384]
+(def x86-gas-debit [0x49 0x29 0xb1 0x80 0x01 0x00 0x00]) ; sub qword [r9+384], rsi
 (def a64-gas-ldr [0xf0 0xc0 0x40 0xf9])                   ; ldr x16, [x7, #384]
 (def x86-version-check [0x49 0x83 0x39 0x0c])           ; cmp qword [r9], 12
 (def a64-version-check [0x1f 0x32 0x00 0xf1])           ; cmp x16, #12
 
 (deftest every-application-form-is-charged-before-its-operands
-  (is (= '(do (gas-charge!) (+ 1 (do (gas-charge!) (* 2 3))))
+  (is (= '(do (gas-charge! 1) (+ 1 (do (gas-charge! 1) (* 2 3))))
          (:body (first (:functions (machine/charge-gas
                                     (module v0 (fn-of 'main [] '(+ 1 (* 2 3)))))))))))
 
 (deftest the-schedule-sets-the-weights
   (testing "a module function call weighs :call, a builtin its weight or :default"
-    (is (= '(do (gas-charge!) (gas-charge!) (gas-charge!) (sq (do (gas-charge!) (gas-charge!) (* 2 3))))
+    (is (= '(do (gas-charge! 3) (sq (do (gas-charge! 2) (* 2 3))))
            (:body (second (:functions (machine/charge-gas
                                        (module (assoc v0 :call 3 :weights {'* 2})
                                                (fn-of 'sq '[x] 'x)
@@ -77,6 +77,16 @@
         (str label ": each debit first refuses a pre-v12 host, whose word 384 is host state"))
     (is (zero? (subvector-count (vec (:code (emit (dissoc counted-loop :gas-schedule)))) debit))
         (str label ": no gas word is touched without a schedule"))))
+
+(deftest a-heavy-form-is-still-one-debit
+  ;; 2026-10-10: the weight is the debit's argument, not a repetition, so a
+  ;; form priced 50 costs the same code as one priced 1.
+  (let [heavy (module (assoc v0 :weights {'* 50}) (fn-of 'main [] '(* 6 7)))]
+    (is (= '(do (gas-charge! 50) (* 6 7)) (:body (first (:functions (machine/charge-gas heavy))))))
+    (doseq [[label emit debit] [["x86-64" x86/emit-program x86-gas-debit]
+                                ["AArch64" arm/emit-program a64-gas-ldr]]]
+      (is (= 1 (subvector-count (vec (:code (emit heavy))) debit))
+          (str label ": one debit for a weight of 50")))))
 
 (deftest gas-does-not-change-what-pays-fuel
   ;; The gas debit is a charge, not a re-entry: metering gas must not give a
