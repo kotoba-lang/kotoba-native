@@ -6768,11 +6768,12 @@
 
 (defn- a64-gas-charge
   "The per-form consensus gas debit (superproject adr-2610092340 D12) on the
-  context's gas word, 384 (ABI v12):
+  context's gas word, 384 (ABI v12). The form's weight arrives in x1, the
+  first runtime argument register (kotoba-gmir :gas-charge, arity 1):
 
     ldr x16, [x7]; cmp x16, #12; b.ne trap        ; refuse a pre-v12 host
-    ldr x16, [x7, #384]; subs x16, x16, #1; b.hs present
-    str x16, [x7, #384]                           ; exhausted: leave 2^64-1
+    ldr x16, [x7, #384]; subs x16, x16, x1; b.hs present
+    mov x16, #-1; str x16, [x7, #384]             ; exhausted: the sentinel
     trap: brk #0
     present: str x16, [x7, #384]
 
@@ -6781,9 +6782,9 @@
   Windows loader's `pair_used`) -- a loader learns no ABI version from the
   code it runs, so without this a gas-metered program on an older loader
   would decrement the host's own bookkeeping. It traps instead, unnamed.
-  Exhaustion STORES the wrapped counter before it traps: a gas word left at 0
-  would be indistinguishable from a run that spent its gas exactly, and the
-  loader reports budget/gas only for the sentinel."
+  Exhaustion (a borrow: the word was below the weight) STORES 2^64-1 before
+  it traps: a word left at 0 would be indistinguishable from a run that spent
+  its gas exactly, and the loader reports budget/gas only for the sentinel."
   [instruction-index]
   (let [present (memory-label instruction-index "gas-present")
         trap (memory-label instruction-index "gas-trap")
@@ -6793,8 +6794,9 @@
                  (u32le 0xf100321f)                               ; cmp x16, #12
                  [(layout/relative-branch :aarch64/b-ne-imm19 trap)]
                  (a64-ldr-x16-context 384)
-                 (u32le 0xf1000610)
+                 (u32le 0xeb010210)                               ; subs x16, x16, x1
                  [(layout/relative-branch :aarch64/b-hs-imm19 present)]
+                 (u32le 0x92800010)                               ; mov x16, #-1
                  store
                  [(layout/label trap)]
                  (u32le 0xd4200000)
@@ -6885,20 +6887,22 @@
 
 (defn- x86-gas-charge
   "The per-form consensus gas debit (superproject adr-2610092340 D12) on the
-  context's gas word, 384 (ABI v12): cmp qword [r9], 12; jne trap;
-  dec qword [r9+384]; jns present; trap: ud2; present. 384 is past disp8, so
-  that ModRM byte is mod=10 with a disp32. The version test refuses a pre-v12
-  host, whose 384 is host state (see `a64-gas-charge`). Unlike fuel the trap
-  path does NOT put the counter back: it is left at 2^64 - 1, the sentinel
-  the loader reports as budget/gas (0 would be a run that spent its gas
-  exactly)."
+  context's gas word, 384 (ABI v12). The form's weight arrives in rsi, the
+  first runtime argument register (kotoba-gmir :gas-charge, arity 1):
+  cmp qword [r9], 12; jne trap; sub qword [r9+384], rsi; jae present (rel32: the layout has no jae rel8);
+  mov qword [r9+384], -1; trap: ud2; present. 384 is past disp8, so those
+  ModRM bytes are mod=10 with a disp32. The version test refuses a pre-v12
+  host, whose 384 is host state (see `a64-gas-charge`). A borrow means the
+  word was below the weight: it is set to 2^64-1, the sentinel the loader
+  reports as budget/gas (0 would be a run that spent its gas exactly)."
   [instruction-index]
   (let [present (memory-label instruction-index "gas-present")
         trap (memory-label instruction-index "gas-trap")]
     (vec (concat [0x49 0x83 0x39 0x0c]
                  [(layout/relative-branch :x86-64/jne-rel8 trap)]
-                 [0x49 0xff 0x89 0x80 0x01 0x00 0x00]
-                 [(layout/relative-branch :x86-64/jns-rel8 present)]
+                 [0x49 0x29 0xb1 0x80 0x01 0x00 0x00]
+                 [(layout/relative-branch :x86-64/jae-rel32 present)]
+                 [0x49 0xc7 0x81 0x80 0x01 0x00 0x00 0xff 0xff 0xff 0xff]
                  [(layout/label trap)]
                  [0x0f 0x0b]
                  [(layout/label present)]))))
@@ -9917,15 +9921,15 @@
 (defn charge-gas
   "Consensus gas (superproject adr-2610092340 D12). When the KIR names a
   `:gas-schedule`, put the weight of every application form in front of it as
-  that many `(gas-charge!)` units: `(op args)` becomes
-  `(do (gas-charge!) ... (op args))`, so the debit precedes the operands, as
+  one `(gas-charge! w)`: `(op args)` becomes `(do (gas-charge! w) (op args))`,
+  so the debit precedes the operands, as
   the reference charges it (osaho `kotoba.kir/execute-metered`: one debit per
   evaluated application form; a module function call weighs `:call`, any
   other head its listed weight or `:default`). Runs FIRST, on the source KIR,
   so the forms charged are the ones the reference evaluates, not the ones
-  later rewrites lower them into. A weight is emitted as that many unit
-  debits; schedule v0-draft weighs every form 1, and an immediate-weight
-  debit can replace the repetition when a schedule needs it. Without a
+  later rewrites lower them into. One debit per form whatever its weight
+  (2026-10-10; before, a weight w was w unit debits, so code grew with the
+  price). A weight of 0 writes nothing. Without a
   schedule the KIR is returned as it is, so an unmetered program's bytes do
   not move."
   [kir]
@@ -9943,7 +9947,7 @@
                        (let [form (apply list (map charge form))
                              w (weight (first form))]
                          (if (pos? w)
-                           (apply list 'do (concat (repeat w (list 'gas-charge!)) [form]))
+                           (list 'do (list 'gas-charge! w) form)
                            form))
                        (vector? form) (mapv charge form)
                        (map? form) (into (empty form) (map (fn [[k v]] [(charge k) (charge v)])) form)
