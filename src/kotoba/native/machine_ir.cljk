@@ -815,7 +815,7 @@
 #?(:kotoba
    (defn- vt-put [t :vector-i64 k [:ref :form/r] x :i64] :vector-i64
      (let [i (vreg-num k)]
-       (if (< i 0) t (vector-assoc (vt-grow t (inc i)) i x)))))
+       (if (< i 0) t (vector-assoc! (vt-grow t (inc i)) i x)))))
 
 #?(:kotoba
    (defn- vt-has? [t :vector-i64 k [:ref :form/r]] :bool (>= (vt-get t k -1) 0)))
