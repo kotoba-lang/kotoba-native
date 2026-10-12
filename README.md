@@ -6,7 +6,7 @@ This is not a being. [`amu`](https://github.com/kotoba-lang/amu) weaves
 (編む); this repository is one pattern in that weave (the metal / ISA face).
 It does not run artifacts and does not decide grants. Execution and runtime
 linking are [`kototama`](https://github.com/kotoba-lang/kototama) (言霊).
-Authority is [`aiueos`](https://github.com/kotoba-lang/aiueos).
+Authority is [`grant`](https://github.com/kotoba-lang/grant); [`aiueos`](https://github.com/kotoba-lang/aiueos) enforces it.
 See root ADR-2608139980.
 
 **Tier**: `T2`  **Role**: `backend` of amu
@@ -257,7 +257,7 @@ Content identity is computed from normalized abstract values encoded as
 deterministic DAG-CBOR, with IPLD links for dependency CIDs. The implementation
 lives at the current authority boundary: the `kotoba-lang` language contract
 provides DefCID and `artifact` provides SourceCID, BuildCID, and ArtifactCID.
-`kotoba-kir` owns the checked IR model but does not introduce a second DefCID
+`osaho` (formerly `kotoba-kir`) owns the checked IR model but does not introduce a second DefCID
 codec. This native repository consumes those contracts rather than defining
 another codec.
 
@@ -269,7 +269,7 @@ another codec.
 
 ## Depends on
 
-- `kotoba-lang/kotoba-kir`
+- `kotoba-lang/osaho` (formerly `kotoba-kir`)
 - `kotoba-lang/kotoba-gmir`
 - `kotoba-lang/kotoba-mir`
 - `kotoba-lang/kotoba-codegen`
