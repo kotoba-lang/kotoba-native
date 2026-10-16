@@ -736,7 +736,7 @@
   '#{document-null document-bool document-i64 document-string document-keyword
      document-symbol document-vector document-list document-set document-map
      document-count document-kind document-equal? document-set-contains?
-     document-contains document-get document-vector-at document-list-at
+     document-contains document-get document-vector-at document-list-at document-set-at
      document-map-entry-at document-vector-assoc document-vector-conj
      document-vector-drop document-vector-remove document-vector-sort
      document-assoc document-dissoc document-merge document-string-value
@@ -802,6 +802,7 @@
     document-get (list 'kotoba$doc-get (require-kind (first args) 10 10) (second args))
     (document-vector-at) (list 'kotoba$doc-nth (require-kind (first args) 7 7) (second args))
     (document-list-at) (list 'kotoba$doc-nth (require-kind (first args) 8 8) (second args))
+    (document-set-at) (list 'kotoba$doc-nth (require-kind (first args) 9 9) (second args))
     document-map-entry-at (list 'kotoba$doc-entry-at (require-kind (first args) 10 10)
                                 (second args))
     document-vector-assoc (list 'kotoba$doc-vector-assoc (require-kind (first args) 7 7)
