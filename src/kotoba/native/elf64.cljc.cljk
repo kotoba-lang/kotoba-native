@@ -35,9 +35,31 @@
 (def ^:private kernel-gdt-offset interrupt-abi/context-gdt-offset)
 (def ^:private kernel-gdtr-offset interrupt-abi/context-gdtr-offset)
 (def ^:private kernel-tss-offset 168)
+(def ^:private kernel-current-domain-offset 0x110)
+(def ^:private kernel-saved-rsp-offset 0x118)
+(def ^:private kernel-saved-rip-offset 0x120)
+(def ^:private kernel-saved-rflags-offset 0x128)
+(def ^:private kernel-request-pointer-offset 0x130)
+(def ^:private kernel-request-offset 0x200)
+(def ^:private kernel-capability-table-offset 0x1000)
+(def ^:private kernel-arena-offset 0x2000)
 (def ^:private kernel-stack-offset 0x3000)
 (def ^:private kernel-stack-bytes 65536)
 (def ^:private kernel-runtime-data-size (+ kernel-stack-offset kernel-stack-bytes))
+(let [block-start interrupt-abi/context-slot-block-offset
+      block-end (+ block-start interrupt-abi/context-slot-block-size)]
+  (when-not (<= (+ kernel-request-pointer-offset 8) block-start)
+    (throw (ex-info "kernel context slot block overlaps the request pointer"
+                    {:block-start block-start
+                     :request-pointer-end (+ kernel-request-pointer-offset 8)})))
+  (when-not (<= block-end kernel-request-offset)
+    (throw (ex-info "kernel context slot block overlaps the request area"
+                    {:block-end block-end :request-offset kernel-request-offset})))
+  (when-not (<= block-end kernel-runtime-data-size)
+    (throw (ex-info "kernel context slot block lies outside the RW context page"
+                    {:block-end block-end :runtime-data-size kernel-runtime-data-size}))))
+(def ^:private live-boot-shim-size 144)
+(def ^:private live-syscall-shim-size 192)
 (def ^:private desktop-kernel-data-size
   (+ interrupt-abi/context-slot-block-offset interrupt-abi/context-slot-block-size))
 (def ^:private user-context-size 88)
@@ -893,7 +915,7 @@
             (interrupt-abi/absent-entry-bytes-for vector)))
         (range interrupt-abi/vector-limit))))
 
-(defn- entry-shim [main-address context-address]
+(defn- entry-shim [main-address context-address syscall-address]
   ;; Enter on an image-owned stack, install the GDT/TSS, reload segment
   ;; selectors, preserve the loader's boot-info pointer, then call Kotoba.
   (let [shim-address (+ image-base text-offset)
@@ -912,10 +934,85 @@
                   0x66 0xb8 0x28 0x00 0x0f 0x00 0xd8
                   0x48 0x89 0x3d] (le (- (+ context-address 80) (+ shim-address 61)) 4)
                  [0x4c 0x8d 0x0d] (le (- context-address (+ shim-address 68)) 4)))
-        call-site (+ shim-address (count prefix))]
-    (vec (concat prefix [0xe8]
-                 (le (- main-address (+ call-site 5)) 4)
-                 [0xfa 0xf4 0xeb 0xfd]))))
+        msrs (when syscall-address
+               (vec (concat
+                     ;; IA32_EFER.SCE, STAR, LSTAR and FMASK. STAR selects
+                     ;; kernel CS 0x08 and SYSRET user SS/CS 0x1b/0x23.
+                     [0xb9 0x80 0x00 0x00 0xc0 0x0f 0x32 0x83 0xc8 0x01 0x0f 0x30
+                      0xb9 0x81 0x00 0x00 0xc0 0x31 0xc0
+                      0xba 0x08 0x00 0x10 0x00 0x0f 0x30
+                      0xb9 0x82 0x00 0x00 0xc0 0xb8]
+                     (le (bit-and syscall-address 0xffffffff) 4)
+                     [0xba] (le (quot syscall-address 4294967296) 4)
+                     [0x0f 0x30
+                      0xb9 0x84 0x00 0x00 0xc0
+                      ;; Mask TF/IF/DF, IOPL, NT and AC in kernel RFLAGS.
+                      0xb8 0x00 0x77 0x04 0x00 0x31 0xd2 0x0f 0x30])))
+        before-call (vec (concat prefix msrs))
+        call-site (+ shim-address (count before-call))
+        bytes (vec (concat before-call [0xe8]
+                           (le (- main-address (+ call-site 5)) 4)
+                           [0xfa 0xf4 0xeb 0xfd]))]
+    (if syscall-address (padded bytes live-boot-shim-size) bytes)))
+
+(defn- live-syscall-shim
+  [shim-address context-address planner-address runtime-entry-address]
+  ;; SYSCALL leaves the user RIP/RFLAGS in RCX/R11 and does not switch RSP.
+  ;; Save its untrusted state before selecting the image-owned stack. Kotoba's
+  ;; planner admits the complete envelope and return state before the bounded
+  ;; entry receives any pointer.
+  (let [slot (fn [offset next-ip]
+               (le (- (+ context-address offset) next-ip) 4))
+        stack-top (+ context-address kernel-runtime-data-size)
+        arena (+ context-address kernel-arena-offset)
+        request (+ context-address kernel-request-offset)
+        cap-table (+ context-address kernel-capability-table-offset)
+        prefix (vec
+                (concat
+                 [0x48 0x89 0x25] (slot kernel-saved-rsp-offset (+ shim-address 7))
+                 [0x48 0x89 0x0d] (slot kernel-saved-rip-offset (+ shim-address 14))
+                 [0x4c 0x89 0x1d] (slot kernel-saved-rflags-offset (+ shim-address 21))
+                 [0x48 0x89 0x3d] (slot kernel-request-pointer-offset (+ shim-address 28))
+                 [0x48 0x8d 0x25] (le (- stack-top (+ shim-address 35)) 4)
+                 [0x48 0x83 0xe4 0xf0
+                  0x49 0xb9] (le context-address 8)
+                 [0x48 0x89 0xc7
+                  0x41 0x8b 0xb1 0x10 0x01 0x00 0x00
+                  0x49 0x8b 0x91 0x30 0x01 0x00 0x00
+                  0x49 0x8b 0x89 0x20 0x01 0x00 0x00
+                  0x4d 0x8b 0x81 0x18 0x01 0x00 0x00]))
+        planner-call-site (+ shim-address (count prefix))
+        through-plan (vec
+                      (concat prefix [0xe8]
+                              (le (- planner-address (+ planner-call-site 5)) 4)
+                              [0x48 0x85 0xc0
+                               ;; accepted is seven bytes after the branch.
+                               0x0f 0x85 0x07 0x00 0x00 0x00
+                               0x31 0xc0
+                               ;; Skip the 52-byte accepted-call sequence.
+                               0xe9 0x34 0x00 0x00 0x00
+                               0x48 0x89 0xc6
+                               0x48 0xbf] (le arena 8)
+                              [0x49 0x8b 0x91 0x30 0x01 0x00 0x00
+                               0x48 0x81 0xe2 0x00 0xf0 0xff 0xff
+                               0x48 0xb9] (le request 8)
+                              [0x49 0xb8] (le cap-table 8)))
+        entry-call-site (+ shim-address (count through-plan))
+        bytes (vec
+               (concat through-plan [0xe8]
+                       (le (- runtime-entry-address (+ entry-call-site 5)) 4)
+                       [0x49 0x8b 0x89 0x20 0x01 0x00 0x00
+                        0x4d 0x8b 0x99 0x28 0x01 0x00 0x00
+                        ;; Whitelist arithmetic flags plus IF and force bit 1;
+                        ;; IOPL/NT/RF/VM/AC never reach SYSRET.
+                        0x41 0x81 0xe3 0xd5 0x0a 0x00 0x00
+                        0x41 0x83 0xcb 0x02
+                        0x49 0x8b 0xa1 0x18 0x01 0x00 0x00
+                        0x48 0x0f 0x07]))]
+    (when (> (count bytes) live-syscall-shim-size)
+      (throw (ex-info "ValueRuntime SYSCALL shim exceeds its sealed slot"
+                      {:bytes (count bytes) :maximum live-syscall-shim-size})))
+    (padded bytes live-syscall-shim-size)))
 
 (defn- desktop-entry-shim [main-address context-address]
   ;; The resident browser shell intentionally keeps its tiny UEFI handoff:
@@ -1030,26 +1127,43 @@
     (throw (ex-info "ELF64 kernel packaging requires a freestanding profile"
                     {:target-profile (:target-profile artifact)})))
   (let [source-entry (get-in artifact [:program :entry])
-        export (get-in artifact [:exports source-entry])]
+        export (get-in artifact [:exports source-entry])
+        planner (get-in artifact [:exports 'aiueos-value-runtime-syscall-plan])
+        runtime-entry (get-in artifact [:exports 'aiueos-value-runtime-entry])]
     (when-not export
       (throw (ex-info "Kotoba kernel entry is not exported" {:entry source-entry})))
-    (let [entry-address (+ image-base text-offset)
-          shim-size 77
-          artifact-address (+ entry-address shim-size)
+    (when (and planner runtime-entry
+               (not= [5 5] [(:arity planner) (:arity runtime-entry)]))
+      (throw (ex-info "ValueRuntime kernel syscall exports have invalid arity"
+                      {:planner (:arity planner) :entry (:arity runtime-entry)})))
+    (let [live? (boolean (and planner runtime-entry))
+          entry-address (+ image-base text-offset)
+          boot-size (if live? live-boot-shim-size 77)
+          syscall-size (if live? live-syscall-shim-size 0)
+          prefix-size (+ boot-size syscall-size)
+          artifact-address (+ entry-address prefix-size)
           isr-exports (interrupt-entry-exports artifact)
-          isr-offset (align16 (+ shim-size (count (:code artifact))))
+          isr-offset (align16 (+ prefix-size (count (:code artifact))))
           isr-region-size (if (seq isr-exports)
                             (* interrupt-abi/vector-limit interrupt-abi/entry-stride)
                             0)
           isr-base (when (seq isr-exports) (+ entry-address isr-offset))
           data-offset (kernel-data-offset-for (+ isr-offset isr-region-size))
           context-address (+ image-base data-offset)
-          shim (entry-shim (+ artifact-address (:offset export)) context-address)
+          syscall-address (when live? (+ entry-address boot-size))
+          boot (entry-shim (+ artifact-address (:offset export))
+                           context-address syscall-address)
+          syscall (when live?
+                    (live-syscall-shim
+                     syscall-address context-address
+                     (+ artifact-address (:offset planner))
+                     (+ artifact-address (:offset runtime-entry))))
           isr-region (when isr-base
                        (interrupt-entry-region isr-base artifact-address
                                                context-address isr-exports))
-          text (vec (concat shim (:code artifact)
-                            (repeat (- isr-offset shim-size (count (:code artifact))) 0xcc)
+          text (vec (concat boot syscall (:code artifact)
+                            (repeat (- isr-offset prefix-size
+                                       (count (:code artifact))) 0xcc)
                             isr-region))
           context (kernel-runtime-data (artifact-fuel artifact) context-address isr-base)
           names (mapv int (utf8-bytes "\u0000.text\u0000.data\u0000.shstrtab\u0000"))
@@ -1074,6 +1188,11 @@
        :source-entry source-entry
        :entry-address entry-address
        :context-address context-address
+       :context-slot-block [(+ context-address interrupt-abi/context-slot-block-offset)
+                            (+ context-address interrupt-abi/context-slot-block-offset
+                               interrupt-abi/context-slot-block-size)]
+       :syscall-entry-address syscall-address
+       :value-runtime-live? live?
        :interrupt-entry-base isr-base
        :interrupt-entry-stride interrupt-abi/entry-stride
        :interrupt-entries (into (sorted-map)
