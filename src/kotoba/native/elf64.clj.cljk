@@ -29,6 +29,7 @@
 (def ^:private kernel-stack-offset 0x3000)
 (def ^:private kernel-stack-bytes 65536)
 (def ^:private kernel-runtime-data-size (+ kernel-stack-offset kernel-stack-bytes))
+(def ^:private kernel-rt-state-size page-size)
 
 ;; The canned handlers' slot block (`interrupt-abi/context-slot-block-offset`,
 ;; 0x160..0x1e0) lives in THIS page, in the gap between the request pointer
@@ -1096,7 +1097,7 @@
     fuel))
 
 (defn- package-kernel-with-minimum-data-offset
-  [artifact minimum-data-offset]
+  [artifact minimum-data-offset extra-data-size]
   (when-not (artifact/valid-seal? artifact)
     (throw (ex-info "ELF64 kernel packaging requires a sealed artifact" {})))
   (when-not (= kernel-target (:target artifact))
@@ -1117,6 +1118,7 @@
       (throw (ex-info "ValueRuntime kernel syscall exports have invalid arity"
                       {:planner (:arity planner) :entry (:arity runtime-entry)})))
     (let [live? (boolean (and planner runtime-entry))
+          runtime-data-size (+ kernel-runtime-data-size extra-data-size)
           entry-address (+ image-base text-offset)
           boot-size (if live? live-boot-shim-size 77)
           syscall-size (if live? live-syscall-shim-size 0)
@@ -1152,20 +1154,21 @@
                                        (count (:code artifact)))
                                     0xcc)
                             isr-region))
-          context (kernel-runtime-data (artifact-fuel artifact) context-address
-                                       isr-base)
+          context (vec (concat (kernel-runtime-data (artifact-fuel artifact)
+                                                    context-address isr-base)
+                               (repeat extra-data-size 0)))
           names (mapv int (kbytes/utf8-bytes "\u0000.text\u0000.data\u0000.shstrtab\u0000"))
-          names-offset (+ data-offset kernel-runtime-data-size)
+          names-offset (+ data-offset runtime-data-size)
           section-offset (+ names-offset (count names)
                             (mod (- 8 (mod (+ names-offset (count names)) 8)) 8))
           sections [(vec (repeat 64 0))
                     (section-header 1 1 0x6 entry-address text-offset (count text) 16)
-                    (section-header 7 1 0x3 context-address data-offset kernel-runtime-data-size 4096)
+                    (section-header 7 1 0x3 context-address data-offset runtime-data-size 4096)
                     (section-header 13 3 0 0 names-offset (count names) 1)]
           header (elf-header entry-address 2 section-offset (count sections))
           phdrs (concat (program-header 0x5 text-offset entry-address (count text) (count text))
                         (program-header 0x6 data-offset context-address
-                                        kernel-runtime-data-size kernel-runtime-data-size))
+                                        runtime-data-size runtime-data-size))
           before-text (padded (concat header phdrs) text-offset)
           before-data (padded (concat before-text text) data-offset)
           before-sections (padded (concat before-data context names) section-offset)
@@ -1179,6 +1182,9 @@
        ;; so a caller can check both landed in the RW segment rather than
        ;; recomputing the layout.
        :context-address context-address
+       :rt-state-address (when (pos? extra-data-size)
+                           (+ context-address kernel-runtime-data-size))
+       :rt-state-size extra-data-size
        :context-slot-block [(+ context-address interrupt-abi/context-slot-block-offset)
                             (+ context-address interrupt-abi/context-slot-block-offset
                                interrupt-abi/context-slot-block-size)]
@@ -1202,13 +1208,14 @@
   "Package a sealed AIUEOS kernel as freestanding ELF64 ET_EXEC with the
   smallest safe page-aligned RW context address."
   [artifact]
-  (package-kernel-with-minimum-data-offset artifact minimum-kernel-data-offset))
+  (package-kernel-with-minimum-data-offset artifact minimum-kernel-data-offset 0))
 
 (defn package-kernel-rt
   "Package an AIUEOS RT image with its fixed state page at 0x110000.
   Larger text still moves the RW segment forward when necessary."
   [artifact]
-  (package-kernel-with-minimum-data-offset artifact x86-kernel-data-offset))
+  (package-kernel-with-minimum-data-offset artifact x86-kernel-data-offset
+                                           kernel-rt-state-size))
 
 (def ^:private aarch64-kernel-target :aarch64-aiueos-kernel-v1)
 
