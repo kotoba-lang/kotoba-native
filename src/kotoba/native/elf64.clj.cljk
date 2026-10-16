@@ -1,5 +1,5 @@
 (ns kotoba.native.elf64
-  {:kotoba/export [max-object-fuel package-kernel package-kernel-aarch64 package-kernel-object package-user pinned-image-addresses]}
+  {:kotoba/export [max-object-fuel package-kernel package-kernel-rt package-kernel-aarch64 package-kernel-object package-user pinned-image-addresses]}
   (:require [kotoba.bytes :as kbytes] [kotoba.lang.text :as str]
             [kotoba.artifact.core :as artifact]
             [kotoba.native.interrupt-abi :as interrupt-abi]
@@ -10,6 +10,7 @@
 (def ^:private page-size 0x1000)
 (def ^:private image-base 0x100000)
 (def ^:private text-offset page-size)
+(def ^:private x86-kernel-data-offset (* 16 page-size))
 (def ^:private data-offset (* 2 page-size))
 (def ^:private minimum-kernel-data-offset (* 8 page-size))
 (def ^:private context-size 80)
@@ -1094,10 +1095,8 @@
                       {:fuel fuel :fuel-abi-initial abi-fuel})))
     fuel))
 
-(defn package-kernel
-  "Package a sealed aiueos kernel artifact as a freestanding ELF64 ET_EXEC.
-  The returned byte vector has no interpreter, dynamic section, or host imports."
-  [artifact]
+(defn- package-kernel-with-minimum-data-offset
+  [artifact minimum-data-offset]
   (when-not (artifact/valid-seal? artifact)
     (throw (ex-info "ELF64 kernel packaging requires a sealed artifact" {})))
   (when-not (= kernel-target (:target artifact))
@@ -1134,7 +1133,8 @@
                             (* interrupt-abi/vector-limit interrupt-abi/entry-stride)
                             0)
           isr-base (when (seq isr-exports) (+ entry-address isr-offset))
-          data-offset (kernel-data-offset-for (+ isr-offset isr-region-size))
+          data-offset (max minimum-data-offset
+                           (kernel-data-offset-for (+ isr-offset isr-region-size)))
           context-address (+ image-base data-offset)
           syscall-address (when live? (+ entry-address boot-size))
           boot (entry-shim (+ artifact-address (:offset export))
@@ -1197,6 +1197,18 @@
        :imports []
        :interpreter nil
        :bytes bytes})))
+
+(defn package-kernel
+  "Package a sealed AIUEOS kernel as freestanding ELF64 ET_EXEC with the
+  smallest safe page-aligned RW context address."
+  [artifact]
+  (package-kernel-with-minimum-data-offset artifact minimum-kernel-data-offset))
+
+(defn package-kernel-rt
+  "Package an AIUEOS RT image with its fixed state page at 0x110000.
+  Larger text still moves the RW segment forward when necessary."
+  [artifact]
+  (package-kernel-with-minimum-data-offset artifact x86-kernel-data-offset))
 
 (def ^:private aarch64-kernel-target :aarch64-aiueos-kernel-v1)
 
