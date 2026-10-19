@@ -6814,6 +6814,16 @@
   [instruction-index runtime]
   (let [trap (memory-label instruction-index "handle-trap")
         done (memory-label instruction-index "handle-done")
+        vector-op? (contains? #{:vector-at :vector-assoc-in-place} runtime)
+        ;; The trap instruction carries the value-trap code (issue #785,
+        ;; option (c)): `udf #<code>` -- the immediate is the code, `udf #0`
+        ;; keeps the unnamed meaning, and the loader's SIGILL handler decodes
+        ;; it to name the refusal. Vector ops trap 12 (vector/index-out-of-
+        ;; range): one trap label per emission, so the handle-range check
+        ;; lands on the same name for now (splitting it needs a second label,
+        ;; which the layout walker rejected when tried unflattened). Pair ops
+        ;; keep 0: no value-trap name has been minted for them yet.
+        trap-code (if vector-op? 12 0)
         {:keys [pair-used-pointer pairs-base vector-used-pointer vectors-base
                 vector-items-base]} inline-context-offsets
         body (case runtime
@@ -6848,7 +6858,9 @@
     (vec (concat body
                  [(layout/relative-branch :aarch64/b-imm26 done)
                   (layout/label trap)]
-                 (u32le 0x00000000)                            ; udf #0 -> SIGILL
+                 ;; udf #<code>: the immediate IS the value-trap code (issue
+                 ;; #785). udf #0 stays the unnamed refusal.
+                 (u32le trap-code)
                  [(layout/label done)]))))
 
 (defn- x86-mov-r10-context
