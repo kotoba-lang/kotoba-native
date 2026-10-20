@@ -26,7 +26,12 @@
   page at `image-base + text-offset`. Same set as the JVM twin's."
   #{image-base (+ image-base text-offset)})
 
-(def ^:private data-offset (* 2 page-size))
+(def ^:private data-offset
+  ;; JUN-145, measured 2026-10-20: the user text room was one page and
+  ;; kaikei_journal exceeded it ("ELF region exceeds its allocation").
+  ;; 16 pages of text room; the aiueos loader pins the same value
+  ;; (ELF_DATA_OFFSET in kernel/loader.c) and moves with it.
+  (* 16 page-size))
 (def ^:private kernel-data-offset (* 8 page-size))
 (def ^:private x86-kernel-data-offset (* 16 page-size))
 (def ^:private context-size 80)
