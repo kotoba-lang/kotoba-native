@@ -106,6 +106,13 @@ Implement the native hash provider and its owning profile/admission binding;
 retaining the real seal check is required. Source presence in the root lock
 does not establish provider availability.
 
+The companion [SHA-256 computation source](linux-static-sha256-port.md) now
+emits a private register-IR routine for the missing computation. Capability
+admission, request-handle resolution, private workspace ownership, result
+interning and the actual native dispatch/profile binding are still required.
+It has not been generated, assembled or executed, so wire 3 remains unavailable
+in the current profile. Do not enable a handler merely because this source exists.
+
 The remaining full packager work is IR/prelude/runtime construction,
 message/context binding, handler and guest text placement, ELF framing,
 native verification and exact source/lock pins. The compiler's required
