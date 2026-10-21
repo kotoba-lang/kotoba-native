@@ -45,6 +45,9 @@ handle boundary and hash-to-pool binding as a [source candidate](docs/linux-stat
 Its companion `linux_static_io.kotoba` supplies the seven I/O, argument,
 environment, clock and entropy handlers plus common capability startup;
 see [the handler source contract](docs/linux-static-io-port.md).
+`linux_static_paths.kotoba` supplies scope startup, path normalization,
+dual root-spelling admission and rooted openat2/parent fragments;
+see [the path source contract](docs/linux-static-paths-port.md).
 Native admission, byte parity, full packager integration and selfhost
 qualification remain open; see [the assembler record](docs/linux-static-assembler-port.md).
 

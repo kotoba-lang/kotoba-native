@@ -6,6 +6,7 @@
   (:require [kotoba.native.linux-static-assembler :as asm]
             [kotoba.native.linux-static-strings :as strings]
             [kotoba.native.linux-static-io :as io]
+            [kotoba.native.linux-static-paths :as paths]
             [kotoba.native.linux-static-sha256 :as sha256])
   (:schemas
    {:linux.static.capability/config
@@ -203,7 +204,8 @@
             request (strings/read-string-fragment context "cap-request")
             answer (strings/read-string-fragment context "cap-result")
             intern (strings/intern-string-fragment context "cap-intern")
-            providers (io/routines isa source-plan layout)]
+            providers (io/routines isa source-plan layout)
+            scope (paths/startup isa source-plan layout)]
         (cond
           (not= (record-get [:ref :linux.static.strings/result] request :error) :ok)
           (failure (record-get [:ref :linux.static.strings/result] request :error))
@@ -213,6 +215,8 @@
           (failure (record-get [:ref :linux.static.strings/result] intern :error))
           (not= (record-get [:ref :linux.static.io/result] providers :error) :ok)
           (failure (record-get [:ref :linux.static.io/result] providers :error))
+          (not= (record-get [:ref :linux.static.paths/result] scope :error) :ok)
+          (failure (record-get [:ref :linux.static.paths/result] scope :error))
           :else
           (let [hash? (granted-hash? (lookup source-plan :grant))
                 cfg (record-new [:ref :linux.static.capability/config]
@@ -224,9 +228,12 @@
                 provider (if hash? (hash-body gate cfg (record-get [:ref :linux.static.strings/result] intern :code)) gate)
                 completed (finish provider (record-get [:ref :linux.static.strings/result] answer :code))
                 kernel (if hash? (join completed (sha256/routine)) completed)
-                code (join kernel (record-get [:ref :linux.static.io/result] providers :code))]
+                code (join (join kernel (record-get [:ref :linux.static.io/result] providers :code))
+                       (record-get [:ref :linux.static.paths/result] scope :code))
+                start (join (record-get [:ref :linux.static.io/result] providers :start)
+                        (record-get [:ref :linux.static.paths/result] scope :start))]
             (record-new [:ref :linux.static.capability/result] code
-              (record-get [:ref :linux.static.io/result] providers :start)
+              start
               (document-map (document-keyword :typed-cap-call) (document-keyword :ls.cap/typed-cap-call)
                             (document-keyword :finish) (document-keyword :ls.cap/finish))
               (externals) :ok)))))))

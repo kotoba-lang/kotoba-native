@@ -1,7 +1,8 @@
 ;; Complete seven non-filesystem/non-spawn C3 handlers, both Linux ISAs.
 ;; Canonical source candidate; never grants authority or runs a hosted helper.
 (ns kotoba.native.linux-static-io
-  {:kotoba/export [routines]}
+  {:kotoba/export [routines state-offset literal register state-field label-address
+                   operand-fragment decision-fragment syscall-fragment]}
   (:require [kotoba.native.linux-static-assembler :as asm]
             [kotoba.native.linux-static-strings :as strings])
   (:schemas
@@ -62,10 +63,21 @@
 
 (defn- offset [key :keyword] :i64
   (case key
-    :pair-used 512 :pool-used 520 :cells 536 :bytes 544 :pool-base 576 :argc 584 :argv 592
-    :envp 1024 :last-mono 1048 :carry-n 1056 :carry 1064 :dctx 1072 :dctx-fuel 1080
-    :ts 1088 :ts-nsec 1096 :rp 1160 :rl 1168 :res 1184 :fd 1200
-    :want 1216 :start 1224 :room 1232 :whole 1240 :limit 1248 :x0 1280 :x6 1328 -1))
+    :pair-used 512 :pool-used 520 :zero 528 :cells 536 :bytes 544 :metered 552
+    :code-base 560 :code-length 568 :pool-base 576 :argc 584 :argv 592 :sigaction 600
+    :stack-t 632 :itoa 656 :envp 1024 :cwd-len 1032 :root-fd 1040 :last-mono 1048
+    :carry-n 1056 :carry 1064 :dctx 1072 :dctx-fuel 1080 :ts 1088 :ts-nsec 1096
+    :how 1104 :how-mode 1112 :how-resolve 1120 :id 1128 :rk 1136 :xk 1144
+    :req 1152 :rp 1160 :rl 1168 :h 1176 :res 1184 :form 1192
+    :fd 1200 :pfd 1208 :want 1216 :start 1224 :room 1232 :whole 1240
+    :limit 1248 :cnt 1256 :tot 1264 :n1 1272 :x0 1280 :x1 1288
+    :x2 1296 :x3 1304 :x4 1312 :x5 1320 :x6 1328 :len-a 1336
+    :rel-a 1344 :len-c 1352 :rel-c 1360 :r-off 1368 :r-len 1376 :r-ok 1384
+    :m-k 1392 :m-plen 1400 :m-pre 1408 :m-dfd 1416 :m-n 1424 :sp-count 1432
+    :sp-plen 1440 :sp-nul 1448 :sp-slash 1456 :sp-prog 1464 :sp-envn 1472 :sp-pid 1480
+    :sp-start 1488 :sp-total 1496 :sp-limit 1504 :sp-exit 1512 :sp-in-r 1520 :sp-in-w 1528
+    :sp-out-r 1536 :sp-out-w 1544 :sp-st-r 1552 :sp-st-w 1560 :sp-dlen 1568 :sp-word 1576
+    :root-real-len 1584 :ru-a 1592 :ru-c 1600 -1))
 
 (defn- load [out [:list [:ref :linux.static/instruction]] d :keyword key :keyword]
   [:list [:ref :linux.static/instruction]] (mem out :ld d :s0 (offset key)))
@@ -84,6 +96,7 @@
     :literal (li out dst (record-get [:ref :linux.static.io/operand] arg :value))
     :register (mov out dst (record-get [:ref :linux.static.io/operand] arg :reg))
     :field (mem out :ld dst :s0 (record-get [:ref :linux.static.io/operand] arg :value))
+    :label (la out dst (record-get [:ref :linux.static.io/operand] arg :reg))
     (append out :invalid-operand :none :none :none :none :none 0 :none)))
 
 (defn- hcall [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.io/config] op :i64
@@ -96,8 +109,20 @@
         (append :call :none :none :none :none :none 0 :ls.cap/h-decide) (mov :t0 :ret))))
 
 (defn- syscall-number [isa :keyword call :keyword] :i64
-  (if (= isa :x86_64) (case call :read 0 :write 1 :clock-gettime 228 :getrandom 318 -1)
-    (case call :read 63 :write 64 :clock-gettime 113 :getrandom 278 -1)))
+  (case isa
+    :x86_64 (case call
+      :write 1 :rt-sigaction 13 :sigaltstack 131 :exit-group 231
+      :read 0 :close 3 :fstat 5 :getdents64 217 :getcwd 79 :openat 257
+      :openat2 437 :mkdirat 258 :unlinkat 263 :renameat2 316 :clock-gettime 228
+      :pread64 17 :fchmod 91 :fsync 74 :getrandom 318 :pipe2 293 :clone 56 :dup3 292
+      :close-range 436 :prctl 157 :fchdir 81 :execve 59 :wait4 61 :kill 62 :ppoll 271 :geteuid 107 -1)
+    :aarch64 (case call
+      :write 64 :rt-sigaction 134 :sigaltstack 132 :exit-group 94
+      :read 63 :close 57 :fstat 80 :getdents64 61 :getcwd 17 :openat 56
+      :openat2 437 :mkdirat 34 :unlinkat 35 :renameat2 276 :clock-gettime 113
+      :pread64 67 :fchmod 52 :fsync 82 :getrandom 278 :pipe2 59 :clone 220 :dup3 24
+      :close-range 436 :prctl 167 :fchdir 50 :execve 221 :wait4 260 :kill 129 :ppoll 73 :geteuid 175 -1)
+    -1))
 
 (defn- sys [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.io/config] call :keyword
             a [:ref :linux.static.io/operand] b [:ref :linux.static.io/operand] c [:ref :linux.static.io/operand]]
@@ -385,6 +410,41 @@
                 (document-i64 5) (document-keyword :ls.cap/env-read)
                 (document-i64 6) (document-keyword :ls.cap/clock)
                 (document-i64 9) (document-keyword :ls.cap/entropy)))
+
+(defn state-offset [key :keyword] :i64 (offset key))
+(defn literal [n :i64] [:ref :linux.static.io/operand] (lit n))
+(defn register [r :keyword] [:ref :linux.static.io/operand] (reg r))
+(defn state-field [key :keyword] [:ref :linux.static.io/operand]
+  (let [n (offset key)]
+    (record-new [:ref :linux.static.io/operand] (if (< n 0) :invalid :field) :none n)))
+(defn label-address [label :keyword] [:ref :linux.static.io/operand]
+  (record-new [:ref :linux.static.io/operand] :label label 0))
+(defn operand-fragment [out [:list [:ref :linux.static/instruction]] dst :keyword arg [:ref :linux.static.io/operand]]
+  [:list [:ref :linux.static/instruction]] (operand out dst arg))
+
+;; Low-level source builders for the other canonical handler modules.
+;; Their caller owns admitted memory, sealed decision targets, argument moves
+;; and matching ISA. Unknown decisions/syscalls produce unassemblable IR.
+(defn decision-fragment [out [:list [:ref :linux.static/instruction]] data :i64 target :keyword
+                         a [:ref :linux.static.io/operand] b [:ref :linux.static.io/operand]
+                         c [:ref :linux.static.io/operand] d [:ref :linux.static.io/operand]
+                         e [:ref :linux.static.io/operand]]
+  [:list [:ref :linux.static/instruction]]
+  (if (not (or (= target :ls.cap/c1-cap) (= target :ls.cap/c1-decide) (= target :ls.cap/h-decide)))
+    (append out :unknown-decision :none :none :none :none :none 0 :none)
+    (let [args (operand (operand (operand (operand (operand out :ctx a) :a1 b) :a2 c) :a3 d) :a4 e)]
+      (-> args (li :t1 9007199254740991) (store :t1 :dctx-fuel) (li :gctx (+ data (offset :dctx)))
+          (append :call :none :none :none :none :none 0 target) (mov :t0 :ret)))))
+
+(defn syscall-fragment [out [:list [:ref :linux.static/instruction]] isa :keyword call :keyword
+                        a [:ref :linux.static.io/operand] b [:ref :linux.static.io/operand]
+                        c [:ref :linux.static.io/operand] d [:ref :linux.static.io/operand]
+                        e [:ref :linux.static.io/operand]]
+  [:list [:ref :linux.static/instruction]]
+  (let [nr (syscall-number isa call)]
+    (if (< nr 0) (append out :unknown-syscall :none :none :none :none :none 0 :none)
+      (let [args (operand (operand (operand (operand (operand out :p0 a) :p1 b) :p2 c) :p3 d) :p4 e)]
+        (-> args (li :nr nr) (append :syscall :none :none :none :none :none 0 :none) (mov :t0 :ret))))))
 
 (defn routines [isa :keyword source-plan :document layout :document] [:ref :linux.static.io/result]
   (let [error (configuration-error isa source-plan layout)]

@@ -14,8 +14,8 @@ syscalls on x86_64 and AArch64 and real calls to the owning decision artifact.
 This is a source candidate. No generator, assembler, compiler build, native
 admission, generated machine code or runtime operation was executed. No test
 was added or run. Source SHA-256:
-`477b5e082e8c7fdfa6919b3b1d3fb8a6d5f74f74e7146cda18e92f5a50f8eff9`.
-Static inventory: 414 lines / 53 functions, balanced delimiters, own/import
+`0d74803fca75afa16d95ed89937690d49f05829f1c387edb16e9ae4651b746b2`.
+Static inventory: 474 lines / 61 functions, balanced delimiters, own/import
 arities after structural thread expansion, known call heads and no local
 data-as-function calls. Source dataflow, state words, dispatch, Linux syscall
 number tables and private label templates were reviewed against the reference;
@@ -70,6 +70,16 @@ op 6, stdin sizing/probe/carry ops 7/8/9, clock ops 10/11, and entropy ops
 The seven provided bodies remain behind the real C1 gate and sealed profile;
 source presence does not widen grants or make absent handlers available.
 
+Shared source emitters now expose typed literal/register/state-field/label
+operands, operand loading, the complete 87-word reference state-offset table,
+decision calls and five-argument syscalls for the remaining canonical handlers.
+Both ISA tables contain the reference's complete 30 syscall numbers. Unknown
+state fields, decisions or syscalls produce explicit -1/invalid operands or
+unassemblable IR, never a fabricated successful operation. Argument-register
+move ordering and admitted memory/ISA/decision bindings remain the trusted
+generator caller's responsibility; only the three owning decision labels are
+accepted. These are code-building APIs, not guest capabilities or callbacks.
+
 All ordinary answers ask op 6 before a single private intern routine copies
 into the bounded pool, charges actual bytes and allocates a checked pair. That
 routine's inline fragment is emitted once, with LR saved/restored; callers use
@@ -101,8 +111,10 @@ Run `start` once after recording kernel argc/argv and before any guest call.
 It derives envp with overflow checks, initializes private context version 11
 and the -1 monotonic sentinel. BSS zero-fill owns initial carry/pool state.
 The existing context ABI remains an implemented native format, not a requirement
-to pin a C loader. Filesystem cwd/root capture and scope setup are still absent
-here and must accompany the remaining filesystem/spawn bodies.
+to pin a C loader. The companion [path component](linux-static-paths-port.md)
+now supplies cwd/root capture and scope setup; the C3 result composes its startup
+after this module's common initialization. Filesystem/spawn bodies still need
+their complete canonical port and placement.
 
 Full prelude/signal/trap/context construction, the remaining three handlers,
 sealed decision text/export placement, hash routing/profile integration, ELF
