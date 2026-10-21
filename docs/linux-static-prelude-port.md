@@ -109,14 +109,14 @@ message lengths, stricter exit-code/offset/collision refusals and real binding
 checks are mechanism changes. Exact historical malformed-input/diagnostic
 precedence and emitted-byte parity are not claimed from source review.
 
-The top-level packager still needs sealed decision text placement, both-pass
-prelude/guest assembly, final ELF framing, native verification/Definition CIDs,
-owning hash routing/profile, reviewed pins and whole compiler self-rebuild.
-The owning `kotoba-object/src/kotoba/object/elf64.cljk` was read back at blob
-`b451737ac85629e9a5d64a149b0aa4e8cc8d57c0`; its corresponding canonical
-`src/kotoba/object/elf64.kotoba` path returned 404 on owning main. That module
-is migration inventory: its complete public encoder boundary needs a canonical owning
-Kotoba port before native ELF framing is connected. A native-local encoder
-copy is not a substitute for that dependency. General vector/byte/runtime
-helper closure remains separately required. The hosted packager is unconnected
-to these source candidates; no native CDCI success is claimed.
+The [complete image source candidate](linux-static-image-port.md) now supplies
+sealed decision placement, both-pass prelude/guest composition, actual context
+binding and final ELF framing. It imports the complete owning ELF64 candidate
+from kotoba-object #8, head `c8b97ec9e3dbc6a8cba1e6ac4a66dadc36a9a0f7`,
+source blob `59a2d23705a5850326eb6fc2be6dae9fc7f38f83`. That lower draft
+is not on owning main or native's current dependency pin yet; exact reviewed
+source/lock integration remains open. A native-local encoder copy is not a
+substitute. Native verification/Definition CIDs, actual hash routing/profile,
+general vector/byte/runtime helper closure and whole compiler self-rebuild
+remain required. The hosted packager is unconnected to these source candidates;
+no native CDCI success is claimed.

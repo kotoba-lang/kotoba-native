@@ -61,7 +61,10 @@ see [the process source contract](docs/linux-static-spawn-port.md).
 return printing and admitted slots; `linux_static_context.kotoba` builds the
 initialized context page from actual assembled bindings. See the
 [prelude and context source contract](docs/linux-static-prelude-port.md).
-Native admission, byte parity, full packager integration and selfhost
+`linux_static.kotoba` connects the complete sealed decision placement,
+two-pass prelude/guest composition, initialized context and owning ELF64
+framing; see [the complete image source contract](docs/linux-static-image-port.md).
+Native admission, byte parity, reviewed owning pins and selfhost
 qualification remain open; see [the assembler record](docs/linux-static-assembler-port.md).
 
 The production direction is one-way:

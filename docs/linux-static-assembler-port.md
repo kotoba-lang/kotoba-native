@@ -90,11 +90,11 @@ added or run, and no compiler build or generated artifact was executed.
 1. Admit and build this whole component with Amu selfhost, account for its
    Definition CIDs and qualify all positive/refusal behavior and exact emitted
    bytes on both ISAs. No legacy host or C loader is an accepted fallback.
-2. Integrate the companion canonical planning/layout source candidate
-   ([contract](linux-static-plan-port.md)) and port the owning packager's IR
-   construction, runtime helpers, context binding, syscall/handler mechanism
-   and ELF framing. Its current dynamic vector IR does not call these typed
-   modules yet.
+2. Qualify the [complete image source composition](linux-static-image-port.md)
+   connecting canonical planning, prelude/handler IR, both assembly passes,
+   sealed decision placement, context binding and owning ELF framing. Those
+   source components are present; the hosted entry still does not call them.
+   The owning ELF source candidate and exact reviewed pins remain dependencies.
 3. Complete the compiler's required vector/string/byte and I/O runtime helper
    closure. The old static packager's implemented-slot list is smaller than
    the seed runtime profile; an assembler port cannot fill that gap.

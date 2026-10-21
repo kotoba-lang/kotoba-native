@@ -123,8 +123,10 @@ handler merely because this source exists.
 
 The [prelude/context candidate](linux-static-prelude-port.md) now supplies
 complete startup/signal/trap/slot composition and initialized data binding.
-Remaining full packager work is its integration, handler/guest text placement, ELF framing,
-native verification and exact source/lock pins. The compiler's required
+The [complete image source candidate](linux-static-image-port.md) now supplies
+handler/guest text placement, both assembly passes, context and owning ELF
+framing. Native admission/behavior/verification and exact reviewed source/lock
+pins remain open. The compiler's required
 vector/string/byte/I/O helper coverage and self-rebuild generations remain
 open under JUN-200 / JUN-202. This module grants no production cutover or
 service-stop authority.
