@@ -64,6 +64,8 @@ initialized context page from actual assembled bindings. See the
 `linux_static.kotoba` connects the complete sealed decision placement,
 two-pass prelude/guest composition, initialized context and owning ELF64
 framing; see [the complete image source contract](docs/linux-static-image-port.md).
+The owning [artifact pin review](docs/linux-static-artifact-pin.md) selects
+artifact main's canonical core and records the remaining root pin/lock work.
 Native admission, byte parity, reviewed owning pins and selfhost
 qualification remain open; see [the assembler record](docs/linux-static-assembler-port.md).
 

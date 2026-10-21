@@ -93,15 +93,20 @@ The source graph review reads that candidate; native's current owning pins
 have not been advanced to it. Owning-main landing and exact reviewed source/
 lock integration are real open dependencies. PE/Mach-O target consumer work
 is not a Linux-static selfhost blocker.
+The [artifact pin review](linux-static-artifact-pin.md) selects owning artifact
+main's canonical core, the same core blob in Amu's existing root revision.
+Root pin/lock normalization, digest semantics and the real hash provider remain
+unqualified.
 
 ## Source evidence and actual remaining work
 
 Static own-source/record review found balanced delimiters, known heads,
 matching call arities and eight own constructors / 26 own accesses. A graph
-reader inspected all 13 canonical Linux-static modules plus owning ELF64:
-32 schemas, 529 imported calls, 414 record uses and 550 explicit type argument
-positions after thread expansion, with no source-contract findings. It leaves
-the external owning `artifact/valid-seal?` call explicitly unqualified.
+reader inspected all 13 canonical Linux-static modules plus owning ELF64
+and pinned canonical artifact core: 32 schemas, 531 imported calls, 414 record
+uses and 556 explicit type argument positions after thread expansion, with
+no source-contract findings. It reads the owning `artifact/valid-seal?` API;
+the hash capability, digest semantics and runtime remain unqualified.
 The export/metadata/frame ledger reads all six original names, 23 metadata
 keys, three program-header calls and four section-header calls. These are
 source observations, not native type or output-byte proof.
