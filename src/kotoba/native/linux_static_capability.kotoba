@@ -1,6 +1,6 @@
-;; Canonical C3 call-gate mechanism and native SHA-256 provider binding.
+;; Canonical C3 call gate, native SHA-256 and physical startup cwd binding.
 ;; Sealed decision text and common trap paths remain required externals.
-;; Source candidate only: does not enable the owning wire-3 profile.
+;; Source candidate only: does not enable the owning wire-3/wire-40 profile.
 (ns kotoba.native.linux-static-capability
   {:kotoba/export [routine]}
   (:require [kotoba.native.linux-static-assembler :as asm]
@@ -14,7 +14,7 @@
   (:schemas
    {:linux.static.capability/config
     [:record :linux.static.capability/config
-     [[:data :i64] [:allow :i64] [:workspace :i64]]]
+     [[:data :i64] [:allow :i64] [:workspace :i64] [:cwd :i64]]]
     :linux.static.capability/result
     [:record :linux.static.capability/result
      [[:code [:list [:ref :linux.static/instruction]]]
@@ -102,9 +102,9 @@
                      (li :ctx 0) (mov :a1 :t0) (mem :ld :a2 :s0 1128) (li :a3 0) (li :a4 0))]
     (-> (decision-call provider data :ls.cap/h-decide) (mem :st :t0 :s0 1176)
         (imm :cmp :t0 0) (branch :eq :ls.cap/no-handler)
-        ;; These eleven handler mechanisms use the string representation.
+        ;; These twelve handler mechanisms use the string representation.
         ;; Equal non-string kinds do not authorize interpreting an integer
-        ;; payload as a string, including provider-0 entropy/spawn fallback.
+        ;; payload as a string, including provider-0 entropy/spawn/cwd routes.
         (mem :ld :t0 :s0 1136) (imm :cmp :t0 1) (branch :ne :ls/bad)
         (mov :ctx :s0) (mem :ld :s1 :s0 1152))))
 
@@ -113,14 +113,16 @@
     1 :ls.cap/io-write 2 :ls.cap/io-write-error 3 :ls.cap/io-read
     4 :ls.cap/cli-args 5 :ls.cap/env-read 6 :ls.cap/clock
     7 :ls.cap/fs-app-data 8 :ls.cap/fs-browse 9 :ls.cap/entropy
-    10 :ls.cap/spawn 11 :ls.cap/hash :ls/bad))
+    10 :ls.cap/spawn 11 :ls.cap/hash 12 :ls.cap/cwd :ls/bad))
 
 (defn- dispatch [out [:list [:ref :linux.static/instruction]] hash? :bool]
   [:list [:ref :linux.static/instruction]]
   (loop [id 1 code out]
-    (if (> id (if hash? 11 10)) (branch code :always :ls/bad)
-      (recur (+ id 1) (-> code (mem :ld :t0 :s0 1176) (imm :cmp :t0 id)
-                         (branch :eq (dispatch-label id)))))))
+    (if (> id 12) (branch code :always :ls/bad)
+      (recur (+ id 1)
+        (if (and (= id 11) (not hash?)) code
+          (-> code (mem :ld :t0 :s0 1176) (imm :cmp :t0 id)
+              (branch :eq (dispatch-label id))))))))
 
 (defn- hash-body [out [:list [:ref :linux.static/instruction]]
                   cfg [:ref :linux.static.capability/config]
@@ -138,6 +140,26 @@
                 (mem :ld :a3 :s0 544) (li :a4 0))
         charge (-> (decision-call raw data :ls.cap/h-decide)
                    (imm :cmp :t0 1) (branch :ne :ls/trap-bytes))]
+    (-> (join charge intern) (mem :st :t0 :s0 1184) (branch :always :ls.cap/finish))))
+
+(defn- cwd-body [out [:list [:ref :linux.static/instruction]]
+                 cfg [:ref :linux.static.capability/config]
+                 intern [:list [:ref :linux.static/instruction]]]
+  [:list [:ref :linux.static/instruction]]
+  ;; paths/startup has already captured getcwd, before its temporary fchdir
+  ;; for scope-root discovery. The private buffer and cwd-len are immutable
+  ;; after startup; a failed/nonabsolute capture leaves length zero.
+  (let [data (record-get [:ref :linux.static.capability/config] cfg :data)
+        captured (-> out (mark :ls.cap/cwd)
+                     (mem :ld :t0 :s0 1168) (imm :cmp :t0 0) (branch :ne :ls/bad)
+                     (mem :ld :s2 :s0 1032) (imm :cmp :s2 0) (branch :le :ls/bad)
+                     (imm :cmp :s2 4096) (branch :hs :ls/bad)
+                     (li :s1 (record-get [:ref :linux.static.capability/config] cfg :cwd))
+                     (li :ctx 6) (mem :ld :a1 :s0 520) (mov :a2 :s2)
+                     (mem :ld :a3 :s0 544) (li :a4 0))
+        charge (-> (decision-call captured data :ls.cap/h-decide)
+                   (imm :cmp :t0 1) (branch :ne :ls/trap-bytes))]
+    ;; Common finish resolves and validates the returned UTF-8 string.
     (-> (join charge intern) (mem :st :t0 :s0 1184) (branch :always :ls.cap/finish))))
 
 (defn- finish [out [:list [:ref :linux.static/instruction]]
@@ -205,6 +227,7 @@
             request (strings/read-string-fragment context "cap-request")
             answer (strings/read-string-fragment context "cap-result")
             intern (strings/intern-string-fragment context "cap-intern")
+            cwd-intern (strings/intern-string-fragment context "cap-cwd-intern")
             providers (io/routines isa source-plan layout)
             scope (paths/startup isa source-plan layout)
             directory (browse/routine isa source-plan layout)
@@ -217,6 +240,8 @@
           (failure (record-get [:ref :linux.static.strings/result] answer :error))
           (not= (record-get [:ref :linux.static.strings/result] intern :error) :ok)
           (failure (record-get [:ref :linux.static.strings/result] intern :error))
+          (not= (record-get [:ref :linux.static.strings/result] cwd-intern :error) :ok)
+          (failure (record-get [:ref :linux.static.strings/result] cwd-intern :error))
           (not= (record-get [:ref :linux.static.io/result] providers :error) :ok)
           (failure (record-get [:ref :linux.static.io/result] providers :error))
           (not= (record-get [:ref :linux.static.paths/result] scope :error) :ok)
@@ -231,12 +256,15 @@
           (let [hash? (granted-hash? (lookup source-plan :grant))
                 cfg (record-new [:ref :linux.static.capability/config]
                       (i64-of (lookup layout :data)) (i64-of (lookup context :allow-bitmap-offset))
-                      (if hash? (i64-of (lookup layout :hash-workspace)) 0))
+                      (if hash? (i64-of (lookup layout :hash-workspace)) 0)
+                      (i64-of (lookup layout :cwd)))
                 requested (-> (join (begin cfg) (record-get [:ref :linux.static.strings/result] request :code))
                               (mem :st :s2 :s0 1160) (mem :st :s3 :s0 1168))
                 gate (dispatch requested hash?)
                 provider (if hash? (hash-body gate cfg (record-get [:ref :linux.static.strings/result] intern :code)) gate)
-                completed (finish provider (record-get [:ref :linux.static.strings/result] answer :code))
+                with-cwd (cwd-body provider cfg
+                           (record-get [:ref :linux.static.strings/result] cwd-intern :code))
+                completed (finish with-cwd (record-get [:ref :linux.static.strings/result] answer :code))
                 kernel (if hash? (join completed (sha256/routine)) completed)
                 handlers (join (join kernel (record-get [:ref :linux.static.io/result] providers :code))
                            (record-get [:ref :linux.static.browse/result] directory :code))
