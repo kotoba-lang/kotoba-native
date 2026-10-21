@@ -32,9 +32,11 @@ checkable from outside.
 
 The canonical Kotoba port of the complete Linux-static register-IR assembler
 is a source candidate at `src/kotoba/native/linux_static_assembler.kotoba`.
-It includes both ISAs and all 29 existing operations. Native admission,
-byte parity, packager integration and selfhost qualification remain open;
-see [the port and integration record](docs/linux-static-assembler-port.md).
+It includes both ISAs and all 29 existing operations. The companion
+`linux_static_plan.kotoba` ports the complete planning and region-layout
+boundary; see [its contract and dependencies](docs/linux-static-plan-port.md).
+Native admission, byte parity, full packager integration and selfhost
+qualification remain open; see [the assembler record](docs/linux-static-assembler-port.md).
 
 The production direction is one-way:
 
