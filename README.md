@@ -42,6 +42,9 @@ including handle windows, UTF-8 and allocation semantics;
 see [the runtime source contract](docs/linux-static-strings-port.md).
 `linux_static_capability.kotoba` adds the C1/C3 call gate, request/result
 handle boundary and hash-to-pool binding as a [source candidate](docs/linux-static-capability-port.md).
+Its companion `linux_static_io.kotoba` supplies the seven I/O, argument,
+environment, clock and entropy handlers plus common capability startup;
+see [the handler source contract](docs/linux-static-io-port.md).
 Native admission, byte parity, full packager integration and selfhost
 qualification remain open; see [the assembler record](docs/linux-static-assembler-port.md).
 

@@ -18,8 +18,8 @@ or run. Definition CIDs, exact bytes, runtime/refusal behavior and whole-compone
 native qualification are open. The hosted packager does not call this module yet.
 
 Source SHA-256:
-`c7c4eb52459e8d7be8d51ea811bac707f0d67bdbc67e8a62d9d4d4b6d0f1a53c`.
-Static inventory: 375 lines, 43 functions, balanced delimiters, own-call
+`7414292f236f0d09b2fb906ebe20ed4318d559005997eb64573cace1c84b3f0a`.
+Static inventory: 384 lines, 44 functions, balanced delimiters, own-call
 arities after structural thread expansion, no unresolved source call heads
 and no local data values used as function heads. Machine register/dataflow,
 source slot coverage and budget/window formulas were reviewed, not executed.
@@ -34,6 +34,7 @@ source slot coverage and budget/window formulas were reviewed, not executed.
 | `routines [context]` | Emit all seven once, with their entry bindings |
 | `read-string-fragment [context prefix]` | Inline C3 handle/window/UTF-8 admission: s0=context and s1=handle become s2=pointer/s3=length |
 | `intern-string-fragment [context prefix]` | Inline C3 copy/pool/cell mechanism: s0=context, s1=trusted bytes, s2=length become t0=handle |
+| `pool-pair-fragment [context]` | Allocate an unvalidated pair for an already admitted/advanced pool span, s4=~offset and s2=length; t0 becomes its handle |
 
 The result record is `:linux.static.strings/result`, with `code`, `bindings`
 and `error`. Only `error=:ok` authorizes using code/bindings. Failure yields
@@ -101,7 +102,7 @@ Exact malformed-input refusal precedence is not claimed identical.
 
 ## Remaining closure
 
-The two inline fragments share the slots' exact handle/validation/pair helpers.
+The inline fragments share the slots' exact handle/validation/pair helpers.
 They require the caller to preserve s0..s4 and LR, use distinct private label
 prefixes, and own the complete mapped context and source spans. Interning
 requires prior op-6 byte-charge admission from the sealed owning decision
@@ -110,6 +111,13 @@ bytes must be stable and disjoint from the new pool tail. The mechanism checks
 remaining capacity, copies, advances pool-used and allocates a pair with a clear
 validation byte; the caller must then validate the result handle. It is not a
 general guest-address API or an approval callback.
+
+The pool-pair fragment is for mechanisms that already filled and advanced a
+bounded pool span, including stdin. The caller must prove the complemented
+offset/length lies within those admitted bytes and preserve the state protocol.
+It performs the same checked cell allocation and clears validation; C3 must
+still validate the completed result. It does not admit a raw source pointer,
+charge bytes twice or accept an unchecked guest handle.
 
 The [C1/C3 source candidate](linux-static-capability-port.md) now calls those
 fragments around its native hash computation and real op-6 decision call. The

@@ -1,10 +1,11 @@
 ;; Canonical C3 call-gate mechanism and native SHA-256 provider binding.
-;; Other handler bodies and sealed decision text remain required externals.
+;; Filesystem/spawn bodies and sealed decision text remain required externals.
 ;; Source candidate only: does not enable the owning wire-3 profile.
 (ns kotoba.native.linux-static-capability
   {:kotoba/export [routine]}
   (:require [kotoba.native.linux-static-assembler :as asm]
             [kotoba.native.linux-static-strings :as strings]
+            [kotoba.native.linux-static-io :as io]
             [kotoba.native.linux-static-sha256 :as sha256])
   (:schemas
    {:linux.static.capability/config
@@ -13,6 +14,7 @@
     :linux.static.capability/result
     [:record :linux.static.capability/result
      [[:code [:list [:ref :linux.static/instruction]]]
+      [:start [:list [:ref :linux.static/instruction]]]
       [:bindings :document] [:externals :document] [:error :keyword]]]}))
 
 (defn- empty-code [] [:list [:ref :linux.static/instruction]]
@@ -146,11 +148,9 @@
   (document-set
     (document-keyword :ls.cap/c1-cap) (document-keyword :ls.cap/c1-decide) (document-keyword :ls.cap/h-decide)
     (document-keyword :ls/bad) (document-keyword :ls/trap-cells) (document-keyword :ls/trap-bytes)
-    (document-keyword :ls.cap/no-handler)
-    (document-keyword :ls.cap/io-write) (document-keyword :ls.cap/io-write-error) (document-keyword :ls.cap/io-read)
-    (document-keyword :ls.cap/cli-args) (document-keyword :ls.cap/env-read) (document-keyword :ls.cap/clock)
+    (document-keyword :ls.cap/no-handler) (document-keyword :ls/trap-exit)
     (document-keyword :ls.cap/fs-app-data) (document-keyword :ls.cap/fs-browse)
-    (document-keyword :ls.cap/entropy) (document-keyword :ls.cap/spawn)))
+    (document-keyword :ls.cap/spawn)))
 
 (defn- lookup [m :document key :keyword] :document
   (if (not= (document-kind m) :map) (document-null)
@@ -194,15 +194,16 @@
       :else :ok)))
 
 (defn- failure [error :keyword] [:ref :linux.static.capability/result]
-  (record-new [:ref :linux.static.capability/result] (empty-code) (document-map) (document-set) error))
+  (record-new [:ref :linux.static.capability/result] (empty-code) (empty-code) (document-map) (document-set) error))
 
-(defn routine [source-plan :document layout :document] [:ref :linux.static.capability/result]
+(defn routine [isa :keyword source-plan :document layout :document] [:ref :linux.static.capability/result]
   (let [error (configuration-error source-plan layout)]
     (if (not= error :ok) (failure error)
       (let [context (lookup source-plan :context-abi)
             request (strings/read-string-fragment context "cap-request")
             answer (strings/read-string-fragment context "cap-result")
-            intern (strings/intern-string-fragment context "cap-intern")]
+            intern (strings/intern-string-fragment context "cap-intern")
+            providers (io/routines isa source-plan layout)]
         (cond
           (not= (record-get [:ref :linux.static.strings/result] request :error) :ok)
           (failure (record-get [:ref :linux.static.strings/result] request :error))
@@ -210,6 +211,8 @@
           (failure (record-get [:ref :linux.static.strings/result] answer :error))
           (not= (record-get [:ref :linux.static.strings/result] intern :error) :ok)
           (failure (record-get [:ref :linux.static.strings/result] intern :error))
+          (not= (record-get [:ref :linux.static.io/result] providers :error) :ok)
+          (failure (record-get [:ref :linux.static.io/result] providers :error))
           :else
           (let [hash? (granted-hash? (lookup source-plan :grant))
                 cfg (record-new [:ref :linux.static.capability/config]
@@ -220,8 +223,10 @@
                 gate (dispatch requested hash?)
                 provider (if hash? (hash-body gate cfg (record-get [:ref :linux.static.strings/result] intern :code)) gate)
                 completed (finish provider (record-get [:ref :linux.static.strings/result] answer :code))
-                code (if hash? (join completed (sha256/routine)) completed)]
+                kernel (if hash? (join completed (sha256/routine)) completed)
+                code (join kernel (record-get [:ref :linux.static.io/result] providers :code))]
             (record-new [:ref :linux.static.capability/result] code
+              (record-get [:ref :linux.static.io/result] providers :start)
               (document-map (document-keyword :typed-cap-call) (document-keyword :ls.cap/typed-cap-call)
                             (document-keyword :finish) (document-keyword :ls.cap/finish))
               (externals) :ok)))))))

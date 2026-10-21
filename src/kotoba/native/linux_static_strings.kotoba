@@ -2,7 +2,7 @@
 ;; Canonical IR source candidate; not admitted, generated or executed yet.
 (ns kotoba.native.linux-static-strings
   {:kotoba/export [supported-slots external-labels routine routines
-                   read-string-fragment intern-string-fragment]}
+                   read-string-fragment intern-string-fragment pool-pair-fragment]}
   (:require [kotoba.native.linux-static-assembler :as asm])
   (:schemas
    {:linux.static.strings/config
@@ -373,3 +373,12 @@
                        (mov :s4 :s3) (unary :not :s4) (mov :ctx :s0))
             code (pair-new copied cfg false :s4 :s2)]
         (record-new [:ref :linux.static.strings/result] code (document-map) :ok)))))
+
+;; The caller has admitted and advanced the pool span, with s4=~offset and
+;; s2=length. This allocates its unvalidated pair; C3 still validates return.
+(defn pool-pair-fragment [context :document] [:ref :linux.static.strings/result]
+  (let [error (configuration-error context)]
+    (if (not= error :ok) (failure error)
+      (record-new [:ref :linux.static.strings/result]
+        (pair-new (mov (empty-code) :ctx :s0) (configuration context) false :s4 :s2)
+        (document-map) :ok))))
