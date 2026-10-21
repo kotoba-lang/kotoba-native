@@ -57,6 +57,10 @@ see [the filesystem source contract](docs/linux-static-filesystem-port.md).
 `linux_static_spawn.kotoba` supplies the complete process/spawn handler,
 including sealed program/env selection, child setup, deadlines and capture;
 see [the process source contract](docs/linux-static-spawn-port.md).
+`linux_static_prelude.kotoba` composes startup, signal/trap handling, guest
+return printing and admitted slots; `linux_static_context.kotoba` builds the
+initialized context page from actual assembled bindings. See the
+[prelude and context source contract](docs/linux-static-prelude-port.md).
 Native admission, byte parity, full packager integration and selfhost
 qualification remain open; see [the assembler record](docs/linux-static-assembler-port.md).
 

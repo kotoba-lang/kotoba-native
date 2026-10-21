@@ -61,8 +61,8 @@ and [process](linux-static-spawn-port.md) components. Hash is conditional below.
 No handler body remains an unresolved external; their native admission and
 full image placement remain unqualified. No dummy success is emitted.
 
-Missing external labels must fail assembly. The full prelude must install only
-admitted slot bindings and retain its refusal stubs. These source APIs do not
+Missing external labels must fail assembly. The [prelude candidate](linux-static-prelude-port.md)
+now installs only admitted slot bindings and retains its refusal stubs. These source APIs do not
 grant a capability or authorize changing the profile.
 
 ## Call and result path
@@ -135,8 +135,8 @@ fuel policy is invented here.
 ## Remaining integration
 
 Owning handler routing, the static profile's wire-3 entry,
-sealed decision text/export placement, complete prelude/context/
-trap messages and ELF construction, native verification/Definition CIDs and
+sealed decision text/export placement, full prelude/context integration and
+ELF construction, native verification/Definition CIDs and
 reviewed pins remain unfinished. The current static profile still has no
 wire-3 provider. Enable it only with the complete native binding and evidence;
 keep the actual artifact seal check and never substitute a host hash or an

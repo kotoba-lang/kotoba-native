@@ -91,7 +91,7 @@ These changes do not claim identical malformed-input diagnostic precedence
 or native fd/resource parity. Fatal paths use the existing non-returning traps.
 
 Full native positive/negative behavior, Definition CIDs, byte/ABI parity,
-sealed decision placement, complete prelude/trap/signal/context and ELF
+sealed decision placement, full [prelude/context](linux-static-prelude-port.md) integration and ELF
 construction, owning hash routing/profile, reviewed dependency pins and whole
 compiler self-rebuild remain open. The hosted packager does not call these
 candidates. This source port enables no CDCI, service or production route.

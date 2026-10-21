@@ -121,8 +121,9 @@ are still required. None of these candidates has been generated, assembled or
 executed, so wire 3 remains unavailable in the current profile. Do not enable a
 handler merely because this source exists.
 
-The remaining full packager work is IR/prelude/runtime construction,
-message/context binding, handler and guest text placement, ELF framing,
+The [prelude/context candidate](linux-static-prelude-port.md) now supplies
+complete startup/signal/trap/slot composition and initialized data binding.
+Remaining full packager work is its integration, handler/guest text placement, ELF framing,
 native verification and exact source/lock pins. The compiler's required
 vector/string/byte/I/O helper coverage and self-rebuild generations remain
 open under JUN-200 / JUN-202. This module grants no production cutover or
@@ -131,5 +132,5 @@ service-stop authority.
 The [pair/string runtime source](linux-static-strings-port.md) now covers all
 seven corresponding slots in the reference and supplies inline request/result
 and pool-interning fragments to the new gate. It does not implement vector/byte
-helpers or the full prelude; the planner's
+helpers. The separate prelude candidate composes these bodies; the planner's
 implemented/admitted sets and native qualification remain separate decisions.

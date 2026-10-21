@@ -104,7 +104,8 @@ full native qualification. Static review is not that evidence.
 The [browse body](linux-static-browse-port.md) now uses these fragments;
 the filesystem component now supplies fs/app-data, and the process component
 supplies spawn. Remaining work includes complete
-prelude/signal/trap/context construction, sealed decision placement, ELF
+prelude/context integration (the [source candidate](linux-static-prelude-port.md)
+now exists), sealed decision placement, ELF
 construction, native verification/Definition CIDs and reviewed pins/self-rebuild.
 The owning hash route/profile remains disabled. These sources do not retire
 the C loader, restore hosted CDCI, stop a service or change a production route.

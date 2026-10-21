@@ -125,7 +125,9 @@ owning decision routing/profile, full image assembly and native qualification
 remain unfinished; wire 3 is still unavailable in the current profile. This
 component does not implement the compiler's missing vector/byte/I/O helpers.
 
-Native source admission/Definition CIDs/behavior, the complete prelude/context,
+The [prelude/context source](linux-static-prelude-port.md) now composes the admitted
+slots and binds initialized data. Native source admission/Definition CIDs/behavior,
+complete prelude/context integration,
 decision code/message placement and ELF construction, reviewed source/lock pins,
 and whole compiler self-rebuild remain open under JUN-200/202. The legacy
 packager and C loader are migration inventory until their canonical replacement

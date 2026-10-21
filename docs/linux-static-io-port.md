@@ -117,7 +117,8 @@ now supplies cwd/root capture and scope setup; the C3 result composes its startu
 after this module's common initialization. The filesystem and process components
 now supply fs/app-data and spawn source bodies; full image placement remains open.
 
-Full prelude/signal/trap/context construction,
+The [prelude/context source](linux-static-prelude-port.md) now supplies startup,
+signal/trap/slot composition and initialized data. Full image integration,
 sealed decision text/export placement, hash routing/profile integration, ELF
 construction and native admission/Definition CIDs/runtime qualification remain
 open. These capability providers do not implement the compiler's missing general

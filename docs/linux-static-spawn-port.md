@@ -107,7 +107,7 @@ resource behavior are not claimed from source review.
 ## Remaining closure
 
 Full native positive/negative execution, Definition CIDs, emitted-byte and ABI
-parity, complete prelude/trap/signal/context/ELF construction, sealed decision
+parity, full [prelude/context](linux-static-prelude-port.md) integration and ELF construction, sealed decision
 placement, owning hash routing/profile, reviewed pins and whole compiler
 self-rebuild remain open. The hosted packager does not call these candidates.
 Source presence does not qualify a loaderless compiler or native CDCI.

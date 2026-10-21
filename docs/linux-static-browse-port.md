@@ -90,7 +90,8 @@ allocation without copying or charging bytes twice; C3 admits the result
 handle/UTF-8. Per-context calls must remain serialized. Full native fd/resource,
 ordering, error, directory-type and UTF-8 behavior still needs qualification.
 
-The remaining closure is full prelude/trap/signal/context,
+The [prelude/context candidate](linux-static-prelude-port.md) now composes these
+bodies. Remaining closure includes full image integration,
 sealed decision placement, hash routing/profile, ELF construction, native
 verification/Definition CIDs, reviewed pins and compiler self-rebuild. Neither
 hosted CDCI nor a native filesystem release is enabled by this source port.
