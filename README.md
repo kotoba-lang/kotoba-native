@@ -48,6 +48,9 @@ see [the handler source contract](docs/linux-static-io-port.md).
 `linux_static_paths.kotoba` supplies scope startup, path normalization,
 dual root-spelling admission and rooted openat2/parent fragments;
 see [the path source contract](docs/linux-static-paths-port.md).
+`linux_static_browse.kotoba` supplies the complete directory-listing handler,
+including record bounds, sorting and pool ownership;
+see [the browse source contract](docs/linux-static-browse-port.md).
 Native admission, byte parity, full packager integration and selfhost
 qualification remain open; see [the assembler record](docs/linux-static-assembler-port.md).
 

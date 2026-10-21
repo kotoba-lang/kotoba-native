@@ -44,7 +44,8 @@ memory. ISA, compiled decision code, context and final assembler must agree.
 The [C1/C3 gate](linux-static-capability-port.md) now imports and appends this
 component, resolves these seven dispatch labels and returns its common `start`
 fragment. That gate's candidate API now takes explicit ISA and exposes `start`.
-Remaining handler-body externals are fs/app-data, fs/browse and spawn; all
+The separate browse component now supplies fs/browse too. Remaining
+handler-body externals are fs/app-data and spawn; all
 eleven dispatch meanings, including the conditional hash candidate, stay intact.
 The hosted packager does not yet call these canonical modules.
 
@@ -113,10 +114,10 @@ and the -1 monotonic sentinel. BSS zero-fill owns initial carry/pool state.
 The existing context ABI remains an implemented native format, not a requirement
 to pin a C loader. The companion [path component](linux-static-paths-port.md)
 now supplies cwd/root capture and scope setup; the C3 result composes its startup
-after this module's common initialization. Filesystem/spawn bodies still need
+after this module's common initialization. Fs/app-data/spawn bodies still need
 their complete canonical port and placement.
 
-Full prelude/signal/trap/context construction, the remaining three handlers,
+Full prelude/signal/trap/context construction, the remaining two handlers,
 sealed decision text/export placement, hash routing/profile integration, ELF
 construction and native admission/Definition CIDs/runtime qualification remain
 open. These capability providers do not implement the compiler's missing general
