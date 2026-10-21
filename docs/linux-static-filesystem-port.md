@@ -24,7 +24,8 @@ were read; native type admission, emitted bytes and behavior remain unqualified.
 `routine [isa source-plan layout]` returns `:linux.static.fs/result` with `code`,
 `binding` and `error`. Only `error=:ok` permits consuming its code; binding is
 `:ls.cap/fs-app-data`, handler id 7. Failure has empty code and binding `:none`.
-The C3 candidate composes this body; only spawn remains a handler-body external.
+The C3 candidate composes this body and the [process body](linux-static-spawn-port.md);
+no existing handler body remains external to that source candidate.
 
 The caller must first admit the full sealed native plan, narrowed grants,
 context ABI, ISA-matched compiled decision exports and exact image layout.
@@ -90,7 +91,7 @@ These changes do not claim identical malformed-input diagnostic precedence
 or native fd/resource parity. Fatal paths use the existing non-returning traps.
 
 Full native positive/negative behavior, Definition CIDs, byte/ABI parity,
-sealed decision placement, spawn, complete prelude/trap/signal/context and ELF
+sealed decision placement, complete prelude/trap/signal/context and ELF
 construction, owning hash routing/profile, reviewed dependency pins and whole
 compiler self-rebuild remain open. The hosted packager does not call these
 candidates. This source port enables no CDCI, service or production route.

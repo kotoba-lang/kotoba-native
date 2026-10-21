@@ -54,6 +54,9 @@ see [the browse source contract](docs/linux-static-browse-port.md).
 `linux_static_filesystem.kotoba` supplies all sixteen fs/app-data forms,
 including range/append, metadata, rooted mutations, sync and temporary directories;
 see [the filesystem source contract](docs/linux-static-filesystem-port.md).
+`linux_static_spawn.kotoba` supplies the complete process/spawn handler,
+including sealed program/env selection, child setup, deadlines and capture;
+see [the process source contract](docs/linux-static-spawn-port.md).
 Native admission, byte parity, full packager integration and selfhost
 qualification remain open; see [the assembler record](docs/linux-static-assembler-port.md).
 

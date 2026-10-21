@@ -29,7 +29,8 @@ is `:ls.cap/fs-browse`, handler id 8. Failure has empty code and binding `:none`
 with named ISA/handler/index/layout/scratch or shared path/context errors.
 The C3 candidate imports and composes this body, so fs/browse is no longer a
 missing handler external. The [filesystem component](linux-static-filesystem-port.md)
-also supplies fs/app-data; spawn remains external.
+also supplies fs/app-data; the [process component](linux-static-spawn-port.md)
+supplies spawn. The C3 source candidate now composes all existing handler bodies.
 
 The caller must admit the complete artifact, native plan, narrowed grants,
 decision code, context, ISA and exact computed layout. This component's bounds
@@ -89,7 +90,7 @@ allocation without copying or charging bytes twice; C3 admits the result
 handle/UTF-8. Per-context calls must remain serialized. Full native fd/resource,
 ordering, error, directory-type and UTF-8 behavior still needs qualification.
 
-The remaining closure is spawn, full prelude/trap/signal/context,
+The remaining closure is full prelude/trap/signal/context,
 sealed decision placement, hash routing/profile, ELF construction, native
 verification/Definition CIDs, reviewed pins and compiler self-rebuild. Neither
 hosted CDCI nor a native filesystem release is enabled by this source port.
