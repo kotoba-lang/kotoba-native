@@ -17,6 +17,8 @@
             [kotoba.native.keyword-equality :as keyword-equality]
             [kotoba.native.document :as document]
             [kotoba.native.string-index :as string-index]
+            ;; host only: kotoba.native.typed-map has no Kotoba-route twin yet
+            #?@(:kotoba [] :default [[kotoba.native.typed-map :as typed-map]])
             [kotoba.native.string-search :as string-search]
             [kotoba.native.vector-region :as vector-region]
             #?@(:cljs [[kotoba.kir.cljs-i64 :as i64]])))
@@ -1864,7 +1866,11 @@
 
 #?(:kotoba
    (defn emit-program [kir0 [:ref :form/r]] [:ref :form/r]
-     (let [k1 (vector-region/rewrite-program (keyword-equality/rewrite-program kir0))
+     ;; as the host: gas first on the source KIR, the constructor fuel after
+     ;; vector-region (which charges the literals it keeps in locals itself).
+     ;; typed-map/augment-functions is host only (no Kotoba-route twin yet).
+     (let [k1 (machine-ir/charge-constructors
+               (vector-region/rewrite-program (keyword-equality/rewrite-program (machine-ir/charge-gas kir0))))
            fs (try (string-search/augment-functions (fget k1 :functions)) (catch e (reject-form! :string-search-helpers)))
            fs1 (try (string-index/augment-functions fs) (catch e (reject-form! :string-index-helpers)))
            fs2 (try (document/augment-functions fs1) (catch e (reject-form! :document-helpers)))
@@ -1877,10 +1883,13 @@
    :default
 (defn emit-program [kir]
   (let [kir (-> kir
+                machine-ir/charge-gas
                 keyword-equality/rewrite-program
                 vector-region/rewrite-program
+                machine-ir/charge-constructors
                 (update :functions #(-> % string-search/augment-functions
                                            string-index/augment-functions
+                                           typed-map/augment-functions
                                            document/augment-functions))
                 (#(if (:exports %) %
                       (assoc % :exports (mapv :name (:functions %))))))]

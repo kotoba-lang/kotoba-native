@@ -365,6 +365,11 @@
        (when s
          (or (pred (first s)) (recur (next s)))))))
 
+#?(:kotoba nil
+   :default
+   (defn- symbol-set-contains? [items item]
+     (contains? items item)))
+
 #?(:kotoba
    (defn- fold-any [xs [:list [:ref :form/r]] ok :bool] :bool ok))
 
@@ -461,7 +466,7 @@
      [form target]
      (cond
        (= form target) 1
-       (and (seq? form) (contains? branching (first form)) (< 2 (count form)))
+       (and (seq? form) (symbol-set-contains? branching (first form)) (< 2 (count form)))
        ;; The test runs on every path; the arms are alternatives. This does not
        ;; separate `cond`/`case` tests from their arms, which over-counts a test
        ;; and never under-counts an arm -- the safe direction.
@@ -505,7 +510,7 @@
    (defn- consuming-call?
      [form target]
      (and (seq? form)
-          (contains? consuming (first form))
+          (symbol-set-contains? consuming (first form))
           (= target (second form)))))
 
 
@@ -517,7 +522,7 @@
    (defn- reading-call?
      [form target]
      (and (seq? form)
-          (contains? reading (first form))
+          (symbol-set-contains? reading (first form))
           (= target (second form)))))
 
 
@@ -655,7 +660,7 @@
           (let [pairs (vec (binding-pairs (second form)))
                 body (drop 2 form)
                 bound (set (map first pairs))]
-            (and (every? bound names)
+            (and (every? (fn [name] (symbol-set-contains? bound name)) names)
                  ;; Every name in the thread is used at most once across all the
                  ;; initialisers, only in vector-operation position, and linearly
                  ;; in the body. A name read after the update that consumed it is

@@ -5,7 +5,7 @@
   lowers through closed GMIR/MIR/MC data; unknown operations, unsupported value
   shapes, use-before-definition, register exhaustion, and malformed labels fail
   closed before either ISA encoder."
-  {:kotoba/export #?(:kotoba [coalesce-program-moves compile-expression compile-gmir compile-kir-module counted-self-recur-plans counted-self-recur-plans-of-gmir encode-mc encode-mc-module entry-fuel-prefixes entry-fuel-prefixes-of-gmir function-reenters-guest? hoist-program-consumers lower-kir-expression lower-kir-module lower-mc pilot-module? signed-division-magic word-result-type?] :default [coalesce-program-moves compile-expression compile-gmir compile-kir-module counted-self-recur-plans encode-mc encode-mc-module entry-fuel-prefixes function-reenters-guest? hoist-program-consumers lower-kir-expression lower-kir-module lower-mc pilot-expression? pilot-module? signed-division-magic word-result-type?])}
+  {:kotoba/export #?(:kotoba [charge-constructors charge-gas coalesce-program-moves compile-expression compile-gmir compile-kir-module counted-self-recur-plans counted-self-recur-plans-of-gmir encode-mc encode-mc-module entry-fuel-prefixes entry-fuel-prefixes-of-gmir function-reenters-guest? hoist-program-consumers lower-kir-expression lower-kir-module lower-mc pilot-module? signed-division-magic word-result-type?] :default [charge-constructors charge-gas charged-constructors charges-written coalesce-program-moves compile-expression compile-gmir compile-kir-module counted-self-recur-plans encode-mc encode-mc-module entry-fuel-prefixes function-reenters-guest? hoist-program-consumers lower-kir-expression lower-kir-module lower-mc pilot-expression? pilot-module? signed-division-magic word-result-type?])}
   #?(:kotoba (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
                                           [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]
                                  :form/rd [:record :form/rd [[:form [:ref :form/r]] [:pos :i64]]]
@@ -23,6 +23,8 @@
             [kotoba.native.interrupt-abi :as interrupt-abi]
             [kotoba.native.document :as document]
             [kotoba.native.string-index :as string-index]
+            ;; host only: kotoba.native.typed-map has no Kotoba-route twin yet
+            #?@(:kotoba [] :default [[kotoba.native.typed-map :as typed-map]])
             [kotoba.native.string-search :as string-search]
             #?(:cljs [kotoba.kir.cljs-i64 :as i64])))
 
@@ -1969,10 +1971,18 @@
 
 #?(:kotoba
    (defn- kir-runtime-ops [] [:ref :form/r]
-     (form/edn-form "{pair :pair pair-first :pair-first pair-second :pair-second kgraph-assert! :kgraph-assert! kgraph-get :kgraph-get kgraph-count :kgraph-count kgraph-entity-at :kgraph-entity-at string-byte-length :string-byte-length string=? :string=? string-concat :string-concat string-substring :string-substring string-code-point-at :string-code-point-at vector-new-empty :vector-new-empty vector-conj :vector-conj vector-count :vector-count vector-at :vector-at vector-assoc :vector-assoc vector-drop :vector-drop vector-f64-new :vector-new-empty vector-f64-conj :vector-conj vector-f64-count :vector-count vector-f64-at :vector-at vector-f64-assoc :vector-assoc vector-f64-drop :vector-drop vector-alloc :vector-alloc vector-assoc! :vector-assoc-in-place string-index-of :string-index-of string-compare :string-compare string-fold-ascii :string-fold-ascii string-find-blank :string-find-blank string-skip-blank :string-skip-blank string-index-of-from :string-index-of-from string-compare-lines :string-compare-lines string-find-byte :string-find-byte string-append-range :string-append-range bytes-empty :vector-new-empty bytes-count :vector-count bytes-at :vector-at string-from-utf8 :string-from-utf8 bytes-from-vector-i64 :bytes-from-vector vector-i64-from-bytes :bytes-from-vector bytes-slice :bytes-slice bytes-concat :bytes-concat}"))
+     (form/edn-form "{pair :pair fuel-charge! :fuel-charge gas-charge! :gas-charge pair-first :pair-first pair-second :pair-second kgraph-assert! :kgraph-assert! kgraph-get :kgraph-get kgraph-count :kgraph-count kgraph-entity-at :kgraph-entity-at string-byte-length :string-byte-length string=? :string=? string-concat :string-concat string-substring :string-substring string-code-point-at :string-code-point-at vector-new-empty :vector-new-empty vector-conj :vector-conj vector-count :vector-count vector-at :vector-at vector-assoc :vector-assoc vector-drop :vector-drop vector-f64-new :vector-new-empty vector-f64-conj :vector-conj vector-f64-count :vector-count vector-f64-at :vector-at vector-f64-assoc :vector-assoc vector-f64-drop :vector-drop vector-alloc :vector-alloc vector-assoc! :vector-assoc-in-place string-index-of :string-index-of string-compare :string-compare string-fold-ascii :string-fold-ascii string-find-blank :string-find-blank string-skip-blank :string-skip-blank string-index-of-from :string-index-of-from string-compare-lines :string-compare-lines string-find-byte :string-find-byte string-append-range :string-append-range bytes-empty :vector-new-empty bytes-count :vector-count bytes-at :vector-at string-from-utf8 :string-from-utf8 bytes-from-vector-i64 :bytes-from-vector vector-i64-from-bytes :bytes-from-vector bytes-slice :bytes-slice bytes-concat :bytes-concat}"))
    :default
 (def ^:private kir-runtime-ops
   {'pair :pair
+   ;; amu ADR 0353 floor :allocation-budget-native: the per-constructor fuel
+   ;; debit `charge-constructors` puts in front of every constructor. No KIR
+   ;; program names it; the frontend refuses the head.
+   'fuel-charge! :fuel-charge
+   ;; superproject adr-2610092340 D12: the per-form consensus gas debit
+   ;; `charge-gas` puts in front of every application form when the KIR names
+   ;; a `:gas-schedule`. No KIR program names it either.
+   'gas-charge! :gas-charge
    'pair-first :pair-first
    'pair-second :pair-second
    'kgraph-assert! :kgraph-assert!
@@ -2394,7 +2404,11 @@
 #?(:kotoba nil ;; folded into the Kotoba twins under another name
    :default
 (defn- hex-of-bytes [bytes]
-  (apply str (map #(let [h (Integer/toString (bit-and (int %) 0xff) 16)] (if (= 1 (count h)) (str "0" h) h)) bytes))))
+  (apply str
+         (map #(let [h #?(:clj (Integer/toHexString (int %))
+                          :cljs (.toString (int %) 16))]
+                 (if (= 1 (count h)) (str "0" h) h))
+              bytes))))
 
 #?(:kotoba
    (defn- hex-digit [d :i64] :string (string-substring "0123456789abcdef" d (+ d 1))))
@@ -2860,18 +2874,27 @@
            (list 'vector-count (second args))
            (and (= op 'typed-set-nth) (= 3 (count args)))
            (list 'vector-at (second args) (nth args 2))
-           ;; `[:list T]` is the same word arena as a typed set: the items are
-           ;; words (i64s, string handles), appended at the end and read by
-           ;; index. `typed-list-conj` is what lets a program build a list whose
-           ;; length is known only while it runs; `vector-count` already walks
-           ;; the carrier, so no count head is needed.
+           ;; `[:list T]` is the typed set's word arena (amu ADR 0353 floor
+           ;; :native-handles): the items are one-word handles -- i64s,
+           ;; strings, records -- read by index, and `vector-count` already
+           ;; walks the carrier, so no count head is needed. An index out of
+           ;; range traps as `vector-at` does, where the reference traps too.
            (= op 'typed-list-new)
            (reduce (fn [items item] (list 'vector-conj items item))
                    (list 'vector-new-empty) (rest args))
-           (and (= op 'typed-list-conj) (= 3 (count args)))
-           (list 'vector-conj (second args) (nth args 2))
            (and (= op 'typed-list-nth) (= 3 (count args)))
            (list 'vector-at (second args) (nth args 2))
+           ;; The list builder (amu ADR 0353 floor :empty-vector-field): conj
+           ;; onto the same arena, appended at the end as the reference does.
+           (and (= op 'typed-list-conj) (= 3 (count args)))
+           (list 'vector-conj (second args) (nth args 2))
+           ;; `[:map K V]` (amu ADR 0353 floor :native-hiccup-node): the
+           ;; same word arena, keys and values interleaved, searched by the
+           ;; helpers `kotoba.native.typed-map` appends.
+           (and (contains? typed-map/operations op)
+                (let [arity (get typed-map/operations op)]
+                  (if arity (= arity (count args)) (odd? (count args)))))
+           (normalize-surface-operations (typed-map/lower op args))
            (and (contains? '#{vector-get vector-f64-get} op)
                 (= 3 (count args)))
            (let [[items-form index-form fallback] args
@@ -3000,7 +3023,9 @@
      (let [op (fnth form 0) args (form/rest-list form) n (lcount args)
            a0 (lget args 0)]
        (cond
-         (and (sym? op "record-new") (<= 2 n))
+         ;; `(<= 1 n)`: a record with no fields is the empty chain, 0 (amu
+         ;; ADR 0353 floor :options-map-argument), as the host's `(seq args)`.
+         (and (sym? op "record-new") (<= 1 n))
          (let [fields (scalar-record-fields a0) values (ldrop args 1)]
            (if (not (and (truthy? fields) (= (fcount fields) (lcount values))))
              (reject-form! :record-boundary :invalid-constructor a0)
@@ -3027,7 +3052,7 @@
          (let [fields (scalar-record-fields a0)
                index (if (truthy? fields) (pair-index fields (lget args 2)) -1)]
            (if (< index 0)
-             (reject-form! :record-boundary :invalid-record-update a0)
+             (reject-form! :record-boundary :invalid-update a0)
              (let2 "record__" (lget args 1) "record_item__" (lget args 3)
                    (pair-chain-assoc (symf "record__") (fcount fields) index (symf "record_item__")))))
          (and (sym? op "record-get") (= n 3))
@@ -3154,7 +3179,9 @@
        form
        (let [op (first form), args (rest form)]
          (cond
-           (and (= op 'record-new) (<= 2 (count args)))
+           ;; `(seq args)`: a record with no fields is the empty chain, 0
+           ;; (amu ADR 0353 floor :options-map-argument).
+           (and (= op 'record-new) (seq args))
            (let [[type & values] args, fields (scalar-record-fields type)]
              (when-not (and fields (= (count fields) (count values)))
                (reject! :record-boundary :invalid-constructor
@@ -3211,32 +3238,6 @@
                                    tail))
                            0 (reverse (range width)))))
 
-                      ;; `record-assoc` over pair-chain handles: rebuild the chain, reading
-           ;; every other field back from the operand (the same shape as
-           ;; `hetero-vector-assoc` above; the operand and the replacement are
-           ;; bound once, in the reference's order).
-           (and (= op 'record-assoc) (= 4 (count args)))
-           (let [[type value field replacement] args
-                 fields (scalar-record-fields type)
-                 index (first (keep-indexed (fn [i [candidate _]]
-                                              (when (= candidate field) i))
-                                            fields))
-                 subject (gensym "record__"), item (gensym "record_item__")]
-             (when (or (nil? fields) (nil? index))
-               (reject! :record-boundary :invalid-record-update
-                        {:type type :field field}))
-             (list 'let [subject value item replacement]
-                   (reduce (fn [tail position]
-                             (list 'pair
-                                   (if (= position index)
-                                     item
-                                     (list 'pair-first
-                                           (nth (iterate (fn [handle] (list 'pair-second handle))
-                                                         subject)
-                                                position)))
-                                   tail))
-                           0 (reverse (range (count fields))))))
-
            (and (= op 'record-get) (= 3 (count args)))
            (let [[type value field] args
                  fields (scalar-record-fields type)
@@ -3249,6 +3250,33 @@
              (list 'pair-first
                    (nth (iterate (fn [handle] (list 'pair-second handle)) value)
                         index)))
+
+           ;; amu ADR 0353 floor :native-record-operations: an update is a
+           ;; fresh chain of the same record, every other field re-projected
+           ;; from the old one -- `hetero-vector-assoc`'s rewrite, over names.
+           ;; The operand is evaluated once, before the replacement, which is
+           ;; the reference's order.
+           (and (= op 'record-assoc) (= 4 (count args)))
+           (let [[type value field item] args
+                 fields (scalar-record-fields type)
+                 index (first (keep-indexed (fn [i [candidate _]]
+                                              (when (= candidate field) i))
+                                            fields))
+                 subject (gensym "record__"), replacement (gensym "record_item__")]
+             (when (or (nil? fields) (nil? index))
+               (reject! :record-boundary :invalid-update
+                        {:type type :field field}))
+             (list 'let [subject value replacement item]
+                   (reduce (fn [tail position]
+                             (list 'pair
+                                   (if (= position index)
+                                     replacement
+                                     (list 'pair-first
+                                           (nth (iterate (fn [handle] (list 'pair-second handle))
+                                                         subject)
+                                                position)))
+                                   tail))
+                           0 (reverse (range (count fields))))))
 
            :else form))))
    body)))
@@ -3381,6 +3409,10 @@
                                             (let [h (fnth x 0)]
                                               (or (sym? h "hetero-vector-new") (sym? h "hetero-vector-at")
                                                   (sym? h "hetero-vector-count") (sym? h "hetero-vector-assoc"))))
+                           ;; the record an [:option R] holds (amu ADR 0353 floor
+                           ;; :native-option-record) selects the pair chain too
+                           (= which 4) (and (form/is-vec? x) (= 2 (fcount x)) (kw? (fnth x 0) :option)
+                                            (aggregate-abi/scalar-record-type? (fnth x 1)))
                            :else (and (head-is? x "typed-cap-call") (= 5 (fcount x))
                                       (let [kind (typed-capability-kind (fnth x 2) (fnth x 3))
                                             id (fnth x 1)]
@@ -3460,6 +3492,7 @@
        (or (some-boundary-type? functions 1 record-types)
            (any-node? nodes 1)
            (any-node? nodes 0)
+           (any-node? nodes 4)
            (any-node? nodes 2))))
    :default
 (defn- record-boundary-module?
@@ -3482,6 +3515,14 @@
      ;; A flat record used as an aggregate variant payload is also boxed before
      ;; the enclosing tag/payload pair is constructed.
      (some aggregate-abi/aggregate-payload-variant-type?
+           (tree-seq coll? seq functions))
+     ;; So is the record an `[:option R]` holds (amu ADR 0353 floor
+     ;; :native-option-record): the option is pair(present, payload), and its
+     ;; payload is one word, so `option-value-of`'s two arms -- the payload
+     ;; and the record fallback -- meet as one handle, not a handle and a
+     ;; scalar-replaced bundle.
+     (some #(and (vector? %) (= :option (first %)) (= 2 (count %))
+                 (aggregate-abi/scalar-record-type? (second %)))
            (tree-seq coll? seq functions))
      ;; ABI v8: a heterogeneous vector has no SROA form at all; it is only
      ;; ever the pair chain this normalization builds.
@@ -5301,6 +5342,32 @@
                              {:form form :field field}))
                   [record-code (nth (:aggregate/values aggregate) field-index)])
 
+                ;; The slot bundle with one register replaced (amu ADR 0353
+                ;; floor :native-record-operations): nothing is allocated.
+                (and (seq? form) (= 'record-assoc (first form)) (= 5 (count form)))
+                (let [type (second form)
+                      fields (or (scalar-record-fields type)
+                                 (reject! :kir-to-gmir :unsupported-record-type
+                                          {:form form :type type}))
+                      [record-code aggregate] (value (nth form 2) env)
+                      field (nth form 3)
+                      field-index (first (keep-indexed
+                                          (fn [index [name _]]
+                                            (when (= name field) index))
+                                          fields))]
+                  (when-not (and (record-value? aggregate)
+                                 (= type (:aggregate/type aggregate)))
+                    (reject! :kir-to-gmir :record-type-mismatch
+                             {:form form :expected type :actual aggregate}))
+                  (when-not (some? field-index)
+                    (reject! :kir-to-gmir :unknown-record-field
+                             {:form form :field field}))
+                  (let [[item-code item] (value (nth form 4) env)]
+                    [(into (vec record-code) item-code)
+                     (record-value type
+                                   (assoc (:aggregate/values aggregate) field-index
+                                          (scalar-register! item form)))]))
+
                 (and (seq? form) (= 'variant-new (first form)) (= 4 (count form)))
                 (let [type (second form)
                       cases (or (scalar-variant-cases type)
@@ -5671,6 +5738,13 @@
                              (some #(= (nth form 3) (first %)) fields))
                     :scalar))
 
+                (and (seq? form) (= 'record-assoc (first form)) (= 5 (count form)))
+                (let [type (second form), fields (scalar-record-fields type)]
+                  (when (and fields (= type (shape (nth form 2) env))
+                             (some #(= (nth form 3) (first %)) fields)
+                             (= :scalar (shape (nth form 4) env)))
+                    type))
+
                 (and (seq? form) (= 'variant-new (first form)) (= 4 (count form)))
                 (let [type (second form), cases (scalar-variant-cases type)
                       tag (nth form 2)]
@@ -5900,7 +5974,7 @@
                                           (:gmir/op instruction)))
                              (:gmir/instructions %))
                       (:gmir/functions module)))))
-         (catch js/Error _ false))))
+         (catch #?(:clj Exception :cljs js/Error) _ false))))
 
 ;; ── MC -> bytes ──────────────────────────────────────────────────────────────
 
@@ -10314,7 +10388,7 @@
    :default
 (def ^:private inline-runtime-operations
   #{:pair-first :pair-second :string-byte-length :vector-count :vector-at
-    :vector-assoc-in-place}))
+    :vector-assoc-in-place :fuel-charge :gas-charge}))
 
 #?(:kotoba
    (defn- a64-ldr-x16-context [offset :i64] [:list [:ref :form/r]]
@@ -10350,10 +10424,107 @@
 #?(:kotoba
    (defn- inline-runtime-op? [runtime :keyword] :bool
      (or (= runtime :pair-first) (= runtime :pair-second) (= runtime :string-byte-length)
-         (= runtime :vector-count) (= runtime :vector-at) (= runtime :vector-assoc-in-place))))
+         (= runtime :vector-count) (= runtime :vector-at) (= runtime :vector-assoc-in-place)
+         (= runtime :fuel-charge) (= runtime :gas-charge))))
+
+#?(:kotoba nil :default
+(declare a64-inline-handle-runtime))
+
+#?(:kotoba
+   (defn- a64-fuel-charge [instruction-index :i64] [:list [:ref :form/r]]
+     (let [present (memory-label instruction-index "fuel-present")]
+       (lcat (cat4 (u32le 0xf94004f0)
+                   (u32le 0xf1000610)
+                   (lone (layout-relative-branch :aarch64/b-hs-imm19 present))
+                   (u32le 0xd4200000))
+             (lcat (lone (layout-label present)) (u32le 0xf90004f0)))))
+   :default
+(defn- a64-fuel-charge
+  "The per-constructor fuel debit, the entry prefix's bytes with this
+  instruction's own label: ldr x16, [x7, #8]; subs x16, x16, #1; b.hs
+  present; brk #0; present: str x16, [x7, #8]. On exhaustion the counter
+  stays 0 and the loader reports budget/fuel, as for the entry charge."
+  [instruction-index]
+  (let [present (memory-label instruction-index "fuel-present")]
+    (vec (concat (u32le 0xf94004f0)
+                 (u32le 0xf1000610)
+                 [(layout/relative-branch :aarch64/b-hs-imm19 present)]
+                 (u32le 0xd4200000)
+                 [(layout/label present)]
+                 (u32le 0xf90004f0))))))
+
+#?(:kotoba
+   (defn- a64-gas-charge [instruction-index :i64] [:list [:ref :form/r]]
+     (let [present (memory-label instruction-index "gas-present")
+           trap (memory-label instruction-index "gas-trap")
+           store (u32le (bit-or (bit-or 0xf9000000 (shl (quot 384 8) 10)) (bit-or (shl 7 5) 16)))]
+       (lcat (cat4 (u32le 0xf94000f0)
+                   (u32le 0xf100321f)
+                   (lone (layout-relative-branch :aarch64/b-ne-imm19 trap))
+                   (a64-ldr-x16-context 384))
+             (lcat (cat4 (u32le 0xeb010210)
+                         (lone (layout-relative-branch :aarch64/b-hs-imm19 present))
+                         (u32le 0x92800010)
+                         store)
+                   (cat4 (lone (layout-label trap))
+                         (u32le 0xd4200000)
+                         (lone (layout-label present))
+                         store)))))
+   :default
+(defn- a64-gas-charge
+  "The per-form consensus gas debit (superproject adr-2610092340 D12) on the
+  context's gas word, 384 (ABI v12). The form's weight arrives in x1, the
+  first runtime argument register (kotoba-gmir :gas-charge, arity 1):
+
+    ldr x16, [x7]; cmp x16, #12; b.ne trap        ; refuse a pre-v12 host
+    ldr x16, [x7, #384]; subs x16, x16, x1; b.hs present
+    mov x16, #-1; str x16, [x7, #384]             ; exhausted: the sentinel
+    trap: brk #0
+    present: str x16, [x7, #384]
+
+  The version test is not decoration. 384 is past v11's last slot, and every
+  v11 loader keeps HOST state there (the POSIX loader's `code_base`, the
+  Windows loader's `pair_used`) -- a loader learns no ABI version from the
+  code it runs, so without this a gas-metered program on an older loader
+  would decrement the host's own bookkeeping. It traps instead, unnamed.
+  Exhaustion (a borrow: the word was below the weight) STORES 2^64-1 before
+  it traps: a word left at 0 would be indistinguishable from a run that spent
+  its gas exactly, and the loader reports budget/gas only for the sentinel."
+  [instruction-index]
+  (let [present (memory-label instruction-index "gas-present")
+        trap (memory-label instruction-index "gas-trap")
+        store (u32le (bit-or 0xf9000000 (bit-shift-left (quot 384 8) 10)
+                             (bit-shift-left 7 5) 16))]
+    (vec (concat (u32le 0xf94000f0)                               ; ldr x16, [x7]
+                 (u32le 0xf100321f)                               ; cmp x16, #12
+                 [(layout/relative-branch :aarch64/b-ne-imm19 trap)]
+                 (a64-ldr-x16-context 384)
+                 (u32le 0xeb010210)                               ; subs x16, x16, x1
+                 [(layout/relative-branch :aarch64/b-hs-imm19 present)]
+                 (u32le 0x92800010)                               ; mov x16, #-1
+                 store
+                 [(layout/label trap)]
+                 (u32le 0xd4200000)
+                 [(layout/label present)]
+                 store)))))
 
 #?(:kotoba
    (defn- a64-inline-runtime [instruction-index :i64 runtime :keyword] [:list [:ref :form/r]]
+     (cond
+       (= runtime :fuel-charge) (a64-fuel-charge instruction-index)
+       (= runtime :gas-charge) (a64-gas-charge instruction-index)
+       :else (a64-inline-handle-runtime instruction-index runtime)))
+   :default
+
+(defn- a64-inline-runtime
+  [instruction-index runtime]
+  (case runtime
+    :fuel-charge (a64-fuel-charge instruction-index)
+    :gas-charge (a64-gas-charge instruction-index)
+    (a64-inline-handle-runtime instruction-index runtime))))
+
+#?(:kotoba
+   (defn- a64-inline-handle-runtime [instruction-index :i64 runtime :keyword] [:list [:ref :form/r]]
      (let [trap (memory-label instruction-index "handle-trap")
            done (memory-label instruction-index "handle-done")
            body (cond
@@ -10373,13 +10544,25 @@
                                 (lcat (u32le 0xf8317a03) (a64-mov (kf :aarch64/x0) (kf :aarch64/x1)))))))]
        (cat4 body
              (form/two-forms (layout-relative-branch :aarch64/b-imm26 done) (layout-label trap))
-             (u32le 0)
+             ;; udf #<code>: vector ops trap 12 (vector/index-out-of-range),
+             ;; pair ops keep 0 -- the host's `trap-code`
+             (u32le (if (or (= runtime :vector-at) (= runtime :vector-assoc-in-place)) 12 0))
              (lone (layout-label done)))))
    :default
-(defn- a64-inline-runtime
+(defn- a64-inline-handle-runtime
   [instruction-index runtime]
   (let [trap (memory-label instruction-index "handle-trap")
         done (memory-label instruction-index "handle-done")
+        vector-op? (contains? #{:vector-at :vector-assoc-in-place} runtime)
+        ;; The trap instruction carries the value-trap code (issue #785,
+        ;; option (c)): `udf #<code>` -- the immediate is the code, `udf #0`
+        ;; keeps the unnamed meaning, and the loader's SIGILL handler decodes
+        ;; it to name the refusal. Vector ops trap 12 (vector/index-out-of-
+        ;; range): one trap label per emission, so the handle-range check
+        ;; lands on the same name for now (splitting it needs a second label,
+        ;; which the layout walker rejected when tried unflattened). Pair ops
+        ;; keep 0: no value-trap name has been minted for them yet.
+        trap-code (if vector-op? 12 0)
         {:keys [pair-used-pointer pairs-base vector-used-pointer vectors-base
                 vector-items-base]} inline-context-offsets
         body (case runtime
@@ -10414,7 +10597,9 @@
     (vec (concat body
                  [(layout/relative-branch :aarch64/b-imm26 done)
                   (layout/label trap)]
-                 (u32le 0x00000000)                            ; udf #0 -> SIGILL
+                 ;; udf #<code>: the immediate IS the value-trap code (issue
+                 ;; #785). udf #0 stays the unnamed refusal.
+                 (u32le trap-code)
                  [(layout/label done)])))))
 
 #?(:kotoba nil :default
@@ -10439,7 +10624,55 @@
         [0x4d 0x01 0xda]))))                                   ; add r10, r11
 
 #?(:kotoba nil :default
+(declare x86-inline-handle-runtime))
+
+#?(:kotoba nil :default
+(defn- x86-fuel-charge
+  "The per-constructor fuel debit, the entry prefix's bytes with this
+  instruction's own label: dec qword [r9+8]; jns present; inc qword [r9+8];
+  ud2; present. The trap path puts the counter back to 0, so the loader
+  reports budget/fuel, as for the entry charge."
+  [instruction-index]
+  (let [present (memory-label instruction-index "fuel-present")]
+    (vec (concat [0x49 0xff 0x49 0x08]
+                 [(layout/relative-branch :x86-64/jns-rel8 present)]
+                 [0x49 0xff 0x41 0x08]
+                 [0x0f 0x0b]
+                 [(layout/label present)])))))
+
+#?(:kotoba nil :default
+(defn- x86-gas-charge
+  "The per-form consensus gas debit (superproject adr-2610092340 D12) on the
+  context's gas word, 384 (ABI v12). The form's weight arrives in rsi, the
+  first runtime argument register (kotoba-gmir :gas-charge, arity 1):
+  cmp qword [r9], 12; jne trap; sub qword [r9+384], rsi; jae present (rel32: the layout has no jae rel8);
+  mov qword [r9+384], -1; trap: ud2; present. 384 is past disp8, so those
+  ModRM bytes are mod=10 with a disp32. The version test refuses a pre-v12
+  host, whose 384 is host state (see `a64-gas-charge`). A borrow means the
+  word was below the weight: it is set to 2^64-1, the sentinel the loader
+  reports as budget/gas (0 would be a run that spent its gas exactly)."
+  [instruction-index]
+  (let [present (memory-label instruction-index "gas-present")
+        trap (memory-label instruction-index "gas-trap")]
+    (vec (concat [0x49 0x83 0x39 0x0c]
+                 [(layout/relative-branch :x86-64/jne-rel8 trap)]
+                 [0x49 0x29 0xb1 0x80 0x01 0x00 0x00]
+                 [(layout/relative-branch :x86-64/jae-rel32 present)]
+                 [0x49 0xc7 0x81 0x80 0x01 0x00 0x00 0xff 0xff 0xff 0xff]
+                 [(layout/label trap)]
+                 [0x0f 0x0b]
+                 [(layout/label present)])))))
+
+#?(:kotoba nil :default
 (defn- x86-inline-runtime
+  [instruction-index runtime]
+  (case runtime
+    :fuel-charge (x86-fuel-charge instruction-index)
+    :gas-charge (x86-gas-charge instruction-index)
+    (x86-inline-handle-runtime instruction-index runtime))))
+
+#?(:kotoba nil :default
+(defn- x86-inline-handle-runtime
   [instruction-index runtime]
   (let [trap (memory-label instruction-index "handle-trap")
         done (memory-label instruction-index "handle-done")
@@ -14862,14 +15095,228 @@
      (let [xs (kids instructions) n (lcount xs)]
        (loop [i 0]
          (if (>= i n) false
-           (let [op (fget (lget xs i) :gmir/op)]
-             (if (or (kw? op :gmir/call) (kw? op :gmir/tail-call) (kw? op :gmir/runtime-call) (kw? op :gmir/capability-call))
+           (let [op (fget (lget xs i) :gmir/op)
+                 runtime (fget (lget xs i) :gmir/runtime)]
+             ;; the per-constructor fuel debit and the consensus gas debit are
+             ;; charges, not re-entry (as on the host)
+             (if (and (or (kw? op :gmir/call) (kw? op :gmir/tail-call) (kw? op :gmir/runtime-call) (kw? op :gmir/capability-call))
+                      (not (or (kw? runtime :fuel-charge) (kw? runtime :gas-charge))))
                true (recur (inc i))))))))
    :default
 (defn function-reenters-guest?
-  "True when lowered instructions can invoke more guest or host work."
+  "True when lowered instructions can invoke more guest or host work. The
+  per-constructor fuel debit is a runtime call that does neither: it is the
+  charge, so it does not make a function pay an entry charge too."
   [instructions]
-  (boolean (some #(contains? guest-reentry-ops (:gmir/op %)) instructions))))
+  (boolean (some #(and (contains? guest-reentry-ops (:gmir/op %))
+                       ;; The consensus gas debit is a charge too: a function
+                       ;; must not start paying an entry FUEL charge because
+                       ;; it is metered for gas.
+                       (not (contains? #{:fuel-charge :gas-charge} (:gmir/runtime %))))
+                 instructions))))
+
+#?(:kotoba nil :default
+(def charged-constructors
+  "The reference's `cell-constructor-ops` (osaho kotoba.kir): every head
+  kotoba.kir debits one unit of fuel for, before it evaluates the operands
+  (amu ADR 0353 point 7). amu's native-constructors-charge-fuel-test pins
+  this set to the reference's."
+  '#{pair kgraph-assert! map-new map-assoc option-some result-ok result-err
+     result-ok-of result-err-of variant-new option-some-of option-none-of
+     hetero-vector-new hetero-vector-assoc typed-list-new typed-list-conj typed-set-new
+     typed-set-conj typed-set-disj typed-map-new typed-map-assoc typed-map-dissoc
+     record-new record-assoc vector-new vector-conj vector-assoc vector-assoc!
+     bytes-slice bytes-concat bytes-from-vector-i64 vector-i64-from-bytes
+     vector-alloc vector-drop vector-take vector-f64-new vector-f64-conj
+     vector-f64-assoc vector-f64-drop vector-f64-take string-index-new
+     string-index-assoc disjoint-set-i64-new disjoint-set-i64-union
+     document-vector document-list document-set document-map}))
+
+#?(:kotoba
+   ;; `charged-constructors`, spelled as the predicate a Kotoba constant cannot
+   ;; be (a constant is evaluated before any function): the same 48 heads.
+   (defn- charged-constructor? [h [:ref :form/r]] :bool
+     (or (sym? h "pair") (sym? h "kgraph-assert!") (sym? h "map-new") (sym? h "map-assoc")
+         (sym? h "option-some") (sym? h "result-ok") (sym? h "result-err") (sym? h "result-ok-of")
+         (sym? h "result-err-of") (sym? h "variant-new") (sym? h "option-some-of")
+         (sym? h "option-none-of") (sym? h "hetero-vector-new") (sym? h "hetero-vector-assoc")
+         (sym? h "typed-list-new") (sym? h "typed-list-conj") (sym? h "typed-set-new")
+         (sym? h "typed-set-conj") (sym? h "typed-set-disj") (sym? h "typed-map-new")
+         (sym? h "typed-map-assoc") (sym? h "typed-map-dissoc") (sym? h "record-new")
+         (sym? h "record-assoc") (sym? h "vector-new") (sym? h "vector-conj")
+         (sym? h "vector-assoc") (sym? h "vector-assoc!") (sym? h "bytes-slice")
+         (sym? h "bytes-concat") (sym? h "bytes-from-vector-i64") (sym? h "vector-i64-from-bytes")
+         (sym? h "vector-alloc") (sym? h "vector-drop") (sym? h "vector-take")
+         (sym? h "vector-f64-new") (sym? h "vector-f64-conj") (sym? h "vector-f64-assoc")
+         (sym? h "vector-f64-drop") (sym? h "vector-f64-take") (sym? h "string-index-new")
+         (sym? h "string-index-assoc") (sym? h "disjoint-set-i64-new")
+         (sym? h "disjoint-set-i64-union") (sym? h "document-vector") (sym? h "document-list")
+         (sym? h "document-set") (sym? h "document-map"))))
+
+#?(:kotoba
+   ;; MODE 0: `charge-constructors`' walk; MODE 1: `charge-gas`' walk, with
+   ;; SCHEDULE and the module's function NAMES (a vector form).
+   (defn- charge-kids [xs [:list [:ref :form/r]] mode :i64 schedule [:ref :form/r] names [:ref :form/r]] [:list [:ref :form/r]]
+     (let [n (lcount xs)]
+       (loop [i 0 acc (lnone)]
+         (if (>= i n) acc (recur (inc i) (lconj acc (charge-walk (lget xs i) mode schedule names))))))))
+
+#?(:kotoba
+   ;; the weight of one application form whose head is OP (osaho execute-metered)
+   (defn- gas-weight [op [:ref :form/r] schedule [:ref :form/r] names [:ref :form/r]] :i64
+     (if (fmember? names op)
+       (form/int-value (fget schedule :call))
+       (let [w (form/form-get (fget schedule :weights) op)]
+         (if (form/is-int? w) (form/int-value w) (form/int-value (fget schedule :default)))))))
+
+#?(:kotoba
+   ;; children first, then the debit in front of the form, as the host's `charge`
+   (defn- charge-walk [f [:ref :form/r] mode :i64 schedule [:ref :form/r] names [:ref :form/r]] [:ref :form/r]
+     (cond
+       (form/is-seq? f)
+       (let [c (lst (charge-kids (kids f) mode schedule names))
+             head (if (> (fcount c) 0) (fnth c 0) (nf))]
+         (if (= mode 0)
+           (if (charged-constructor? head) (form/call2 "do" (form/call0 "fuel-charge!") c) c)
+           (let [w (gas-weight head schedule names)]
+             (if (> w 0) (form/call2 "do" (form/call1 "gas-charge!" (intf w)) c) c))))
+       (form/is-vec? f) (fvec (charge-kids (kids f) mode schedule names))
+       (form/is-map? f) (fmap (charge-kids (kids f) mode schedule names))
+       :else f)))
+
+#?(:kotoba
+   (defn- charge-functions [fs [:list [:ref :form/r]] mode :i64 schedule [:ref :form/r] names [:ref :form/r]] [:ref :form/r]
+     (let [n (lcount fs)]
+       (loop [i 0 acc (lnone)]
+         (if (>= i n) (fvec acc)
+           (let [fn-form (lget fs i)]
+             (recur (inc i) (lconj acc (fassoc fn-form :body (charge-walk (fget fn-form :body) mode schedule names))))))))))
+
+#?(:kotoba
+   (defn- function-name-forms [fs [:list [:ref :form/r]]] [:ref :form/r]
+     (let [n (lcount fs)]
+       (loop [i 0 acc (lnone)]
+         (if (>= i n) (fvec acc) (recur (inc i) (lconj acc (fget (lget fs i) :name))))))))
+
+#?(:kotoba
+   (defn- pos-int-form? [x [:ref :form/r]] :bool (and (form/is-int? x) (> (form/int-value x) 0))))
+
+#?(:kotoba
+   (defn- gas-weights-ok? [w [:ref :form/r]] :bool
+     (let [xs (kids w) n (lcount xs)]
+       (loop [j 0]
+         (if (>= (+ j 1) n) true
+           (let [k (lget xs j) v (lget xs (+ j 1))]
+             (if (and (form/is-symbol? k) (form/is-int? v) (>= (form/int-value v) 0))
+               (recur (+ j 2))
+               false)))))))
+
+#?(:kotoba nil :default
+(defn charges-written
+  "KIR whose constructor charges are already written out as `(fuel-charge!)`,
+  which `charge-constructors` then leaves as it is. For a test that compares
+  a form with its hand-written lowering: a `record-new` costs one unit and
+  the pair chain it lowers to costs one per pair, so the hand-written form
+  must carry the source's charge, not its own."
+  [kir]
+  (vary-meta kir assoc ::charges-written true)))
+
+#?(:kotoba
+   ;; As the host, minus the `charges-written` escape: that marks a KIR by
+   ;; metadata, which a Form does not carry, and only host tests write it.
+   (defn charge-constructors [kir [:ref :form/r]] [:ref :form/r]
+     (fassoc kir :functions (charge-functions (kids (fget kir :functions)) 0 (nf) (nf))))
+   :default
+(defn charge-constructors
+  "amu ADR 0353 floor :allocation-budget-native (ADR 0089). Put one unit of fuel in
+  front of every constructor of the program's own functions, as the
+  reference charges it: `(C args)` becomes `(do (fuel-charge!) (C args))`,
+  so the debit precedes the operands. Runs on the KIR the program names,
+  after `vector-region` (which charges the literals it keeps in locals
+  itself) and before the rewrites that lower one source constructor into
+  several (string-index) or into helper functions (document), so each
+  source constructor costs exactly one unit however it is lowered."
+  [kir]
+  (let [charge (fn charge [form]
+                 (cond
+                   (seq? form)
+                   (let [form (apply list (map charge form))]
+                     (if (contains? charged-constructors (first form))
+                       (list 'do (list 'fuel-charge!) form)
+                       form))
+                   (vector? form) (mapv charge form)
+                   (map? form) (into (empty form) (map (fn [[k v]] [(charge k) (charge v)])) form)
+                   :else form))]
+    (if (::charges-written (meta kir))
+      kir
+      (update kir :functions (fn [functions] (mapv #(update % :body charge) functions)))))))
+
+#?(:kotoba
+   (defn- valid-gas-schedule? [s [:ref :form/r]] :bool
+     (and (form/is-map? s)
+          (form/is-keyword? (fget s :gas-schedule/id))
+          (pos-int-form? (fget s :default))
+          (pos-int-form? (fget s :call))
+          (form/is-map? (fget s :weights))
+          (gas-weights-ok? (fget s :weights))))
+   :default
+(defn- valid-gas-schedule? [schedule]
+  (let [pos-int? (fn [x] (and (integer? x) (pos? x)))]
+    (and (map? schedule) (keyword? (:gas-schedule/id schedule))
+         (pos-int? (:default schedule)) (pos-int? (:call schedule))
+         (map? (:weights schedule))
+         (every? (fn [[k v]] (and (symbol? k) (integer? v) (not (neg? v))))
+                 (:weights schedule))))))
+
+#?(:kotoba
+   (defn charge-gas [kir [:ref :form/r]] [:ref :form/r]
+     (let [schedule (fget kir :gas-schedule)]
+       (if (not (truthy? schedule))
+         kir
+         (if (not (valid-gas-schedule? schedule))
+           (throw (ex-info "gas schedule refused" {:phase :native :reason :gas-schedule}))
+           (let [fs (kids (fget kir :functions))]
+             (fassoc (form/dissoc-form kir (kf :gas-schedule)) :functions
+                     (charge-functions fs 1 schedule (function-name-forms fs))))))))
+   :default
+(defn charge-gas
+  "Consensus gas (superproject adr-2610092340 D12). When the KIR names a
+  `:gas-schedule`, put the weight of every application form in front of it as
+  one `(gas-charge! w)`: `(op args)` becomes `(do (gas-charge! w) (op args))`,
+  so the debit precedes the operands, as
+  the reference charges it (osaho `kotoba.kir/execute-metered`: one debit per
+  evaluated application form; a module function call weighs `:call`, any
+  other head its listed weight or `:default`). Runs FIRST, on the source KIR,
+  so the forms charged are the ones the reference evaluates, not the ones
+  later rewrites lower them into. One debit per form whatever its weight
+  (2026-10-10; before, a weight w was w unit debits, so code grew with the
+  price). A weight of 0 writes nothing. Without a
+  schedule the KIR is returned as it is, so an unmetered program's bytes do
+  not move."
+  [kir]
+  (if-let [schedule (:gas-schedule kir)]
+    (do
+      (when-not (valid-gas-schedule? schedule)
+        (throw (ex-info "gas schedule refused" {:phase :native :reason :gas-schedule})))
+      (let [functions (set (map :name (:functions kir)))
+            weight (fn [op] (if (contains? functions op)
+                              (:call schedule)
+                              (get (:weights schedule) op (:default schedule))))
+            charge (fn charge [form]
+                     (cond
+                       (seq? form)
+                       (let [form (apply list (map charge form))
+                             w (weight (first form))]
+                         (if (pos? w)
+                           (list 'do (list 'gas-charge! w) form)
+                           form))
+                       (vector? form) (mapv charge form)
+                       (map? form) (into (empty form) (map (fn [[k v]] [(charge k) (charge v)])) form)
+                       :else form))]
+        (-> kir
+            (dissoc :gas-schedule)
+            (update :functions (fn [fs] (mapv #(update % :body charge) fs))))))
+    kir)))
 
 #?(:kotoba
    ;; the host takes TOKENS-FOR, a function of the name; every caller answers the

@@ -606,6 +606,22 @@
    :default
    (declare rewrite*))
 
+#?(:kotoba
+   ;; A literal kept in locals is still a constructor: it pays the one unit of
+   ;; fuel the reference charges for it, before its items (amu ADR 0353 floor
+   ;; :allocation-budget-native). The binding pair [fresh (fuel-charge!)] as a
+   ;; vector form, so it precedes the items' own.
+   (defn- charge [used [:ref :form/r] counter :i64] [:ref :vr/rw]
+     (let [f (fresh used "charge" counter)]
+       (rw (form-vec2 (rw-form f) (form-call0 "fuel-charge!")) (rw-n f))))
+   :default
+   (defn- charge
+     "A literal kept in locals is still a constructor: it pays the one unit of
+     fuel the reference charges for it, before its items (amu ADR 0353 floor
+     :allocation-budget-native). A binding, so it precedes the items' own."
+     [state used]
+     [(fresh! state used "charge") (list 'fuel-charge!)]))
+
 
 #?(:kotoba
    (defn- selected-chain [items [:ref :form/r] i [:ref :form/r] fallback [:ref :form/r]] [:ref :form/r]
@@ -664,7 +680,8 @@
          (and literal-items
               (or (contains? counts op) (contains? ats op) (contains? gets op)))
          (let [slots (mapv (fn [_] (fresh! state used "item")) literal-items)
-               bindings (vec (mapcat vector slots (map #(rewrite* % state used) literal-items)))
+               bindings (into (charge state used)
+                              (mapcat vector slots (map #(rewrite* % state used) literal-items)))
                result (cond
                         (contains? counts op) (count slots)
                         (contains? ats op) (select-form slots index (list 'quot 1 0) state used)
@@ -690,13 +707,17 @@
          (and (not (form-is-nil? lit)) any-read)
          (let [sl (fresh-slots (form-count-of lit) used counter)
                slots (rw-form sl)
-               bl (literal-bindings slots lit (rw-n sl) used)
+               ch (charge used (rw-n sl))
+               bl (literal-bindings slots lit (rw-n ch) used)
                result (cond
                         (count-op? op) (rw (num (form-count-of slots)) (rw-n bl))
                         (at-op? op) (select-form slots index (form-call2 "quot" (num 1) (num 0)) (rw-n bl) used)
                         :else (let [fb (rewrite* fallback (rw-n bl) used)]
                                 (select-form slots index (rw-form fb) (rw-n fb) used)))]
-           (rw (form-call2 "let" (rw-form bl) (rw-form result)) (rw-n result)))
+           (rw (form-call2 "let"
+                           (form-form-vec (form-append-many (form-kids-of (rw-form ch)) (form-kids-of (rw-form bl))))
+                           (rw-form result))
+               (rw-n result)))
          :else (rw (form-nil-form) counter)))))
 
 
@@ -724,8 +745,9 @@
                      (let [remainder (concat (map second (rest pairs)) body)]
                        (if (every? #(safe-uses? % name) remainder)
                          (let [slots (mapv (fn [_] (fresh! state used "item")) items)
-                               lowered (mapcat vector slots
-                                               (map #(rewrite-with-regions % active state used) items))]
+                               lowered (concat (charge state used)
+                                               (mapcat vector slots
+                                                       (map #(rewrite-with-regions % active state used) items)))]
                            (recur (rest pairs) (into out lowered)
                                   (assoc active name slots)))
                          (recur (rest pairs)
@@ -786,9 +808,11 @@
                  items (if (form-is-symbol? name) (constructor-items value) (form-nil-form))]
              (if (and (not (form-is-nil? items)) (rest-safe? bindings i argf name))
                (let [sl (fresh-slots (form-count-of items) used c)
-                     low (lower-items items (rw-form sl) active (rw-n sl) used)]
+                     ch (charge used (rw-n sl))
+                     low (lower-items items (rw-form sl) active (rw-n ch) used)]
                  (recur (+ i 2)
-                        (form-append-many out (form-kids-of (rw-form low)))
+                        (form-append-many (form-append-many out (form-kids-of (rw-form ch)))
+                                          (form-kids-of (rw-form low)))
                         (form-assoc-form active name (rw-form sl))
                         (rw-n low)))
                (let [v (rewrite-with-regions value active c used)]

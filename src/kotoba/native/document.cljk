@@ -20,6 +20,19 @@
   Canonical text makes structural equality `string=?`: two documents are
   equal exactly when their canonical texts are.
 
+  The IPLD Data Model's bytes and link (root ADR-2610092310 S4) are the two
+  EDN tagged literals the reference prints: `#kotoba/bytes \"<lowercase hex>\"`
+  and `#kotoba/cid \"b<lowercase unpadded base32 of the binary CIDv1>\"`.
+  `document-bytes` / `document-link` write them from a `:bytes` handle (a
+  vector-arena handle on native); `document-link` answers none unless the
+  bytes are one binary CIDv1 (osaho `cidv1-binary-items?`, re-derived as
+  `kotoba$doc-cidv1?`); the two value readers read the text back into a
+  `:bytes`. Their canonical bytes (`x<len>:` / `c<len>:` then the payload)
+  are re-derived with the payload in an order-preserving spelling -- the hex
+  itself, and the base32 digits respelled `0`..`O` -- which orders exactly as
+  the raw payload does, because two canonical byte strings can first differ
+  inside a payload only at one offset of two payloads of one tag and length.
+
   ## Order
 
   Map keys that are both keywords compare by their text, set items and every
@@ -617,7 +630,7 @@
 
 #?(:kotoba
    (def ^:private helpers-text
-     "[{:name kotoba$doc-width, :params [c], :param-types [:i64], :result :i64, :body (if (< c 128) 1 (if (< c 2048) 2 (if (< c 65536) 3 4)))} {:name kotoba$doc-closer?, :params [c], :param-types [:i64], :result :bool, :body (if (= c 93) true (if (= c 41) true (= c 125)))} {:name kotoba$doc-trap, :params [], :param-types [], :result :i64, :body (vector-at (vector-new) 0)} {:name kotoba$doc-token-end, :params [s i], :param-types [:string :i64], :result :i64, :body (if (>= i (string-byte-length s)) i (let [c (string-code-point-at s i)] (if (= c 32) i (if (kotoba$doc-closer? c) i (kotoba$doc-token-end s (+ i (kotoba$doc-width c)))))))} {:name kotoba$doc-string-end, :params [s i], :param-types [:string :i64], :result :i64, :body (let [q (string-find-byte s 34 i) b (string-find-byte s 92 i)] (if (< b 0) (+ q 1) (if (< b q) (kotoba$doc-string-end s (+ b 2)) (+ q 1))))} {:name kotoba$doc-seq-end, :params [s i], :param-types [:string :i64], :result :i64, :body (let [c (string-code-point-at s i)] (if (= c 32) (kotoba$doc-seq-end s (+ i 1)) (if (kotoba$doc-closer? c) (+ i 1) (kotoba$doc-seq-end s (kotoba$doc-end s i)))))} {:name kotoba$doc-end, :params [s i], :param-types [:string :i64], :result :i64, :body (let [c (string-code-point-at s i)] (if (= c 34) (kotoba$doc-string-end s (+ i 1)) (if (= c 91) (kotoba$doc-seq-end s (+ i 1)) (if (= c 40) (kotoba$doc-seq-end s (+ i 1)) (if (= c 123) (kotoba$doc-seq-end s (+ i 1)) (if (= c 35) (kotoba$doc-seq-end s (+ i 2)) (kotoba$doc-token-end s i)))))))} {:name kotoba$doc-open, :params [d], :param-types [:string], :result :i64, :body (if (= (string-code-point-at d 0) 35) 2 1)} {:name kotoba$doc-item, :params [d i k], :param-types [:string :i64 :i64], :result :i64, :body (let [c (string-code-point-at d i)] (if (= c 32) (kotoba$doc-item d (+ i 1) k) (if (kotoba$doc-closer? c) -1 (if (= k 0) i (kotoba$doc-item d (kotoba$doc-end d i) (- k 1))))))} {:name kotoba$doc-close, :params [d], :param-types [:string], :result :i64, :body (- (string-byte-length d) 1)} {:name kotoba$doc-count-from, :params [d i n], :param-types [:string :i64 :i64], :result :i64, :body (let [c (string-code-point-at d i)] (if (= c 32) (kotoba$doc-count-from d (+ i 1) n) (if (kotoba$doc-closer? c) n (kotoba$doc-count-from d (kotoba$doc-end d i) (+ n 1)))))} {:name kotoba$doc-forms, :params [d], :param-types [:string], :result :i64, :body (kotoba$doc-count-from d (kotoba$doc-open d) 0)} {:name kotoba$doc-region=?, :params [s i j t k], :param-types [:string :i64 :i64 :string :i64], :result :bool, :body (if (= i j) (= k (string-byte-length t)) (if (>= k (string-byte-length t)) false (let [c (string-code-point-at s i)] (if (= c (string-code-point-at t k)) (kotoba$doc-region=? s (+ i (kotoba$doc-width c)) j t (+ k (kotoba$doc-width c))) false))))} {:name kotoba$doc-digit?, :params [c], :param-types [:i64], :result :bool, :body (if (< c 48) false (< c 58))} {:name kotoba$doc-at, :params [t i e], :param-types [:string :i64 :i64], :result :i64, :body (if (>= i e) -1 (string-code-point-at t i))} {:name kotoba$doc-digits-end, :params [t i e], :param-types [:string :i64 :i64], :result :i64, :body (if (>= i e) i (if (kotoba$doc-digit? (string-code-point-at t i)) (kotoba$doc-digits-end t (+ i 1) e) i))} {:name kotoba$doc-exp-end, :params [t i e], :param-types [:string :i64 :i64], :result :i64, :body (let [c (kotoba$doc-at t i e)] (if (if (= c 101) true (= c 69)) (let [s (kotoba$doc-at t (+ i 1) e) j (if (if (= s 43) true (= s 45)) (+ i 2) (+ i 1)) k (kotoba$doc-digits-end t j e)] (if (> k j) k -1)) i))} {:name kotoba$doc-number-kind, :params [t i e], :param-types [:string :i64 :i64], :result :i64, :body (let [c0 (kotoba$doc-at t i e) i0 (if (if (= c0 43) true (= c0 45)) (+ i 1) i) d1 (kotoba$doc-digits-end t i0 e)] (if (= d1 e) (if (> d1 i0) 2 0) (let [c (string-code-point-at t d1)] (if (= c 46) (let [d2 (kotoba$doc-digits-end t (+ d1 1) e)] (if (if (= d1 i0) (= d2 (+ d1 1)) false) 0 (if (= (kotoba$doc-exp-end t d2 e) e) 3 0))) (if (if (= c 101) true (= c 69)) (if (= d1 i0) 0 (let [x (kotoba$doc-exp-end t d1 e)] (if (< x 0) 0 (if (= (kotoba$doc-exp-end t x e) e) 3 0)))) 0)))))} {:name kotoba$doc-kind-at, :params [d i e], :param-types [:string :i64 :i64], :result :i64, :body (let [c (string-code-point-at d i)] (if (= c 34) 4 (if (= c 58) 5 (if (= c 91) 7 (if (= c 40) 8 (if (= c 35) 9 (if (= c 123) 10 (if (kotoba$doc-region=? d i e \"nil\" 0) 0 (if (kotoba$doc-region=? d i e \"true\" 0) 1 (if (kotoba$doc-region=? d i e \"false\" 0) 1 (let [k (kotoba$doc-number-kind d i e)] (if (= k 0) 6 k))))))))))))} {:name kotoba$doc-kind, :params [d], :param-types [:string], :result :i64, :body (kotoba$doc-kind-at d 0 (string-byte-length d))} {:name kotoba$doc-require, :params [d lo hi], :param-types [:string :i64 :i64], :result :string, :body (let [k (kotoba$doc-kind d)] (if (< k lo) (kotoba$doc-trap) (if (> k hi) (kotoba$doc-trap) d)))} {:name kotoba$doc-dec-neg, :params [acc m], :param-types [:string :i64], :result :string, :body (let [q (quot m 10) d (- 0 (- m (* q 10)))] (string-append-range (if (= q 0) acc (kotoba$doc-dec-neg acc q)) \"0123456789\" d (+ d 1)))} {:name kotoba$doc-dec, :params [n], :param-types [:i64], :result :string, :body (if (< n 0) (kotoba$doc-dec-neg \"-\" n) (kotoba$doc-dec-neg \"\" (- 0 n)))} {:name kotoba$doc-parse-neg, :params [t i acc], :param-types [:string :i64 :i64], :result :i64, :body (if (>= i (string-byte-length t)) acc (kotoba$doc-parse-neg t (+ i 1) (- (* acc 10) (- (string-code-point-at t i) 48))))} {:name kotoba$doc-parse-i64, :params [t], :param-types [:string], :result :i64, :body (let [c (string-code-point-at t 0)] (if (= c 45) (kotoba$doc-parse-neg t 1 0) (- 0 (kotoba$doc-parse-neg t (if (= c 43) 1 0) 0))))} {:name kotoba$doc-plain?, :params [c], :param-types [:i64], :result :bool, :body (if (< c 32) false (if (= c 34) false (bool-not (= c 92))))} {:name kotoba$doc-plain-end, :params [s i], :param-types [:string :i64], :result :i64, :body (if (>= i (string-byte-length s)) i (let [c (string-code-point-at s i)] (if (kotoba$doc-plain? c) (kotoba$doc-plain-end s (+ i (kotoba$doc-width c))) i)))} {:name kotoba$doc-escape-char, :params [acc c], :param-types [:string :i64], :result :string, :body (if (= c 34) (string-concat acc \"\\\\\\\"\") (if (= c 92) (string-concat acc \"\\\\\\\\\") (if (= c 8) (string-concat acc \"\\\\b\") (if (= c 9) (string-concat acc \"\\\\t\") (if (= c 10) (string-concat acc \"\\\\n\") (if (= c 12) (string-concat acc \"\\\\f\") (if (= c 13) (string-concat acc \"\\\\r\") (string-append-range (string-append-range (string-concat acc \"\\\\u00\") \"0123456789abcdef\" (quot c 16) (+ (quot c 16) 1)) \"0123456789abcdef\" (- c (* (quot c 16) 16)) (+ (- c (* (quot c 16) 16)) 1)))))))))} {:name kotoba$doc-escape-from, :params [acc s i], :param-types [:string :string :i64], :result :string, :body (let [j (kotoba$doc-plain-end s i) acc (string-append-range acc s i j)] (if (>= j (string-byte-length s)) (string-concat acc \"\\\"\") (kotoba$doc-escape-from (kotoba$doc-escape-char acc (string-code-point-at s j)) s (+ j 1))))} {:name kotoba$doc-escape, :params [s], :param-types [:string], :result :string, :body (kotoba$doc-escape-from \"\\\"\" s 0)} {:name kotoba$doc-hex, :params [c], :param-types [:i64], :result :i64, :body (if (< c 58) (- c 48) (if (< c 71) (- c 55) (- c 87)))} {:name kotoba$doc-unescape-from, :params [acc t i end], :param-types [:string :string :i64 :i64], :result :string, :body (let [b (string-find-byte t 92 i)] (if (if (< b 0) true (>= b end)) (string-append-range acc t i end) (let [acc (string-append-range acc t i b) e (string-code-point-at t (+ b 1))] (if (= e 117) (let [u (+ (* 16 (kotoba$doc-hex (string-code-point-at t (+ b 4)))) (kotoba$doc-hex (string-code-point-at t (+ b 5))))] (if (if (= (string-code-point-at t (+ b 2)) 48) (if (= (string-code-point-at t (+ b 3)) 48) (< u 32) false) false) (kotoba$doc-unescape-from (string-append-range acc kotoba$doc-control u (+ u 1)) t (+ b 6) end) (kotoba$doc-trap))) (kotoba$doc-unescape-from (string-concat acc (if (= e 110) \"\\n\" (if (= e 116) \"\\t\" (if (= e 98) \"\\b\" (if (= e 102) \"\\f\" (if (= e 114) \"\\r\" (if (= e 34) \"\\\"\" \"\\\\\"))))))) t (+ b 2) end)))))} {:name kotoba$doc-unescape, :params [t], :param-types [:string], :result :string, :body (kotoba$doc-unescape-from \"\" t 1 (- (string-byte-length t) 1))} {:name kotoba$doc-symbol-char-ok?, :params [c], :param-types [:i64], :result :bool, :body (if (<= c 32) false (if (= c 44) false (if (= c 91) false (if (= c 93) false (if (= c 123) false (if (= c 125) false (if (= c 40) false (if (= c 41) false (if (= c 34) false (if (= c 39) false (if (= c 59) false (if (= c 96) false (if (= c 126) false (if (= c 94) false (bool-not (= c 92))))))))))))))))} {:name kotoba$doc-symbol-chars-ok?, :params [s i], :param-types [:string :i64], :result :bool, :body (if (>= i (string-byte-length s)) true (let [c (string-code-point-at s i)] (if (kotoba$doc-symbol-char-ok? c) (kotoba$doc-symbol-chars-ok? s (+ i (kotoba$doc-width c))) false)))} {:name kotoba$doc-symbol, :params [s], :param-types [:string], :result :string, :body (if (= (string-byte-length s) 0) (kotoba$doc-trap) (if (kotoba$doc-symbol-chars-ok? s 0) (let [c (string-code-point-at s 0)] (if (= c 58) (kotoba$doc-trap) (if (= c 35) (kotoba$doc-trap) (if (string=? s \"nil\") (kotoba$doc-trap) (if (string=? s \"true\") (kotoba$doc-trap) (if (string=? s \"false\") (kotoba$doc-trap) (if (= (kotoba$doc-number-kind s 0 (string-byte-length s)) 0) s (kotoba$doc-trap)))))))) (kotoba$doc-trap)))} {:name kotoba$doc-max, :params [a b], :param-types [:i64 :i64], :result :i64, :body (if (> a b) a b)} {:name kotoba$doc-keyword-at?, :params [d i], :param-types [:string :i64], :result :bool, :body (= (string-code-point-at d i) 58)} {:name kotoba$doc-depth-items, :params [d i m map? key?], :param-types [:string :i64 :i64 :bool :bool], :result :i64, :body (let [c (string-code-point-at d i)] (if (= c 32) (kotoba$doc-depth-items d (+ i 1) m map? key?) (if (kotoba$doc-closer? c) m (let [here (if (if key? (kotoba$doc-keyword-at? d i) false) 0 (kotoba$doc-depth-at d i))] (kotoba$doc-depth-items d (kotoba$doc-end d i) (kotoba$doc-max m here) map? (if map? (bool-not key?) false))))))} {:name kotoba$doc-depth-at, :params [d i], :param-types [:string :i64], :result :i64, :body (let [k (kotoba$doc-kind-at d i (kotoba$doc-end d i))] (if (< k 7) 1 (+ 1 (kotoba$doc-depth-items d (+ i (if (= k 9) 2 1)) 0 (= k 10) (= k 10)))))} {:name kotoba$doc-nodes-items, :params [d i n map? key?], :param-types [:string :i64 :i64 :bool :bool], :result :i64, :body (let [c (string-code-point-at d i)] (if (= c 32) (kotoba$doc-nodes-items d (+ i 1) n map? key?) (if (kotoba$doc-closer? c) n (let [here (if (if key? (kotoba$doc-keyword-at? d i) false) 0 (kotoba$doc-nodes-at d i))] (kotoba$doc-nodes-items d (kotoba$doc-end d i) (+ n here) map? (if map? (bool-not key?) false))))))} {:name kotoba$doc-nodes-at, :params [d i], :param-types [:string :i64], :result :i64, :body (let [k (kotoba$doc-kind-at d i (kotoba$doc-end d i))] (if (< k 7) 1 (+ 1 (kotoba$doc-nodes-items d (+ i (if (= k 9) 2 1)) 0 (= k 10) (= k 10)))))} {:name kotoba$doc-bounded, :params [d], :param-types [:string], :result :string, :body (let [k (kotoba$doc-kind d)] (if (< k 7) d (if (> (if (= k 10) (quot (kotoba$doc-forms d) 2) (kotoba$doc-forms d)) 32) (kotoba$doc-trap) (if (> (kotoba$doc-depth-at d 0) 9) (kotoba$doc-trap) (if (> (kotoba$doc-nodes-at d 0) 4096) (kotoba$doc-trap) d)))))} {:name kotoba$doc-len-text, :params [acc tag s], :param-types [:string :string :string], :result :string, :body (string-concat (string-concat (string-concat (string-concat acc tag) (kotoba$doc-dec (string-byte-length s))) \":\") s)} {:name kotoba$doc-len-range, :params [acc tag d i e], :param-types [:string :string :string :i64 :i64], :result :string, :body (string-append-range (string-concat (string-concat (string-concat acc tag) (kotoba$doc-dec (- e i))) \":\") d i e)} {:name kotoba$doc-canon-items, :params [acc d i map? key?], :param-types [:string :string :i64 :bool :bool], :result :string, :body (let [c (string-code-point-at d i)] (if (= c 32) (kotoba$doc-canon-items acc d (+ i 1) map? key?) (if (kotoba$doc-closer? c) acc (let [e (kotoba$doc-end d i) acc (if key? (if (kotoba$doc-keyword-at? d i) (kotoba$doc-len-range acc \"K\" d i e) (kotoba$doc-canon-at (string-concat acc \"D\") d i)) (kotoba$doc-canon-at acc d i))] (kotoba$doc-canon-items acc d e map? (if map? (bool-not key?) false))))))} {:name kotoba$doc-canon-at, :params [acc d i], :param-types [:string :string :i64], :result :string, :body (let [e (kotoba$doc-end d i) k (kotoba$doc-kind-at d i e)] (if (= k 0) (string-concat acc \"n\") (if (= k 1) (string-concat acc (if (kotoba$doc-region=? d i e \"true\" 0) \"bt\" \"bf\")) (if (= k 2) (string-concat (string-append-range (string-concat acc \"i\") d i e) \";\") (if (= k 3) (kotoba$doc-trap) (if (= k 4) (kotoba$doc-len-text acc \"s\" (kotoba$doc-unescape-from \"\" d (+ i 1) (- e 1))) (if (= k 5) (kotoba$doc-len-range acc \"k\" d i e) (if (= k 6) (kotoba$doc-len-range acc \"y\" d i e) (let [open (+ i (if (= k 9) 2 1)) forms (kotoba$doc-count-from d open 0) head (string-concat (string-concat (string-concat acc (if (= k 7) \"v\" (if (= k 8) \"l\" (if (= k 9) \"e\" \"m\")))) (kotoba$doc-dec (if (= k 10) (quot forms 2) forms))) \":\")] (kotoba$doc-canon-items head d open (= k 10) (= k 10)))))))))))} {:name kotoba$doc-canon, :params [d], :param-types [:string], :result :string, :body (kotoba$doc-canon-at \"\" d 0)} {:name kotoba$doc-compare, :params [a b], :param-types [:string :string], :result :i64, :body (string-compare (kotoba$doc-canon a) (kotoba$doc-canon b))} {:name kotoba$doc-region-compare, :params [a i j b k l], :param-types [:string :i64 :i64 :string :i64 :i64], :result :i64, :body (if (= i j) (if (= k l) 0 -1) (if (= k l) 1 (let [x (string-code-point-at a i) y (string-code-point-at b k)] (if (< x y) -1 (if (> x y) 1 (kotoba$doc-region-compare a (+ i (kotoba$doc-width x)) j b (+ k (kotoba$doc-width y)) l))))))} {:name kotoba$doc-key-compare-at, :params [key m i e], :param-types [:string :string :i64 :i64], :result :i64, :body (if (if (= (string-code-point-at key 0) 58) (kotoba$doc-keyword-at? m i) false) (kotoba$doc-region-compare key 0 (string-byte-length key) m i e) (string-compare (kotoba$doc-canon key) (kotoba$doc-canon-at \"\" m i)))} {:name kotoba$doc-map-find, :params [m key i], :param-types [:string :string :i64], :result :i64, :body (let [c (string-code-point-at m i)] (if (= c 32) (kotoba$doc-map-find m key (+ i 1)) (if (kotoba$doc-closer? c) -1 (let [ke (kotoba$doc-end m i)] (if (kotoba$doc-region=? m i ke key 0) i (kotoba$doc-map-find m key (kotoba$doc-end m (+ ke 1))))))))} {:name kotoba$doc-map-slot, :params [m key i unique?], :param-types [:string :string :i64 :bool], :result :i64, :body (let [c (string-code-point-at m i)] (if (= c 32) (kotoba$doc-map-slot m key (+ i 1) unique?) (if (kotoba$doc-closer? c) i (let [ke (kotoba$doc-end m i) order (kotoba$doc-key-compare-at key m i ke)] (if (< order 0) i (if (if unique? (= order 0) false) (kotoba$doc-trap) (kotoba$doc-map-slot m key (kotoba$doc-end m (+ ke 1)) unique?)))))))} {:name kotoba$doc-insert-at, :params [m q entry], :param-types [:string :i64 :string], :result :string, :body (if (= q (kotoba$doc-close m)) (if (= q (kotoba$doc-open m)) (string-concat (string-append-range \"\" m 0 q) (string-concat entry (string-substring m q (string-byte-length m)))) (string-concat (string-concat (string-append-range \"\" m 0 q) \" \") (string-concat entry (string-substring m q (string-byte-length m))))) (string-concat (string-append-range \"\" m 0 q) (string-concat (string-concat entry \" \") (string-substring m q (string-byte-length m)))))} {:name kotoba$doc-map-put, :params [m key value unique?], :param-types [:string :string :string :bool], :result :string, :body (kotoba$doc-bounded (kotoba$doc-insert-at m (kotoba$doc-map-slot m key 1 unique?) (string-concat (string-concat key \" \") value)))} {:name kotoba$doc-assoc, :params [m key value], :param-types [:string :string :string], :result :string, :body (let [p (kotoba$doc-map-find m key 1)] (if (< p 0) (kotoba$doc-map-put m key value false) (let [vs (+ (kotoba$doc-end m p) 1) ve (kotoba$doc-end m vs)] (kotoba$doc-bounded (string-concat (string-append-range \"\" m 0 vs) (string-concat value (string-substring m ve (string-byte-length m))))))))} {:name kotoba$doc-cut, :params [d p e], :param-types [:string :i64 :i64], :result :string, :body (if (= (string-code-point-at d e) 32) (string-append-range (string-append-range \"\" d 0 p) d (+ e 1) (string-byte-length d)) (if (= (string-code-point-at d (- p 1)) 32) (string-append-range (string-append-range \"\" d 0 (- p 1)) d e (string-byte-length d)) (string-append-range (string-append-range \"\" d 0 p) d e (string-byte-length d))))} {:name kotoba$doc-dissoc, :params [m key], :param-types [:string :string], :result :string, :body (let [p (kotoba$doc-map-find m key 1)] (if (< p 0) m (kotoba$doc-cut m p (kotoba$doc-end m (+ (kotoba$doc-end m p) 1)))))} {:name kotoba$doc-get, :params [m key], :param-types [:string :string], :result [:option :document], :body (let [p (kotoba$doc-map-find m key 1)] (if (< p 0) (option-none-of [:option :document]) (let [vs (+ (kotoba$doc-end m p) 1)] (option-some-of [:option :document] (string-substring m vs (kotoba$doc-end m vs))))))} {:name kotoba$doc-merge-from, :params [acc m i], :param-types [:string :string :i64], :result :string, :body (let [c (string-code-point-at m i)] (if (= c 32) (kotoba$doc-merge-from acc m (+ i 1)) (if (kotoba$doc-closer? c) acc (let [ke (kotoba$doc-end m i) ve (kotoba$doc-end m (+ ke 1))] (kotoba$doc-merge-from (kotoba$doc-assoc acc (string-substring m i ke) (string-substring m (+ ke 1) ve)) m ve)))))} {:name kotoba$doc-merge, :params [a b], :param-types [:string :string], :result :string, :body (kotoba$doc-merge-from a b 1)} {:name kotoba$doc-entry-at, :params [m i], :param-types [:string :i64], :result [:option :document], :body (if (< i 0) (option-none-of [:option :document]) (let [p (kotoba$doc-item m 1 (* 2 i))] (if (< p 0) (option-none-of [:option :document]) (let [ke (kotoba$doc-end m p)] (option-some-of [:option :document] (string-concat (string-concat \"[\" (string-substring m p (kotoba$doc-end m (+ ke 1)))) \"]\"))))))} {:name kotoba$doc-nth, :params [d i], :param-types [:string :i64], :result [:option :document], :body (if (< i 0) (option-none-of [:option :document]) (let [p (kotoba$doc-item d (kotoba$doc-open d) i)] (if (< p 0) (option-none-of [:option :document]) (option-some-of [:option :document] (string-substring d p (kotoba$doc-end d p))))))} {:name kotoba$doc-conj, :params [v x], :param-types [:string :string], :result :string, :body (kotoba$doc-bounded (kotoba$doc-insert-at v (kotoba$doc-close v) x))} {:name kotoba$doc-vector-assoc, :params [v i x], :param-types [:string :i64 :string], :result :string, :body (let [p (if (< i 0) -1 (kotoba$doc-item v 1 i))] (if (< p 0) (kotoba$doc-trap) (kotoba$doc-bounded (string-concat (string-append-range \"\" v 0 p) (string-concat x (string-substring v (kotoba$doc-end v p) (string-byte-length v)))))))} {:name kotoba$doc-vector-remove, :params [v i], :param-types [:string :i64], :result :string, :body (let [p (if (< i 0) -1 (kotoba$doc-item v 1 i))] (if (< p 0) (kotoba$doc-trap) (kotoba$doc-cut v p (kotoba$doc-end v p))))} {:name kotoba$doc-vector-drop, :params [v n], :param-types [:string :i64], :result :string, :body (if (< n 0) (kotoba$doc-trap) (if (> n (kotoba$doc-forms v)) (kotoba$doc-trap) (if (= n 0) v (let [p (kotoba$doc-item v 1 n)] (if (< p 0) \"[]\" (string-append-range \"[\" v p (string-byte-length v)))))))} {:name kotoba$doc-set-contains, :params [s x i], :param-types [:string :string :i64], :result :bool, :body (let [c (string-code-point-at s i)] (if (= c 32) (kotoba$doc-set-contains s x (+ i 1)) (if (kotoba$doc-closer? c) false (let [e (kotoba$doc-end s i)] (if (kotoba$doc-region=? s i e x 0) true (kotoba$doc-set-contains s x e))))))} {:name kotoba$doc-item-slot, :params [s cx i unique?], :param-types [:string :string :i64 :bool], :result :i64, :body (let [c (string-code-point-at s i)] (if (= c 32) (kotoba$doc-item-slot s cx (+ i 1) unique?) (if (kotoba$doc-closer? c) i (let [order (string-compare cx (kotoba$doc-canon-at \"\" s i))] (if (< order 0) i (if (if unique? (= order 0) false) (kotoba$doc-trap) (kotoba$doc-item-slot s cx (kotoba$doc-end s i) unique?)))))))} {:name kotoba$doc-set-put, :params [s x], :param-types [:string :string], :result :string, :body (kotoba$doc-bounded (kotoba$doc-insert-at s (kotoba$doc-item-slot s (kotoba$doc-canon x) 2 true) x))} {:name kotoba$doc-sort-from, :params [acc v i], :param-types [:string :string :i64], :result :string, :body (let [c (string-code-point-at v i)] (if (= c 32) (kotoba$doc-sort-from acc v (+ i 1)) (if (kotoba$doc-closer? c) acc (let [e (kotoba$doc-end v i) x (string-substring v i e)] (kotoba$doc-sort-from (kotoba$doc-insert-at acc (kotoba$doc-item-slot acc (kotoba$doc-canon x) 1 false) x) v e)))))} {:name kotoba$doc-vector-sort, :params [v], :param-types [:string], :result :string, :body (kotoba$doc-sort-from \"[]\" v 1)}]")
+     "[{:name kotoba$doc-width, :params [c], :param-types [:i64], :result :i64, :body (if (< c 128) 1 (if (< c 2048) 2 (if (< c 65536) 3 4)))} {:name kotoba$doc-closer?, :params [c], :param-types [:i64], :result :bool, :body (if (= c 93) true (if (= c 41) true (= c 125)))} {:name kotoba$doc-trap, :params [], :param-types [], :result :i64, :body (vector-at (vector-new) 0)} {:name kotoba$doc-token-end, :params [s i], :param-types [:string :i64], :result :i64, :body (if (>= i (string-byte-length s)) i (let [c (string-code-point-at s i)] (if (= c 32) i (if (kotoba$doc-closer? c) i (kotoba$doc-token-end s (+ i (kotoba$doc-width c)))))))} {:name kotoba$doc-string-end, :params [s i], :param-types [:string :i64], :result :i64, :body (let [q (string-find-byte s 34 i) b (string-find-byte s 92 i)] (if (< b 0) (+ q 1) (if (< b q) (kotoba$doc-string-end s (+ b 2)) (+ q 1))))} {:name kotoba$doc-seq-end, :params [s i], :param-types [:string :i64], :result :i64, :body (let [c (string-code-point-at s i)] (if (= c 32) (kotoba$doc-seq-end s (+ i 1)) (if (kotoba$doc-closer? c) (+ i 1) (kotoba$doc-seq-end s (kotoba$doc-end s i)))))} {:name kotoba$doc-end, :params [s i], :param-types [:string :i64], :result :i64, :body (let [c (string-code-point-at s i)] (if (= c 34) (kotoba$doc-string-end s (+ i 1)) (if (= c 91) (kotoba$doc-seq-end s (+ i 1)) (if (= c 40) (kotoba$doc-seq-end s (+ i 1)) (if (= c 123) (kotoba$doc-seq-end s (+ i 1)) (if (= c 35) (if (= (string-code-point-at s (+ i 1)) 123) (kotoba$doc-seq-end s (+ i 2)) (+ (string-find-byte s 34 (+ (string-find-byte s 34 i) 1)) 1)) (kotoba$doc-token-end s i)))))))} {:name kotoba$doc-open, :params [d], :param-types [:string], :result :i64, :body (if (= (string-code-point-at d 0) 35) 2 1)} {:name kotoba$doc-item, :params [d i k], :param-types [:string :i64 :i64], :result :i64, :body (let [c (string-code-point-at d i)] (if (= c 32) (kotoba$doc-item d (+ i 1) k) (if (kotoba$doc-closer? c) -1 (if (= k 0) i (kotoba$doc-item d (kotoba$doc-end d i) (- k 1))))))} {:name kotoba$doc-close, :params [d], :param-types [:string], :result :i64, :body (- (string-byte-length d) 1)} {:name kotoba$doc-count-from, :params [d i n], :param-types [:string :i64 :i64], :result :i64, :body (let [c (string-code-point-at d i)] (if (= c 32) (kotoba$doc-count-from d (+ i 1) n) (if (kotoba$doc-closer? c) n (kotoba$doc-count-from d (kotoba$doc-end d i) (+ n 1)))))} {:name kotoba$doc-forms, :params [d], :param-types [:string], :result :i64, :body (kotoba$doc-count-from d (kotoba$doc-open d) 0)} {:name kotoba$doc-region=?, :params [s i j t k], :param-types [:string :i64 :i64 :string :i64], :result :bool, :body (if (= i j) (= k (string-byte-length t)) (if (>= k (string-byte-length t)) false (let [c (string-code-point-at s i)] (if (= c (string-code-point-at t k)) (kotoba$doc-region=? s (+ i (kotoba$doc-width c)) j t (+ k (kotoba$doc-width c))) false))))} {:name kotoba$doc-digit?, :params [c], :param-types [:i64], :result :bool, :body (if (< c 48) false (< c 58))} {:name kotoba$doc-at, :params [t i e], :param-types [:string :i64 :i64], :result :i64, :body (if (>= i e) -1 (string-code-point-at t i))} {:name kotoba$doc-digits-end, :params [t i e], :param-types [:string :i64 :i64], :result :i64, :body (if (>= i e) i (if (kotoba$doc-digit? (string-code-point-at t i)) (kotoba$doc-digits-end t (+ i 1) e) i))} {:name kotoba$doc-exp-end, :params [t i e], :param-types [:string :i64 :i64], :result :i64, :body (let [c (kotoba$doc-at t i e)] (if (if (= c 101) true (= c 69)) (let [s (kotoba$doc-at t (+ i 1) e) j (if (if (= s 43) true (= s 45)) (+ i 2) (+ i 1)) k (kotoba$doc-digits-end t j e)] (if (> k j) k -1)) i))} {:name kotoba$doc-number-kind, :params [t i e], :param-types [:string :i64 :i64], :result :i64, :body (let [c0 (kotoba$doc-at t i e) i0 (if (if (= c0 43) true (= c0 45)) (+ i 1) i) d1 (kotoba$doc-digits-end t i0 e)] (if (= d1 e) (if (> d1 i0) 2 0) (let [c (string-code-point-at t d1)] (if (= c 46) (let [d2 (kotoba$doc-digits-end t (+ d1 1) e)] (if (if (= d1 i0) (= d2 (+ d1 1)) false) 0 (if (= (kotoba$doc-exp-end t d2 e) e) 3 0))) (if (if (= c 101) true (= c 69)) (if (= d1 i0) 0 (let [x (kotoba$doc-exp-end t d1 e)] (if (< x 0) 0 (if (= (kotoba$doc-exp-end t x e) e) 3 0)))) 0)))))} {:name kotoba$doc-kind-at, :params [d i e], :param-types [:string :i64 :i64], :result :i64, :body (let [c (string-code-point-at d i)] (if (= c 34) 4 (if (= c 58) 5 (if (= c 91) 7 (if (= c 40) 8 (if (= c 35) (if (= (string-code-point-at d (+ i 1)) 123) 9 (if (= (string-code-point-at d (+ i 8)) 98) 11 12)) (if (= c 123) 10 (if (kotoba$doc-region=? d i e \"nil\" 0) 0 (if (kotoba$doc-region=? d i e \"true\" 0) 1 (if (kotoba$doc-region=? d i e \"false\" 0) 1 (let [k (kotoba$doc-number-kind d i e)] (if (= k 0) 6 k))))))))))))} {:name kotoba$doc-scalar?, :params [k], :param-types [:i64], :result :bool, :body (if (< k 7) true (> k 10))} {:name kotoba$doc-kind, :params [d], :param-types [:string], :result :i64, :body (kotoba$doc-kind-at d 0 (string-byte-length d))} {:name kotoba$doc-require, :params [d lo hi], :param-types [:string :i64 :i64], :result :string, :body (let [k (kotoba$doc-kind d)] (if (< k lo) (kotoba$doc-trap) (if (> k hi) (kotoba$doc-trap) d)))} {:name kotoba$doc-dec-neg, :params [acc m], :param-types [:string :i64], :result :string, :body (let [q (quot m 10) d (- 0 (- m (* q 10)))] (string-append-range (if (= q 0) acc (kotoba$doc-dec-neg acc q)) \"0123456789\" d (+ d 1)))} {:name kotoba$doc-dec, :params [n], :param-types [:i64], :result :string, :body (if (< n 0) (kotoba$doc-dec-neg \"-\" n) (kotoba$doc-dec-neg \"\" (- 0 n)))} {:name kotoba$doc-parse-neg, :params [t i acc], :param-types [:string :i64 :i64], :result :i64, :body (if (>= i (string-byte-length t)) acc (kotoba$doc-parse-neg t (+ i 1) (- (* acc 10) (- (string-code-point-at t i) 48))))} {:name kotoba$doc-parse-i64, :params [t], :param-types [:string], :result :i64, :body (let [c (string-code-point-at t 0)] (if (= c 45) (kotoba$doc-parse-neg t 1 0) (- 0 (kotoba$doc-parse-neg t (if (= c 43) 1 0) 0))))} {:name kotoba$doc-plain?, :params [c], :param-types [:i64], :result :bool, :body (if (< c 32) false (if (= c 34) false (bool-not (= c 92))))} {:name kotoba$doc-plain-end, :params [s i], :param-types [:string :i64], :result :i64, :body (if (>= i (string-byte-length s)) i (let [c (string-code-point-at s i)] (if (kotoba$doc-plain? c) (kotoba$doc-plain-end s (+ i (kotoba$doc-width c))) i)))} {:name kotoba$doc-escape-char, :params [acc c], :param-types [:string :i64], :result :string, :body (if (= c 34) (string-concat acc \"\\\\\\\"\") (if (= c 92) (string-concat acc \"\\\\\\\\\") (if (= c 8) (string-concat acc \"\\\\b\") (if (= c 9) (string-concat acc \"\\\\t\") (if (= c 10) (string-concat acc \"\\\\n\") (if (= c 12) (string-concat acc \"\\\\f\") (if (= c 13) (string-concat acc \"\\\\r\") (string-append-range (string-append-range (string-concat acc \"\\\\u00\") \"0123456789abcdef\" (quot c 16) (+ (quot c 16) 1)) \"0123456789abcdef\" (- c (* (quot c 16) 16)) (+ (- c (* (quot c 16) 16)) 1)))))))))} {:name kotoba$doc-escape-from, :params [acc s i], :param-types [:string :string :i64], :result :string, :body (let [j (kotoba$doc-plain-end s i) acc (string-append-range acc s i j)] (if (>= j (string-byte-length s)) (string-concat acc \"\\\"\") (kotoba$doc-escape-from (kotoba$doc-escape-char acc (string-code-point-at s j)) s (+ j 1))))} {:name kotoba$doc-escape, :params [s], :param-types [:string], :result :string, :body (kotoba$doc-escape-from \"\\\"\" s 0)} {:name kotoba$doc-hex, :params [c], :param-types [:i64], :result :i64, :body (if (< c 58) (- c 48) (if (< c 71) (- c 55) (- c 87)))} {:name kotoba$doc-unescape-from, :params [acc t i end], :param-types [:string :string :i64 :i64], :result :string, :body (let [b (string-find-byte t 92 i)] (if (if (< b 0) true (>= b end)) (string-append-range acc t i end) (let [acc (string-append-range acc t i b) e (string-code-point-at t (+ b 1))] (if (= e 117) (let [u (+ (* 16 (kotoba$doc-hex (string-code-point-at t (+ b 4)))) (kotoba$doc-hex (string-code-point-at t (+ b 5))))] (if (if (= (string-code-point-at t (+ b 2)) 48) (if (= (string-code-point-at t (+ b 3)) 48) (< u 32) false) false) (kotoba$doc-unescape-from (string-append-range acc kotoba$doc-control u (+ u 1)) t (+ b 6) end) (kotoba$doc-trap))) (kotoba$doc-unescape-from (string-concat acc (if (= e 110) \"\\n\" (if (= e 116) \"\\t\" (if (= e 98) \"\\b\" (if (= e 102) \"\\f\" (if (= e 114) \"\\r\" (if (= e 34) \"\\\"\" \"\\\\\"))))))) t (+ b 2) end)))))} {:name kotoba$doc-unescape, :params [t], :param-types [:string], :result :string, :body (kotoba$doc-unescape-from \"\" t 1 (- (string-byte-length t) 1))} {:name kotoba$doc-symbol-char-ok?, :params [c], :param-types [:i64], :result :bool, :body (if (<= c 32) false (if (= c 44) false (if (= c 91) false (if (= c 93) false (if (= c 123) false (if (= c 125) false (if (= c 40) false (if (= c 41) false (if (= c 34) false (if (= c 39) false (if (= c 59) false (if (= c 96) false (if (= c 126) false (if (= c 94) false (bool-not (= c 92))))))))))))))))} {:name kotoba$doc-symbol-chars-ok?, :params [s i], :param-types [:string :i64], :result :bool, :body (if (>= i (string-byte-length s)) true (let [c (string-code-point-at s i)] (if (kotoba$doc-symbol-char-ok? c) (kotoba$doc-symbol-chars-ok? s (+ i (kotoba$doc-width c))) false)))} {:name kotoba$doc-symbol, :params [s], :param-types [:string], :result :string, :body (if (= (string-byte-length s) 0) (kotoba$doc-trap) (if (kotoba$doc-symbol-chars-ok? s 0) (let [c (string-code-point-at s 0)] (if (= c 58) (kotoba$doc-trap) (if (= c 35) (kotoba$doc-trap) (if (string=? s \"nil\") (kotoba$doc-trap) (if (string=? s \"true\") (kotoba$doc-trap) (if (string=? s \"false\") (kotoba$doc-trap) (if (= (kotoba$doc-number-kind s 0 (string-byte-length s)) 0) s (kotoba$doc-trap)))))))) (kotoba$doc-trap)))} {:name kotoba$doc-max, :params [a b], :param-types [:i64 :i64], :result :i64, :body (if (> a b) a b)} {:name kotoba$doc-keyword-at?, :params [d i], :param-types [:string :i64], :result :bool, :body (= (string-code-point-at d i) 58)} {:name kotoba$doc-depth-items, :params [d i m map? key?], :param-types [:string :i64 :i64 :bool :bool], :result :i64, :body (let [c (string-code-point-at d i)] (if (= c 32) (kotoba$doc-depth-items d (+ i 1) m map? key?) (if (kotoba$doc-closer? c) m (let [here (if (if key? (kotoba$doc-keyword-at? d i) false) 0 (kotoba$doc-depth-at d i))] (kotoba$doc-depth-items d (kotoba$doc-end d i) (kotoba$doc-max m here) map? (if map? (bool-not key?) false))))))} {:name kotoba$doc-depth-at, :params [d i], :param-types [:string :i64], :result :i64, :body (let [k (kotoba$doc-kind-at d i (kotoba$doc-end d i))] (if (kotoba$doc-scalar? k) 1 (+ 1 (kotoba$doc-depth-items d (+ i (if (= k 9) 2 1)) 0 (= k 10) (= k 10)))))} {:name kotoba$doc-nodes-items, :params [d i n map? key?], :param-types [:string :i64 :i64 :bool :bool], :result :i64, :body (let [c (string-code-point-at d i)] (if (= c 32) (kotoba$doc-nodes-items d (+ i 1) n map? key?) (if (kotoba$doc-closer? c) n (let [here (if (if key? (kotoba$doc-keyword-at? d i) false) 0 (kotoba$doc-nodes-at d i))] (kotoba$doc-nodes-items d (kotoba$doc-end d i) (+ n here) map? (if map? (bool-not key?) false))))))} {:name kotoba$doc-nodes-at, :params [d i], :param-types [:string :i64], :result :i64, :body (let [k (kotoba$doc-kind-at d i (kotoba$doc-end d i))] (if (kotoba$doc-scalar? k) 1 (+ 1 (kotoba$doc-nodes-items d (+ i (if (= k 9) 2 1)) 0 (= k 10) (= k 10)))))} {:name kotoba$doc-bounded, :params [d], :param-types [:string], :result :string, :body (let [k (kotoba$doc-kind d)] (if (kotoba$doc-scalar? k) d (if (> (if (= k 10) (quot (kotoba$doc-forms d) 2) (kotoba$doc-forms d)) 32) (kotoba$doc-trap) (if (> (kotoba$doc-depth-at d 0) 9) (kotoba$doc-trap) (if (> (kotoba$doc-nodes-at d 0) 4096) (kotoba$doc-trap) d)))))} {:name kotoba$doc-len-text, :params [acc tag s], :param-types [:string :string :string], :result :string, :body (string-concat (string-concat (string-concat (string-concat acc tag) (kotoba$doc-dec (string-byte-length s))) \":\") s)} {:name kotoba$doc-len-range, :params [acc tag d i e], :param-types [:string :string :string :i64 :i64], :result :string, :body (string-append-range (string-concat (string-concat (string-concat acc tag) (kotoba$doc-dec (- e i))) \":\") d i e)} {:name kotoba$doc-canon-items, :params [acc d i map? key?], :param-types [:string :string :i64 :bool :bool], :result :string, :body (let [c (string-code-point-at d i)] (if (= c 32) (kotoba$doc-canon-items acc d (+ i 1) map? key?) (if (kotoba$doc-closer? c) acc (let [e (kotoba$doc-end d i) acc (if key? (if (kotoba$doc-keyword-at? d i) (kotoba$doc-len-range acc \"K\" d i e) (kotoba$doc-canon-at (string-concat acc \"D\") d i)) (kotoba$doc-canon-at acc d i))] (kotoba$doc-canon-items acc d e map? (if map? (bool-not key?) false))))))} {:name kotoba$doc-canon-at, :params [acc d i], :param-types [:string :string :i64], :result :string, :body (let [e (kotoba$doc-end d i) k (kotoba$doc-kind-at d i e)] (if (= k 0) (string-concat acc \"n\") (if (= k 1) (string-concat acc (if (kotoba$doc-region=? d i e \"true\" 0) \"bt\" \"bf\")) (if (= k 2) (string-concat (string-append-range (string-concat acc \"i\") d i e) \";\") (if (= k 3) (kotoba$doc-trap) (if (= k 4) (kotoba$doc-len-text acc \"s\" (kotoba$doc-unescape-from \"\" d (+ i 1) (- e 1))) (if (= k 5) (kotoba$doc-len-range acc \"k\" d i e) (if (= k 6) (kotoba$doc-len-range acc \"y\" d i e) (if (= k 11) (kotoba$doc-canon-bytes acc d i e) (if (= k 12) (kotoba$doc-canon-link acc d i e) (let [open (+ i (if (= k 9) 2 1)) forms (kotoba$doc-count-from d open 0) head (string-concat (string-concat (string-concat acc (if (= k 7) \"v\" (if (= k 8) \"l\" (if (= k 9) \"e\" \"m\")))) (kotoba$doc-dec (if (= k 10) (quot forms 2) forms))) \":\")] (kotoba$doc-canon-items head d open (= k 10) (= k 10)))))))))))))} {:name kotoba$doc-canon-bytes, :params [acc d i e], :param-types [:string :string :i64 :i64], :result :string, :body (let [q (+ (string-find-byte d 34 i) 1)] (string-append-range (string-concat (string-concat (string-concat acc \"x\") (kotoba$doc-dec (quot (- (- e 1) q) 2))) \":\") d q (- e 1)))} {:name kotoba$doc-b32-value, :params [c], :param-types [:i64], :result :i64, :body (if (>= c 97) (- c 97) (- c 24))} {:name kotoba$doc-b32-ordered-into, :params [v k d i e], :param-types [:vector-i64 :i64 :string :i64 :i64], :result :vector-i64, :body (if (>= i e) v (kotoba$doc-b32-ordered-into (vector-assoc! v k (+ 48 (kotoba$doc-b32-value (string-code-point-at d i)))) (+ k 1) d (+ i 1) e))} {:name kotoba$doc-canon-link, :params [acc d i e], :param-types [:string :string :i64 :i64], :result :string, :body (let [q (+ (string-find-byte d 34 i) 2) n (- (- e 1) q)] (string-concat (string-concat (string-concat (string-concat acc \"c\") (kotoba$doc-dec (quot (* 5 n) 8))) \":\") (string-from-utf8 (bytes-from-vector-i64 (kotoba$doc-b32-ordered-into (vector-alloc n) 0 d q (- e 1))))))} {:name kotoba$doc-canon, :params [d], :param-types [:string], :result :string, :body (kotoba$doc-canon-at \"\" d 0)} {:name kotoba$doc-compare, :params [a b], :param-types [:string :string], :result :i64, :body (string-compare (kotoba$doc-canon a) (kotoba$doc-canon b))} {:name kotoba$doc-region-compare, :params [a i j b k l], :param-types [:string :i64 :i64 :string :i64 :i64], :result :i64, :body (if (= i j) (if (= k l) 0 -1) (if (= k l) 1 (let [x (string-code-point-at a i) y (string-code-point-at b k)] (if (< x y) -1 (if (> x y) 1 (kotoba$doc-region-compare a (+ i (kotoba$doc-width x)) j b (+ k (kotoba$doc-width y)) l))))))} {:name kotoba$doc-key-compare-at, :params [key m i e], :param-types [:string :string :i64 :i64], :result :i64, :body (if (if (= (string-code-point-at key 0) 58) (kotoba$doc-keyword-at? m i) false) (kotoba$doc-region-compare key 0 (string-byte-length key) m i e) (string-compare (kotoba$doc-canon key) (kotoba$doc-canon-at \"\" m i)))} {:name kotoba$doc-map-find, :params [m key i], :param-types [:string :string :i64], :result :i64, :body (let [c (string-code-point-at m i)] (if (= c 32) (kotoba$doc-map-find m key (+ i 1)) (if (kotoba$doc-closer? c) -1 (let [ke (kotoba$doc-end m i)] (if (kotoba$doc-region=? m i ke key 0) i (kotoba$doc-map-find m key (kotoba$doc-end m (+ ke 1))))))))} {:name kotoba$doc-map-slot, :params [m key i unique?], :param-types [:string :string :i64 :bool], :result :i64, :body (let [c (string-code-point-at m i)] (if (= c 32) (kotoba$doc-map-slot m key (+ i 1) unique?) (if (kotoba$doc-closer? c) i (let [ke (kotoba$doc-end m i) order (kotoba$doc-key-compare-at key m i ke)] (if (< order 0) i (if (if unique? (= order 0) false) (kotoba$doc-trap) (kotoba$doc-map-slot m key (kotoba$doc-end m (+ ke 1)) unique?)))))))} {:name kotoba$doc-insert-at, :params [m q entry], :param-types [:string :i64 :string], :result :string, :body (if (= q (kotoba$doc-close m)) (if (= q (kotoba$doc-open m)) (string-concat (string-append-range \"\" m 0 q) (string-concat entry (string-substring m q (string-byte-length m)))) (string-concat (string-concat (string-append-range \"\" m 0 q) \" \") (string-concat entry (string-substring m q (string-byte-length m))))) (string-concat (string-append-range \"\" m 0 q) (string-concat (string-concat entry \" \") (string-substring m q (string-byte-length m)))))} {:name kotoba$doc-map-put, :params [m key value unique?], :param-types [:string :string :string :bool], :result :string, :body (kotoba$doc-bounded (kotoba$doc-insert-at m (kotoba$doc-map-slot m key 1 unique?) (string-concat (string-concat key \" \") value)))} {:name kotoba$doc-assoc, :params [m key value], :param-types [:string :string :string], :result :string, :body (let [p (kotoba$doc-map-find m key 1)] (if (< p 0) (kotoba$doc-map-put m key value false) (let [vs (+ (kotoba$doc-end m p) 1) ve (kotoba$doc-end m vs)] (kotoba$doc-bounded (string-concat (string-append-range \"\" m 0 vs) (string-concat value (string-substring m ve (string-byte-length m))))))))} {:name kotoba$doc-cut, :params [d p e], :param-types [:string :i64 :i64], :result :string, :body (if (= (string-code-point-at d e) 32) (string-append-range (string-append-range \"\" d 0 p) d (+ e 1) (string-byte-length d)) (if (= (string-code-point-at d (- p 1)) 32) (string-append-range (string-append-range \"\" d 0 (- p 1)) d e (string-byte-length d)) (string-append-range (string-append-range \"\" d 0 p) d e (string-byte-length d))))} {:name kotoba$doc-dissoc, :params [m key], :param-types [:string :string], :result :string, :body (let [p (kotoba$doc-map-find m key 1)] (if (< p 0) m (kotoba$doc-cut m p (kotoba$doc-end m (+ (kotoba$doc-end m p) 1)))))} {:name kotoba$doc-get, :params [m key], :param-types [:string :string], :result [:option :document], :body (let [p (kotoba$doc-map-find m key 1)] (if (< p 0) (option-none-of [:option :document]) (let [vs (+ (kotoba$doc-end m p) 1)] (option-some-of [:option :document] (string-substring m vs (kotoba$doc-end m vs))))))} {:name kotoba$doc-merge-from, :params [acc m i], :param-types [:string :string :i64], :result :string, :body (let [c (string-code-point-at m i)] (if (= c 32) (kotoba$doc-merge-from acc m (+ i 1)) (if (kotoba$doc-closer? c) acc (let [ke (kotoba$doc-end m i) ve (kotoba$doc-end m (+ ke 1))] (kotoba$doc-merge-from (kotoba$doc-assoc acc (string-substring m i ke) (string-substring m (+ ke 1) ve)) m ve)))))} {:name kotoba$doc-merge, :params [a b], :param-types [:string :string], :result :string, :body (kotoba$doc-merge-from a b 1)} {:name kotoba$doc-entry-at, :params [m i], :param-types [:string :i64], :result [:option :document], :body (if (< i 0) (option-none-of [:option :document]) (let [p (kotoba$doc-item m 1 (* 2 i))] (if (< p 0) (option-none-of [:option :document]) (let [ke (kotoba$doc-end m p)] (option-some-of [:option :document] (string-concat (string-concat \"[\" (string-substring m p (kotoba$doc-end m (+ ke 1)))) \"]\"))))))} {:name kotoba$doc-nth, :params [d i], :param-types [:string :i64], :result [:option :document], :body (if (< i 0) (option-none-of [:option :document]) (let [p (kotoba$doc-item d (kotoba$doc-open d) i)] (if (< p 0) (option-none-of [:option :document]) (option-some-of [:option :document] (string-substring d p (kotoba$doc-end d p))))))} {:name kotoba$doc-conj, :params [v x], :param-types [:string :string], :result :string, :body (kotoba$doc-bounded (kotoba$doc-insert-at v (kotoba$doc-close v) x))} {:name kotoba$doc-vector-assoc, :params [v i x], :param-types [:string :i64 :string], :result :string, :body (let [p (if (< i 0) -1 (kotoba$doc-item v 1 i))] (if (< p 0) (kotoba$doc-trap) (kotoba$doc-bounded (string-concat (string-append-range \"\" v 0 p) (string-concat x (string-substring v (kotoba$doc-end v p) (string-byte-length v)))))))} {:name kotoba$doc-vector-remove, :params [v i], :param-types [:string :i64], :result :string, :body (let [p (if (< i 0) -1 (kotoba$doc-item v 1 i))] (if (< p 0) (kotoba$doc-trap) (kotoba$doc-cut v p (kotoba$doc-end v p))))} {:name kotoba$doc-vector-drop, :params [v n], :param-types [:string :i64], :result :string, :body (if (< n 0) (kotoba$doc-trap) (if (> n (kotoba$doc-forms v)) (kotoba$doc-trap) (if (= n 0) v (let [p (kotoba$doc-item v 1 n)] (if (< p 0) \"[]\" (string-append-range \"[\" v p (string-byte-length v)))))))} {:name kotoba$doc-set-contains, :params [s x i], :param-types [:string :string :i64], :result :bool, :body (let [c (string-code-point-at s i)] (if (= c 32) (kotoba$doc-set-contains s x (+ i 1)) (if (kotoba$doc-closer? c) false (let [e (kotoba$doc-end s i)] (if (kotoba$doc-region=? s i e x 0) true (kotoba$doc-set-contains s x e))))))} {:name kotoba$doc-item-slot, :params [s cx i unique?], :param-types [:string :string :i64 :bool], :result :i64, :body (let [c (string-code-point-at s i)] (if (= c 32) (kotoba$doc-item-slot s cx (+ i 1) unique?) (if (kotoba$doc-closer? c) i (let [order (string-compare cx (kotoba$doc-canon-at \"\" s i))] (if (< order 0) i (if (if unique? (= order 0) false) (kotoba$doc-trap) (kotoba$doc-item-slot s cx (kotoba$doc-end s i) unique?)))))))} {:name kotoba$doc-set-put, :params [s x], :param-types [:string :string], :result :string, :body (kotoba$doc-bounded (kotoba$doc-insert-at s (kotoba$doc-item-slot s (kotoba$doc-canon x) 2 true) x))} {:name kotoba$doc-sort-from, :params [acc v i], :param-types [:string :string :i64], :result :string, :body (let [c (string-code-point-at v i)] (if (= c 32) (kotoba$doc-sort-from acc v (+ i 1)) (if (kotoba$doc-closer? c) acc (let [e (kotoba$doc-end v i) x (string-substring v i e)] (kotoba$doc-sort-from (kotoba$doc-insert-at acc (kotoba$doc-item-slot acc (kotoba$doc-canon x) 1 false) x) v e)))))} {:name kotoba$doc-vector-sort, :params [v], :param-types [:string], :result :string, :body (kotoba$doc-sort-from \"[]\" v 1)}]")
    :default
    (defn- h [name params types result body]
      {:name name :params params :param-types types :result result :body body}))
@@ -666,8 +679,13 @@
                 (if (= c 91) (kotoba$doc-seq-end s (+ i 1))
                     (if (= c 40) (kotoba$doc-seq-end s (+ i 1))
                         (if (= c 123) (kotoba$doc-seq-end s (+ i 1))
-                            (if (= c 35) (kotoba$doc-seq-end s (+ i 2))
-                                (kotoba$doc-token-end s i))))))))
+                            (if (= c 35)
+                              (if (= (string-code-point-at s (+ i 1)) 123)
+                                (kotoba$doc-seq-end s (+ i 2))
+                                ;; `#kotoba/bytes \"<hex>\"` / `#kotoba/cid \"b<base32>\"`:
+                                ;; neither payload alphabet has a quote or a backslash
+                                (+ (string-find-byte s 34 (+ (string-find-byte s 34 i) 1)) 1))
+                              (kotoba$doc-token-end s i))))))))
       (h 'kotoba$doc-open '[d] [:string] :i64
          '(if (= (string-code-point-at d 0) 35) 2 1))
       ;; offset of item K at or after I, or -1 when the container closes first
@@ -736,20 +754,27 @@
                     0))))))
       ;; the kind of the form d[i, e):
       ;; 0 null 1 bool 2 i64 3 f64 4 string 5 keyword 6 symbol
-      ;; 7 vector 8 list 9 set 10 map
+      ;; 7 vector 8 list 9 set 10 map 11 bytes 12 link
+      ;; (bytes and link, root ADR-2610092310, are scalars numbered after the
+      ;; containers so every existing 7..10 container range stays as it was)
       (h 'kotoba$doc-kind-at '[d i e] [:string :i64 :i64] :i64
          '(let [c (string-code-point-at d i)]
             (if (= c 34) 4
                 (if (= c 58) 5
                     (if (= c 91) 7
                         (if (= c 40) 8
-                            (if (= c 35) 9
+                            (if (= c 35)
+                              (if (= (string-code-point-at d (+ i 1)) 123) 9
+                                  ;; `#kotoba/` is 8 bytes: then `b`ytes or `c`id
+                                  (if (= (string-code-point-at d (+ i 8)) 98) 11 12))
                                 (if (= c 123) 10
                                     (if (kotoba$doc-region=? d i e "nil" 0) 0
                                         (if (kotoba$doc-region=? d i e "true" 0) 1
                                             (if (kotoba$doc-region=? d i e "false" 0) 1
                                                 (let [k (kotoba$doc-number-kind d i e)]
                                                   (if (= k 0) 6 k)))))))))))))
+      (h 'kotoba$doc-scalar? '[k] [:i64] :bool
+         '(if (< k 7) true (> k 10)))
       (h 'kotoba$doc-kind '[d] [:string] :i64
          '(kotoba$doc-kind-at d 0 (string-byte-length d)))
       (h 'kotoba$doc-require '[d lo hi] [:string :i64 :i64] :string
@@ -878,7 +903,7 @@
       ;; levels of the form at I (a scalar is one)
       (h 'kotoba$doc-depth-at '[d i] [:string :i64] :i64
          '(let [k (kotoba$doc-kind-at d i (kotoba$doc-end d i))]
-            (if (< k 7) 1
+            (if (kotoba$doc-scalar? k) 1
                 (+ 1 (kotoba$doc-depth-items d (+ i (if (= k 9) 2 1)) 0 (= k 10) (= k 10))))))
       (h 'kotoba$doc-nodes-items '[d i n map? key?] [:string :i64 :i64 :bool :bool] :i64
          '(let [c (string-code-point-at d i)]
@@ -891,12 +916,12 @@
                                               (if map? (bool-not key?) false)))))))
       (h 'kotoba$doc-nodes-at '[d i] [:string :i64] :i64
          '(let [k (kotoba$doc-kind-at d i (kotoba$doc-end d i))]
-            (if (< k 7) 1
+            (if (kotoba$doc-scalar? k) 1
                 (+ 1 (kotoba$doc-nodes-items d (+ i (if (= k 9) 2 1)) 0 (= k 10) (= k 10))))))
       ;; D itself when it is within the reference's bounds, else a trap
       (h 'kotoba$doc-bounded '[d] [:string] :string
          '(let [k (kotoba$doc-kind d)]
-            (if (< k 7) d
+            (if (kotoba$doc-scalar? k) d
                 (if (> (if (= k 10) (quot (kotoba$doc-forms d) 2) (kotoba$doc-forms d)) 32)
                   (kotoba$doc-trap)
                   (if (> (kotoba$doc-depth-at d 0) 9)
@@ -937,6 +962,8 @@
                                                              (kotoba$doc-unescape-from "" d (+ i 1) (- e 1)))
                                 (if (= k 5) (kotoba$doc-len-range acc "k" d i e)
                                     (if (= k 6) (kotoba$doc-len-range acc "y" d i e)
+                                        (if (= k 11) (kotoba$doc-canon-bytes acc d i e)
+                                        (if (= k 12) (kotoba$doc-canon-link acc d i e)
                                         (let [open (+ i (if (= k 9) 2 1))
                                               forms (kotoba$doc-count-from d open 0)
                                               head (string-concat
@@ -946,7 +973,43 @@
                                                                                      (if (= k 9) "e" "m"))))
                                                      (kotoba$doc-dec (if (= k 10) (quot forms 2) forms)))
                                                     ":")]
-                                          (kotoba$doc-canon-items head d open (= k 10) (= k 10))))))))))))
+                                          (kotoba$doc-canon-items head d open (= k 10) (= k 10))))))))))))))
+      ;; bytes: `x<length>:` then the payload. Two canonical byte strings can
+      ;; first differ inside an x / c payload only at the same offset of payloads
+      ;; of the same tag and length (the encoding is length-prefixed), so any
+      ;; order-preserving fixed-width spelling of the payload orders exactly as
+      ;; the raw bytes do. Lowercase hex is one, and it is the EDN text already.
+      (h 'kotoba$doc-canon-bytes '[acc d i e] [:string :string :i64 :i64] :string
+         '(let [q (+ (string-find-byte d 34 i) 1)]
+            (string-append-range
+             (string-concat (string-concat (string-concat acc "x")
+                                           (kotoba$doc-dec (quot (- (- e 1) q) 2)))
+                            ":")
+             d q (- e 1))))
+      ;; base32 digit value: a..z are 0..25, 2..7 are 26..31
+      (h 'kotoba$doc-b32-value '[c] [:i64] :i64
+         '(if (>= c 97) (- c 97) (- c 24)))
+      ;; V from K on: the base32 digits d[i, e) respelled `0`..`O` (code points
+      ;; 48 + value), an order-preserving alphabet -- MSB-first 5-bit groups of
+      ;; equally long byte strings order as the bytes do. Written into one
+      ;; vector-alloc'd run and made text once (`string-from-utf8`), so a link's
+      ;; canonical bytes cost its length in the string pool, not its square.
+      (h 'kotoba$doc-b32-ordered-into '[v k d i e] [:vector-i64 :i64 :string :i64 :i64] :vector-i64
+         '(if (>= i e) v
+              (kotoba$doc-b32-ordered-into
+               (vector-assoc! v k (+ 48 (kotoba$doc-b32-value (string-code-point-at d i))))
+               (+ k 1) d (+ i 1) e)))
+      ;; link: `c<length>:` then the binary CID, from `#kotoba/cid \"b<base32>\"`
+      (h 'kotoba$doc-canon-link '[acc d i e] [:string :string :i64 :i64] :string
+         '(let [q (+ (string-find-byte d 34 i) 2)
+                n (- (- e 1) q)]
+            (string-concat
+             (string-concat (string-concat (string-concat acc "c")
+                                           (kotoba$doc-dec (quot (* 5 n) 8)))
+                            ":")
+             (string-from-utf8
+              (bytes-from-vector-i64
+               (kotoba$doc-b32-ordered-into (vector-alloc n) 0 d q (- e 1)))))))
       (h 'kotoba$doc-canon '[d] [:string] :string '(kotoba$doc-canon-at "" d 0))
       (h 'kotoba$doc-compare '[a b] [:string :string] :i64
          '(string-compare (kotoba$doc-canon a) (kotoba$doc-canon b)))
@@ -1111,10 +1174,148 @@
 
 
 
+;; The :bytes and :link constructors and readers (root ADR-2610092310 S4).
+;; Appended only when a body names one of the four operations, so a document
+;; program that does not keeps the helpers (and the code) it had; they are the
+;; only helpers that touch a `:bytes` handle (a vector-arena handle on native).
 #?(:kotoba
-   (defn helper-names [] [:ref :form/r] (name-set (form-kids-of (helpers))))
+   ;; The host table below, printed (pr-str) and read by the Form EDN reader,
+   ;; exactly as `helpers-text` is for `helpers`.
+   (def ^:private bytes-helpers-text
+     "[{:name kotoba$doc-pow2, :params [n], :param-types [:i64], :result :i64, :body (if (<= n 0) 1 (* 2 (kotoba$doc-pow2 (- n 1))))} {:name kotoba$doc-text-of, :params [v], :param-types [:vector-i64], :result :string, :body (string-from-utf8 (bytes-from-vector-i64 v))} {:name kotoba$doc-hex-digit, :params [n], :param-types [:i64], :result :i64, :body (if (< n 10) (+ n 48) (+ n 87))} {:name kotoba$doc-hex-into, :params [v b i], :param-types [:vector-i64 :bytes :i64], :result :vector-i64, :body (if (>= i (bytes-count b)) v (let [x (bytes-at b i) hi (quot x 16)] (kotoba$doc-hex-into (vector-assoc! (vector-assoc! v (* 2 i) (kotoba$doc-hex-digit hi)) (+ (* 2 i) 1) (kotoba$doc-hex-digit (- x (* hi 16)))) b (+ i 1))))} {:name kotoba$doc-bytes, :params [b], :param-types [:bytes], :result :string, :body (if (> (bytes-count b) 65536) (kotoba$doc-trap) (if (= (bytes-count b) 0) \"#kotoba/bytes \\\"\\\"\" (string-concat (string-concat \"#kotoba/bytes \\\"\" (kotoba$doc-text-of (kotoba$doc-hex-into (vector-alloc (* 2 (bytes-count b))) b 0))) \"\\\"\")))} {:name kotoba$doc-unhex-into, :params [v k d i e], :param-types [:vector-i64 :i64 :string :i64 :i64], :result :vector-i64, :body (if (>= i e) v (kotoba$doc-unhex-into (vector-assoc! v k (+ (* 16 (kotoba$doc-hex (string-code-point-at d i))) (kotoba$doc-hex (string-code-point-at d (+ i 1))))) (+ k 1) d (+ i 2) e))} {:name kotoba$doc-bytes-payload, :params [d], :param-types [:string], :result :bytes, :body (let [q (+ (string-find-byte d 34 0) 1) e (- (string-byte-length d) 1)] (if (>= q e) (bytes-empty) (bytes-from-vector-i64 (kotoba$doc-unhex-into (vector-alloc (quot (- e q) 2)) 0 d q e))))} {:name kotoba$doc-varint-end, :params [b i j], :param-types [:bytes :i64 :i64], :result :i64, :body (if (>= j (bytes-count b)) -1 (if (>= (- j i) 9) -1 (let [x (bytes-at b j)] (if (< x 128) (if (if (= x 0) (> j i) false) -1 (+ j 1)) (kotoba$doc-varint-end b i (+ j 1))))))} {:name kotoba$doc-varint-value, :params [b i e mult acc], :param-types [:bytes :i64 :i64 :i64 :i64], :result :i64, :body (if (>= i e) acc (let [x (bytes-at b i) acc (+ acc (* mult (if (< x 128) x (- x 128))))] (if (>= (+ i 1) e) acc (kotoba$doc-varint-value b (+ i 1) e (* mult 128) acc))))} {:name kotoba$doc-cidv1?, :params [b], :param-types [:bytes], :result :bool, :body (let [n (bytes-count b)] (if (> n 128) false (if (< n 1) false (if (= (bytes-at b 0) 1) (let [i1 (kotoba$doc-varint-end b 1 1)] (if (< i1 0) false (let [i2 (kotoba$doc-varint-end b i1 i1)] (if (< i2 0) false (let [i3 (kotoba$doc-varint-end b i2 i2)] (if (< i3 0) false (= (kotoba$doc-varint-value b i2 i3 1 0) (- n i3)))))))) false))))} {:name kotoba$doc-b32-digit, :params [x], :param-types [:i64], :result :i64, :body (if (< x 26) (+ x 97) (+ x 24))} {:name kotoba$doc-b32-into, :params [v k b i buf bits], :param-types [:vector-i64 :i64 :bytes :i64 :i64 :i64], :result :vector-i64, :body (if (>= bits 5) (let [p (kotoba$doc-pow2 (- bits 5)) x (quot buf p)] (kotoba$doc-b32-into (vector-assoc! v k (kotoba$doc-b32-digit x)) (+ k 1) b i (- buf (* x p)) (- bits 5))) (if (< i (bytes-count b)) (kotoba$doc-b32-into v k b (+ i 1) (+ (* buf 256) (bytes-at b i)) (+ bits 8)) (if (> bits 0) (vector-assoc! v k (kotoba$doc-b32-digit (* buf (kotoba$doc-pow2 (- 5 bits))))) v)))} {:name kotoba$doc-link, :params [b], :param-types [:bytes], :result [:option :document], :body (if (kotoba$doc-cidv1? b) (option-some-of [:option :document] (string-concat (string-concat \"#kotoba/cid \\\"b\" (kotoba$doc-text-of (kotoba$doc-b32-into (vector-alloc (quot (+ (* 8 (bytes-count b)) 4) 5)) 0 b 0 0 0))) \"\\\"\")) (option-none-of [:option :document]))} {:name kotoba$doc-unb32-into, :params [v k d i e buf bits], :param-types [:vector-i64 :i64 :string :i64 :i64 :i64 :i64], :result :vector-i64, :body (if (>= bits 8) (let [p (kotoba$doc-pow2 (- bits 8)) x (quot buf p)] (kotoba$doc-unb32-into (vector-assoc! v k x) (+ k 1) d i e (- buf (* x p)) (- bits 8))) (if (>= i e) v (kotoba$doc-unb32-into v k d (+ i 1) e (+ (* buf 32) (kotoba$doc-b32-value (string-code-point-at d i))) (+ bits 5))))} {:name kotoba$doc-link-payload, :params [d], :param-types [:string], :result :bytes, :body (let [q (+ (string-find-byte d 34 0) 2) e (- (string-byte-length d) 1)] (bytes-from-vector-i64 (kotoba$doc-unb32-into (vector-alloc (quot (* 5 (- e q)) 8)) 0 d q e 0 0)))}]")
    :default
-   (def helper-names (set (map :name helpers))))
+   (def ^:private bytes-helpers
+     [(h 'kotoba$doc-pow2 '[n] [:i64] :i64
+         '(if (<= n 0) 1 (* 2 (kotoba$doc-pow2 (- n 1)))))
+      ;; Text is written as code points into one vector-alloc'd run and made a
+      ;; string once, so a payload costs its length in the string pool (an
+      ;; append per digit would cost its square).
+      (h 'kotoba$doc-text-of '[v] [:vector-i64] :string
+         '(string-from-utf8 (bytes-from-vector-i64 v)))
+      (h 'kotoba$doc-hex-digit '[n] [:i64] :i64 '(if (< n 10) (+ n 48) (+ n 87)))
+      ;; V with the lowercase hex of B[I, end) at 2I on
+      (h 'kotoba$doc-hex-into '[v b i] [:vector-i64 :bytes :i64] :vector-i64
+         '(if (>= i (bytes-count b)) v
+              (let [x (bytes-at b i)
+                    hi (quot x 16)]
+                (kotoba$doc-hex-into
+                 (vector-assoc! (vector-assoc! v (* 2 i) (kotoba$doc-hex-digit hi))
+                                (+ (* 2 i) 1) (kotoba$doc-hex-digit (- x (* hi 16))))
+                 b (+ i 1)))))
+      ;; the reference's bytes-value-byte-limit, then the EDN text
+      (h 'kotoba$doc-bytes '[b] [:bytes] :string
+         '(if (> (bytes-count b) 65536) (kotoba$doc-trap)
+              (if (= (bytes-count b) 0) "#kotoba/bytes \"\""
+                  (string-concat
+                   (string-concat "#kotoba/bytes \""
+                                  (kotoba$doc-text-of
+                                   (kotoba$doc-hex-into (vector-alloc (* 2 (bytes-count b))) b 0)))
+                   "\""))))
+      ;; V with the bytes the hex digits d[i, e) spell, from K on
+      (h 'kotoba$doc-unhex-into '[v k d i e] [:vector-i64 :i64 :string :i64 :i64] :vector-i64
+         '(if (>= i e) v
+              (kotoba$doc-unhex-into
+               (vector-assoc! v k (+ (* 16 (kotoba$doc-hex (string-code-point-at d i)))
+                                     (kotoba$doc-hex (string-code-point-at d (+ i 1)))))
+               (+ k 1) d (+ i 2) e)))
+      (h 'kotoba$doc-bytes-payload '[d] [:string] :bytes
+         '(let [q (+ (string-find-byte d 34 0) 1)
+                e (- (string-byte-length d) 1)]
+            (if (>= q e) (bytes-empty)
+                (bytes-from-vector-i64
+                 (kotoba$doc-unhex-into (vector-alloc (quot (- e q) 2)) 0 d q e)))))
+      ;; ── CIDv1 (osaho kotoba.kir.value/cidv1-binary-items?) ──
+      ;; the end of the minimal unsigned LEB128 varint that starts at I, or -1
+      ;; when it is truncated, longer than 9 bytes, or not minimal
+      (h 'kotoba$doc-varint-end '[b i j] [:bytes :i64 :i64] :i64
+         '(if (>= j (bytes-count b)) -1
+              (if (>= (- j i) 9) -1
+                  (let [x (bytes-at b j)]
+                    (if (< x 128)
+                      (if (if (= x 0) (> j i) false) -1 (+ j 1))
+                      (kotoba$doc-varint-end b i (+ j 1)))))))
+      ;; the value of the varint B[I, E); at most 63 bits, so it never wraps
+      (h 'kotoba$doc-varint-value '[b i e mult acc] [:bytes :i64 :i64 :i64 :i64] :i64
+         '(if (>= i e) acc
+              (let [x (bytes-at b i)
+                    acc (+ acc (* mult (if (< x 128) x (- x 128))))]
+                (if (>= (+ i 1) e) acc
+                    (kotoba$doc-varint-value b (+ i 1) e (* mult 128) acc)))))
+      ;; version 1 (a minimal varint 1 is the one byte 1), codec, multihash code,
+      ;; digest length, exactly that many digest bytes, at most 128 bytes in all
+      (h 'kotoba$doc-cidv1? '[b] [:bytes] :bool
+         '(let [n (bytes-count b)]
+            (if (> n 128) false
+                (if (< n 1) false
+                    (if (= (bytes-at b 0) 1)
+                      (let [i1 (kotoba$doc-varint-end b 1 1)]
+                        (if (< i1 0) false
+                            (let [i2 (kotoba$doc-varint-end b i1 i1)]
+                              (if (< i2 0) false
+                                  (let [i3 (kotoba$doc-varint-end b i2 i2)]
+                                    (if (< i3 0) false
+                                        (= (kotoba$doc-varint-value b i2 i3 1 0) (- n i3))))))))
+                      false)))))
+      (h 'kotoba$doc-b32-digit '[x] [:i64] :i64 '(if (< x 26) (+ x 97) (+ x 24)))
+      ;; V from K on: the lowercase unpadded base32 of B from I; BUF holds the
+      ;; BITS (< 13) not yet written
+      (h 'kotoba$doc-b32-into '[v k b i buf bits] [:vector-i64 :i64 :bytes :i64 :i64 :i64] :vector-i64
+         '(if (>= bits 5)
+            (let [p (kotoba$doc-pow2 (- bits 5))
+                  x (quot buf p)]
+              (kotoba$doc-b32-into (vector-assoc! v k (kotoba$doc-b32-digit x)) (+ k 1)
+                                   b i (- buf (* x p)) (- bits 5)))
+            (if (< i (bytes-count b))
+              (kotoba$doc-b32-into v k b (+ i 1) (+ (* buf 256) (bytes-at b i)) (+ bits 8))
+              (if (> bits 0)
+                (vector-assoc! v k (kotoba$doc-b32-digit (* buf (kotoba$doc-pow2 (- 5 bits)))))
+                v))))
+      (h 'kotoba$doc-link '[b] [:bytes] [:option :document]
+         '(if (kotoba$doc-cidv1? b)
+            (option-some-of [:option :document]
+                            (string-concat
+                             (string-concat "#kotoba/cid \"b"
+                                            (kotoba$doc-text-of
+                                             (kotoba$doc-b32-into
+                                              (vector-alloc (quot (+ (* 8 (bytes-count b)) 4) 5))
+                                              0 b 0 0 0)))
+                             "\""))
+            (option-none-of [:option :document])))
+      ;; V from K on: the bytes the base32 digits d[i, e) spell; the trailing
+      ;; bits of canonical base32 are zero and are dropped
+      (h 'kotoba$doc-unb32-into '[v k d i e buf bits] [:vector-i64 :i64 :string :i64 :i64 :i64 :i64] :vector-i64
+         '(if (>= bits 8)
+            (let [p (kotoba$doc-pow2 (- bits 8))
+                  x (quot buf p)]
+              (kotoba$doc-unb32-into (vector-assoc! v k x) (+ k 1) d i e (- buf (* x p)) (- bits 8)))
+            (if (>= i e) v
+                (kotoba$doc-unb32-into v k d (+ i 1) e
+                                       (+ (* buf 32) (kotoba$doc-b32-value (string-code-point-at d i)))
+                                       (+ bits 5)))))
+      (h 'kotoba$doc-link-payload '[d] [:string] :bytes
+         '(let [q (+ (string-find-byte d 34 0) 2)
+                e (- (string-byte-length d) 1)]
+            (bytes-from-vector-i64
+             (kotoba$doc-unb32-into (vector-alloc (quot (* 5 (- e q)) 8)) 0 d q e 0 0))))]))
+
+#?(:kotoba
+   (defn- bytes-helpers [] [:ref :form/r] (form-edn-form bytes-helpers-text)))
+
+#?(:kotoba
+   (defn- bytes-operation? [f [:ref :form/r]] :bool
+     (or (sym-is? f "document-bytes") (sym-is? f "document-bytes-value")
+         (sym-is? f "document-link") (sym-is? f "document-link-value")))
+   :default
+   (def ^:private bytes-operations
+     '#{document-bytes document-bytes-value document-link document-link-value}))
+
+
+
+#?(:kotoba
+   (defn helper-names [] [:ref :form/r]
+     (name-set (form-append-many (form-kids-of (helpers)) (form-kids-of (bytes-helpers)))))
+   :default
+   (def helper-names (set (map :name (concat helpers bytes-helpers)))))
 
 
 
@@ -1150,7 +1351,7 @@
      [] [:ref :form/r]
      (form-form-set
       (form-kids-of
-       (form-edn-form "[document-null document-bool document-i64 document-string document-keyword document-symbol document-vector document-list document-set document-map document-count document-kind document-equal? document-set-contains? document-contains document-get document-vector-at document-list-at document-map-entry-at document-vector-assoc document-vector-conj document-vector-drop document-vector-remove document-vector-sort document-assoc document-dissoc document-merge document-string-value document-keyword-value document-symbol-value document-bool-value document-i64-value document-edn-print document-edn-read]"))))
+       (form-edn-form "[document-null document-bool document-i64 document-string document-keyword document-symbol document-vector document-list document-set document-map document-count document-kind document-equal? document-set-contains? document-contains document-get document-vector-at document-list-at document-set-at document-map-entry-at document-vector-assoc document-vector-conj document-vector-drop document-vector-remove document-vector-sort document-assoc document-dissoc document-merge document-string-value document-keyword-value document-symbol-value document-bool-value document-i64-value document-edn-print document-edn-read document-bytes document-bytes-value document-link document-link-value]"))))
    :default
    (def operations
      "The document operations this lowering answers. Refused before it (by the
@@ -1159,12 +1360,13 @@
      '#{document-null document-bool document-i64 document-string document-keyword
         document-symbol document-vector document-list document-set document-map
         document-count document-kind document-equal? document-set-contains?
-        document-contains document-get document-vector-at document-list-at
+        document-contains document-get document-vector-at document-list-at document-set-at
         document-map-entry-at document-vector-assoc document-vector-conj
         document-vector-drop document-vector-remove document-vector-sort
         document-assoc document-dissoc document-merge document-string-value
         document-keyword-value document-symbol-value document-bool-value
-        document-i64-value document-edn-print document-edn-read}))
+        document-i64-value document-edn-print document-edn-read
+        document-bytes document-bytes-value document-link document-link-value}))
 
 #?(:kotoba
    (defn- operation? [f [:ref :form/r]] :bool
@@ -1178,10 +1380,10 @@
 
 #?(:kotoba
    (defn- kind-keyword [i :i64] :keyword
-     (case i 0 :null 1 :bool 2 :i64 3 :f64 4 :string 5 :keyword 6 :symbol 7 :vector 8 :list 9 :set :map))
+     (case i 0 :null 1 :bool 2 :i64 3 :f64 4 :string 5 :keyword 6 :symbol 7 :vector 8 :list 9 :set 11 :bytes 12 :link :map))
    :default
    (def ^:private kind-keywords
-     [:null :bool :i64 :f64 :string :keyword :symbol :vector :list :set :map]))
+     [:null :bool :i64 :f64 :string :keyword :symbol :vector :list :set :map :bytes :link]))
 
 
 
@@ -1215,20 +1417,24 @@
 
 
 #?(:kotoba
-   (defn- value-of [kind :i64 f [:ref :form/r] payload [:ref :form/r]] [:ref :form/r]
+   ;; VALUE-TYPE is the option's payload type: the kind's keyword, except
+   ;; :bytes for both :bytes and :link (whose reader answers the CID's bytes).
+   (defn- value-of-typed [kind :i64 f [:ref :form/r] payload [:ref :form/r] value-type :keyword] [:ref :form/r]
      (let [d (sym "document__")
-           t (form-vec2 (form-keyword-form :option) (form-keyword-form (kind-keyword kind)))]
+           t (form-vec2 (form-keyword-form :option) (form-keyword-form value-type))]
        (form-call2 "let" (form-vec2 d f)
                    (form-call3 "if" (form-call2 "=" (form-call1 "kotoba$doc-kind" d) (num kind))
                                (form-call2 "option-some-of" t payload)
                                (form-call1 "option-none-of" t)))))
    :default
-   (defn- value-of [kind form payload]
-     (let [d (gensym "document__")]
-       (list 'let [d form]
-             (list 'if (list '= (list 'kotoba$doc-kind d) kind)
-                   (list 'option-some-of [:option (nth kind-keywords kind)] (payload d))
-                   (list 'option-none-of [:option (nth kind-keywords kind)]))))))
+   (defn- value-of
+     ([kind form payload] (value-of kind form payload (nth kind-keywords kind)))
+     ([kind form payload value-type]
+      (let [d (gensym "document__")]
+        (list 'let [d form]
+              (list 'if (list '= (list 'kotoba$doc-kind d) kind)
+                    (list 'option-some-of [:option value-type] (payload d))
+                    (list 'option-none-of [:option value-type])))))))
 
 
 
@@ -1264,7 +1470,7 @@
                        (list 'let [k (list 'kotoba$doc-kind (first args))]
                              (reduce (fn [acc index]
                                        (list 'if (list '= k index) (nth kind-keywords index) acc))
-                                     :map (range 9 -1 -1))))
+                                     :map (concat [12 11] (range 9 -1 -1)))))
        document-equal? (list 'string=? (first args) (second args))
        document-set-contains? (list 'kotoba$doc-set-contains
                                     (require-kind (first args) 9 9) (second args) 2)
@@ -1274,6 +1480,7 @@
        document-get (list 'kotoba$doc-get (require-kind (first args) 10 10) (second args))
        (document-vector-at) (list 'kotoba$doc-nth (require-kind (first args) 7 7) (second args))
        (document-list-at) (list 'kotoba$doc-nth (require-kind (first args) 8 8) (second args))
+       (document-set-at) (list 'kotoba$doc-nth (require-kind (first args) 9 9) (second args))
        document-map-entry-at (list 'kotoba$doc-entry-at (require-kind (first args) 10 10)
                                    (second args))
        document-vector-assoc (list 'kotoba$doc-vector-assoc (require-kind (first args) 7 7)
@@ -1294,6 +1501,12 @@
        document-symbol-value (value-of 6 (first args) identity)
        document-bool-value (value-of 1 (first args) (fn [d] (list 'string=? d "true")))
        document-i64-value (value-of 2 (first args) (fn [d] (list 'kotoba$doc-parse-i64 d)))
+       ;; :bytes and :link (root ADR-2610092310): the EDN tagged literals
+       ;; `#kotoba/bytes \"<hex>\"` and `#kotoba/cid \"b<base32>\"`.
+       document-bytes (list 'kotoba$doc-bytes (first args))
+       document-bytes-value (value-of 11 (first args) (fn [d] (list 'kotoba$doc-bytes-payload d)) :bytes)
+       document-link (list 'kotoba$doc-link (first args))
+       document-link-value (value-of 12 (first args) (fn [d] (list 'kotoba$doc-link-payload d)) :bytes)
        ;; Identity at the ABI: the native document IS its canonical EDN text.
        (document-edn-print document-edn-read) (first args)
        (throw (ex-info "unknown native document operation" {:phase :native :operation op})))))
@@ -1307,8 +1520,16 @@
            (recur (+ i 2) (form-call4 "kotoba$doc-map-put" acc (typed-list-nth [:list [:ref :form/r]] args i) (typed-list-nth [:list [:ref :form/r]] args (+ i 1)) (form-bool-form true))))))))
 
 #?(:kotoba
+   (defn- value-of [kind :i64 f [:ref :form/r] payload [:ref :form/r]] [:ref :form/r]
+     (value-of-typed kind f payload (kind-keyword kind))))
+
+#?(:kotoba
+   ;; As the host's reduce over 12, 11, 9 .. 0: 12 and 11 innermost, before :map.
    (defn- kind-chain [k [:ref :form/r]] [:ref :form/r]
-     (loop [index 9 acc (form-keyword-form :map)]
+     (loop [index 9
+            acc (form-call3 "if" (form-call2 "=" k (num 11)) (form-keyword-form :bytes)
+                            (form-call3 "if" (form-call2 "=" k (num 12)) (form-keyword-form :link)
+                                        (form-keyword-form :map)))]
        (if (< index 0)
          acc
          (recur (dec index) (form-call3 "if" (form-call2 "=" k (num index)) (form-keyword-form (kind-keyword index)) acc))))))
@@ -1362,6 +1583,7 @@
          (sym-is? op "document-get") (form-call2 "kotoba$doc-get" (require-kind a0 10 10) a1)
          (sym-is? op "document-vector-at") (form-call2 "kotoba$doc-nth" (require-kind a0 7 7) a1)
          (sym-is? op "document-list-at") (form-call2 "kotoba$doc-nth" (require-kind a0 8 8) a1)
+         (sym-is? op "document-set-at") (form-call2 "kotoba$doc-nth" (require-kind a0 9 9) a1)
          (sym-is? op "document-map-entry-at") (form-call2 "kotoba$doc-entry-at" (require-kind a0 10 10) a1)
          (sym-is? op "document-vector-assoc") (form-call3 "kotoba$doc-vector-assoc" (require-kind a0 7 7) a1 a2)
          (sym-is? op "document-vector-conj") (form-call2 "kotoba$doc-conj" (require-kind a0 7 7) a1)
@@ -1376,6 +1598,12 @@
          (sym-is? op "document-symbol-value") (value-of 6 a0 d)
          (sym-is? op "document-bool-value") (value-of 1 a0 (form-call2 "string=?" d (str- "true")))
          (sym-is? op "document-i64-value") (value-of 2 a0 (form-call1 "kotoba$doc-parse-i64" d))
+         ;; :bytes and :link (root ADR-2610092310): the EDN tagged literals
+         ;; `#kotoba/bytes \"<hex>\"` and `#kotoba/cid \"b<base32>\"`.
+         (sym-is? op "document-bytes") (form-call1 "kotoba$doc-bytes" a0)
+         (sym-is? op "document-bytes-value") (value-of-typed 11 a0 (form-call1 "kotoba$doc-bytes-payload" d) :bytes)
+         (sym-is? op "document-link") (form-call1 "kotoba$doc-link" a0)
+         (sym-is? op "document-link-value") (value-of-typed 12 a0 (form-call1 "kotoba$doc-link-payload" d) :bytes)
          (or (sym-is? op "document-edn-print") (sym-is? op "document-edn-read")) a0
          :else (throw (ex-info "unknown native document operation"
                                {:phase :native :problem :unknown-operation}))))))
@@ -1411,6 +1639,30 @@
 
 
 #?(:kotoba
+   (defn- any-uses-bytes? [xs [:list [:ref :form/r]]] :bool
+     (let [n (vector-count xs)]
+       (loop [i 0]
+         (if (>= i n) false (if (uses-bytes? (typed-list-nth [:list [:ref :form/r]] xs i)) true (recur (inc i)))))))
+   :default
+   (defn- uses-bytes? [form]
+     (cond
+       (seq? form) (or (contains? bytes-operations (first form))
+                       (boolean (some uses-bytes? (rest form))))
+       (vector? form) (boolean (some uses-bytes? form))
+       :else false)))
+
+#?(:kotoba
+   (defn- uses-bytes? [f [:ref :form/r]] :bool
+     (cond
+       (form-is-seq? f)
+       (or (bytes-operation? (form-first-of f))
+           (any-uses-bytes? (form-rest-list f)))
+       (form-is-vec? f) (any-uses-bytes? (form-kids-of f))
+       :else false)))
+
+
+
+#?(:kotoba
    (defn- substitute-kids [xs [:list [:ref :form/r]]] [:list [:ref :form/r]]
      (let [n (vector-count xs)]
        (loop [i 0 acc (form-no-forms)]
@@ -1439,8 +1691,12 @@
 
 
 #?(:kotoba
-   (defn- wanted-helpers [] [:list [:ref :form/r]]
-     (let [hs (form-kids-of (helpers))
+   ;; The helpers, plus the bytes helpers when BYTES? (a body names a :bytes /
+   ;; :link operation), with the control table substituted.
+   (defn- wanted-helpers [bytes? :bool] [:list [:ref :form/r]]
+     (let [hs (if bytes?
+                (form-append-many (form-kids-of (helpers)) (form-kids-of (bytes-helpers)))
+                (form-kids-of (helpers)))
            n (vector-count hs)]
        (loop [i 0 acc (form-no-forms)]
          (if (>= i n) acc
@@ -1457,7 +1713,10 @@
      (if-not (some #(uses? (:body %)) functions)
        functions
        (let [declared (into {} (map (juxt :name identity)) functions)
-             wanted (mapv #(update % :body substitute-control) helpers)
+             wanted (mapv #(update % :body substitute-control)
+                          (if (some #(uses-bytes? (:body %)) functions)
+                            (concat helpers bytes-helpers)
+                            helpers))
              clashes (filter (fn [helper]
                                (when-let [existing (get declared (:name helper))]
                                  (not= existing helper)))
@@ -1472,6 +1731,12 @@
      (let [n (vector-count functions)]
        (loop [i 0]
          (if (>= i n) false (if (uses? (fget (typed-list-nth [:list [:ref :form/r]] functions i) :body)) true (recur (inc i))))))))
+
+#?(:kotoba
+   (defn- any-body-uses-bytes? [functions [:list [:ref :form/r]]] :bool
+     (let [n (vector-count functions)]
+       (loop [i 0]
+         (if (>= i n) false (if (uses-bytes? (fget (typed-list-nth [:list [:ref :form/r]] functions i) :body)) true (recur (inc i))))))))
 
 #?(:kotoba
    (defn- declared-named [functions [:list [:ref :form/r]] name [:ref :form/r]] [:ref :form/r]
@@ -1515,7 +1780,7 @@
      (let [fs (form-kids-of functions)]
        (if (not (any-body-uses? fs))
          functions
-         (let [wanted (wanted-helpers)]
+         (let [wanted (wanted-helpers (any-body-uses-bytes? fs))]
            (if (any-clash? fs wanted)
              (throw (ex-info "a program function collides with a native document helper"
                              {:phase :native :problem :helper-collision}))

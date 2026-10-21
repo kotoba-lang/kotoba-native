@@ -30,6 +30,7 @@
             [kotoba.native.boot-scratch-test]
             [kotoba.native.vector-region-test]
             [kotoba.native.string-index-test]
+            [kotoba.native.typed-map-test]
             [kotoba.native.document-test]
             [kotoba.native.string-search-test]
             [kotoba.native.code-point-literal-test]
@@ -49,6 +50,7 @@
             ;; the 22 that were JVM-only until 2026-09-18
             [kotoba.native.aggregate-abi-test]
             [kotoba.native.context-slots-test]
+            [kotoba.native.gas-charge-test]
             [kotoba.native.dequant-fusion-test]
             [kotoba.native.dequant-kquant-test]
             [kotoba.native.elf64-test]
@@ -68,50 +70,33 @@
             [kotoba.native.store-result-test]
             [kotoba.native.uefi-boundary-test]
             [kotoba.native.vector-boundary-spelling-test]
+            [kotoba.native.option-record-payload-test]
             [kotoba.native.vector-test]
             [kotoba.native-test]))
 
 (def namespaces
   '[kotoba.native.peephole-test kotoba.native.boot-scratch-test kotoba.native.vector-region-test
-    kotoba.native.string-index-test kotoba.native.document-test kotoba.native.string-search-test kotoba.native.code-point-literal-test
+    kotoba.native.string-index-test kotoba.native.typed-map-test kotoba.native.document-test kotoba.native.string-search-test kotoba.native.code-point-literal-test
     kotoba.native.arena-scope-test kotoba.native.text-slots-test kotoba.native.line-slots-test
     kotoba.native.inline-handle-ops-test kotoba.native.range-slots-test kotoba.native.bytes-slots-test kotoba.native.macho-test kotoba.native.linux-static-test
     kotoba.native.affine-test kotoba.native.elf64-portable-test kotoba.native.aggregate-abi-portable-test
     kotoba.native.recursive-adt-test
-    kotoba.native.aggregate-abi-test kotoba.native.context-slots-test kotoba.native.dequant-fusion-test
+    kotoba.native.aggregate-abi-test kotoba.native.context-slots-test kotoba.native.gas-charge-test kotoba.native.dequant-fusion-test
     kotoba.native.dequant-kquant-test kotoba.native.elf64-test kotoba.native.elf64-twin-parity-test
     kotoba.native.f32-test kotoba.native.false-argument-test kotoba.native.firmware-store-test
     kotoba.native.fuel64-test kotoba.native.interrupt-abi-test kotoba.native.isa-parity-test
     kotoba.native.keyword-equality-test kotoba.native.layout-test kotoba.native.machine-ir-test
     kotoba.native.rodata-literal-test kotoba.native.source-control-bytes-test kotoba.native.stack-arguments-test kotoba.native.store-result-test
-    kotoba.native.uefi-boundary-test kotoba.native.vector-boundary-spelling-test kotoba.native.vector-test
+    kotoba.native.uefi-boundary-test kotoba.native.vector-boundary-spelling-test kotoba.native.option-record-payload-test kotoba.native.vector-test
     kotoba.native-test])
 
-;; deftest name -> the one reason it is red on this host. Every entry is the
-;; x86-64 aiueos kernel image reading what only the JVM twin lays (ADR 0036):
-;; `elf64.cljc.cljk` refuses with `:isr-image-needs-the-jvm-packager` or has
-;; no interrupt entry region / GDT / TSS / value-runtime shim. Shortening this
-;; list is the port of those features into the portable twin.
+;; deftest name -> the one reason it remains red on this host. The portable
+;; twin now lays the same GDT/TSS, ValueRuntime syscall shim and interrupt
+;; entry region as the JVM packager. CPL3 ValueRuntime images remain refused
+;; until their C-free provider qualification is complete.
 (def known-red
-  (let [twin "elf64 twin gap: the portable packager lays no GDT/TSS/rsp0 stack, value-runtime shim or interrupt entry region (ADR 0036; port pending)"]
-    {'value-runtime-kernel-installs-and-enters-a-closed-syscall-shim twin
-     'the-slot-block-lies-inside-the-rw-segment twin
-     'x86-kernel-image-owns-gdt-tss-and-rsp0-stack twin
-     'an-image-entry-body-with-the-wrong-arity-is-refused twin
-     'the-image-context-word-was-always-64-bit twin
-     'large-kernel-image-moves-data-to-the-next-page twin
-     'kernel-image-context-uses-the-sealed-fuel-bound twin
-     'an-image-with-no-entry-declares-no-region twin
-     'aiueos-user-packaging-refuses-value-runtime-until-c-free-provider-qualification twin
-     'a-half-value-runtime-boundary-never-installs-lstar twin
-     'the-undefined-opcode-slot-names-itself twin
-     'the-scan-goes-red-on-a-re-hardcoded-slot twin
-     'the-immediate-scan-goes-red-on-the-re-hardcoded-data-page twin
-     'the-image-lays-an-entry-region-and-names-its-base twin
-     'the-image-entry-reaches-its-body-and-its-context twin
-     'the-aiueos-geometry-put-the-old-slots-inside-rx-text twin
-     'every-vector-in-the-table-has-a-slot twin
-     'emitted-text-has-no-absolute-operand-into-itself twin}))
+  {'aiueos-user-packaging-refuses-value-runtime-until-c-free-provider-qualification
+   "the user image's ValueRuntime provider has not completed C-free qualification"})
 
 (defn- current-test []
   (some-> (t/get-current-env) :testing-vars first meta :name))

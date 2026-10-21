@@ -11,6 +11,7 @@
   breaks for some other reason cannot be counted as this test discriminating."
   (:require [kotoba.test :refer [deftest is testing]]
             [kotoba.kir :as kir]
+            [kotoba.native.aggregate-abi :as aggregate-abi]
             [kotoba.native.machine-ir :as machine]
             [kotoba.native.aarch64 :as aarch64]
             [kotoba.native.x86-64 :as x86-64]))
@@ -81,3 +82,31 @@
                     (assoc-in [:functions 1 :body]
                               '(vector-f64-count (build (vector-f64-new) 0 4))))]
     (is (nil? (rejection f64-kir)))))
+
+;; amu ADR 0353 floor :native-vector-field: the same spelling inside a record.
+;; `aggregate-abi` listed `:vector`, so a record holding a selection [start end]
+;; was not a word record and the module was `unsupported-function-module`.
+(def ^:private selection-record
+  [:record :b/state [[:sel :vector-i64] [:v :string]]])
+
+(def ^:private vector-field-kir
+  {:format :kotoba.kir/v4
+   :entry 'main
+   :exports ['main]
+   :functions
+   [{:name 'mk :params [] :param-types [] :result selection-record
+     :body (list 'record-new selection-record '(vector-new 1 2) "ab")}
+    {:name 'main :params [] :param-types [] :result :i64
+     :body (list 'vector-at (list 'record-get selection-record '(mk) :sel) 1)}]})
+
+(deftest a-vector-i64-record-field-lowers-on-both-isas
+  (is (aggregate-abi/scalar-record-type? selection-record))
+  (is (not (aggregate-abi/scalar-record-type?
+            [:record :b/state [[:sel :vector] [:v :string]]]))
+      ":vector is a spelling no producer emits, in a record too")
+  (is (true? (kir/only-native-word-typed-features? vector-field-kir)))
+  (is (nil? (rejection vector-field-kir)))
+  (doseq [[target emit] [[:aarch64 aarch64/emit-program]
+                         [:x86-64 x86-64/emit-program]]]
+    (testing (name target)
+      (is (seq (:code (emit vector-field-kir)))))))

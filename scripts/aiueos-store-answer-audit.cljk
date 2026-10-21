@@ -8,7 +8,7 @@
 ;; outside this repository's tree, and nothing here runs it in CI. A check
 ;; whose input is not in the tree it is attached to cannot be green or red for
 ;; a reason anyone can act on -- see the `root-permit-index` note in the
-;; superproject's CLAUDE.md.
+;; superproject's AGENTS.md.
 ;;
 ;;   kbb --backend sci scripts/aiueos-store-answer-audit.cljk <path-to>/os/aiueos/kotoba
 ;;

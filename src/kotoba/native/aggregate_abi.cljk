@@ -578,11 +578,12 @@
 
 #?(:kotoba
    (defn- word-scalar? [f [:ref :form/r]] :bool
-     (kw-in? f "[:kotoba.form/set :i64 :bool :f32 :f64 :string :keyword :vector :vector-i64 :vector-f64 :string-index :bytes]"))
+     (kw-in? f "[:kotoba.form/set :i64 :bool :f32 :f64 :string :keyword :vector-i64 :vector-f64 :string-index :bytes]"))
    :default
    (defn scalar-record-type?
-     "True for a named, non-empty record whose unique fields each occupy one
-     native word. A nested record occupies one word through its pair-chain handle;
+     "True for a named record whose unique fields each occupy one native word.
+     The record with no fields is `{}` passed as an options map (amu ADR 0353
+     floor :options-map-argument): the empty pair chain, 0. A nested record occupies one word through its pair-chain handle;
      nesting is bounded so adversarial schemas fail closed during admission."
      [type]
      (letfn [(record-type? [candidate depth]
@@ -590,7 +591,7 @@
                     (vector? candidate) (= 3 (count candidate))
                     (= :record (first candidate))
                     (keyword? (second candidate))
-                    (vector? (nth candidate 2)) (seq (nth candidate 2))
+                    (vector? (nth candidate 2))
                     (every? #(and (vector? %) (= 2 (count %))
                                   (keyword? (first %))
                                   (word-field-type? (second %) (inc depth)))
@@ -598,8 +599,13 @@
                     (= (count (nth candidate 2))
                        (count (distinct (map first (nth candidate 2)))))))
              (word-field-type? [field-type depth]
+               ;; `:vector-i64` is how kotoba.kir spells the i64 vector handle.
+               ;; This listed `:vector`, which nothing produces (see
+               ;; `machine-ir/word-result-type?`), so a record holding a
+               ;; selection [start end] was refused here (amu ADR 0353 floor
+               ;; :native-vector-field).
                (or (contains? #{:i64 :bool :f32 :f64 :string :keyword
-                                :vector :vector-i64 :vector-f64 :string-index :bytes}
+                                :vector-i64 :vector-f64 :string-index :bytes}
                               field-type)
                    (and (vector? field-type)
                         (contains? #{:option :result :list :set :map :ref}
@@ -634,14 +640,14 @@
           (form-eq (form-first-of candidate) (form-keyword-form :record))
           (form-is-keyword? (form-nth-of candidate 1))
           (form-is-vec? (form-nth-of candidate 2))
-          (> (form-count-of (form-nth-of candidate 2)) 0)
           (fields-ok? (form-nth-of candidate 2) depth)
           (distinct-firsts? (form-nth-of candidate 2)))))
 
 #?(:kotoba
    (defn scalar-record-type?
-     "True for a named, non-empty record whose unique fields each occupy one
-     native word."
+     "True for a named record whose unique fields each occupy one native word.
+     The record with no fields is the empty pair chain (amu ADR 0353 floor
+     :options-map-argument)."
      [type [:ref :form/r]] :bool
      (record-type? type 0)))
 
@@ -715,7 +721,7 @@
 
 #?(:kotoba
    (defn- payload-word-type? [t [:ref :form/r] depth :i64] :bool
-     (or (kw-in? t "[:kotoba.form/set :i64 :bool :f32 :f64 :string :keyword :vector :vector-f64 :string-index]")
+     (or (kw-in? t "[:kotoba.form/set :i64 :bool :f32 :f64 :string :keyword :vector-i64 :vector-f64 :string-index]")
          (and (form-is-vec? t) (form-eq (form-first-of t) (form-keyword-form :ref)) (= 2 (form-count-of t))
               (qualified-keyword? (form-nth-of t 1)))
          (and (form-is-vec? t) (kw-in? (form-first-of t) "[:kotoba.form/set :option :result :list :set :map]"))
@@ -727,7 +733,7 @@
      reference, or a record / variant / heterogeneous-vector handle."
      [type depth]
      (or (contains? #{:i64 :bool :f32 :f64 :string :keyword
-                      :vector :vector-f64 :string-index} type)
+                      :vector-i64 :vector-f64 :string-index} type)
          ;; A reference names a schema, so it must name one: qualified, the same
          ;; rule a record or variant's own name obeys.
          (and (vector? type) (= :ref (first type)) (= 2 (count type))

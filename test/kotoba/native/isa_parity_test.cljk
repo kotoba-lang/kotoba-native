@@ -30,6 +30,18 @@
   {:format :kotoba.kir/v4 :exports ['main]
    :functions [{:name 'main :params params :body body}]})
 
+(defn- charged
+  "FORM behind the source constructor's one unit of fuel, as
+  `machine/charge-constructors` places it (amu ADR 0353 floor
+  :allocation-budget-native)."
+  [form]
+  (list 'do '(fuel-charge!) form))
+
+(defn- written
+  "PROGRAM whose charges are written out by hand, as the source's."
+  [program]
+  (machine/charges-written program))
+
 (defn- emits? [emit params body]
   (try (seq (:code (emit (program params body))))
        (catch :default _ false)))
@@ -1118,8 +1130,8 @@
 (def ^:private inner '[:record :t/s [[:a :i64] [:b :i64]]])
 (def ^:private outer '[:record :t/n [[:i [:record :t/s [[:a :i64] [:b :i64]]]] [:m :i64]]])
 
-(def ^:private boxed-inner '(pair 1 (pair 2 0)))
-(def ^:private boxed-outer (list 'pair boxed-inner '(pair 9 0)))
+(def ^:private boxed-inner (charged '(pair 1 (pair 2 0))))
+(def ^:private boxed-outer (charged (list 'pair boxed-inner '(pair 9 0))))
 
 (deftest nested-records-lower-to-the-versioned-recursive-pair-boundary
   ;; Each nested record is a one-word handle. Compare the public production
@@ -1141,14 +1153,14 @@
                 (list 'let ['r (list 'record-new outer (list 'record-new inner 4 5) 6)]
                       (list '+ (list 'record-get inner (list 'record-get outer 'r :i) :a)
                             (list 'record-get outer 'r :m)))
-                (list 'let ['r '(pair (pair 4 (pair 5 0)) (pair 6 0))]
+                (list 'let ['r (charged (list 'pair (charged '(pair 4 (pair 5 0))) '(pair 6 0)))]
                       '(+ (pair-first (pair-first r))
                           (pair-first (pair-second r))))]
                ["construction, outer field"
                 (list 'record-get outer (list 'record-new outer (list 'record-new inner 1 2) 7) :m)
-                '(pair-first (pair-second (pair (pair 1 (pair 2 0)) (pair 7 0))))]]]
+                (list 'pair-first (list 'pair-second (charged (list 'pair boxed-inner '(pair 7 0)))))]]]
         (let [actual (emit (program [] body))
-              expected (emit (program [] boxed))]
+              expected (emit (written (program [] boxed)))]
           (is (seq (:code actual)) why)
           (is (= expected actual) why))))))
 
@@ -1159,7 +1171,7 @@
                                            (list 'record-new inner 1 2) 9)]
                             (list 'record-get outer 'r :i))
             walked (list 'let ['r boxed-outer] '(pair-first r))]
-        (is (= (emit (program [] walked))
+        (is (= (emit (written (program [] walked)))
                (emit (program [] projected))))))))
 
 ;; ---------------------------------------------------------------------------
@@ -1181,8 +1193,8 @@
                 (list 'variant-match clock-result
                       (list 'variant-new clock-result :wall (list 'record-new wall 123 4))
                       [[:wall 'p (list 'record-get wall 'p :unix-millis)] [:error 'p 0]])
-                '(let [v (pair 0 (pair 123 (pair 4 0)))]
-                   (if (= (pair-first v) 0)
+                (list 'let ['v (charged (list 'pair 0 (charged '(pair 123 (pair 4 0)))))]
+                   '(if (= (pair-first v) 0)
                      (let [p (pair-second v)] (pair-first p))
                      (if (= (pair-first v) 1)
                        (let [p (pair-second v)] 0)
@@ -1191,15 +1203,15 @@
                 (list 'variant-match clock-result
                       (list 'variant-new clock-result :error (list 'record-new clock-error :timeout "slow"))
                       [[:wall 'p 0] [:error 'p (list 'string-byte-length (list 'record-get clock-error 'p :message))]])
-                '(let [v (pair 1 (pair :timeout (pair "slow" 0)))]
-                   (if (= (pair-first v) 0)
+                (list 'let ['v (charged (list 'pair 1 (charged '(pair :timeout (pair "slow" 0)))))]
+                   '(if (= (pair-first v) 0)
                      (let [p (pair-second v)] 0)
                      (if (= (pair-first v) 1)
                        (let [p (pair-second v)]
                          (string-byte-length (pair-first (pair-second p))))
                        (quot 1 0))))]]]
         (let [actual (emit (program [] body))
-              expected (emit (program [] boxed))]
+              expected (emit (written (program [] boxed)))]
           (is (seq (:code actual)) why)
           (is (= expected actual) why))))))
 
@@ -1297,9 +1309,10 @@
                 :body (list 'record-get tail-rec '(mk) field)}]})
 
 (def ^:private boxed-chain
-  ;; What ADR 0062's boundary shape IS, written out: pair(11, pair(22, 0)).
+  ;; What ADR 0062's boundary shape IS, written out: pair(11, pair(22, 0)),
+  ;; behind the one unit the source's record-new costs.
   ;; Every placement below must produce exactly this, in exactly this position.
-  '(pair 11 (pair 22 0)))
+  (charged '(pair 11 (pair 22 0))))
 
 (def ^:private tail-placements
   [["outermost"        (list 'record-new tail-rec 11 22)                boxed-chain]
@@ -1334,7 +1347,7 @@
           ;; construction was already the pair chain. That is what makes this a
           ;; rewrite into a shape both backends already executed, rather than a
           ;; new encoding that happens to compile.
-          (is (= emitted (:code (emit (mk-program tail-rec already-boxed field))))
+          (is (= emitted (:code (emit (written (mk-program tail-rec already-boxed field)))))
               (str why " / " field
                    " must emit exactly the pre-boxed body's code")))))))
 

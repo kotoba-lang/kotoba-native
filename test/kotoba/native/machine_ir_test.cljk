@@ -2688,6 +2688,40 @@
   (count (filter #(= needle (vec %))
                  (partition (count needle) 1 haystack))))
 
+(deftest constructors-charge-fuel-before-their-operands
+  ;; amu ADR 0353 floor :allocation-budget-native (ADR 0089). Every
+  ;; constructor the reference charges costs one unit, in front of its
+  ;; operands; the debit is an inline :fuel-charge, not a host call, so it
+  ;; does not give a leaf an entry charge. Break: drop the wrap and the loop
+  ;; builds its records for free again.
+  (let [point '[:record :t/p [[:x :i64] [:y :i64]]]
+        kir {:format :kotoba.kir/v4 :exports ['main]
+             :functions [{:name 'main :params ['n] :result :i64
+                          :body (list 'record-get point
+                                      (list 'record-new point
+                                            (list 'record-get point (list 'record-new point 'n 1) :y) 2)
+                                      :x)}]}
+        charged (machine/charge-constructors kir)]
+    (is (= (list 'record-get point
+                 (list 'do '(fuel-charge!)
+                       (list 'record-new point
+                             (list 'record-get point
+                                   (list 'do '(fuel-charge!) (list 'record-new point 'n 1)) :y)
+                             2))
+                 :x)
+           (:body (first (:functions charged)))))
+    (is (= charged (machine/charge-constructors (machine/charges-written charged)))
+        "a program whose charges are written out is left as it is: no second unit")
+    (is (empty? (machine/entry-fuel-prefixes charged (constantly [:fuel])))
+        "the charge is not a re-entry: a constructing leaf pays no entry charge")
+    (is (= 2 (count (filter #(= :fuel-charge (:gmir/runtime %))
+                            (:gmir/instructions
+                             (first (:gmir/functions (machine/lower-kir-module charged))))))))
+    (doseq [[label emit charge] [["x86-64" x86/emit-program [0x49 0xff 0x49 0x08]]
+                                 ["AArch64" arm/emit-program [0xf0 0x04 0x40 0xf9 0x10 0x06 0x00 0xf1]]]]
+      (is (= 2 (subvector-count (vec (:code (emit kir))) charge))
+          (str label ": two inline decrements of the fuel word, and no entry charge")))))
+
 (deftest production-self-tail-call-reuses-one-frame-and-recharges-fuel
   ;; `loop/recur` lowers to a self tail call. Releasing the frame and branching
   ;; to the public function label rebuilt the complete call-live frame on every
@@ -4236,3 +4270,60 @@
       (is (= result-kind (:gmir/kind (first calls))) request-type)
       (doseq [target [:x86-64 :aarch64]]
         (is (seq (:mc/functions (machine/compile-gmir target gmir))) [request-type target])))))
+
+;; amu ADR 0353 floor :native-record-operations: `record-assoc`, the update a
+;; row operation on a present field elaborates to. In a record-boundary module
+;; it is a fresh pair chain re-projecting the other fields; in a module whose
+;; records never cross a boundary it is the slot bundle with one register
+;; replaced, and allocates nothing. Executed under amu's kexe_loader by amu's
+;; native-row-operations-test.
+(def record-assoc-boundary-kir
+  {:format :kotoba.kir/v4
+   :exports ['main]
+   :functions
+   [{:name 'mk :params ['value] :param-types [:i64]
+     :result scalar-record-type
+     :body (list 'record-new scalar-record-type 'value 9)}
+    {:name 'main :params ['value] :param-types [:i64] :result :i64
+     :body (list 'record-get scalar-record-type
+                 (list 'record-assoc scalar-record-type (list 'mk 'value) :a 7)
+                 :b)}]})
+
+(def record-assoc-sroa-kir
+  {:format :kotoba.kir/v4
+   :exports ['main]
+   :functions
+   [{:name 'main :params ['value] :param-types [:i64] :result :i64
+     :body (list 'record-get scalar-record-type
+                 (list 'record-assoc scalar-record-type
+                       (list 'record-new scalar-record-type 'value 9) :b 'value)
+                 :b)}]})
+
+(deftest a-record-update-lowers-on-both-record-routes
+  (testing "across a boundary: a fresh pair chain"
+    (let [instructions (mapcat :gmir/instructions
+                               (:gmir/functions (machine/lower-kir-module record-assoc-boundary-kir)))]
+      (is (some #(and (= :gmir/runtime-call (:gmir/op %)) (= :pair (:gmir/runtime %)))
+                instructions)))
+    (doseq [target [:x86-64 :aarch64]]
+      (is (seq (:code (machine/compile-kir-module target record-assoc-boundary-kir))) target)))
+  (testing "local: the slot bundle, nothing allocated"
+    (let [instructions (mapcat :gmir/instructions
+                               (:gmir/functions (machine/lower-kir-module record-assoc-sroa-kir)))]
+      (is (not-any? #(and (= :gmir/runtime-call (:gmir/op %)) (= :pair (:gmir/runtime %)))
+                    instructions)))
+    (doseq [target [:x86-64 :aarch64]]
+      (is (seq (:code (machine/compile-kir-module target record-assoc-sroa-kir))) target)))
+  (testing "refused: a field the record does not declare, on either route"
+    (let [problem (fn [kir] (try (machine/lower-kir-module kir) nil
+                                 (catch :default e (:problem (ex-data e)))))]
+      (is (= :invalid-update
+             (problem (assoc-in record-assoc-boundary-kir [:functions 1 :body]
+                                (list 'record-get scalar-record-type
+                                      (list 'record-assoc scalar-record-type '(mk value) :z 1) :a)))))
+      (is (= :unknown-record-field
+             (problem (assoc-in record-assoc-sroa-kir [:functions 0 :body]
+                                (list 'record-get scalar-record-type
+                                      (list 'record-assoc scalar-record-type
+                                            (list 'record-new scalar-record-type 'value 9) :z 1)
+                                      :a))))))))
