@@ -18,8 +18,8 @@ or run. Definition CIDs, exact bytes, runtime/refusal behavior and whole-compone
 native qualification are open. The hosted packager does not call this module yet.
 
 Source SHA-256:
-`1a2af20327c57dcdc8726e8998e023ee92970df0f8e71821278bc2e40160f256`.
-Static inventory: 333 lines, 38 functions, balanced delimiters, own-call
+`c7c4eb52459e8d7be8d51ea811bac707f0d67bdbc67e8a62d9d4d4b6d0f1a53c`.
+Static inventory: 375 lines, 43 functions, balanced delimiters, own-call
 arities after structural thread expansion, no unresolved source call heads
 and no local data values used as function heads. Machine register/dataflow,
 source slot coverage and budget/window formulas were reviewed, not executed.
@@ -32,6 +32,8 @@ source slot coverage and budget/window formulas were reviewed, not executed.
 | `external-labels []` | Required external trap labels: `:bad -> :ls/bad`, `:cells -> :ls/trap-cells`, `:bytes -> :ls/trap-bytes` |
 | `routine [context slot]` | Emit one supported slot and its entry binding; unknown slots, including `:all`, fail |
 | `routines [context]` | Emit all seven once, with their entry bindings |
+| `read-string-fragment [context prefix]` | Inline C3 handle/window/UTF-8 admission: s0=context and s1=handle become s2=pointer/s3=length |
+| `intern-string-fragment [context prefix]` | Inline C3 copy/pool/cell mechanism: s0=context, s1=trusted bytes, s2=length become t0=handle |
 
 The result record is `:linux.static.strings/result`, with `code`, `bindings`
 and `error`. Only `error=:ok` authorizes using code/bindings. Failure yields
@@ -99,11 +101,21 @@ Exact malformed-input refusal precedence is not claimed identical.
 
 ## Remaining closure
 
-This source covers the reference's pair/string component, not its typed-cap-call
-slot, C3 `intern` decision-call/result mechanism, or the compiler's still-missing
-vector/byte/I/O helpers. The companion SHA-256 routine still needs actual grant,
-kind, UTF-8 request, workspace, resource, result interning and dispatch/profile
-binding; these slot sources alone do not make wire 3 available.
+The two inline fragments share the slots' exact handle/validation/pair helpers.
+They require the caller to preserve s0..s4 and LR, use distinct private label
+prefixes, and own the complete mapped context and source spans. Interning
+requires prior op-6 byte-charge admission from the sealed owning decision
+artifact; its extra arithmetic checks do not replace that authority. The source
+bytes must be stable and disjoint from the new pool tail. The mechanism checks
+remaining capacity, copies, advances pool-used and allocates a pair with a clear
+validation byte; the caller must then validate the result handle. It is not a
+general guest-address API or an approval callback.
+
+The [C1/C3 source candidate](linux-static-capability-port.md) now calls those
+fragments around its native hash computation and real op-6 decision call. The
+owning decision routing/profile, full image assembly and native qualification
+remain unfinished; wire 3 is still unavailable in the current profile. This
+component does not implement the compiler's missing vector/byte/I/O helpers.
 
 Native source admission/Definition CIDs/behavior, the complete prelude/context,
 decision code/message placement and ELF construction, reviewed source/lock pins,

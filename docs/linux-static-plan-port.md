@@ -15,7 +15,7 @@ operation or test was run. It does not yet replace the hosted packager or
 produce a qualified ELF/compiler generation.
 
 Candidate source SHA-256:
-`39331c249362d396623d5e1132659274cc57deae8ae3db564485c9bbe0900b7e`.
+`40dde90afbb66e30c821b2cf0cef96f61b9ee0bcad9adf5ab7c0781840953d4e`.
 Static inventory found balanced delimiters, matching own-function arities,
 no unresolved source call heads, both target profiles, the eight implemented
 slots and all 13 scratch-region names. This does not measure executed behavior.
@@ -107,11 +107,19 @@ retaining the real seal check is required. Source presence in the root lock
 does not establish provider availability.
 
 The companion [SHA-256 computation source](linux-static-sha256-port.md) now
-emits a private register-IR routine for the missing computation. Capability
-admission, request-handle resolution, private workspace ownership, result
-interning and the actual native dispatch/profile binding are still required.
-It has not been generated, assembled or executed, so wire 3 remains unavailable
-in the current profile. Do not enable a handler merely because this source exists.
+emits a private register-IR routine for the missing computation. Layout now
+appends a 16-byte-aligned `:hash-workspace`, sized by that source's
+`workspace-bytes` accessor (816), only when wire 3 is in the narrowed grant.
+It follows the existing 13 scratch regions; plans without wire 3 retain their
+original layout. Malformed grants and a hash grant without handlers are refused,
+and the extra region uses the same checked size/address arithmetic.
+
+The [C1/C3 gate source](linux-static-capability-port.md) adds request/result
+handle validation and hash-result interning. Owning decision routing, handler
+body/text placement, full profile/admission integration and native qualification
+are still required. None of these candidates has been generated, assembled or
+executed, so wire 3 remains unavailable in the current profile. Do not enable a
+handler merely because this source exists.
 
 The remaining full packager work is IR/prelude/runtime construction,
 message/context binding, handler and guest text placement, ELF framing,
@@ -121,6 +129,7 @@ open under JUN-200 / JUN-202. This module grants no production cutover or
 service-stop authority.
 
 The [pair/string runtime source](linux-static-strings-port.md) now covers all
-seven corresponding slots in the reference. It does not implement typed-cap-call,
-vector/byte helpers, C3 result interning or the full prelude; the planner's
+seven corresponding slots in the reference and supplies inline request/result
+and pool-interning fragments to the new gate. It does not implement vector/byte
+helpers or the full prelude; the planner's
 implemented/admitted sets and native qualification remain separate decisions.

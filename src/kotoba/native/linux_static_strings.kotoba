@@ -1,7 +1,8 @@
 ;; Complete pair/string portion of linux_static.cljk's slot-routines.
 ;; Canonical IR source candidate; not admitted, generated or executed yet.
 (ns kotoba.native.linux-static-strings
-  {:kotoba/export [supported-slots external-labels routine routines]}
+  {:kotoba/export [supported-slots external-labels routine routines
+                   read-string-fragment intern-string-fragment]}
   (:require [kotoba.native.linux-static-assembler :as asm])
   (:schemas
    {:linux.static.strings/config
@@ -306,21 +307,33 @@
       :all (concat-slot (substring-slot (index-of-slot (equal-slot (pair-slots out cfg) cfg) cfg) cfg) cfg)
       out)))
 
-(defn- generate [context :document slot :keyword] [:ref :linux.static.strings/result]
+(defn- configuration-error [context :document] :keyword
   (let [version (lookup context :version) pairs (lookup context :pairs-base-offset)
         validated (lookup context :pair-validated-base-offset)
         p (i64-of pairs) v (i64-of validated)]
     (cond
       (or (not= (document-kind version) :i64) (not= (i64-of version) 11))
-      (record-new [:ref :linux.static.strings/result] (empty-code) (document-map) :context-abi-version)
+      :context-abi-version
       (or (not= (document-kind pairs) :i64) (not= (document-kind validated) :i64)
           (not (base-offset? p)) (not (base-offset? v)) (= p v))
-      (record-new [:ref :linux.static.strings/result] (empty-code) (document-map) :context-base-offset)
-      :else
-      (let [cfg (record-new [:ref :linux.static.strings/config] p v)
+      :context-base-offset
+      :else :ok)))
+
+(defn- configuration [context :document] [:ref :linux.static.strings/config]
+  (record-new [:ref :linux.static.strings/config]
+    (i64-of (lookup context :pairs-base-offset))
+    (i64-of (lookup context :pair-validated-base-offset))))
+
+(defn- failure [error :keyword] [:ref :linux.static.strings/result]
+  (record-new [:ref :linux.static.strings/result] (empty-code) (document-map) error))
+
+(defn- generate [context :document slot :keyword] [:ref :linux.static.strings/result]
+  (let [error (configuration-error context)]
+    (if (not= error :ok) (failure error)
+      (let [cfg (configuration context)
             all (bindings) entry (lookup all slot)]
         (if (and (not= slot :all) (= (document-kind entry) :null))
-          (record-new [:ref :linux.static.strings/result] (empty-code) (document-map) :unknown-slot)
+          (failure :unknown-slot)
           (record-new [:ref :linux.static.strings/result] (slot-code cfg slot)
             (if (= slot :all) all (document-map (document-keyword slot) entry)) :ok))))))
 
@@ -331,3 +344,32 @@
 
 (defn routines [context :document] [:ref :linux.static.strings/result]
   (generate context :all))
+
+;; Inline C3 fragments, not callable guest slots. The owner has saved s0..s4.
+;; read: s0=context, s1=handle -> s2=pointer/s3=length after full UTF-8 checks.
+(defn read-string-fragment [context :document prefix :string] [:ref :linux.static.strings/result]
+  (let [error (configuration-error context)]
+    (if (not= error :ok) (failure error)
+      (let [cfg (configuration context)
+            resolved (resolve-string (mov (empty-code) :ctx :s0) cfg prefix :s1 :s2 :s3 :t0 :t1)
+            code (validate (mov resolved :ctx :s0) cfg prefix :s1 :s2 :s3 :t0 :t1 :t2 :t3)]
+        (record-new [:ref :linux.static.strings/result] code (document-map) :ok)))))
+
+;; intern: s0=context, s1=trusted source pointer, s2=length -> t0=handle.
+;; The owning caller must first obtain op-6 byte-charge admission from its
+;; sealed decision artifact and admit a stable source window disjoint from
+;; the new pool tail. These arithmetic guards do not grant that authority.
+;; The new handle starts unvalidated; C3's finish path validates its result.
+(defn intern-string-fragment [context :document prefix :string] [:ref :linux.static.strings/result]
+  (let [error (configuration-error context)]
+    (if (not= error :ok) (failure error)
+      (let [cfg (configuration context)
+            start (-> (mov (empty-code) :ctx :s0) (imm :cmp :s2 0) (branch :lt :ls/bad)
+                      (mem :ld :t0 :ctx 520) (mem :ld :t1 :ctx 544))
+            room (-> (byte-room start :t0 :t1 :s2 :t2)
+                     (mov :s3 :t0) (mem :ld :t2 :ctx 576) (alu :add :t2 :s3))
+            copied (-> (copy room prefix :t2 :s1 :s2 :t0 :t1)
+                       (mov :t0 :s3) (alu :add :t0 :s2) (mem :st :t0 :ctx 520)
+                       (mov :s4 :s3) (unary :not :s4) (mov :ctx :s0))
+            code (pair-new copied cfg false :s4 :s2)]
+        (record-new [:ref :linux.static.strings/result] code (document-map) :ok)))))

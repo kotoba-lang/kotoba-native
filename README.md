@@ -40,6 +40,8 @@ by the seal-verifier closure; [capability binding remains open](docs/linux-stati
 `linux_static_strings.kotoba` ports all seven existing pair/string slots,
 including handle windows, UTF-8 and allocation semantics;
 see [the runtime source contract](docs/linux-static-strings-port.md).
+`linux_static_capability.kotoba` adds the C1/C3 call gate, request/result
+handle boundary and hash-to-pool binding as a [source candidate](docs/linux-static-capability-port.md).
 Native admission, byte parity, full packager integration and selfhost
 qualification remain open; see [the assembler record](docs/linux-static-assembler-port.md).
 

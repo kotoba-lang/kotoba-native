@@ -102,8 +102,12 @@ introduced by hashing; these bytes are not a capability grant or seal verdict.
 
 ## Missing capability integration
 
-The current owning static profile has no wire-3 handler. Keep that state until
-the complete native call chain exists:
+The current owning static profile has no wire-3 handler. The companion
+[C1/C3 gate candidate](linux-static-capability-port.md) now supplies the grant,
+kind, request/result handle and pool-interning source path, and the planner
+conditionally allocates its workspace. Neither has been generated or executed.
+Keep the owning profile unchanged until this complete native chain is integrated
+and qualified:
 
 1. Admit the sealed grant bit and request/result kinds using the owning C1
    decisions. Hash's public/pure classification does not waive its grant bit.

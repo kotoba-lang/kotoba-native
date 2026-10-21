@@ -3,7 +3,8 @@
 ;; Source candidate only: no hosted numeric conversion or verifier callback.
 (ns kotoba.native.linux-static-plan
   {:kotoba/export [targets implemented-slots slot-names plan image-layout]}
-  (:require [kotoba.artifact.core :as artifact])
+  (:require [kotoba.artifact.core :as artifact]
+            [kotoba.native.linux-static-sha256 :as sha256])
   (:schemas {:linux.static.plan/result
              [:record :linux.static.plan/result
               [[:value :document] [:error :keyword] [:data :document]]]}))
@@ -514,6 +515,17 @@
               (document-vector (document-keyword :names) (value names))
               (document-vector (document-keyword :index) (value index)))))))))
 
+(defn- hash-layout [current [:ref :linux.static.plan/result] source-plan :document]
+  [:ref :linux.static.plan/result]
+  (if (not (good? current)) current
+    (let [raw (get-key source-plan :grant)
+          grant (wire-vector (if (= (document-kind raw) :null) (document-vector) raw) :grant-malformed)]
+      (cond
+        (not (good? grant)) grant
+        (not (contains-value? (value grant) (document-i64 3))) current
+        (not (bool-of (get-key source-plan :handlers?))) (fail :layout-input (field :grant))
+        :else (append-region (value current) :hash-workspace (sha256/workspace-bytes))))))
+
 (defn image-layout [text-size :i64 source-plan :document] [:ref :linux.static.plan/result]
   (let [cells (get-key source-plan :cells) bytes (get-key source-plan :bytes)
         handlers (get-key source-plan :handlers?)]
@@ -538,7 +550,8 @@
               (let [end (checked-align (i64-of (get-key (value regions) :end)) 16)]
                 (if (not (good? end)) end
                   (let [aligned (put-key (value regions) :end (value end))
-                        all (if (bool-of handlers) (scratch-layout aligned (i64-of bytes)) (ok aligned))]
+                        scratch (if (bool-of handlers) (scratch-layout aligned (i64-of bytes)) (ok aligned))
+                        all (hash-layout scratch source-plan)]
                     (if (not (good? all)) all
                       (ok (put-key (document-dissoc (value all) :end) :memory-size
                             (document-i64 (- (i64-of (get-key (value all) :end))
