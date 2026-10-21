@@ -1,5 +1,5 @@
 ;; Canonical C3 call-gate mechanism and native SHA-256 provider binding.
-;; Fs/app-data, spawn and sealed decision text remain required externals.
+;; Spawn and sealed decision text remain required externals.
 ;; Source candidate only: does not enable the owning wire-3 profile.
 (ns kotoba.native.linux-static-capability
   {:kotoba/export [routine]}
@@ -8,6 +8,7 @@
             [kotoba.native.linux-static-io :as io]
             [kotoba.native.linux-static-paths :as paths]
             [kotoba.native.linux-static-browse :as browse]
+            [kotoba.native.linux-static-filesystem :as filesystem]
             [kotoba.native.linux-static-sha256 :as sha256])
   (:schemas
    {:linux.static.capability/config
@@ -151,7 +152,6 @@
     (document-keyword :ls.cap/c1-cap) (document-keyword :ls.cap/c1-decide) (document-keyword :ls.cap/h-decide)
     (document-keyword :ls/bad) (document-keyword :ls/trap-cells) (document-keyword :ls/trap-bytes)
     (document-keyword :ls.cap/no-handler) (document-keyword :ls/trap-exit)
-    (document-keyword :ls.cap/fs-app-data)
     (document-keyword :ls.cap/spawn)))
 
 (defn- lookup [m :document key :keyword] :document
@@ -207,7 +207,8 @@
             intern (strings/intern-string-fragment context "cap-intern")
             providers (io/routines isa source-plan layout)
             scope (paths/startup isa source-plan layout)
-            directory (browse/routine isa source-plan layout)]
+            directory (browse/routine isa source-plan layout)
+            files (filesystem/routine isa source-plan layout)]
         (cond
           (not= (record-get [:ref :linux.static.strings/result] request :error) :ok)
           (failure (record-get [:ref :linux.static.strings/result] request :error))
@@ -221,6 +222,8 @@
           (failure (record-get [:ref :linux.static.paths/result] scope :error))
           (not= (record-get [:ref :linux.static.browse/result] directory :error) :ok)
           (failure (record-get [:ref :linux.static.browse/result] directory :error))
+          (not= (record-get [:ref :linux.static.fs/result] files :error) :ok)
+          (failure (record-get [:ref :linux.static.fs/result] files :error))
           :else
           (let [hash? (granted-hash? (lookup source-plan :grant))
                 cfg (record-new [:ref :linux.static.capability/config]
@@ -234,7 +237,8 @@
                 kernel (if hash? (join completed (sha256/routine)) completed)
                 handlers (join (join kernel (record-get [:ref :linux.static.io/result] providers :code))
                            (record-get [:ref :linux.static.browse/result] directory :code))
-                code (join handlers
+                with-files (join handlers (record-get [:ref :linux.static.fs/result] files :code))
+                code (join with-files
                        (record-get [:ref :linux.static.paths/result] scope :code))
                 start (join (record-get [:ref :linux.static.io/result] providers :start)
                         (record-get [:ref :linux.static.paths/result] scope :start))]

@@ -45,7 +45,8 @@ the owning caller's actual trap/refusal path, not dummy success.
 
 The C3 candidate now appends startup constants and composes scope startup after
 the common I/O startup, once before guest code. The browse body now uses these
-path fragments; fs/app-data and spawn are not yet ported/integrated. Context
+path fragments; the filesystem candidate also composes them for fs/app-data.
+The spawn body is not yet ported/integrated. Context
 version 11 is the implemented native format, not a C-loader pin condition.
 All source/ISA/assembler and context/layout bindings still require qualification.
 
@@ -101,7 +102,8 @@ full native qualification. Static review is not that evidence.
 ## Remaining closure
 
 The [browse body](linux-static-browse-port.md) now uses these fragments;
-fs/app-data and spawn bodies are still missing, as are complete
+the filesystem component now supplies fs/app-data. The spawn body is still
+missing, as are complete
 prelude/signal/trap/context construction, sealed decision placement, ELF
 construction, native verification/Definition CIDs and reviewed pins/self-rebuild.
 The owning hash route/profile remains disabled. These sources do not retire

@@ -45,7 +45,7 @@ The [C1/C3 gate](linux-static-capability-port.md) now imports and appends this
 component, resolves these seven dispatch labels and returns its common `start`
 fragment. That gate's candidate API now takes explicit ISA and exposes `start`.
 The separate browse component now supplies fs/browse too. Remaining
-handler-body externals are fs/app-data and spawn; all
+handler-body external is spawn; the filesystem component supplies fs/app-data. All
 eleven dispatch meanings, including the conditional hash candidate, stay intact.
 The hosted packager does not yet call these canonical modules.
 
