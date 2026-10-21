@@ -30,6 +30,12 @@ checkable from outside.
 
 ## Native is not an effect provider
 
+The canonical Kotoba port of the complete Linux-static register-IR assembler
+is a source candidate at `src/kotoba/native/linux_static_assembler.kotoba`.
+It includes both ISAs and all 29 existing operations. Native admission,
+byte parity, packager integration and selfhost qualification remain open;
+see [the port and integration record](docs/linux-static-assembler-port.md).
+
 The production direction is one-way:
 
 ```text
