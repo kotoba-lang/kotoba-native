@@ -119,3 +119,8 @@ native verification and exact source/lock pins. The compiler's required
 vector/string/byte/I/O helper coverage and self-rebuild generations remain
 open under JUN-200 / JUN-202. This module grants no production cutover or
 service-stop authority.
+
+The [pair/string runtime source](linux-static-strings-port.md) now covers all
+seven corresponding slots in the reference. It does not implement typed-cap-call,
+vector/byte helpers, C3 result interning or the full prelude; the planner's
+implemented/admitted sets and native qualification remain separate decisions.
