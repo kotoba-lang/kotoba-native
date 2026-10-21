@@ -97,6 +97,15 @@ with an unreviewed history range, or retain a C-loader identity as a native
 acceptance condition. The canonical artifact printer/seal behavior and
 declared `hash/sha256` capability also require native qualification.
 
+The current remote `lang/limits.edn` blob
+`9549aaf1fd92f975d8f58b1b7c80e8df95cfd153` lists static capability handlers
+for wires 7, 20, 23, 33, 34, 35, 37, 38, 39 and 41. It does not include wire
+3 (`hash/sha256`), which the canonical seal verifier calls. Thus the current
+static profile cannot qualify running this planner's seal verification.
+Implement the native hash provider and its owning profile/admission binding;
+retaining the real seal check is required. Source presence in the root lock
+does not establish provider availability.
+
 The remaining full packager work is IR/prelude/runtime construction,
 message/context binding, handler and guest text placement, ELF framing,
 native verification and exact source/lock pins. The compiler's required
