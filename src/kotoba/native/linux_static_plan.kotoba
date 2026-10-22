@@ -558,6 +558,7 @@
         (if (not (good? index)) index
           (append-regions (ok layout)
             (document-vector
+              (document-vector (document-keyword :decision-context) (document-i64 512))
               (document-vector (document-keyword :buf-a) (document-i64 4096))
               (document-vector (document-keyword :buf-b) (document-i64 4096))
               (document-vector (document-keyword :buf-c) (document-i64 4096))

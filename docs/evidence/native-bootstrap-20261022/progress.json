@@ -1,0 +1,76 @@
+{
+  "compilerCoreSelfRecompile": true,
+  "rawCodeSHA256": "b10e381344a1f5a8b82cac981c0011bd20ecbcc4b48dd5f5dce97364c74e8a00",
+  "rawCodeBytes": 2552512,
+  "matchesAdoptedM105": true,
+  "compilerHost": "native aarch64-linux prototype ELF",
+  "bootstrapEmitTarget": "historical aarch64-macos AAPCS64 raw payload",
+  "completeNativeBuildClosureQualified": false,
+  "publicCLIQualified": false,
+  "contextFixture": {
+    "nativeCompilerCheck": true,
+    "nativeCompilerCompile": true,
+    "linuxAarch64ExecutionStdout": "0\n",
+    "projectPinMode": "explicit --unpinned bootstrap snapshot; public module-lock not qualified",
+    "nativeContainerCodeSHA256": "b8fe4f1c2e86a7bf5519f77bb4ec3d306652d47d8d02f95d436a8a8a881d3680",
+    "sourceFiles": [
+      {
+        "path": "src/kotoba/native/linux_static_assembler.kotoba",
+        "sha256": "cc0943562e25c0772e11d68cf1d96b9412cc02eadc8492e4d6d1fff78a23c13a"
+      },
+      {
+        "path": "src/kotoba/native/linux_static_context.kotoba",
+        "sha256": "b808dfef96fdcca274edc1df607c27721943254209b9ef08407b21b1c301ccfc"
+      },
+      {
+        "path": "src/kotoba/native/linux_static_io.kotoba",
+        "sha256": "8abcf63643e1ad58e687ecf464c6f25c2f4c82a52f4da993f555d3a662c5f1f2"
+      },
+      {
+        "path": "src/kotoba/native/linux_static_strings.kotoba",
+        "sha256": "236f64f993889b3ca0e740362f30861b3c5937ea6d8afcdc34ac17e2cfc05dd3"
+      }
+    ],
+    "fixtureSHA256": "e9ce71b435a9326a286faa89b4474864ca0effaa78457417c1b37587a96d31de"
+  },
+  "nativeDecisions": {
+    "c1": {
+      "containerSHA256": "9abec71f266d75e01766ae409ac1900e845b04c68b3c6dafb35ff131cdbc1bc6",
+      "codeSHA256": "734eefafb004a60ae4e3f2962f4523eb567f409e1113efc42977cb05138acbd0",
+      "bytes": 12296,
+      "exports": {
+        "constant": {
+          "offset": 0,
+          "arity": 1
+        },
+        "cap-admitted": {
+          "offset": 1812,
+          "arity": 5
+        },
+        "decide": {
+          "offset": 6944,
+          "arity": 5
+        }
+      },
+      "nativeExecution": true,
+      "artifactSealVerified": false
+    },
+    "c3": {
+      "containerSHA256": "23a2e7b11ca7646f6c0d61644a89a224dd95064dd3a00aa3be63bfad1ccda238",
+      "codeSHA256": "0184ca4dac942407c2d3dcb0025e81b09c1a53dd41a8cf1167d14884abd5fd0e",
+      "bytes": 15688,
+      "exports": {
+        "decide": {
+          "offset": 12780,
+          "arity": 5
+        }
+      },
+      "nativeExecution": true,
+      "artifactSealVerified": false
+    }
+  },
+  "initialMaterialization": "disposable Python calculator of canonical IR; NOT accepted required build closure",
+  "historicalNativeFilesystemCommit": "4382ee948822bd63f9911f51d4cdc569e1fb6597",
+  "freshFull19EmbenchExecuted": false,
+  "publicImportCLIQualified": false
+}

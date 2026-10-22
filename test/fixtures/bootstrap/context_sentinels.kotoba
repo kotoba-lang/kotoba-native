@@ -1,0 +1,68 @@
+(ns bootstrap.context-sentinels
+  (:require [kotoba.native.linux-static-context :as context]
+            [kotoba.native.linux-static-assembler :as asm]
+            [kotoba.native.linux-static-io :as io])
+  (:export [main]))
+
+;; Pure builder fixture. This supplies layout test data, not a sealed artifact
+;; or an authority grant. Four initially unowned descriptors must encode -1.
+(defn- abi [] :document
+  (document-map
+    (document-keyword :version) (document-i64 11)
+    (document-keyword :fuel-offset) (document-i64 8)
+    (document-keyword :allow-bitmap-offset) (document-i64 16)
+    (document-keyword :pair-used-pointer-offset) (document-i64 288)
+    (document-keyword :pairs-base-offset) (document-i64 296)
+    (document-keyword :pair-validated-base-offset) (document-i64 304)
+    (document-keyword :vector-used-pointer-offset) (document-i64 312)
+    (document-keyword :vectors-base-offset) (document-i64 320)
+    (document-keyword :vector-items-base-offset) (document-i64 328)))
+
+(defn- plan [fuel :i64] :document
+  (document-map
+    (document-keyword :context-abi) (abi)
+    (document-keyword :fuel) (document-i64 fuel)
+    (document-keyword :cells) (document-i64 2)
+    (document-keyword :bytes) (document-i64 16)
+    (document-keyword :vectors) (document-i64 2)
+    (document-keyword :vector-items) (document-i64 16)
+    (document-keyword :metered?) (document-bool false)
+    (document-keyword :slots) (document-map)
+    (document-keyword :grant) (document-vector)))
+
+(defn- layout [] :document
+  (document-map
+    (document-keyword :text) (document-i64 4198400)
+    (document-keyword :data) (document-i64 4202496)
+    (document-keyword :memory-size) (document-i64 65536)
+    (document-keyword :alt) (document-i64 4206592)
+    (document-keyword :pairs) (document-i64 4222976)
+    (document-keyword :valid) (document-i64 4223008)
+    (document-keyword :vectors) (document-i64 4223024)
+    (document-keyword :vector-items) (document-i64 4223056)
+    (document-keyword :pool) (document-i64 4223184)))
+
+(defn- build [fuel :i64] [:ref :linux.static.context/result]
+  (let [labels (typed-list-conj [:list [:ref :linux.static/label]]
+                 (typed-list-new [:list [:ref :linux.static/label]])
+                 (asm/label :ls/handler 4198400))]
+    (context/context-bytes (plan fuel) (layout) labels (document-map) 4198416 8)))
+
+(defn- empty-fd? [bytes :vector-i64 key :keyword] :bool
+  (let [offset (io/state-offset key)]
+    (loop [index 0]
+      (if (= index 8) true
+        (if (= (vector-at bytes (+ offset index)) 255) (recur (+ index 1)) false)))))
+
+(defn main [] :i64
+  (let [good (build 1000) bad (build -1)]
+    (if (not= (record-get [:ref :linux.static.context/result] good :error) :ok) 1
+      (let [bytes (record-get [:ref :linux.static.context/result] good :bytes)]
+        (if (and (= (vector-count bytes) (context/initialized-size))
+                 (<= (context/initialized-size) 4096)
+                 (= (vector-at bytes 384) 16) (= (vector-at bytes 385) 16)
+                 (= (vector-at bytes 386) 64) (= (vector-at bytes 392) 8)
+                 (empty-fd? bytes :out-parent) (empty-fd? bytes :out-directory)
+                 (empty-fd? bytes :out-file) (empty-fd? bytes :out-probe)
+                 (= (record-get [:ref :linux.static.context/result] bad :error) :initial-values))
+          0 2)))))

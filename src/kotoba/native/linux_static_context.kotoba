@@ -1,7 +1,7 @@
 ;; Complete initialized data/context page, from admitted plan and real labels.
 ;; Source candidate: document/span checks do not attest an artifact or mapping.
 (ns kotoba.native.linux-static-context
-  {:kotoba/export [context-bytes]}
+  {:kotoba/export [context-bytes initialized-size]}
   (:require [kotoba.native.linux-static-assembler :as asm]
             [kotoba.native.linux-static-io :as io])
   (:schemas
@@ -9,6 +9,11 @@
     [:record :linux.static.context/word [[:offset :i64] [:value :i64]]]
     :linux.static.context/result
     [:record :linux.static.context/result [[:bytes :vector-i64] [:error :keyword]]]}))
+
+;; The context ABI occupies the first 512 bytes; owned-output state extends
+;; through byte 1887. Keep its negative empty-FD sentinels in the file image,
+;; within the planner's existing 4096-byte data page.
+(defn initialized-size [] :i64 2048)
 
 (defn- lookup [m :document key :keyword] :document
   (if (not= (document-kind m) :map) (document-null)
@@ -54,6 +59,10 @@
                  (word (io/state-offset :cells) (i64-of (lookup source-plan :cells)))
                  (word (io/state-offset :bytes) (i64-of (lookup source-plan :bytes)))
                  (word (io/state-offset :metered) (if (true? (lookup source-plan :metered?)) 1 0))
+                 ;; The measured seed's vector-table and literal fast paths
+                 ;; read the v11 data prefix directly (CTX-CODE-BASE=384),
+                 ;; independently of the provider's private state at 560/568.
+                 (word 384 code-address) (word 392 code-length)
                  (word (io/state-offset :code-base) code-address) (word (io/state-offset :code-length) code-length)
                  (word (io/state-offset :pool-base) (i64-of (lookup layout :pool)))
                  (word (io/state-offset :sigaction) handler)
@@ -65,8 +74,18 @@
                  (word (io/state-offset :out-count) 0)
                  (word (io/state-offset :out-parent) -1) (word (io/state-offset :out-directory) -1)
                  (word (io/state-offset :out-file) -1) (word (io/state-offset :out-probe) -1))
+        handlers? (true? (lookup source-plan :handlers?))
+        caps (if handlers?
+               (-> base
+                   (word (io/state-offset :dctx) (i64-of (lookup layout :decision-context)))
+                   (word (io/state-offset :c1-code-base) (address labels :ls.cap/c1-code-base))
+                   (word (io/state-offset :c1-code-length)
+                     (document-count (lookup (lookup (lookup source-plan :handler-code) :decisions) :code)))
+                   (word (io/state-offset :c3-code-base) (address labels :ls.cap/h-code-base))
+                   (word (io/state-offset :c3-code-length)
+                     (document-count (lookup (lookup (lookup source-plan :handler-code) :handlers) :code)))) base)
         slots (lookup source-plan :slots)]
-    (loop [index 0 words base]
+    (loop [index 0 words caps]
       (if (>= index (document-count slots)) words
         (let [pair (entry slots index) slot (key-of (item pair 0)) description (item pair 1)]
           (recur (+ index 1) (word words (i64-of (lookup description :offset))
@@ -105,6 +124,10 @@
           (> (+ table (* 16 table-count)) items) (> (+ items (* 8 item-count)) pool)) :arena-layout
       (or (not= (document-kind slots) :map) (not= (document-kind bindings) :map)
           (not= (document-kind grant) :vector)) :context-input
+      (and (true? (lookup source-plan :handlers?))
+           (let [decisions (i64-of (lookup layout :decision-context))]
+             (or (not (span? decisions 512 (+ data 4096) (+ data memory)))
+                 (< decisions (+ pool bytes))))) :decision-context-layout
       :else
       (let [abi-valid? (loop [index 0]
                          (if (= index 8) true
@@ -132,6 +155,13 @@
                          (= (document-kind binding) :keyword) (>= pointer text) (< pointer code-address))
                   (recur (+ index 1)) :slot-binding)))))))))
 
+(defn- empty-owned-fd? [offset :i64 value :i64] :bool
+  (and (= value -1)
+       (or (= offset (io/state-offset :out-parent))
+           (= offset (io/state-offset :out-directory))
+           (= offset (io/state-offset :out-file))
+           (= offset (io/state-offset :out-probe)))))
+
 (defn- words-error [words [:list [:ref :linux.static.context/word]] bitmap :i64] :keyword
   (loop [index 0]
     (if (>= index (vector-count words)) :ok
@@ -139,7 +169,8 @@
             offset (record-get [:ref :linux.static.context/word] current :offset)
             value (record-get [:ref :linux.static.context/word] current :value)]
         (cond
-          (or (< offset 0) (> offset 1016) (not= (bit-and offset 7) 0) (< value 0)) :context-word-unbound
+          (or (< offset 0) (> offset (- (initialized-size) 8)) (not= (bit-and offset 7) 0)
+              (and (< value 0) (not (empty-owned-fd? offset value)))) :context-word-unbound
           (and (< offset (+ bitmap 32)) (> (+ offset 8) bitmap)) :context-bitmap-overlap
           :else
           (let [duplicate? (loop [previous 0]
@@ -164,7 +195,7 @@
           (recur (+ index 1)))))))
 (defn- encode [words [:list [:ref :linux.static.context/word]] grant :document bitmap :i64] :vector-i64
   (loop [offset 0 out (vector-alloc 0)]
-    (if (= offset 1024) out
+    (if (= offset (initialized-size)) out
       (recur (+ offset 1) (vector-conj out
         (if (and (>= offset bitmap) (< offset (+ bitmap 32))) (grant-byte grant (- offset bitmap)) (word-byte words offset)))))))
 (defn- failure [error :keyword] [:ref :linux.static.context/result]

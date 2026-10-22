@@ -79,9 +79,8 @@
   [:list [:ref :linux.static/instruction]]
   ;; Five value arguments are already in ctx/p0,a1..a4. gctx is the
   ;; separate hidden private context, not a guest-controlled argument.
-  (-> out (li :t1 9007199254740991) (mem :st :t1 :s0 1080)
-      (li :gctx (+ data 1072))
-      (append :call :none :none :none :none :none 0 target) (mov :t0 :ret)))
+  (io/decision-fragment out data target
+    (io/register :ctx) (io/register :a1) (io/register :a2) (io/register :a3) (io/register :a4)))
 
 (defn- begin [cfg [:ref :linux.static.capability/config]] [:list [:ref :linux.static/instruction]]
   (let [data (record-get [:ref :linux.static.capability/config] cfg :data)

@@ -63,8 +63,14 @@
 (defn- zeros [n :i64] :vector-i64
   (loop [index 0 out (vector-alloc 0)] (if (= index n) out (recur (+ index 1) (vector-conj out 0)))))
 (defn- join [a :vector-i64 b :vector-i64] :vector-i64
-  (loop [index 0 out a]
-    (if (= index (vector-count b)) out (recur (+ index 1) (vector-conj out (vector-at b index))))))
+  (let [left (vector-count a) right (vector-count b)
+        allocated (vector-alloc (+ left right))]
+    ;; The image can contain millions of bytes. One fresh owned destination
+    ;; avoids creating a persistent vector root for every appended byte.
+    (loop [index 0 out allocated]
+      (if (= index (+ left right)) out
+        (recur (+ index 1) (vector-assoc! out index
+          (if (< index left) (vector-at a index) (vector-at b (- index left)))))))))
 (defn- append-bytes [out [:ref :linux.static.image/result] more :vector-i64] [:ref :linux.static.image/result]
   (if (not (good? out)) out
     (if (< (checked-add (vector-count (bytes-of out)) (vector-count more)) 0) (fail :image-overflow (detail :frame :bytes))
@@ -127,6 +133,8 @@
             :else
             (let [bytes (join (join (join (zeros (- c1 code-end)) (bytes-of dr)) (zeros (- h dend))) (bytes-of hr))
                   labels (-> (typed-list-new [:list [:ref :linux.static/label]])
+                             (add-label :ls.cap/c1-code-base c1)
+                             (add-label :ls.cap/h-code-base h)
                              (add-label :ls.cap/c1-cap (+ c1 cap))
                              (add-label :ls.cap/c1-decide (+ c1 decide))
                              (add-label :ls.cap/h-decide (+ h handle)))
@@ -237,12 +245,13 @@
         text-offset (i64-of (get-key layout :text-offset)) text-address (i64-of (get-key layout :text))
         data-offset (i64-of (get-key layout :data-offset)) data-address (i64-of (get-key layout :data))
         memory-size (i64-of (get-key layout :memory-size)) names (utf8 "\u0000.text\u0000.data\u0000.bss\u0000.shstrtab\u0000")
-        names-offset (checked-add data-offset 1024) section-offset (align-up (checked-add names-offset (vector-count names)) 8)
+        initialized-size (context/initialized-size)
+        names-offset (checked-add data-offset initialized-size) section-offset (align-up (checked-add names-offset (vector-count names)) 8)
         end (checked-add section-offset 320)]
     (cond
       (or (< names-offset 0) (< section-offset 0) (< end 0)) (fail :image-overflow (detail :frame :section-offset))
       (or (not= text-offset 4096) (not= text-address (text-base)) (< data-offset text-offset)
-          (> (vector-count text) (- data-offset text-offset)) (not= (vector-count context) 1024) (< memory-size 4096)
+          (> (vector-count text) (- data-offset text-offset)) (not= (vector-count context) initialized-size) (< memory-size 4096)
           (< data-address 0) (> memory-size (- 9223372036854775807 data-address))) (fail :layout-input (detail :frame :regions))
       :else
       (let [header (elf/encode-header
@@ -252,13 +261,13 @@
                        (document-keyword :section-header-count) (document-i64 5) (document-keyword :section-name-index) (document-i64 4)))
             bytes (-> (from-elf header :header)
                       (append-elf (program-header (document-keyword :load) 5 text-offset text-address (vector-count text) (vector-count text) 4096) :text-program)
-                      (append-elf (program-header (document-keyword :load) 6 data-offset data-address 1024 memory-size 4096) :data-program)
+                      (append-elf (program-header (document-keyword :load) 6 data-offset data-address initialized-size memory-size 4096) :data-program)
                       (append-elf (program-header (document-i64 1685382481) 6 0 0 0 0 16) :stack-program)
                       (pad-result text-offset :before-text) (append-bytes text) (pad-result data-offset :before-data)
                       (append-bytes context) (append-bytes names) (pad-result section-offset :before-sections)
                       (append-bytes (zeros 64))
                       (append-elf (section 1 :progbits 6 text-address text-offset (vector-count text) 16) :text-section)
-                      (append-elf (section 7 :progbits 3 data-address data-offset 1024 16) :data-section)
+                      (append-elf (section 7 :progbits 3 data-address data-offset initialized-size 16) :data-section)
                       (append-elf (section 13 :nobits 3 (+ data-address 4096) names-offset (- memory-size 4096) 16) :bss-section)
                       (append-elf (section 18 :strtab 0 0 names-offset (vector-count names) 1) :names-section))]
         (if (and (good? bytes) (not= (vector-count (bytes-of bytes)) end))

@@ -66,7 +66,7 @@
     :pair-used 512 :pool-used 520 :zero 528 :cells 536 :bytes 544 :metered 552
     :code-base 560 :code-length 568 :pool-base 576 :argc 584 :argv 592 :sigaction 600
     :stack-t 632 :itoa 656 :envp 1024 :cwd-len 1032 :root-fd 1040 :last-mono 1048
-    :carry-n 1056 :carry 1064 :dctx 1072 :dctx-fuel 1080 :ts 1088 :ts-nsec 1096
+    :carry-n 1056 :carry 1064 :dctx 1072 :ts 1088 :ts-nsec 1096
     :how 1104 :how-mode 1112 :how-resolve 1120 :id 1128 :rk 1136 :xk 1144
     :req 1152 :rp 1160 :rl 1168 :h 1176 :res 1184 :form 1192
     :fd 1200 :pfd 1208 :want 1216 :start 1224 :room 1232 :whole 1240
@@ -88,7 +88,8 @@
     :out-count 1784 :out-path-length 1792 :out-name-length 1800 :out-index 1808
     :out-failed 1816 :out-cleaning 1824 :out-probe 1832 :out-rmdir 1840
     :out-create 1848 :out-managed-member 1856 :out-message 1864
-    :out-message-length 1872 :out-exit 1880 -1))
+    :out-message-length 1872 :out-exit 1880
+    :c1-code-base 1888 :c1-code-length 1896 :c3-code-base 1904 :c3-code-length 1912 -1))
 
 (defn- load [out [:list [:ref :linux.static/instruction]] d :keyword key :keyword]
   [:list [:ref :linux.static/instruction]] (mem out :ld d :s0 (offset key)))
@@ -110,14 +111,25 @@
     :label (la out dst (record-get [:ref :linux.static.io/operand] arg :reg))
     (append out :invalid-operand :none :none :none :none :none 0 :none)))
 
+(defn- enter-decision [out [:list [:ref :linux.static/instruction]] data :i64 target :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (let [base-key (if (= target :ls.cap/h-decide) :c3-code-base :c1-code-base)
+        length-key (if (= target :ls.cap/h-decide) :c3-code-length :c1-code-length)]
+    ;; Per-component read-only spans support the measured compiler's inline
+    ;; literal tables. The context is separate from all private IO state.
+    (-> out (li :t1 (+ data (offset :dctx))) (mem :ld :gctx :t1 0)
+        (li :t1 11) (mem :st :t1 :gctx 0)
+        (li :t1 9007199254740991) (mem :st :t1 :gctx 8)
+        (li :t1 (+ data (offset base-key))) (mem :ld :t1 :t1 0) (mem :st :t1 :gctx 384)
+        (li :t1 (+ data (offset length-key))) (mem :ld :t1 :t1 0) (mem :st :t1 :gctx 392)
+        (append :call :none :none :none :none :none 0 target) (mov :t0 :ret))))
+
 (defn- hcall [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.io/config] op :i64
               a [:ref :linux.static.io/operand] b [:ref :linux.static.io/operand]
               c [:ref :linux.static.io/operand] d [:ref :linux.static.io/operand]]
   [:list [:ref :linux.static/instruction]]
   (let [args (operand (operand (operand (operand (li out :ctx op) :a1 a) :a2 b) :a3 c) :a4 d)]
-    (-> args (li :t1 9007199254740991) (store :t1 :dctx-fuel)
-        (li :gctx (+ (record-get [:ref :linux.static.io/config] cfg :data) (offset :dctx)))
-        (append :call :none :none :none :none :none 0 :ls.cap/h-decide) (mov :t0 :ret))))
+    (enter-decision args (record-get [:ref :linux.static.io/config] cfg :data) :ls.cap/h-decide)))
 
 (defn- syscall-number [isa :keyword call :keyword] :i64
   (case isa
@@ -382,7 +394,7 @@
       (imm :cmp :t2 0) (branch :le :ls/bad) (li :t1 9223372036854775807)
       (alu :sub :t1 :t2) (alu :cmp :t0 :t1) (branch :hi :ls/bad)
       (alu :add :t2 :t0) (store :t2 :envp)
-      (li :t0 11) (store :t0 :dctx) (li :t0 -1) (store :t0 :last-mono)))
+      (li :t0 -1) (store :t0 :last-mono)))
 
 (defn- lookup [m :document key :keyword] :document
   (if (not= (document-kind m) :map) (document-null)
@@ -444,8 +456,7 @@
   (if (not (or (= target :ls.cap/c1-cap) (= target :ls.cap/c1-decide) (= target :ls.cap/h-decide)))
     (append out :unknown-decision :none :none :none :none :none 0 :none)
     (let [args (operand (operand (operand (operand (operand out :ctx a) :a1 b) :a2 c) :a3 d) :a4 e)]
-      (-> args (li :t1 9007199254740991) (store :t1 :dctx-fuel) (li :gctx (+ data (offset :dctx)))
-          (append :call :none :none :none :none :none 0 target) (mov :t0 :ret)))))
+      (enter-decision args data target))))
 
 (defn syscall-fragment [out [:list [:ref :linux.static/instruction]] isa :keyword call :keyword
                         a [:ref :linux.static.io/operand] b [:ref :linux.static.io/operand]
