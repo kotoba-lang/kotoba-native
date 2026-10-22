@@ -1,5 +1,12 @@
 # Canonical Linux-static fs/app-data handler source
 
+Update: [FS2 framing](linux-static-filesystem-framing.md) supplies explicit
+form/path/tail spans for all sixteen forms and mandatory response
+acknowledgement, bypassing ambiguous token scanning for canonical callers.
+The token protocol below remains only as native migration inventory until
+its callers are retired. Initial source digest/counts below are provenance;
+they do not identify or qualify the updated source.
+
 Tracking: [JUN-201](https://linear.app/kotobalabs/issue/JUN-201),
 [JUN-200](https://linear.app/kotobalabs/issue/JUN-200).
 

@@ -8,6 +8,7 @@
             [kotoba.native.linux-static-io :as io]
             [kotoba.native.linux-static-paths :as paths]
             [kotoba.native.linux-static-browse :as browse]
+            [kotoba.native.linux-static-fs-protocol :as fs-protocol]
             [kotoba.native.linux-static-filesystem :as filesystem]
             [kotoba.native.linux-static-spawn :as spawn]
             [kotoba.native.linux-static-sha256 :as sha256])
@@ -232,6 +233,7 @@
             scope (paths/startup isa source-plan layout)
             directory (browse/routine isa source-plan layout)
             files (filesystem/routine isa source-plan layout)
+            filesystem-answer (fs-protocol/answer-routine (i64-of (lookup layout :data)) context)
             process (spawn/routine isa source-plan layout)]
         (cond
           (not= (record-get [:ref :linux.static.strings/result] request :error) :ok)
@@ -250,6 +252,8 @@
           (failure (record-get [:ref :linux.static.browse/result] directory :error))
           (not= (record-get [:ref :linux.static.fs/result] files :error) :ok)
           (failure (record-get [:ref :linux.static.fs/result] files :error))
+          (not= (record-get [:ref :linux.static.fs.protocol/result] filesystem-answer :error) :ok)
+          (failure (record-get [:ref :linux.static.fs.protocol/result] filesystem-answer :error))
           (not= (record-get [:ref :linux.static.spawn/result] process :error) :ok)
           (failure (record-get [:ref :linux.static.spawn/result] process :error))
           :else
@@ -268,7 +272,9 @@
                 kernel (if hash? (join completed (sha256/routine)) completed)
                 handlers (join (join kernel (record-get [:ref :linux.static.io/result] providers :code))
                            (record-get [:ref :linux.static.browse/result] directory :code))
-                with-files (join handlers (record-get [:ref :linux.static.fs/result] files :code))
+                with-file-body (join handlers (record-get [:ref :linux.static.fs/result] files :code))
+                with-files (join with-file-body
+                             (record-get [:ref :linux.static.fs.protocol/result] filesystem-answer :code))
                 with-spawn (join with-files (record-get [:ref :linux.static.spawn/result] process :code))
                 code (join with-spawn
                        (record-get [:ref :linux.static.paths/result] scope :code))

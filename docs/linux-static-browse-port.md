@@ -1,5 +1,11 @@
 # Canonical Linux-static directory browse handler
 
+Update: [FS2 framing](linux-static-filesystem-framing.md) adds a complete
+NUL-framed native listing and mandatory response acknowledgement. The raw
+TAB/LF layout described below remains only for legacy requests pending caller
+retirement. The recorded initial source digest/counts below are provenance;
+they do not identify or qualify the updated source.
+
 Tracking: [JUN-201](https://linear.app/kotobalabs/issue/JUN-201),
 [JUN-200](https://linear.app/kotobalabs/issue/JUN-200).
 

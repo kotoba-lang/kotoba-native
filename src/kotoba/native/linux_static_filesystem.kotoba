@@ -4,6 +4,7 @@
   {:kotoba/export [routine]}
   (:require [kotoba.native.linux-static-assembler :as asm]
             [kotoba.native.linux-static-io :as io]
+            [kotoba.native.linux-static-fs-protocol :as protocol]
             [kotoba.native.linux-static-paths :as paths]
             [kotoba.native.linux-static-strings :as strings])
   (:schemas
@@ -104,7 +105,7 @@
       (imm :cmp :t0 1) (branch :ne :ls/trap-bytes)
       (append :call :none :none :none :none :none 0 :ls.io/intern) (mov :t0 :ret)))
 (defn- finish [out [:list [:ref :linux.static/instruction]]]
-  [:list [:ref :linux.static/instruction]] (branch (store out :t0 :res) :always :ls.cap/finish))
+  [:list [:ref :linux.static/instruction]] (branch (store out :t0 :res) :always :ls.fs-protocol/finish))
 (defn- answer [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.fs/config] label :keyword n :i64]
   [:list [:ref :linux.static/instruction]] (finish (intern (-> out (la :s1 label) (li :s2 n)) cfg)))
 (defn- utoa [out [:list [:ref :linux.static/instruction]]]
@@ -162,11 +163,15 @@
         (imm :cmp :t0 1) (branch :ne :ls/bad) (load :s1 :rp))))
 (defn- after-token [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.fs/config] token :i64]
   [:list [:ref :linux.static/instruction]]
-  (-> out (li :t1 (record-get [:ref :linux.static.fs/config] cfg :tokens))
+  (-> out (load :t0 :fs-frame) (imm :cmp :t0 0) (branch :eq (tag "tail-legacy" (string-from-i64 token)))
+      (load :s1 :fs-tail) (load :s2 :fs-tail-len) (branch :always (tag "tail-done" (string-from-i64 token)))
+      (mark (tag "tail-legacy" (string-from-i64 token)))
+      (li :t1 (record-get [:ref :linux.static.fs/config] cfg :tokens))
       (mem :ld :t0 :t1 (+ 8 (* 16 token))) (imm :cmp :t0 0) (branch :lt :ls/bad)
       (load :t1 :rl) (alu :cmp :t0 :t1) (branch :hi :ls/bad) (alu :sub :t1 :t0)
       (li :t2 (bytes-count (string-to-utf8 (token-name token)))) (alu :cmp :t2 :t1) (branch :hi :ls/bad)
-      (alu :add :t0 :t2) (load :s1 :rp) (alu :add :s1 :t0) (load :s2 :rl) (alu :sub :s2 :t0)))
+      (alu :add :t0 :t2) (load :s1 :rp) (alu :add :s1 :t0) (load :s2 :rl) (alu :sub :s2 :t0)
+      (mark (tag "tail-done" (string-from-i64 token)))))
 
 (defn- write-all [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.fs/config] prefix :string form :i64]
   [:list [:ref :linux.static/instruction]]
@@ -543,18 +548,30 @@
   (let [error (configuration-error isa source-plan layout)]
     (if (not= error :ok) (failure error)
       (let [sources (source-fragments isa source-plan layout) source-error (source-error sources)
-            pair (strings/pool-pair-fragment (lookup source-plan :context-abi))]
+            pair (strings/pool-pair-fragment (lookup source-plan :context-abi))
+            frame (protocol/request-fragment :app-data :ls.fs/legacy-request)]
         (cond
           (not= source-error :ok) (failure source-error)
           (not= (record-get [:ref :linux.static.strings/result] pair :error) :ok)
           (failure (record-get [:ref :linux.static.strings/result] pair :error))
+          (not= (record-get [:ref :linux.static.fs.protocol/result] frame :error) :ok)
+          (failure (record-get [:ref :linux.static.fs.protocol/result] frame :error))
           :else
           (let [cfg (record-new [:ref :linux.static.fs/config] isa (i64-of (lookup layout :data))
                       (i64-of (lookup layout :buf-a)) (i64-of (lookup layout :buf-b)) (i64-of (lookup layout :buf-c))
                       (i64-of (lookup layout :stat-buf)) (i64-of (lookup layout :answer)) (i64-of (lookup layout :tokens))
                       (i64-of (lookup layout :probe)) sources (record-get [:ref :linux.static.strings/result] pair :code))
-                parsed (-> (empty-code) (append :align :none :none :none :none :none 16 :none)
-                           (mark :ls.cap/fs-app-data) (tokens cfg) (fragment cfg :resolve-a))
+                entry (-> (empty-code) (append :align :none :none :none :none :none 16 :none)
+                          (mark :ls.cap/fs-app-data))
+                framed (-> (hd (join entry (record-get [:ref :linux.static.fs.protocol/result] frame :code)) cfg 2
+                             (io/state-field :form) (io/literal 0) (io/literal 0) (io/literal 0))
+                           (imm :cmp :t0 1) (branch :ne :ls/bad)
+                           (li :t2 1) (load :t0 :form) (imm :cmp :t0 0) (branch :ne :ls.fs/framed-occurrence)
+                           (li :t2 0) (mark :ls.fs/framed-occurrence))
+                checked (-> (hd framed cfg 17 (io/state-field :form) (io/register :t2) (io/literal 0) (io/literal 0))
+                            (imm :cmp :t0 1) (branch :ne :ls/bad) (branch :always :ls.fs/request-ready)
+                            (mark :ls.fs/legacy-request) (tokens cfg) (mark :ls.fs/request-ready))
+                parsed (fragment checked cfg :resolve-a)
                 dispatch (loop [form 0 code parsed]
                            (if (= form 16) (branch code :always :ls/bad)
                              (recur (+ form 1) (-> code (load :t0 :form) (imm :cmp :t0 form) (branch :eq (form-label form))))))
