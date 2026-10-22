@@ -331,9 +331,11 @@
         written (-> (write-all ready cfg "stage" 16) (mark :ls.fs/stage-flush))
         flushed (sys written cfg :fsync (io/state-field :fd) (io/literal 0) (io/literal 0) (io/literal 0) (io/literal 0))
         done (outcome flushed cfg "stage-flush" 16 3 :ls.fs/stage-flush :ls/bad :ls/bad)
-        closed (-> (close done cfg :fd) (imm :cmp :t0 0) (branch :ne :ls/bad)
-                   (load :t0 :out-managed-member) (imm :cmp :t0 0) (branch :eq :ls.fs/stage-closed)
-                   (li :t0 -1) (store :t0 :out-file) (mark :ls.fs/stage-closed))]
+        closing (-> done (load :t0 :out-managed-member) (imm :cmp :t0 0) (branch :eq :ls.fs/stage-closing)
+                    ;; Linux consumes the FD even on close error. Retire its
+                    ;; cleanup alias before the syscall or any fatal conversion.
+                    (li :t0 -1) (store :t0 :out-file) (mark :ls.fs/stage-closing))
+        closed (-> (close closing cfg :fd) (imm :cmp :t0 0) (branch :ne :ls/bad))]
     (answer closed cfg :ls.fs/one 1)))
 
 (defn- discard-output-form [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.fs/config]]
