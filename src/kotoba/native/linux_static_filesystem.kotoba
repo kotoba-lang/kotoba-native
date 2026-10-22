@@ -296,6 +296,38 @@
         written (write-all content cfg prefix form)]
     (finish (intern (-> (close written cfg :fd) (load :s1 :x0) (load :s2 :x1)) cfg))))
 
+(defn- stage-member-form [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.fs/config]]
+  [:list [:ref :linux.static/instruction]]
+  ;; Q path NUL octal-mode NUL bytes. All mode parsing precedes creation.
+  ;; One exclusive FD remains usable even when fchmod sets mode 0000/0400.
+  (let [scan (-> out (mark (form-label 16)) (load :s2 :fs-tail) (load :s3 :fs-tail-len)
+                 (li :s4 0) (mark :ls.fs/stage-mode-end) (alu :cmp :s4 :s3) (branch :hs :ls/bad)
+                 (byte-op :ldb :t0 :s2 :s4) (imm :cmp :t0 0) (branch :eq :ls.fs/stage-mode-size)
+                 (imm :add :s4 1) (imm :cmp :s4 6) (branch :hi :ls/bad)
+                 (branch :always :ls.fs/stage-mode-end) (mark :ls.fs/stage-mode-size))
+        sized (-> (hd scan cfg 24 (io/register :s4) (io/literal 0) (io/literal 0) (io/literal 0))
+                  (imm :cmp :t0 1) (branch :ne :ls/bad) (store :s4 :x3)
+                  (mov :t0 :s2) (alu :add :t0 :s4) (imm :add :t0 1) (store :t0 :x0)
+                  (mov :t0 :s3) (alu :sub :t0 :s4) (imm :sub :t0 1) (store :t0 :x1)
+                  (li :s1 0) (li :s4 0) (mark :ls.fs/stage-mode-digit)
+                  (load :t0 :x3) (alu :cmp :s4 :t0) (branch :hs :ls.fs/stage-mode-parsed)
+                  (byte-op :ldb :t1 :s2 :s4))
+        parsed (-> (hd sized cfg 23 (io/register :s1) (io/register :t1) (io/literal 0) (io/literal 0))
+                   (imm :cmp :t0 -2) (branch :eq :ls/bad) (mov :s1 :t0) (imm :add :s4 1)
+                   (branch :always :ls.fs/stage-mode-digit) (mark :ls.fs/stage-mode-parsed))
+        mode (-> (hd parsed cfg 25 (io/register :s1) (io/literal 0) (io/literal 0) (io/literal 0))
+                 (store :t0 :x2) (mark :ls.fs/stage-open))
+        opened (-> (outcome (fragment mode cfg :open-stage) cfg "stage-open" 16 0 :ls.fs/stage-open :ls/bad :ls/bad)
+                   (store :t0 :fd) (mark :ls.fs/stage-mode-apply))
+        changed (sys opened cfg :fchmod (io/state-field :fd) (io/state-field :x2) (io/literal 0) (io/literal 0) (io/literal 0))
+        ready (-> (outcome changed cfg "stage-mode" 16 3 :ls.fs/stage-mode-apply :ls/bad :ls/bad)
+                  (load :s1 :x0) (load :s2 :x1))
+        written (-> (write-all ready cfg "stage" 16) (mark :ls.fs/stage-flush))
+        flushed (sys written cfg :fsync (io/state-field :fd) (io/literal 0) (io/literal 0) (io/literal 0) (io/literal 0))
+        done (outcome flushed cfg "stage-flush" 16 3 :ls.fs/stage-flush :ls/bad :ls/bad)
+        closed (-> (close done cfg :fd) (imm :cmp :t0 0) (branch :ne :ls/bad))]
+    (answer closed cfg :ls.fs/one 1)))
+
 (defn- exists-form [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.fs/config]]
   [:list [:ref :linux.static/instruction]]
   (let [opened (fragment (-> out (mark (form-label 3)) (mark :ls.fs/exists-open)) cfg :open-read)
@@ -531,6 +563,8 @@
         (add-source :parent-rename-c (paths/open-parent isa source-plan layout "fs-parent-rename-c" 11 c :len-c :fd :x0 :ls.fs/rename-no-second))
         (add-source :open-read (paths/open-at isa source-plan layout (io/state-field :rel-a) nf 0))
         (add-source :open-write (paths/open-at isa source-plan layout (io/state-field :rel-a) (+ nf 577) 420))
+        ;; O_WRONLY|O_CREAT|O_EXCL, initial 0600, NOFOLLOW/CLOEXEC as above.
+        (add-source :open-stage (paths/open-at isa source-plan layout (io/state-field :rel-a) (+ nf 193) 384))
         (add-source :open-append (paths/open-at isa source-plan layout (io/state-field :rel-a) (+ nf 1025) 0))
         (add-source :open-nofollow (paths/open-at isa source-plan layout (io/state-field :rel-a) (+ nf 2097152) 0))
         (add-source :open-temp-root (paths/open-at isa source-plan layout (io/state-field :rel-a) (+ 2621440 directory) 0)))))
@@ -579,12 +613,13 @@
                             (tokens cfg) (mark :ls.fs/request-ready))
                 typed (-> (hd checked cfg 49 (io/state-field :rk) (io/state-field :form) (io/literal 0) (io/literal 0))
                           (imm :cmp :t0 1) (branch :ne :ls/bad)
-                          (load :t0 :rk) (imm :cmp :t0 8) (branch :ne :ls.fs/path-utf8-ready))
+                          (load :t0 :rk) (imm :cmp :t0 8) (branch :eq :ls.fs/check-path-utf8)
+                          (imm :cmp :t0 11) (branch :ne :ls.fs/path-utf8-ready) (mark :ls.fs/check-path-utf8))
                 path-checked (-> (join typed (record-get [:ref :linux.static.strings/result] path-utf8 :code))
                                  (mark :ls.fs/path-utf8-ready))
                 parsed (fragment path-checked cfg :resolve-a)
                 dispatch (loop [form 0 code parsed]
-                           (if (= form 16) (branch code :always :ls/bad)
+                           (if (= form 17) (branch code :always :ls/bad)
                              (recur (+ form 1) (-> code (load :t0 :form) (imm :cmp :t0 form) (branch :eq (form-label form))))))
                 failed (-> dispatch (mark :ls.fs/path-failed) (load :t0 :path-denied)
                            (imm :cmp :t0 1) (branch :eq :ls.fs/scope-absent)
@@ -600,5 +635,6 @@
                 code (-> path-failed (read-form cfg) (write-form cfg 1) (write-form cfg 2) (exists-form cfg)
                          (range-form cfg) (metadata-form cfg 5) (metadata-form cfg 6) (chmod-form cfg)
                          (mutation-form cfg 8) (mutation-form cfg 9) (mutation-form cfg 10) (rename-form cfg)
-                         (fsync-form cfg) (temp-form cfg) (metadata-form cfg 14) (metadata-form cfg 15) (constants cfg))]
+                         (fsync-form cfg) (temp-form cfg) (metadata-form cfg 14) (metadata-form cfg 15)
+                         (stage-member-form cfg) (constants cfg))]
             (record-new [:ref :linux.static.fs/result] code :ls.cap/fs-app-data :ok)))))))

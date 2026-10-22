@@ -62,11 +62,11 @@
                     (store :t0 :fs-tail) (store :t0 :fs-tail-len)
                     (load :s1 :rp) (load :s3 :rl) (imm :cmp :s3 0) (branch :eq legacy)
                     (li :t0 0) (byte-op :ldb :t1 :s1 :t0) (imm :cmp :t1 0) (branch :ne legacy)
-                    ;; NUL FS2 NUL, one form byte A..P, nonempty path, NUL, tail.
+                    ;; NUL FS2 NUL, form A..P or proposed stage Q, path, NUL, tail.
                     (imm :cmp :s3 8) (branch :lo :ls/bad))
           header (-> (checked-marker start) (li :t0 5) (byte-op :ldb :t1 :s1 :t0)
                      (imm :cmp :t1 65) (branch :lo :ls/bad)
-                     (imm :cmp :t1 (if (= family :browse) 65 80)) (branch :hi :ls/bad)
+                     (imm :cmp :t1 (if (= family :browse) 65 81)) (branch :hi :ls/bad)
                      (imm :sub :t1 65) (store :t1 :form)
                      (imm :add :s1 6) (imm :sub :s3 6) (li :s2 0)
                      (mark (tag family "path")) (alu :cmp :s2 :s3) (branch :hs :ls/bad)
@@ -77,11 +77,11 @@
                      (mov :t0 :s3) (alu :sub :t0 :s2) (imm :sub :t0 1) (store :t0 :fs-tail-len))
           tail (if (= family :browse)
                  (-> header (imm :cmp :t0 0) (branch :ne :ls/bad))
-                 ;; Only these six forms accept a tail; all other forms require none.
+                 ;; The six original tail forms plus stage-member (16).
                  (let [body (loop [index 0 code (load header :t1 :form)]
-                              (if (= index 6) code
+                              (if (= index 7) code
                                 (recur (+ index 1)
-                                  (-> code (imm :cmp :t1 (case index 0 1 1 2 2 4 3 7 4 11 13))
+                                  (-> code (imm :cmp :t1 (case index 0 1 1 2 2 4 3 7 4 11 5 13 16))
                                       (branch :eq (tag family "tail-ok"))))))]
                    (-> body (load :t0 :fs-tail-len) (imm :cmp :t0 0) (branch :ne :ls/bad)
                        (mark (tag family "tail-ok")))))]

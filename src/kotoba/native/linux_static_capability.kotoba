@@ -106,26 +106,30 @@
                       (imm :cmp :t0 0) (branch :eq :ls.cap/no-handler))
         ;; Discriminators name full request/result contracts, not primitive
         ;; type codes. Only fs/app-data handler 7 accepts byte contracts
-        ;; 8/9 and string-byte-chunks-v1 (10); all others are string/string.
+        ;; 8/9 and segmented contracts 10/11; all others are string/string.
           kind (if (record-get [:ref :linux.static.capability/config] cfg :raw?)
                  (-> handler (mem :ld :t0 :s0 1136) (imm :cmp :t0 1) (branch :eq :ls.cap/kind-ready)
                      (mem :ld :t1 :s0 1176) (imm :cmp :t1 7) (branch :ne :ls/bad)
                      (imm :cmp :t0 8) (branch :eq :ls.cap/kind-ready)
                      (imm :cmp :t0 9) (branch :eq :ls.cap/kind-ready)
-                     (imm :cmp :t0 10) (branch :ne :ls/bad) (mark :ls.cap/kind-ready))
+                     (imm :cmp :t0 10) (branch :eq :ls.cap/kind-ready)
+                     (imm :cmp :t0 11) (branch :ne :ls/bad) (mark :ls.cap/kind-ready))
                  (-> handler (mem :ld :t0 :s0 1136) (imm :cmp :t0 1) (branch :ne :ls/bad)))]
       (-> kind (mov :ctx :s0) (mem :ld :s1 :s0 1152)))))
 
 (defn- request-code [cfg [:ref :linux.static.capability/config]
-                     text [:list [:ref :linux.static/instruction]] raw [:list [:ref :linux.static/instruction]]]
+                     text [:list [:ref :linux.static/instruction]] raw [:list [:ref :linux.static/instruction]]
+                     chunks [:list [:ref :linux.static/instruction]]]
   [:list [:ref :linux.static/instruction]]
   (let [code (if (not (record-get [:ref :linux.static.capability/config] cfg :raw?))
                (join (begin cfg) text)
                (let [selected (-> (begin cfg) (mem :ld :t0 :s0 1136) (imm :cmp :t0 8)
-                                   (branch :eq :ls.cap/bytes-request))
+                                   (branch :eq :ls.cap/bytes-request)
+                                   (imm :cmp :t0 11) (branch :eq :ls.cap/chunks-request))
                      textual (branch (join selected text) :always :ls.cap/request-ready)
-                     binary (join (mark textual :ls.cap/bytes-request) raw)]
-                 (mark binary :ls.cap/request-ready)))]
+                     binary (branch (join (mark textual :ls.cap/bytes-request) raw) :always :ls.cap/request-ready)
+                     segmented (join (mark binary :ls.cap/chunks-request) chunks)]
+                 (mark segmented :ls.cap/request-ready)))]
     (-> code (mem :st :s2 :s0 1160) (mem :st :s3 :s0 1168))))
 
 (defn- dispatch-label [id :i64] :keyword
@@ -193,7 +197,8 @@
                (let [selected (-> loaded (mem :ld :t0 :s0 1144) (imm :cmp :t0 1)
                                    (branch :eq :ls.cap/string-result))
                      span (-> (join selected raw-reader) (mov :s1 :s2) (mov :s2 :s3)
-                              (mem :ld :t0 :s0 1144) (imm :cmp :t0 10) (branch :eq :ls.cap/chunks-result))
+                              (mem :ld :t0 :s0 1144) (imm :cmp :t0 10) (branch :eq :ls.cap/chunks-result)
+                              (imm :cmp :t0 11) (branch :eq :ls.cap/chunks-result))
                      raw (-> (join span raw-writer) (mov :s1 :t0) (branch :always :ls.cap/result-ready))
                      chunks (-> (join (mark raw :ls.cap/chunks-result) chunks-writer)
                                 (mov :s1 :t0) (branch :always :ls.cap/result-ready))
@@ -264,6 +269,8 @@
             answer (strings/read-string-fragment context "cap-result")
             byte-request (if raw? (vectors/read-bytes-fragment context (i64-of (lookup layout :data)) "cap-request-bytes")
                            (record-new [:ref :linux.static.vectors/result] (empty-code) (document-map) :ok))
+            chunks-request (if raw? (vectors/read-chunks-fragment context (i64-of (lookup layout :data)) "cap-request-chunks")
+                             (record-new [:ref :linux.static.vectors/result] (empty-code) (document-map) :ok))
             raw-answer (strings/read-span-fragment context "cap-result-raw")
             byte-answer (if raw? (vectors/intern-bytes-fragment context "cap-result-bytes")
                           (record-new [:ref :linux.static.vectors/result] (empty-code) (document-map) :ok))
@@ -284,6 +291,8 @@
           (failure (record-get [:ref :linux.static.strings/result] answer :error))
           (not= (record-get [:ref :linux.static.vectors/result] byte-request :error) :ok)
           (failure (record-get [:ref :linux.static.vectors/result] byte-request :error))
+          (not= (record-get [:ref :linux.static.vectors/result] chunks-request :error) :ok)
+          (failure (record-get [:ref :linux.static.vectors/result] chunks-request :error))
           (not= (record-get [:ref :linux.static.strings/result] raw-answer :error) :ok)
           (failure (record-get [:ref :linux.static.strings/result] raw-answer :error))
           (not= (record-get [:ref :linux.static.vectors/result] byte-answer :error) :ok)
@@ -313,7 +322,8 @@
                       (if hash? (i64-of (lookup layout :hash-workspace)) 0)
                       (i64-of (lookup layout :cwd)) raw?)
                 requested (request-code cfg (record-get [:ref :linux.static.strings/result] request :code)
-                            (record-get [:ref :linux.static.vectors/result] byte-request :code))
+                            (record-get [:ref :linux.static.vectors/result] byte-request :code)
+                            (record-get [:ref :linux.static.vectors/result] chunks-request :code))
                 gate (dispatch requested hash?)
                 provider (if hash? (hash-body gate cfg (record-get [:ref :linux.static.strings/result] intern :code)) gate)
                 with-cwd (cwd-body provider cfg

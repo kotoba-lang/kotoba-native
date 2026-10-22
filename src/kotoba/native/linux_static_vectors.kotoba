@@ -1,7 +1,7 @@
 ;; Complete vector-i64/vector-f64 arena mechanism, also used by bytes values.
 ;; Canonical source candidate. This does not itself admit bytes capabilities.
 (ns kotoba.native.linux-static-vectors
-  {:kotoba/export [supported-slots supported-byte-slots routine read-bytes-fragment intern-bytes-fragment intern-chunks-fragment]}
+  {:kotoba/export [supported-slots supported-byte-slots routine read-bytes-fragment read-chunks-fragment intern-bytes-fragment intern-chunks-fragment]}
   (:require [kotoba.native.linux-static-assembler :as asm]
             [kotoba.native.linux-static-io :as io]
             [kotoba.native.linux-static-strings :as strings])
@@ -348,6 +348,62 @@
                        (byte-op :stb :t1 :a1 :t0) (imm :add :t2 8) (imm :add :t0 1)
                        (branch :always (tag prefix "raw-copy")) (mark (tag prefix "raw-copied"))
                        (alu :add :t7 :t5) (store :t7 :pool-used) (mov :a2 :t5))
+            code (-> (fragment-restore copied) (mov :s2 :a1) (mov :s3 :a2))]
+        (record-new [:ref :linux.static.vectors/result] code (document-map) :ok)))))
+
+(defn- chunk-handle [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.vectors/config]]
+  [:list [:ref :linux.static/instruction]]
+  (-> out (load :t4 :chunk-outer-offset) (load :t0 :chunk-index) (alu :add :t4 :t0) (shl :t4 3)
+      (mem :ld :t6 :ctx (record-get [:ref :linux.static.vectors/config] cfg :items))
+      (alu :add :t4 :t6) (mem :ld :a1 :t4 0)))
+
+;; Outer list<bytes> -> ONE raw request span. Validate every inner window and
+;; word before pool allocation. Two passes do not yield or invoke guest code;
+;; the intervening sealed charge decision is pure and cannot mutate the list.
+(defn read-chunks-fragment [context :document data :i64 prefix :string] [:ref :linux.static.vectors/result]
+  (let [error (configuration-error context)]
+    (cond
+      (not= error :ok) (record-new [:ref :linux.static.vectors/result] (empty-code) (document-map) error)
+      (or (<= data 0) (not= (bit-and data 4095) 0) (> data 9223372036854771711))
+      (record-new [:ref :linux.static.vectors/result] (empty-code) (document-map) :data-base)
+      :else
+      (let [cfg (configuration context)
+            outer (-> (resolve (mov (fragment-begin) :a1 :s1) cfg)
+                      (store :t4 :chunk-outer-offset) (store :t5 :chunk-outer-count)
+                      (li :t0 0) (store :t0 :chunk-total) (store :t0 :chunk-index)
+                      (mark (tag prefix "validate")) (load :t0 :chunk-index) (load :t1 :chunk-outer-count)
+                      (alu :cmp :t0 :t1) (branch :hs (tag prefix "validated")))
+            inner (-> (resolve (chunk-handle outer cfg) cfg) (load :t0 :byte-value-limit)
+                      (alu :cmp :t5 :t0) (branch :hi (value-label 10))
+                      (li :t0 65536) (alu :cmp :t5 :t0) (branch :hi (value-label 10)))
+            bytes (byte-items inner prefix (value-label 9))
+            measured (-> bytes (load :t7 :chunk-total) (li :t0 9223372036854775807) (alu :sub :t0 :t5)
+                         (alu :cmp :t7 :t0) (branch :hi :ls/trap-bytes)
+                         (alu :add :t7 :t5) (store :t7 :chunk-total)
+                         (load :t0 :chunk-index) (imm :add :t0 1) (store :t0 :chunk-index)
+                         (branch :always (tag prefix "validate")) (mark (tag prefix "validated"))
+                         (load :t5 :chunk-total) (mov :s0 :ctx))
+            charged (-> (io/decision-fragment measured data :ls.cap/h-decide (io/literal 6)
+                          (io/state-field :pool-used) (io/register :t5) (io/state-field :bytes) (io/literal 0))
+                        (mov :ctx :s0) (imm :cmp :t0 1) (branch :ne :ls/trap-bytes)
+                        (load :t5 :chunk-total) (load :t7 :pool-used) (load :t0 :bytes)
+                        (alu :cmp :t7 :t0) (branch :hi :ls/trap-bytes) (alu :sub :t0 :t7)
+                        (alu :cmp :t5 :t0) (branch :hi :ls/trap-bytes) (store :t7 :chunk-pool)
+                        (li :t0 0) (store :t0 :chunk-index) (store :t0 :chunk-copied)
+                        (mark (tag prefix "chunk")) (load :t0 :chunk-index) (load :t1 :chunk-outer-count)
+                        (alu :cmp :t0 :t1) (branch :hs (tag prefix "done")))
+            span (-> (resolve (chunk-handle charged cfg) cfg)
+                     (mov :t2 :t4) (shl :t2 3) (alu :add :t2 :t6)
+                     (load :a1 :pool-base) (load :t7 :chunk-pool) (alu :add :a1 :t7)
+                     (load :t7 :chunk-copied) (alu :add :a1 :t7) (li :t0 0))
+            copied (-> span (mark (tag prefix "copy")) (alu :cmp :t0 :t5)
+                       (branch :hs (tag prefix "copied")) (mem :ld :t1 :t2 0) (byte-op :stb :t1 :a1 :t0)
+                       (imm :add :t2 8) (imm :add :t0 1) (branch :always (tag prefix "copy"))
+                       (mark (tag prefix "copied")) (alu :add :t7 :t5) (store :t7 :chunk-copied)
+                       (load :t0 :chunk-index) (imm :add :t0 1) (store :t0 :chunk-index)
+                       (branch :always (tag prefix "chunk")) (mark (tag prefix "done"))
+                       (load :t5 :chunk-total) (load :t7 :chunk-pool) (alu :add :t7 :t5) (store :t7 :pool-used)
+                       (load :a1 :pool-base) (load :t7 :chunk-pool) (alu :add :a1 :t7) (mov :a2 :t5))
             code (-> (fragment-restore copied) (mov :s2 :a1) (mov :s3 :a2))]
         (record-new [:ref :linux.static.vectors/result] code (document-map) :ok)))))
 

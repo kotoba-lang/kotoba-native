@@ -81,7 +81,9 @@
     :fs-frame 1608 :fs-tail 1616 :fs-tail-len 1624 :path-denied 1632 :fs-root-fd 1640
     :vector-used 1648 :vector-item-used 1656 :vector-capacity 1664
     :vector-item-capacity 1672 :vector-item-limit 1680
-    :byte-value-limit 1688 :string-value-limit 1696 -1))
+    :byte-value-limit 1688 :string-value-limit 1696
+    :chunk-outer-offset 1704 :chunk-outer-count 1712 :chunk-total 1720
+    :chunk-index 1728 :chunk-pool 1736 :chunk-copied 1744 -1))
 
 (defn- load [out [:list [:ref :linux.static/instruction]] d :keyword key :keyword]
   [:list [:ref :linux.static/instruction]] (mem out :ld d :s0 (offset key)))
