@@ -66,7 +66,7 @@
                   (imm :cmp :t0 1) (branch :hi :ls.output/prepare-invalid)
                   (load :t0 :m-dfd) (store :t0 :out-parent)
                   (li :t0 1) (store :t0 :out-active)
-                  (li :t0 -1) (store :t0 :out-directory) (store :t0 :out-file)
+                  (li :t0 -1) (store :t0 :out-directory) (store :t0 :out-file) (store :t0 :out-probe)
                   (li :t0 0) (store :t0 :out-count)
                   (li :s1 (record-get [:ref :linux.static.output/config] cfg :path)) (load :s2 :len-a)
                   (imm :cmp :s2 1) (branch :lt :ls.output/prepare-invalid)
@@ -164,6 +164,17 @@
            (mark :ls.output/path-match) (li :a1 1) (branch :always :ls.output/path-return)
            (mark :ls.output/path-mismatch) (li :a1 0) (mark :ls.output/path-return))))
 
+;; Linux consumes a close descriptor even when it reports an I/O error or EINTR.
+;; Consume the journal first; neither a later cleanup nor an error path retries it.
+(defn- close-owned [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.output/config]
+                    field :keyword prefix :string]
+  [:list [:ref :linux.static/instruction]]
+  (let [ready (-> out (load :t0 field) (imm :cmp :t0 0) (branch :lt (tag prefix "-closed"))
+                  (mov :s4 :t0) (li :t0 -1) (store :t0 field))
+        closed (sys ready cfg :close (io/register :s4) (io/literal 0) (io/literal 0))]
+    (-> closed (imm :cmp :t0 0) (branch :eq (tag prefix "-closed"))
+        (li :t0 1) (store :t0 :out-failed) (mark (tag prefix "-closed")))))
+
 (defn- cleanup [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.output/config]]
   [:list [:ref :linux.static/instruction]]
   (let [space (record-get [:ref :linux.static.output/config] cfg :space)
@@ -171,13 +182,10 @@
                   (imm :cmp :t0 0) (branch :ne :ls.output/cleanup-recursive)
                   (li :t0 1) (store :t0 :out-cleaning) (li :t0 0) (store :t0 :out-failed)
                   (load :t0 :out-active) (imm :cmp :t0 0) (branch :eq :ls.output/cleanup-success)
-                  (imm :cmp :t0 1) (branch :eq :ls.output/cleanup-parent)
-                  (imm :cmp :t0 3) (branch :ne :ls.output/cleanup-failed)
-                  (load :t0 :out-file) (imm :cmp :t0 0) (branch :lt :ls.output/cleanup-file-closed))
-        closed (sys start cfg :close (io/state-field :out-file) (io/literal 0) (io/literal 0))
-        entries (-> closed (imm :cmp :t0 0) (branch :eq :ls.output/cleanup-file-closed)
-                    (li :t0 1) (store :t0 :out-failed) (mark :ls.output/cleanup-file-closed)
-                    (li :t0 -1) (store :t0 :out-file) (li :t0 0) (store :t0 :out-index)
+                  (imm :cmp :t0 1) (branch :eq :ls.output/cleanup-release)
+                  (imm :cmp :t0 3) (branch :ne :ls.output/cleanup-incomplete))
+        closed (close-owned start cfg :out-file "cleanup-file")
+        entries (-> closed (li :t0 0) (store :t0 :out-index)
                     (mark :ls.output/cleanup-next) (load :t0 :out-index) (load :t1 :out-count)
                     (alu :cmp :t0 :t1) (branch :hs :ls.output/cleanup-directory) (mov :t1 :t0))
         removed (sys (member-name entries cfg "cleanup") cfg :unlinkat
@@ -189,30 +197,30 @@
                  (branch :always :ls.output/cleanup-next) (mark :ls.output/cleanup-directory))
         probe (sys next cfg :openat (io/state-field :out-parent) (io/literal (+ space 4096))
                 (io/literal (+ 2621440 (if (= (record-get [:ref :linux.static.output/config] cfg :isa) :x86_64) 196608 49152))))
-        probe-fd (-> probe (imm :cmp :t0 0) (branch :lt :ls.output/cleanup-failed) (store :t0 :out-probe))
+        probe-fd (-> probe (imm :cmp :t0 0) (branch :lt :ls.output/cleanup-incomplete) (store :t0 :out-probe))
         own-stat (sys probe-fd cfg :fstat (io/state-field :out-directory) (io/literal (+ space 4160)) (io/literal 0))
-        other-stat (sys (-> own-stat (imm :cmp :t0 0) (branch :ne :ls.output/cleanup-probe-failed)) cfg
+        other-stat (sys (-> own-stat (imm :cmp :t0 0) (branch :ne :ls.output/cleanup-incomplete)) cfg
                      :fstat (io/state-field :out-probe) (io/literal (+ space 4416)) (io/literal 0))
-        identity (-> other-stat (imm :cmp :t0 0) (branch :ne :ls.output/cleanup-probe-failed)
+        identity (-> other-stat (imm :cmp :t0 0) (branch :ne :ls.output/cleanup-incomplete)
                      (li :s1 (+ space 4160)) (li :s2 (+ space 4416))
-                     (mem :ld :t0 :s1 0) (mem :ld :t1 :s2 0) (alu :cmp :t0 :t1) (branch :ne :ls.output/cleanup-probe-failed)
-                     (mem :ld :t0 :s1 8) (mem :ld :t1 :s2 8) (alu :cmp :t0 :t1) (branch :ne :ls.output/cleanup-probe-failed))
+                     (mem :ld :t0 :s1 0) (mem :ld :t1 :s2 0) (alu :cmp :t0 :t1) (branch :ne :ls.output/cleanup-incomplete)
+                     (mem :ld :t0 :s1 8) (mem :ld :t1 :s2 8) (alu :cmp :t0 :t1) (branch :ne :ls.output/cleanup-incomplete))
         rmdir (sys identity cfg :unlinkat (io/state-field :out-parent) (io/literal (+ space 4096)) (io/literal 512))
-        result (-> rmdir (store :t0 :out-rmdir))
-        probe-close (sys result cfg :close (io/state-field :out-probe) (io/literal 0) (io/literal 0))
-        directory-close (sys (-> probe-close (imm :cmp :t0 0) (branch :ne :ls.output/cleanup-failed)
-                                 (load :t0 :out-rmdir) (imm :cmp :t0 0) (branch :ne :ls.output/cleanup-failed))
-                          cfg :close (io/state-field :out-directory) (io/literal 0) (io/literal 0))
-        parent-close (sys (-> directory-close (imm :cmp :t0 0) (branch :eq :ls.output/cleanup-parent)
-                             (li :t0 1) (store :t0 :out-failed) (mark :ls.output/cleanup-parent))
-                       cfg :close (io/state-field :out-parent) (io/literal 0) (io/literal 0))
-        reset (-> parent-close (imm :cmp :t0 0) (branch :eq :ls.output/cleanup-reset)
-                  (li :t0 1) (store :t0 :out-failed) (mark :ls.output/cleanup-reset)
-                  (li :t0 0) (store :t0 :out-active) (li :t0 -1) (store :t0 :out-parent) (store :t0 :out-directory)
-                  (load :t0 :out-failed) (imm :cmp :t0 0) (branch :eq :ls.output/cleanup-success)
-                  (branch :always :ls.output/cleanup-failed))
-        failure-close (sys (mark reset :ls.output/cleanup-probe-failed) cfg :close (io/state-field :out-probe) (io/literal 0) (io/literal 0))]
-    (end (-> failure-close (mark :ls.output/cleanup-failed) (li :a1 0) (branch :always :ls.output/cleanup-done)
+        result (-> rmdir (store :t0 :out-rmdir) (imm :cmp :t0 0) (branch :eq :ls.output/cleanup-release)
+                   (mark :ls.output/cleanup-incomplete) (li :t0 1) (store :t0 :out-failed)
+                   (mark :ls.output/cleanup-release))
+        ;; Every owned descriptor is released even when probe/stat/unlink fails.
+        ;; The second file guard is a no-op after the phase-3 close above.
+        released (-> result (close-owned cfg :out-file "cleanup-final-file")
+                     (close-owned cfg :out-probe "cleanup-probe")
+                     (close-owned cfg :out-directory "cleanup-directory")
+                     (close-owned cfg :out-parent "cleanup-parent"))
+        reset (-> released (load :t0 :out-failed) (imm :cmp :t0 0) (branch :eq :ls.output/cleanup-reset)
+                  ;; Phase 4 is poisoned: no new output set can hide this failure.
+                  ;; A later cleanup still reports failure, without reusing FDs.
+                  (li :t0 4) (store :t0 :out-active) (li :a1 0) (branch :always :ls.output/cleanup-done)
+                  (mark :ls.output/cleanup-reset) (li :t0 0) (store :t0 :out-active))]
+    (end (-> reset
              (mark :ls.output/cleanup-success) (li :a1 1) (mark :ls.output/cleanup-done)
              (li :t0 0) (store :t0 :out-cleaning) (branch :always :ls.output/cleanup-return)
              (mark :ls.output/cleanup-recursive) (li :a1 0) (mark :ls.output/cleanup-return)))))

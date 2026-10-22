@@ -1,0 +1,68 @@
+;; Golden inputs/observations for the native syscall fault harness.
+;; Data only: importing these cases does not execute the provider or qualify it.
+(ns kotoba.native.owned-output-cleanup-cases
+  {:kotoba/export [cases]}
+  (:schemas
+   {:linux.static.cleanup/case
+    [:record :linux.static.cleanup/case
+     [[:name :keyword] [:phase :i64] [:fault :keyword] [:close-mask :i64]
+      [:members? :bool] [:rmdir? :bool] [:result :i64] [:final-phase :i64]]]}))
+
+(defn- sample [name :keyword phase :i64 fault :keyword close-mask :i64
+               members? :bool rmdir? :bool result :i64 final-phase :i64]
+  [:ref :linux.static.cleanup/case]
+  (record-new [:ref :linux.static.cleanup/case]
+    name phase fault close-mask members? rmdir? result final-phase))
+
+(defn- add-case [out [:list [:ref :linux.static.cleanup/case]] value [:ref :linux.static.cleanup/case]]
+  [:list [:ref :linux.static.cleanup/case]]
+  (typed-list-conj [:list [:ref :linux.static.cleanup/case]] out value))
+
+;; close-mask: member=1, probe=2, directory=4, parent=8. It records attempted
+;; closes, each at most once, rather than merely observing process-exit teardown.
+(defn cases [] [:list [:ref :linux.static.cleanup/case]]
+  (-> (typed-list-new [:list [:ref :linux.static.cleanup/case]])
+      (add-case
+        (sample :inactive 0 :none 0 false false 1 0))
+      (add-case
+        (sample :reserved-parent 1 :none 8 false false 1 0))
+      (add-case
+        (sample :reserved-close-error 1 :parent-close-eio 8 false false 0 4))
+      (add-case
+        (sample :created-without-capture 2 :none 8 false false 0 4))
+      (add-case
+        (sample :capture-open-error 2 :capture-open-error 8 false false 0 4))
+      (add-case
+        (sample :complete 3 :none 15 true true 1 0))
+      (add-case
+        (sample :published-members 3 :members-enoent 15 true true 1 0))
+      (add-case
+        (sample :member-close-error 3 :member-close-eio 15 true true 0 4))
+      (add-case
+        (sample :member-close-interrupted 3 :member-close-eintr 15 true true 0 4))
+      (add-case
+        (sample :probe-open-error 3 :probe-open-error 13 true false 0 4))
+      (add-case
+        (sample :owned-stat-error 3 :owned-stat-error 15 true false 0 4))
+      (add-case
+        (sample :named-stat-error 3 :named-stat-error 15 true false 0 4))
+      (add-case
+        (sample :device-replaced 3 :device-mismatch 15 true false 0 4))
+      (add-case
+        (sample :inode-replaced 3 :inode-mismatch 15 true false 0 4))
+      (add-case
+        (sample :directory-remove-error 3 :rmdir-error 15 true true 0 4))
+      (add-case
+        (sample :probe-close-error 3 :probe-close-eio 15 true true 0 4))
+      (add-case
+        (sample :directory-close-error 3 :directory-close-eio 15 true true 0 4))
+      (add-case
+        (sample :parent-close-error 3 :parent-close-eio 15 true true 0 4))
+      (add-case
+        (sample :member-remove-error 3 :member-unlink-error 15 true true 0 4))
+      (add-case
+        (sample :poisoned-retry 4 :none 0 false false 0 4))
+      (add-case
+        (sample :recursive-cleanup 3 :cleanup-in-progress 0 false false 0 3))
+      (add-case
+        (sample :stage-close-alias-consumed 3 :stage-close-error-before-cleanup 14 true true 1 0))))

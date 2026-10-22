@@ -55,6 +55,48 @@ successful native exit becomes nonzero, while a fatal exit retains its code.
 Single-active staging follows the synchronous IO API; nested begin refuses
 without replacing a live registry. No controller or workflow is qualified.
 
+## Error-path descriptor release source change
+
+Probe open/stat, identity mismatch and directory-removal failures now join
+one descriptor-release path. It attempts every live member/probe/directory/
+parent close, retaining all earlier failures even if later operations succeed.
+The probe sentinel is initialized before managed creation, so a failed probe
+cannot turn an uninitialized zero into a close of stdin.
+
+Each descriptor journal is consumed before its Linux close syscall. A close
+error is recorded and other owned descriptors are still released; close is
+never retried. The stage-member path likewise retires its managed cleanup
+alias before close, so a fatal close result cannot lead to a second close.
+This follows Linux's descriptor-release behavior, including EINTR; it is not
+a portability assumption about every operating system. See the Linux
+[close manual](https://man7.org/linux/man-pages/man2/close.2.html).
+
+The registry phases are now explicit:
+
+| Phase | Meaning | Cleanup source behavior |
+| --- | --- | --- |
+| 0 | inactive | success without touching descriptors |
+| 1 | parent reserved, directory not created | release parent; success only without close errors |
+| 2 | directory created, no captured directory FD | release descriptors and report incomplete; no guessed name removal |
+| 3 | captured managed directory | remove known members, verify directory identity, attempt rmdir, release all descriptors |
+| 4 | cleanup failed; descriptors consumed | keep reporting failure and reject a new managed begin |
+
+Phase 4 prevents a later successful begin or cleanup from hiding an earlier
+failure. It makes no promise that a failed unlink left no staging directory.
+The existing result/fatal diagnostic/exit preservation remains unchanged.
+
+`test/kotoba/native/owned_output_cleanup_cases.kotoba` adds 22 canonical golden
+inputs/observations for the native fault harness. They include phases 0..4,
+probe/stat/identity/unlink/rmdir/close failures, Linux EINTR, no double-close,
+published missing members and recursive cleanup. They have not been compiled
+or executed, and no consuming native fault harness is currently qualified.
+Their close masks denote actual syscall attempts, not OS teardown on exit.
+Fault injection must preserve real Linux close consumption; returning a fake
+EIO without consuming the FD is not an equivalent oracle. The stage-close
+case also requires the original fatal diagnostic/exit to survive cleanup.
+These vectors extend the required whole-provider corpus; they do not replace
+the existing positive/refusal/authority/resource/path/race obligations.
+
 ## Correctness still required
 
 Identity inspection followed by unlinkat is not an atomic inode-bound remove
