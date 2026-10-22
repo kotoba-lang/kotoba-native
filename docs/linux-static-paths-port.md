@@ -57,20 +57,23 @@ All source/ISA/assembler and context/layout bindings still require qualification
 
 ## Startup and path admission
 
-Startup initializes root-fd to -1, captures an absolute cwd in its bounded
-region, and opens a configured scope with O_PATH/O_DIRECTORY/O_CLOEXEC. It
+Startup initializes both root-fd and fs-root-fd to -1, captures an absolute cwd
+in its bounded region, and opens the filesystem anchor with
+O_PATH/O_DIRECTORY/O_CLOEXEC. Absent/false scope uses `/`; explicit scope also
+sets the separate spawn root-fd, preserving inherited spawn cwd when absent. It
 captures the root's kernel spelling by saving the cwd descriptor, fchdir to
 the root, getcwd, then fchdir back and close. Failure to restore cwd traps
 before main; failure to obtain a real spelling retains the sealed spelling
-only. There is no /proc or ambient-root substitute. Absent/false scope retains
-the reference's unscoped behavior; a configured scope must be bounded, absolute
+only. There is no /proc fallback. Absent/false scope retains
+unscoped filesystem behavior; a configured scope must be bounded, absolute
 and NUL-free, with full canonical admission still owned by the planner.
 
 Path input must already be a stable admitted request byte window, disjoint from
 the scratch buffers. Owning handler op 14 decides absolute versus cwd-relative
 construction and its 4096-byte bound. The mechanism copies, NUL-terminates and
 classifies segments; op 13 decides drop/pop/keep. Dot/dot-dot/slash and root
-boundaries retain the reference's decisions rather than adding a local policy.
+boundaries retain the owning lexical decisions. Raw POSIX traversal of a
+component removed by normalization is not a separate admission requirement.
 
 The normalized path is compared with both sealed and kernel root spellings,
 only when owning op 43 admits that spelling. C1 op 8 receives prefix equality,

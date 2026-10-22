@@ -45,9 +45,31 @@ bits are the [Linux v6.12 UAPI](https://github.com/torvalds/linux/blob/v6.12/inc
 the final-link metadata exception is documented by
 [openat2(2)](https://man7.org/linux/man-pages/man2/openat2.2.html).
 These source settings do not prove their actual kernel behavior.
-Normalization still precedes opening. Original dot-segment/symlink semantics
-must be included in whole-provider qualification; the flags alone do not
-prove the behavior of a component removed by lexical normalization.
+The owning API performs lexical normalization before scope admission and
+opening. The no-follow claim applies to the resulting path. Earlier wording
+made raw POSIX component traversal sound like a separate required port; that
+was broader than this API's contract. It is not a new acceptance condition.
+Full native qualification must still cover the declared normalization,
+no-follow, descriptor, race and absence behavior.
+
+## Complete root and parent cases
+
+The filesystem anchor is now a distinct `fs-root-fd` word at data+1640.
+Absent/false scope opens `/` as its filesystem root instead of leaving every
+path unusable. Explicit scope uses the configured root. Spawn retains its
+separate `root-fd`: explicit scope selects that cwd, absent/false scope leaves
+it at -1 and preserves inherited cwd. No process source or grant changes.
+
+Owning op 15 accepts a direct child's slash index zero under `/`; its new
+answer 2 means ordinary negative for an empty/dot/dot-dot base. Op 19 treats
+root length one with slash zero as the root parent. A parent outside the
+admitted scope gives an ordinary negative response without opening it, so a
+mutation cannot act on the scope root through its external parent. Unknown
+decision answers still trap. Beneath-root parents use the already admitted
+relative pointer; adding root-length plus one was wrong for global root `/`.
+All four public path APIs, 53 handler functions, decision IDs 0..48 and public
+five-i64 ABI remain; only the existing split-parent/parent-place rule bodies
+change in this step. Exact updated sealed artifacts are still required.
 
 ## All sixteen answers, before target filesystem access
 
@@ -89,3 +111,11 @@ timing. Full native positive/refusal/resource evidence, general runtime/ABI,
 raw-byte digest, resolver/materializer/authoring callers, legacy-decoder
 retirement, reviewed owning main/pins and compiler self-rebuild remain open.
 No workflow/protection/live service/production route changed.
+
+Current source receipt: paths blob `c5417e0a334029bec6c9e9b5d030ffa80cb8c808`,
+SHA-256 `7c1819d029e54b3df191568c792ada82f1e794c453dcbae906e294dd068f72d4`;
+I/O blob `4f28698b2c96a889baa36c1e2f1606b9ff1b5060`. Static source inventory
+reads 16 sources, 33 schemas, 558 import calls, 439 record uses and 585 type
+positions with no structural findings. All 92 named state offsets are unique,
+aligned and inside the private header. This inventory evaluates no project
+implementation or generated instructions and is not native qualification.

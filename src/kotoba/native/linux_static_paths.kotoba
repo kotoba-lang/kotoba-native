@@ -92,6 +92,8 @@
     (-> decided (imm :cmp :t0 1) (branch :eq admitted)
         (imm :cmp :t0 0) (branch :ne :ls/bad) (mark (tag prefix "spelling-skip")))))
 
+;; Resolve the canonical spelling before scope admission, as the owning API
+;; specifies. This is lexical path semantics, not raw POSIX component walking.
 (defn- normalize [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.paths/config]
                   prefix :string target :i64]
   [:list [:ref :linux.static/instruction]]
@@ -158,7 +160,7 @@
         absolute (-> (copy relative (string-concat prefix "-absolute") :s3 :s1 :s2)
                      (li :t1 0) (byte-op :stb :t1 :s3 :s2))
         normalized (-> (normalize absolute cfg prefix target) (store :s2 length-key)
-                       (load :t0 :root-fd) (imm :cmp :t0 0) (branch :lt fail))
+                       (load :t0 :fs-root-fd) (imm :cmp :t0 0) (branch :lt fail))
         sealed (prefix-root normalized cfg (string-concat prefix "-sealed") 0 length-key (tag prefix "admitted"))
         resolved (prefix-root sealed cfg (string-concat prefix "-real") 1 length-key (tag prefix "admitted"))]
     ;; Only failure of both real C1 scope-prefix decisions is an absent path.
@@ -178,7 +180,7 @@
                 ;; BENEATH | NO_MAGICLINKS | NO_SYMLINKS: reject interior links
                 ;; too; O_NOFOLLOW alone only protects the final component.
                 (li :t1 14) (store :t1 :how-resolve))]
-    (sys how cfg :openat2 (io/state-field :root-fd) (io/register :a4)
+    (sys how cfg :openat2 (io/state-field :fs-root-fd) (io/register :a4)
       (io/literal (+ (record-get [:ref :linux.static.paths/config] cfg :data) (io/state-offset :how))) (io/literal 24))))
 
 (defn- join [out [:list [:ref :linux.static/instruction]] code [:list [:ref :linux.static/instruction]]]
@@ -203,12 +205,13 @@
                  (li :t1 1) (byte-op :ldb :t0 :s3 :t1) (imm :cmp :t0 46) (branch :ne (tag prefix "class-done"))
                  (li :a2 1) (mark (tag prefix "class-done")) (store :a2 :x3) (store :s3 base-key))
         base (-> (hd scan cfg 15 (io/register :s1) (io/register :s2) (io/state-field :x3) (io/literal 0))
-                 (imm :cmp :t0 1) (branch :ne :ls/bad))
+                 (imm :cmp :t0 2) (branch :eq negative) (imm :cmp :t0 1) (branch :ne :ls/bad))
         parent (-> (hd base cfg 19 (io/register :s1) (io/state-field (root-key length-key)) (io/literal 0) (io/literal 0))
-                   (imm :cmp :t0 0) (branch :eq :ls/bad) (la :t2 :ls.path/dot)
+                   (imm :cmp :t0 0) (branch :eq negative) (la :t2 :ls.path/dot)
                    (imm :cmp :t0 1) (branch :eq (tag prefix "dot"))
-                   (li :t0 0) (byte-op :stb :t0 :s4 :s1) (li :t2 (+ target 1))
-                   (load :t0 (root-key length-key)) (alu :add :t2 :t0) (mark (tag prefix "dot"))
+                   (imm :cmp :t0 2) (branch :ne :ls/bad)
+                   (li :t0 0) (byte-op :stb :t0 :s4 :s1)
+                   (load :t2 (if (= length-key :len-a) :rel-a :rel-c)) (mark (tag prefix "dot"))
                    (store :t2 :x5) (mark (tag prefix "open")))
         opened (-> (join parent (open-code cfg (io/state-field :x5) (open-flags cfg) 0))
                    (store :t0 :x6) (li :t1 0) (imm :cmp :t0 0) (branch :ge (tag prefix "errno-done"))
@@ -221,16 +224,21 @@
 
 (defn- startup-code [cfg [:ref :linux.static.paths/config]] [:list [:ref :linux.static/instruction]]
   (let [initial (-> (empty-code) (li :s0 (record-get [:ref :linux.static.paths/config] cfg :data))
-                    (li :t0 -1) (store :t0 :root-fd) (li :t0 0) (store :t0 :root-real-len))
+                    (li :t0 -1) (store :t0 :root-fd) (store :t0 :fs-root-fd)
+                    (li :t0 0) (store :t0 :root-real-len))
         cwd (-> (sys initial cfg :getcwd (io/literal (record-get [:ref :linux.static.paths/config] cfg :cwd))
                   (io/literal 4096) (io/literal 0) (io/literal 0))
                 (li :t1 0) (imm :cmp :t0 1) (branch :le :ls.path/no-cwd) (imm :cmp :t0 4096) (branch :hi :ls/bad)
                 (li :t2 (record-get [:ref :linux.static.paths/config] cfg :cwd)) (li :t3 0) (byte-op :ldb :t3 :t2 :t3)
                 (imm :cmp :t3 47) (branch :ne :ls.path/no-cwd) (mov :t1 :t0) (imm :sub :t1 1)
-                (mark :ls.path/no-cwd) (store :t1 :cwd-len))]
-    (if (not (record-get [:ref :linux.static.paths/config] cfg :scoped?)) cwd
-      (let [root (-> (sys cwd cfg :openat (io/literal -100) (io/label-address :ls.path/root) (io/literal (open-flags cfg)) (io/literal 0))
-                     (imm :cmp :t0 0) (branch :lt :ls.path/no-root) (store :t0 :root-fd))
+                (mark :ls.path/no-cwd) (store :t1 :cwd-len))
+        opened (-> (sys cwd cfg :openat (io/literal -100) (io/label-address :ls.path/root)
+                      (io/literal (open-flags cfg)) (io/literal 0))
+                   (imm :cmp :t0 0) (branch :lt :ls.path/no-root) (store :t0 :fs-root-fd))]
+    ;; Filesystem always needs an anchor. Spawn uses the separate root-fd
+    ;; only for explicit scopes, otherwise retaining its inherited cwd.
+    (if (not (record-get [:ref :linux.static.paths/config] cfg :scoped?)) (mark opened :ls.path/no-root)
+      (let [root (store opened :t0 :root-fd)
             saved (-> (sys root cfg :openat (io/literal -100) (io/label-address :ls.path/dot) (io/literal (open-flags cfg)) (io/literal 0))
                       (imm :cmp :t0 0) (branch :lt :ls.path/no-real) (store :t0 :x0))
             entered (-> (sys saved cfg :fchdir (io/state-field :root-fd) (io/literal 0) (io/literal 0) (io/literal 0))
@@ -268,7 +276,7 @@
             (option-value-of [:option :document] (document-vector-at pair 1) (document-null)) (recur (+ index 1))))))))
 (defn- i64-of [d :document] :i64 (option-value-of [:option :i64] (document-i64-value d) -1))
 (defn- scope-string [source-plan :document] :string
-  (option-value-of [:option :string] (document-string-value (lookup source-plan :fs-scope)) ""))
+  (option-value-of [:option :string] (document-string-value (lookup source-plan :fs-scope)) "/"))
 (defn- no-nul? [text :string] :bool
   (let [bytes (string-to-utf8 text)]
     (loop [index 0]
