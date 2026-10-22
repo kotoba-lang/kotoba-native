@@ -42,15 +42,15 @@
                    bindings :document code-address :i64 code-length :i64]
   [:list [:ref :linux.static.context/word]]
   (let [context (lookup source-plan :context-abi) data (i64-of (lookup layout :data))
-        zero (+ data (io/state-offset :zero)) handler (address labels :ls/handler)
+        handler (address labels :ls/handler)
         base (-> (typed-list-new [:list [:ref :linux.static.context/word]])
                  (word 0 11) (word (i64-of (lookup context :fuel-offset)) (i64-of (lookup source-plan :fuel)))
                  (word (i64-of (lookup context :pair-used-pointer-offset)) (+ data (io/state-offset :pair-used)))
                  (word (i64-of (lookup context :pairs-base-offset)) (i64-of (lookup layout :pairs)))
                  (word (i64-of (lookup context :pair-validated-base-offset)) (i64-of (lookup layout :valid)))
-                 (word (i64-of (lookup context :vector-used-pointer-offset)) zero)
-                 (word (i64-of (lookup context :vectors-base-offset)) zero)
-                 (word (i64-of (lookup context :vector-items-base-offset)) zero)
+                 (word (i64-of (lookup context :vector-used-pointer-offset)) (+ data (io/state-offset :vector-used)))
+                 (word (i64-of (lookup context :vectors-base-offset)) (i64-of (lookup layout :vectors)))
+                 (word (i64-of (lookup context :vector-items-base-offset)) (i64-of (lookup layout :vector-items)))
                  (word (io/state-offset :cells) (i64-of (lookup source-plan :cells)))
                  (word (io/state-offset :bytes) (i64-of (lookup source-plan :bytes)))
                  (word (io/state-offset :metered) (if (true? (lookup source-plan :metered?)) 1 0))
@@ -74,6 +74,8 @@
                             bindings :document code-address :i64 code-length :i64] :keyword
   (let [data (i64-of (lookup layout :data)) memory (i64-of (lookup layout :memory-size))
         cells (i64-of (lookup source-plan :cells)) bytes (i64-of (lookup source-plan :bytes))
+        table-count (i64-of (lookup source-plan :vectors)) item-count (i64-of (lookup source-plan :vector-items))
+        table (i64-of (lookup layout :vectors)) items (i64-of (lookup layout :vector-items))
         fuel (i64-of (lookup source-plan :fuel)) context (lookup source-plan :context-abi)
         slots (lookup source-plan :slots) grant (lookup source-plan :grant)
         alt (i64-of (lookup layout :alt)) pairs (i64-of (lookup layout :pairs))
@@ -85,13 +87,18 @@
       (or (not (document-equal? (lookup context :version) (document-i64 11)))
           (< fuel 0) (< cells 0) (< bytes 0) (> cells (quot 9223372036854775807 16))
           (not= (document-kind (lookup source-plan :metered?)) :bool)) :initial-values
+      (or (< table-count 0) (< item-count 0)
+          (> table-count (quot 9223372036854775807 16)) (> item-count (quot 9223372036854775807 8))) :vector-initial-values
       (or (<= text 0) (< code-address text) (< code-length 0) (> code-address data)
           (> code-length (- data code-address)) (< handler text) (>= handler code-address)) :code-span
       (or (not (span? alt 16384 (+ data 4096) (+ data memory)))
           (not (span? pairs (* cells 16) (+ data 4096) (+ data memory)))
           (not (span? valid cells (+ data 4096) (+ data memory)))
+          (not (span? table (* 16 table-count) (+ data 4096) (+ data memory)))
+          (not (span? items (* 8 item-count) (+ data 4096) (+ data memory)))
           (not (span? pool bytes (+ data 4096) (+ data memory)))
-          (> (+ alt 16384) pairs) (> (+ pairs (* cells 16)) valid) (> (+ valid cells) pool)) :arena-layout
+          (> (+ alt 16384) pairs) (> (+ pairs (* cells 16)) valid) (> (+ valid cells) table)
+          (> (+ table (* 16 table-count)) items) (> (+ items (* 8 item-count)) pool)) :arena-layout
       (or (not= (document-kind slots) :map) (not= (document-kind bindings) :map)
           (not= (document-kind grant) :vector)) :context-input
       :else

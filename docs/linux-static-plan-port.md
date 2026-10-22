@@ -1,5 +1,9 @@
 # Canonical Linux-static planning and layout source port
 
+Update: [complete vector arena composition](linux-static-vectors-port.md)
+extends the source to sixteen implemented slots and real vector table/item
+regions. The initial counts and eight-slot evidence below are provenance.
+
 Tracking: [JUN-201](https://linear.app/kotobalabs/issue/JUN-201),
 [JUN-200](https://linear.app/kotobalabs/issue/JUN-200).
 

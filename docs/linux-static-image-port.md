@@ -1,5 +1,9 @@
 # Canonical complete Linux-static image source
 
+Update: [complete vector arena composition](linux-static-vectors-port.md)
+adds real table/item regions, sixteen implemented source slots and complete
+vector budget metadata. Earlier source counts are labelled provenance.
+
 Tracking: [JUN-201](https://linear.app/kotobalabs/issue/JUN-201),
 [JUN-200](https://linear.app/kotobalabs/issue/JUN-200), Kotoba Labs.
 

@@ -1,5 +1,9 @@
 # Canonical Linux-static prelude and context source
 
+Update: [complete vector arena composition](linux-static-vectors-port.md)
+adds actual vector pointers/counters/capacities, eight routines and distinct
+table/item exhaustion paths. Initial counts below are historical source data.
+
 Tracking: [JUN-201](https://linear.app/kotobalabs/issue/JUN-201),
 [JUN-200](https://linear.app/kotobalabs/issue/JUN-200).
 

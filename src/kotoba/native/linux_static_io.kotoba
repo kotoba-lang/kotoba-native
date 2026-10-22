@@ -78,7 +78,9 @@
     :sp-start 1488 :sp-total 1496 :sp-limit 1504 :sp-exit 1512 :sp-in-r 1520 :sp-in-w 1528
     :sp-out-r 1536 :sp-out-w 1544 :sp-st-r 1552 :sp-st-w 1560 :sp-dlen 1568 :sp-word 1576
     :root-real-len 1584 :ru-a 1592 :ru-c 1600
-    :fs-frame 1608 :fs-tail 1616 :fs-tail-len 1624 :path-denied 1632 :fs-root-fd 1640 -1))
+    :fs-frame 1608 :fs-tail 1616 :fs-tail-len 1624 :path-denied 1632 :fs-root-fd 1640
+    :vector-used 1648 :vector-item-used 1656 :vector-capacity 1664
+    :vector-item-capacity 1672 :vector-item-limit 1680 -1))
 
 (defn- load [out [:list [:ref :linux.static/instruction]] d :keyword key :keyword]
   [:list [:ref :linux.static/instruction]] (mem out :ld d :s0 (offset key)))

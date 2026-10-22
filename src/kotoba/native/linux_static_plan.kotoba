@@ -4,7 +4,8 @@
 (ns kotoba.native.linux-static-plan
   {:kotoba/export [targets implemented-slots slot-names plan image-layout]}
   (:require [kotoba.artifact.core :as artifact]
-            [kotoba.native.linux-static-sha256 :as sha256])
+            [kotoba.native.linux-static-sha256 :as sha256]
+            [kotoba.native.linux-static-vectors :as vectors])
   (:schemas {:linux.static.plan/result
              [:record :linux.static.plan/result
               [[:value :document] [:error :keyword] [:data :document]]]}))
@@ -207,6 +208,10 @@
   (document-set (document-keyword :pair-new) (document-keyword :pair-first) (document-keyword :pair-second)
                  (document-keyword :string-equal) (document-keyword :string-concat)
                  (document-keyword :string-substring) (document-keyword :string-index-of)
+                 (document-keyword :vector-new-empty) (document-keyword :vector-conj)
+                 (document-keyword :vector-count) (document-keyword :vector-at)
+                 (document-keyword :vector-assoc) (document-keyword :vector-alloc)
+                 (document-keyword :vector-assoc-in-place) (document-keyword :vector-drop)
                  (document-keyword :typed-cap-call)))
 
 (defn- normalized-code [code :document] [:ref :linux.static.plan/result]
@@ -388,12 +393,23 @@
           (if (not (i64-document? (lookup exits outcome))) (fail :exit-code-missing outcome)
             (recur (+ index 1))))))))
 
-(defn- budgets [profile :document overrides :document] [:ref :linux.static.plan/result]
+(defn- vector-slots? [admitted :document] :bool
+  (loop [index 0]
+    (if (>= index (document-count admitted)) false
+      (if (document-set-contains? (vectors/supported-slots) (item admitted index)) true (recur (+ index 1))))))
+
+(defn- budgets [profile :document overrides :document vectors? :bool] [:ref :linux.static.plan/result]
   (let [raw-cells (get-key overrides :cells) raw-bytes (get-key overrides :bytes)
         cells (if (truthy? raw-cells) raw-cells (get3 profile :cells :default :value))
         cells-max (get3 profile :cells :pair-arena-max :value)
         bytes (if (truthy? raw-bytes) raw-bytes (get3 profile :bytes :default :value))
-        bytes-max (get3 profile :bytes :max :value)]
+        bytes-max (get3 profile :bytes :max :value)
+        raw-vectors (get-key overrides :vectors) raw-items (get-key overrides :vector-items)
+        table (if (truthy? raw-vectors) raw-vectors (get3 profile :cells :vectors :value))
+        table-max (get3 profile :cells :vectors :max)
+        items (if (truthy? raw-items) raw-items (get3 profile :cells :vector-items :value))
+        items-max (get3 profile :cells :vector-items :max)
+        limit (get3 profile :cells :vector-items :per-vector-max)]
     (cond
       (not (i64-document? cells-max)) (fail :native-profile-incomplete (field :pair-arena-max))
       (not (i64-document? bytes-max)) (fail :native-profile-incomplete (field :bytes-max))
@@ -401,7 +417,20 @@
       (fail :cells-outside-profile cells)
       (or (not (i64-document? bytes)) (< (i64-of bytes) 1) (> (i64-of bytes) (i64-of bytes-max)))
       (fail :bytes-outside-profile bytes)
-      :else (ok (document-map (document-keyword :cells) cells (document-keyword :bytes) bytes)))))
+      (and vectors? (or (not (i64-document? table-max)) (not (i64-document? items-max))
+                       (not (i64-document? limit)) (< (i64-of table-max) 1)
+                       (< (i64-of items-max) 1) (< (i64-of limit) 1)))
+      (fail :native-profile-incomplete (field :vector-bounds))
+      (and vectors? (or (not (i64-document? table)) (< (i64-of table) 1) (> (i64-of table) (i64-of table-max))))
+      (fail :vectors-outside-profile table)
+      (and vectors? (or (not (i64-document? items)) (< (i64-of items) 1) (> (i64-of items) (i64-of items-max))))
+      (fail :vector-items-outside-profile items)
+      (and (not vectors?) (or (truthy? raw-vectors) (truthy? raw-items)))
+      (fail :vector-slots-not-admitted (field :vectors))
+      :else (ok (document-map (document-keyword :cells) cells (document-keyword :bytes) bytes
+                  (document-keyword :vectors) (if vectors? table (document-i64 0))
+                  (document-keyword :vector-items) (if vectors? items (document-i64 0))
+                  (document-keyword :vector-item-limit) (if vectors? limit (document-i64 0)))))))
 
 (defn- slot-plan [names :document admitted :document handlers? :bool] :document
   (loop [index 0 out (document-map)]
@@ -434,8 +463,9 @@
       (fail :context-abi-version (get-key context :version))
       (not (i64-document? fuel)) (fail :native-profile-incomplete (field :initial-fuel))
       :else
-      (let [limits (budgets profile overrides) names (slot-names context)
-            admitted (admitted-slots (get2 static :admitted-slots :value))]
+      (let [names (slot-names context)
+            admitted (admitted-slots (get2 static :admitted-slots :value))
+            limits (budgets profile overrides (and (good? admitted) (vector-slots? (value admitted))))]
         (cond
           (not (good? limits)) limits
           (not (good? names)) names
@@ -528,12 +558,17 @@
 
 (defn image-layout [text-size :i64 source-plan :document] [:ref :linux.static.plan/result]
   (let [cells (get-key source-plan :cells) bytes (get-key source-plan :bytes)
+        table (get-key source-plan :vectors) items (get-key source-plan :vector-items)
         handlers (get-key source-plan :handlers?)]
     (cond
       (or (not (i64-document? cells)) (not (i64-document? bytes)) (< (i64-of cells) 0) (< (i64-of bytes) 0)
           (not= (document-kind handlers) :bool))
       (fail :layout-input source-plan)
       (> (i64-of cells) (quot 9223372036854775807 16)) (fail :layout-overflow (field :pairs))
+      (or (not (i64-document? table)) (not (i64-document? items)) (< (i64-of table) 0) (< (i64-of items) 0))
+      (fail :layout-input (field :vectors))
+      (> (i64-of table) (quot 9223372036854775807 16)) (fail :layout-overflow (field :vectors))
+      (> (i64-of items) (quot 9223372036854775807 8)) (fail :layout-overflow (field :vector-items))
       :else
       (let [start (layout-start text-size) valid (checked-align (i64-of cells) 16)]
         (cond
@@ -545,6 +580,8 @@
                             (document-vector (document-keyword :alt) (document-i64 16384))
                             (document-vector (document-keyword :pairs) (document-i64 (* 16 (i64-of cells))))
                             (document-vector (document-keyword :valid) (value valid))
+                            (document-vector (document-keyword :vectors) (document-i64 (* 16 (i64-of table))))
+                            (document-vector (document-keyword :vector-items) (document-i64 (* 8 (i64-of items))))
                             (document-vector (document-keyword :pool) bytes)))]
             (if (not (good? regions)) regions
               (let [end (checked-align (i64-of (get-key (value regions) :end)) 16)]
