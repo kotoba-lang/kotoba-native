@@ -1,4 +1,5 @@
-;; Complete pair/string portion of linux_static.cljk's slot-routines.
+;; Pair/string portion of linux_static.cljk's slot-routines, extended with
+;; the v11 code-point and ordering helpers used by the native seed compiler.
 ;; Canonical IR source candidate; not admitted, generated or executed yet.
 (ns kotoba.native.linux-static-strings
   {:kotoba/export [supported-slots external-labels routine routines
@@ -17,7 +18,8 @@
   (document-set (document-keyword :pair-new) (document-keyword :pair-first)
     (document-keyword :pair-second) (document-keyword :string-equal)
     (document-keyword :string-index-of) (document-keyword :string-substring)
-    (document-keyword :string-concat)))
+    (document-keyword :string-concat) (document-keyword :string-code-point-at)
+    (document-keyword :string-compare)))
 
 (defn external-labels [] :document
   (document-map (document-keyword :bad) (document-keyword :ls/bad)
@@ -216,6 +218,50 @@
         (mark (tag "idx" "found")) (branch :always (tag "string-index-of" "out"))
         (mark (tag "idx" "none")) (li :t0 -1) (end "string-index-of"))))
 
+;; Byte offsets, exclusive upper bound, canonical UTF-8 and a code-point
+;; boundary are all required. The validated span proves the decoder's width
+;; stays in the window, including for pooled strings and substring views.
+(defn- code-point-slot [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.strings/config]]
+  [:list [:ref :linux.static/instruction]]
+  (let [resolved (resolve-string (mov (begin out "string-code-point-at") :t4 :a2)
+                   cfg "cp" :a1 :t1 :t2 :t0 :t3)
+        bounded (-> resolved (imm :cmp :t4 0) (branch :lt :ls/bad)
+                    (alu :cmp :t4 :t2) (branch :hs :ls/bad))
+        checked (validate bounded cfg "cp" :a1 :t1 :t2 :t0 :t3 :t5 :t6)]
+    (-> checked (alu :add :t1 :t4) (li :t4 0) (byte-op :ldb :t0 :t1 :t4)
+        (imm :cmp :t0 127) (branch :ls (tag "string-code-point-at" "out"))
+        (imm :cmp :t0 194) (branch :lo :ls/bad)
+        (imm :cmp :t0 223) (branch :hi (tag "cp" "three"))
+        (imm :and :t0 31) (li :t5 2) (branch :always (tag "cp" "decode"))
+        (mark (tag "cp" "three")) (imm :cmp :t0 239) (branch :hi (tag "cp" "four"))
+        (imm :and :t0 15) (li :t5 3) (branch :always (tag "cp" "decode"))
+        (mark (tag "cp" "four")) (imm :and :t0 7) (li :t5 4)
+        (mark (tag "cp" "decode")) (li :t4 1)
+        (mark (tag "cp" "loop")) (shl :t0 6) (byte-op :ldb :t3 :t1 :t4)
+        (imm :and :t3 63) (alu :or :t0 :t3) (imm :add :t4 1)
+        (alu :cmp :t4 :t5) (branch :lo (tag "cp" "loop"))
+        (end "string-code-point-at"))))
+
+;; Canonical UTF-8 byte order equals scalar-value order. Return exactly
+;; -1/0/1, including prefix and embedded-NUL cases; allocate no result pair.
+(defn- compare-slot [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.strings/config]]
+  [:list [:ref :linux.static/instruction]]
+  (let [first (resolve-string (begin out "string-compare") cfg "cmp-a" :a1 :t1 :t2 :t0 :t3)
+        second (resolve-string first cfg "cmp-b" :a2 :t4 :t5 :t0 :t3)
+        a (validate second cfg "cmp-a" :a1 :t1 :t2 :t0 :t3 :t6 :t7)
+        b (validate a cfg "cmp-b" :a2 :t4 :t5 :t0 :t3 :t6 :t7)]
+    (-> b (li :t8 0) (mark (tag "cmp" "loop"))
+        (alu :cmp :t8 :t2) (branch :hs (tag "cmp" "lengths"))
+        (alu :cmp :t8 :t5) (branch :hs (tag "cmp" "lengths"))
+        (byte-op :ldb :t3 :t1 :t8) (byte-op :ldb :t6 :t4 :t8)
+        (alu :cmp :t3 :t6) (branch :lo (tag "cmp" "less")) (branch :hi (tag "cmp" "greater"))
+        (imm :add :t8 1) (branch :always (tag "cmp" "loop"))
+        (mark (tag "cmp" "lengths")) (alu :cmp :t2 :t5)
+        (branch :lo (tag "cmp" "less")) (branch :hi (tag "cmp" "greater"))
+        (li :t0 0) (branch :always (tag "string-compare" "out"))
+        (mark (tag "cmp" "less")) (li :t0 -1) (branch :always (tag "string-compare" "out"))
+        (mark (tag "cmp" "greater")) (li :t0 1) (end "string-compare"))))
+
 (defn- substring-slot [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.strings/config]]
   [:list [:ref :linux.static/instruction]]
   (let [first (resolve-string (begin out "string-substring") cfg "sub" :a1 :t1 :t2 :t0 :t3)
@@ -297,7 +343,9 @@
     (document-keyword :string-equal) (document-keyword (tag "string-equal" "entry"))
     (document-keyword :string-index-of) (document-keyword (tag "string-index-of" "entry"))
     (document-keyword :string-substring) (document-keyword (tag "string-substring" "entry"))
-    (document-keyword :string-concat) (document-keyword (tag "string-concat" "entry"))))
+    (document-keyword :string-concat) (document-keyword (tag "string-concat" "entry"))
+    (document-keyword :string-code-point-at) (document-keyword (tag "string-code-point-at" "entry"))
+    (document-keyword :string-compare) (document-keyword (tag "string-compare" "entry"))))
 
 (defn- slot-code [cfg [:ref :linux.static.strings/config] slot :keyword]
   [:list [:ref :linux.static/instruction]]
@@ -312,7 +360,10 @@
       :string-index-of (index-of-slot out cfg)
       :string-substring (substring-slot out cfg)
       :string-concat (concat-slot out cfg)
-      :all (concat-slot (substring-slot (index-of-slot (equal-slot (pair-slots out cfg) cfg) cfg) cfg) cfg)
+      :string-code-point-at (code-point-slot out cfg)
+      :string-compare (compare-slot out cfg)
+      :all (compare-slot (code-point-slot
+             (concat-slot (substring-slot (index-of-slot (equal-slot (pair-slots out cfg) cfg) cfg) cfg) cfg) cfg) cfg)
       out)))
 
 (defn- configuration-error [context :document] :keyword

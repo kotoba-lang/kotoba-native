@@ -1,0 +1,4 @@
+;; Keep the index dynamic so the actual helper's negative guard is exercised.
+(ns bootstrap.code-point-negative (:export [main]))
+(defn- index [] :i64 -1)
+(defn main [] :i64 (string-code-point-at "日" (index)))
