@@ -1,0 +1,42 @@
+(ns bootstrap.context-sentinels
+  (:require [kotoba.artifact.data :as meta]
+            [kotoba.native.linux-static-context :as context]
+            [kotoba.native.linux-static-assembler :as asm]
+            [kotoba.native.linux-static-io :as io])
+  (:export [main]))
+
+;; Pure builder fixture. This supplies layout test data, not a sealed artifact
+;; or an authority grant. Four initially unowned descriptors must encode -1.
+(defn- abi [] [:ref :form/r]
+  (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map) (meta/value-keyword :version) (meta/value-i64 11)) (meta/value-keyword :fuel-offset) (meta/value-i64 8)) (meta/value-keyword :allow-bitmap-offset) (meta/value-i64 16)) (meta/value-keyword :pair-used-pointer-offset) (meta/value-i64 288)) (meta/value-keyword :pairs-base-offset) (meta/value-i64 296)) (meta/value-keyword :pair-validated-base-offset) (meta/value-i64 304)) (meta/value-keyword :vector-used-pointer-offset) (meta/value-i64 312)) (meta/value-keyword :vectors-base-offset) (meta/value-i64 320)) (meta/value-keyword :vector-items-base-offset) (meta/value-i64 328)))
+
+(defn- plan [fuel :i64] [:ref :form/r]
+  (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map) (meta/value-keyword :context-abi) (abi)) (meta/value-keyword :fuel) (meta/value-i64 fuel)) (meta/value-keyword :cells) (meta/value-i64 2)) (meta/value-keyword :bytes) (meta/value-i64 16)) (meta/value-keyword :vectors) (meta/value-i64 2)) (meta/value-keyword :vector-items) (meta/value-i64 16)) (meta/value-keyword :metered?) (meta/value-bool false)) (meta/value-keyword :slots) (meta/value-map)) (meta/value-keyword :grant) (meta/value-vector)))
+
+(defn- layout [] [:ref :form/r]
+  (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map) (meta/value-keyword :text) (meta/value-i64 4198400)) (meta/value-keyword :data) (meta/value-i64 4202496)) (meta/value-keyword :memory-size) (meta/value-i64 65536)) (meta/value-keyword :alt) (meta/value-i64 4206592)) (meta/value-keyword :pairs) (meta/value-i64 4222976)) (meta/value-keyword :valid) (meta/value-i64 4223008)) (meta/value-keyword :vectors) (meta/value-i64 4223024)) (meta/value-keyword :vector-items) (meta/value-i64 4223056)) (meta/value-keyword :pool) (meta/value-i64 4223184)))
+
+(defn- build [fuel :i64] [:ref :linux.static.context/result]
+  (let [labels (typed-list-conj [:list [:ref :linux.static/label]]
+                 (typed-list-new [:list [:ref :linux.static/label]])
+                 (asm/label "ls/handler" 4198400))]
+    (context/context-bytes (plan fuel) (layout) labels (meta/value-map) 4198416 8)))
+
+(defn- empty-fd? [bytes :vector-i64 key :keyword] :bool
+  (let [offset (io/state-offset key)]
+    (loop [index 0]
+      (if (= index 8) true
+        (if (= (vector-at bytes (+ offset index)) 255) (recur (+ index 1)) false)))))
+
+(defn main [] :i64
+  (let [good (build 1000) bad (build -1)]
+    (if (not= (record-get [:ref :linux.static.context/result] good :error) :ok) 1
+      (let [bytes (record-get [:ref :linux.static.context/result] good :bytes)]
+        (if (and (= (vector-count bytes) (context/initialized-size))
+                 (<= (context/initialized-size) 4096)
+                 (= (vector-at bytes 384) 16) (= (vector-at bytes 385) 16)
+                 (= (vector-at bytes 386) 64) (= (vector-at bytes 392) 8)
+                 (empty-fd? bytes :out-parent) (empty-fd? bytes :out-directory)
+                 (empty-fd? bytes :out-file) (empty-fd? bytes :out-probe)
+                 (= (record-get [:ref :linux.static.context/result] bad :error) :initial-values))
+          0 2)))))

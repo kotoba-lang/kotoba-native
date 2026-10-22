@@ -1,0 +1,705 @@
+;; Canonical planning boundary for the complete Linux-static packager.
+;; Reference: linux_static.cljk, owning main 535ca0a3.
+;; Source candidate only: no hosted numeric conversion or verifier callback.
+(ns kotoba.native.linux-static-plan
+  {:kotoba/export [targets implemented-slots slot-names plan image-layout]}
+  (:require [kotoba.artifact.data :as meta]
+            [kotoba.artifact.form-seal :as artifact]
+            [kotoba.native.linux-static-sha256 :as sha256]
+            [kotoba.native.linux-static-vectors :as vectors])
+  (:schemas {:linux.static.plan/result
+             [:record :linux.static.plan/result
+              [[:value [:ref :form/r]] [:error :keyword] [:data [:ref :form/r]]]]}))
+
+(defn- ok [value [:ref :form/r]] [:ref :linux.static.plan/result]
+  (record-new [:ref :linux.static.plan/result] value :ok (meta/value-null)))
+
+(defn- fail [error :keyword data [:ref :form/r]] [:ref :linux.static.plan/result]
+  (record-new [:ref :linux.static.plan/result] (meta/value-null) error data))
+
+(defn- value [r [:ref :linux.static.plan/result]] [:ref :form/r]
+  (record-get [:ref :linux.static.plan/result] r :value))
+
+(defn- good? [r [:ref :linux.static.plan/result]] :bool
+  (= (record-get [:ref :linux.static.plan/result] r :error) :ok))
+
+(defn- item [v [:ref :form/r] index :i64] [:ref :form/r]
+  (option-value-of [:option [:ref :form/r]] (meta/value-vector-at v index) (meta/value-null)))
+
+(defn- entry [m [:ref :form/r] index :i64] [:ref :form/r]
+  (option-value-of [:option [:ref :form/r]] (meta/value-map-entry-at m index) (meta/value-null)))
+
+(defn- lookup [m [:ref :form/r] key [:ref :form/r]] [:ref :form/r]
+  (if (not= (meta/value-kind m) :map) (meta/value-null)
+    (loop [index 0]
+      (if (>= index (meta/value-count m)) (meta/value-null)
+        (let [pair (entry m index)]
+          (if (meta/value-equal? (item pair 0) key) (item pair 1) (recur (+ index 1))))))))
+
+(defn- has? [m [:ref :form/r] key [:ref :form/r]] :bool
+  (if (not= (meta/value-kind m) :map) false
+    (loop [index 0]
+      (if (>= index (meta/value-count m)) false
+        (if (meta/value-equal? (item (entry m index) 0) key) true (recur (+ index 1)))))))
+
+(defn- get-key [m [:ref :form/r] key :keyword] [:ref :form/r] (lookup m (meta/value-keyword key)))
+(defn- get2 [m [:ref :form/r] a :keyword b :keyword] [:ref :form/r] (get-key (get-key m a) b))
+(defn- get3 [m [:ref :form/r] a :keyword b :keyword c :keyword] [:ref :form/r] (get-key (get2 m a b) c))
+(defn- i64-of [d [:ref :form/r]] :i64 (option-value-of [:option :i64] (meta/value-i64-value d) 0))
+(defn- string-of [d [:ref :form/r]] :string (option-value-of [:option :string] (meta/value-string-value d) ""))
+(defn- key-of [d [:ref :form/r]] :keyword (option-value-of [:option :keyword] (meta/value-keyword-value d) :none))
+(defn- bool-of [d [:ref :form/r]] :bool (option-value-of [:option :bool] (meta/value-bool-value d) false))
+(defn- i64-document? [d [:ref :form/r]] :bool (= (meta/value-kind d) :i64))
+
+(defn- truthy? [d [:ref :form/r]] :bool
+  (and (not= (meta/value-kind d) :null) (not (and (= (meta/value-kind d) :bool) (not (bool-of d))))))
+
+(defn- put [m [:ref :form/r] key [:ref :form/r] v [:ref :form/r]] [:ref :form/r]
+  (meta/value-merge m (-> (meta/value-map)
+      (meta/value-map-insert key v))))
+
+(defn- put-key [m [:ref :form/r] key :keyword v [:ref :form/r]] [:ref :form/r] (put m (meta/value-keyword key) v))
+
+(defn- field [name :keyword] [:ref :form/r] (-> (meta/value-map)
+      (meta/value-map-insert (meta/value-keyword :field) (meta/value-keyword name))))
+
+(defn- sequence-vector [xs [:ref :form/r] reason :keyword] [:ref :linux.static.plan/result]
+  (case (meta/value-kind xs)
+    :vector (ok xs)
+    :list (loop [index 0 out (meta/value-vector)]
+            (if (>= index (meta/value-count xs)) (ok out)
+              (recur (+ index 1)
+                     (meta/value-vector-conj out
+                       (option-value-of [:option [:ref :form/r]] (meta/value-list-at xs index) (meta/value-null))))))
+    :set (ok (meta/value-as-vector xs))
+    (fail reason xs)))
+
+(defn- contains-value? [xs [:ref :form/r] x [:ref :form/r]] :bool
+  (loop [index 0]
+    (if (>= index (meta/value-count xs)) false
+      (if (meta/value-equal? (item xs index) x) true (recur (+ index 1))))))
+
+(defn- insert-wire [xs [:ref :form/r] wire :i64] [:ref :form/r]
+  (loop [index 0 inserted false out (meta/value-vector)]
+    (if (>= index (meta/value-count xs))
+      (if inserted out (meta/value-vector-conj out (meta/value-i64 wire)))
+      (let [current (i64-of (item xs index))]
+        (cond
+          (= current wire) xs
+          (and (not inserted) (< wire current))
+          (recur index true (meta/value-vector-conj out (meta/value-i64 wire)))
+          :else (recur (+ index 1) inserted (meta/value-vector-conj out (item xs index))))))))
+
+(defn- wire-vector [xs [:ref :form/r] reason :keyword] [:ref :linux.static.plan/result]
+  (let [parsed (sequence-vector xs reason)]
+    (if (not (good? parsed)) parsed
+      (loop [index 0 out (meta/value-vector)]
+        (if (>= index (meta/value-count (value parsed))) (ok out)
+          (let [wire (item (value parsed) index)]
+            (cond
+              (not (i64-document? wire)) (fail reason wire)
+              (or (< (i64-of wire) 0) (> (i64-of wire) 255)) (fail :capability-wire-range wire)
+              :else (recur (+ index 1) (insert-wire out (i64-of wire))))))))))
+
+(defn- effect-ids [effects [:ref :form/r]] [:ref :linux.static.plan/result]
+  (let [parsed (sequence-vector (if (= (meta/value-kind effects) :null) (meta/value-vector) effects)
+                                :effect-not-capability)]
+    (if (not (good? parsed)) parsed
+      (loop [index 0 out (meta/value-vector)]
+        (if (>= index (meta/value-count (value parsed))) (ok out)
+          (let [effect (item (value parsed) index)]
+            (cond
+              (and (= (meta/value-kind effect) :keyword)
+                   (or (= (key-of effect) :state) (= (key-of effect) :abort)))
+              (recur (+ index 1) out)
+              (not (and (= (meta/value-kind effect) :vector) (= (meta/value-count effect) 2)
+                        (= (meta/value-kind (item effect 0)) :keyword) (= (key-of (item effect 0)) :cap/call)
+                        (i64-document? (item effect 1))))
+              (fail :effect-not-capability effect)
+              (or (< (i64-of (item effect 1)) 0) (> (i64-of (item effect 1)) 255))
+              (fail :capability-wire-range effect)
+              :else (recur (+ index 1) (insert-wire out (i64-of (item effect 1)))))))))))
+
+(defn- canonical-scope? [path :string] :bool
+  (let [bytes (string-to-utf8 path) n (bytes-count bytes)]
+    (if (or (< n 1) (>= n 4096) (not= (bytes-at bytes 0) 47)
+            (and (> n 1) (= (bytes-at bytes (- n 1)) 47))) false
+      (if (= n 1) true
+        (loop [index 1 start 1]
+          (if (or (= index n) (= (bytes-at bytes index) 47))
+            (let [length (- index start)]
+              (if (or (= length 0)
+                      (and (= length 1) (= (bytes-at bytes start) 46))
+                      (and (= length 2) (= (bytes-at bytes start) 46) (= (bytes-at bytes (+ start 1)) 46))) false
+                (if (= index n) true (recur (+ index 1) (+ index 1)))))
+            (if (= (bytes-at bytes index) 0) false (recur (+ index 1) start))))))))
+
+(defn- basename [path :string] :string
+  (let [bytes (string-to-utf8 path) n (bytes-count bytes)]
+    (loop [index 0 start 0]
+      (if (>= index n) (string-substring path start n)
+        (recur (+ index 1) (if (= (bytes-at bytes index) 47) (+ index 1) start))))))
+
+(defn- env-name? [name :string] :bool
+  (let [bytes (string-to-utf8 name) n (bytes-count bytes)]
+    (if (or (< n 1) (>= n 256)) false
+      (loop [index 0]
+        (if (>= index n) true
+          (if (or (= (bytes-at bytes index) 0) (= (bytes-at bytes index) 61)) false (recur (+ index 1))))))))
+
+(defn- spawn-programs [programs [:ref :form/r] lookup? :bool] [:ref :linux.static.plan/result]
+  (if (or (not= (meta/value-kind programs) :vector) (> (meta/value-count programs) 16))
+    (fail :spawn-programs-malformed programs)
+    (loop [index 0 seen (meta/value-vector) names (meta/value-vector)]
+      (if (>= index (meta/value-count programs)) (ok programs)
+        (let [program (item programs index)]
+          (cond
+            (or (not= (meta/value-kind program) :string) (not (canonical-scope? (string-of program)))
+                (string=? (string-of program) "/") (contains-value? seen program))
+            (fail :spawn-programs-malformed program)
+            (and lookup? (contains-value? names (meta/value-string (basename (string-of program)))))
+            (fail :spawn-lookup-ambiguous program)
+            :else (recur (+ index 1) (meta/value-vector-conj seen program)
+                         (meta/value-vector-conj names (meta/value-string (basename (string-of program)))))))))))
+
+(defn- spawn-env [env [:ref :form/r]] [:ref :linux.static.plan/result]
+  (if (or (not= (meta/value-kind env) :vector) (> (meta/value-count env) 16))
+    (fail :spawn-env-malformed env)
+    (loop [index 0]
+      (if (>= index (meta/value-count env)) (ok env)
+        (let [name (item env index)]
+          (if (and (= (meta/value-kind name) :string) (env-name? (string-of name)))
+            (recur (+ index 1)) (fail :spawn-env-malformed name)))))))
+
+(defn- spawn-grant [spawn [:ref :form/r] grant [:ref :form/r]] [:ref :linux.static.plan/result]
+  (if (not (truthy? spawn))
+    (ok (-> (meta/value-map)
+      (meta/value-map-insert (meta/value-keyword :programs) (meta/value-vector))
+      (meta/value-map-insert (meta/value-keyword :path-lookup) (meta/value-bool false))
+      (meta/value-map-insert (meta/value-keyword :env) (meta/value-vector))))
+    (cond
+      (not (contains-value? grant (meta/value-i64 20))) (fail :spawn-without-capability spawn)
+      (not= (meta/value-kind spawn) :map) (fail :spawn-programs-malformed spawn)
+      :else
+      (let [programs0 (get-key spawn :programs) env0 (get-key spawn :env)
+            lookup (get-key spawn :path-lookup)
+            programs (if (truthy? programs0) programs0 (meta/value-vector))
+            env (if (truthy? env0) env0 (meta/value-vector))]
+        (if (not (or (= (meta/value-kind lookup) :null) (= (meta/value-kind lookup) :bool)))
+          (fail :spawn-path-lookup-malformed lookup)
+          (let [pr (spawn-programs programs (bool-of lookup)) er (spawn-env env)]
+            (cond
+              (not (good? pr)) pr
+              (not (good? er)) er
+              :else (ok (-> (meta/value-map)
+      (meta/value-map-insert (meta/value-keyword :programs) (value pr))
+      (meta/value-map-insert (meta/value-keyword :path-lookup) (meta/value-bool (bool-of lookup)))
+      (meta/value-map-insert (meta/value-keyword :env) (value er)))))))))))
+
+(defn targets [] [:ref :form/r]
+  (-> (meta/value-map)
+      (meta/value-map-insert (meta/value-keyword :x86_64-linux-static-kotoba-v1) (-> (meta/value-map)
+      (meta/value-map-insert (meta/value-keyword :isa) (meta/value-keyword :x86_64))
+      (meta/value-map-insert (meta/value-keyword :machine) (meta/value-keyword :x86-64))
+      (meta/value-map-insert (meta/value-keyword :context-register) (meta/value-keyword :r9))))
+      (meta/value-map-insert (meta/value-keyword :aarch64-linux-static-kotoba-v1) (-> (meta/value-map)
+      (meta/value-map-insert (meta/value-keyword :isa) (meta/value-keyword :aarch64))
+      (meta/value-map-insert (meta/value-keyword :machine) (meta/value-keyword :aarch64))
+      (meta/value-map-insert (meta/value-keyword :context-register) (meta/value-keyword :x7))))))
+
+(defn implemented-slots [] [:ref :form/r]
+  (-> (meta/value-set)
+      (meta/value-set-conj (meta/value-keyword :pair-new))
+      (meta/value-set-conj (meta/value-keyword :pair-first))
+      (meta/value-set-conj (meta/value-keyword :pair-second))
+      (meta/value-set-conj (meta/value-keyword :kgraph-assert))
+      (meta/value-set-conj (meta/value-keyword :kgraph-get))
+      (meta/value-set-conj (meta/value-keyword :string-equal))
+      (meta/value-set-conj (meta/value-keyword :string-concat))
+      (meta/value-set-conj (meta/value-keyword :string-substring))
+      (meta/value-set-conj (meta/value-keyword :string-index-of))
+      (meta/value-set-conj (meta/value-keyword :string-code-point-at))
+      (meta/value-set-conj (meta/value-keyword :string-compare))
+      (meta/value-set-conj (meta/value-keyword :vector-new-empty))
+      (meta/value-set-conj (meta/value-keyword :vector-conj))
+      (meta/value-set-conj (meta/value-keyword :vector-count))
+      (meta/value-set-conj (meta/value-keyword :vector-at))
+      (meta/value-set-conj (meta/value-keyword :vector-assoc))
+      (meta/value-set-conj (meta/value-keyword :vector-alloc))
+      (meta/value-set-conj (meta/value-keyword :vector-assoc-in-place))
+      (meta/value-set-conj (meta/value-keyword :vector-drop))
+      (meta/value-set-conj (meta/value-keyword :bytes-from-vector))
+      (meta/value-set-conj (meta/value-keyword :bytes-slice))
+      (meta/value-set-conj (meta/value-keyword :bytes-concat))
+      (meta/value-set-conj (meta/value-keyword :string-from-utf8))
+      (meta/value-set-conj (meta/value-keyword :typed-cap-call))))
+
+(defn- normalized-code [code [:ref :form/r]] [:ref :linux.static.plan/result]
+  ;; A decision component is a bounded byte node, not one document-vector
+  ;; member per byte. That vector would exceed the document collection bound.
+  (if (= (meta/value-kind code) :bytes)
+    (if (option-some?-of [:option :bytes] (meta/value-bytes-value code))
+      (ok code) (fail :handler-code code))
+    (let [parsed (sequence-vector code :handler-code)]
+    (if (not (good? parsed)) parsed
+      (loop [index 0 out (vector-alloc (meta/value-count (value parsed)))]
+        (if (>= index (meta/value-count (value parsed)))
+          (ok (meta/value-bytes (bytes-from-vector-i64 out)))
+          (let [byte (item (value parsed) index)]
+            (if (not (i64-document? byte)) (fail :handler-code byte)
+              (recur (+ index 1) (vector-assoc! out index (bit-and (i64-of byte) 255)))))))))))
+
+(defn- code-size [code [:ref :form/r]] :i64
+  (bytes-count (option-value-of [:option :bytes] (meta/value-bytes-value code) (bytes-empty))))
+
+(defn- handler-code [source [:ref :form/r] isa :keyword names [:ref :form/r]] [:ref :linux.static.plan/result]
+  (cond
+    (or (not= (meta/value-kind source) :map) (not (artifact/valid-seal? source)))
+    (fail :handler-unsealed (get-key source :sha256))
+    (not (meta/value-equal? (get-key source :lowering)
+                          (meta/value-keyword (if (= isa :x86_64) :runtime-sysv-v1 :runtime-aapcs64-v1))))
+    (fail :handler-isa (get-key source :lowering))
+    :else
+    (let [code (normalized-code (get-key source :code)) exports (get-key source :exports)]
+      (if (not (good? code)) code
+        (loop [index 0 offsets (meta/value-map)]
+          (if (>= index (meta/value-count names))
+            (ok (-> (meta/value-map)
+      (meta/value-map-insert (meta/value-keyword :code) (value code))
+      (meta/value-map-insert (meta/value-keyword :offsets) offsets)))
+            (let [name (item names index) export (lookup exports name) offset (get-key export :offset)]
+              (if (or (not= (meta/value-kind export) :map) (not (i64-document? offset))
+                      (< (i64-of offset) 0) (>= (i64-of offset) (code-size (value code))))
+                (fail :handler-export name)
+                (recur (+ index 1) (put offsets name offset))))))))))
+
+(defn- handler-pair [overrides [:ref :form/r] isa :keyword] [:ref :linux.static.plan/result]
+  (let [handlers (get-key overrides :handlers)
+        decisions (get-key handlers :decisions) service (get-key handlers :handlers)]
+    (if (or (not (truthy? decisions)) (not (truthy? service))) (fail :handlers-missing handlers)
+      (let [dr (handler-code decisions isa
+                 (-> (meta/value-vector)
+      (meta/value-vector-conj (meta/value-symbol "cap-admitted"))
+      (meta/value-vector-conj (meta/value-symbol "decide"))))]
+        (if (not (good? dr)) dr
+          (let [hr (handler-code service isa (-> (meta/value-vector)
+      (meta/value-vector-conj (meta/value-symbol "decide"))))]
+            (if (not (good? hr)) hr
+              (ok (-> (meta/value-map)
+      (meta/value-map-insert (meta/value-keyword :decisions) (value dr))
+      (meta/value-map-insert (meta/value-keyword :handlers) (value hr)))))))))))
+
+(defn- grant-subset? [grant [:ref :form/r] effects [:ref :form/r]] :bool
+  (loop [index 0]
+    (if (>= index (meta/value-count grant)) true
+      (if (contains-value? effects (item grant index)) (recur (+ index 1)) false))))
+
+(defn- unhandled [effects [:ref :form/r] handled [:ref :form/r] named [:ref :form/r]] [:ref :form/r]
+  (loop [index 0 out (meta/value-vector)]
+    (if (>= index (meta/value-count effects)) out
+      (let [wire (item effects index)]
+        (recur (+ index 1)
+               (if (has? handled wire) out
+                 (meta/value-vector-conj out (-> (meta/value-vector)
+      (meta/value-vector-conj wire)
+      (meta/value-vector-conj (lookup named wire))))))))))
+
+(defn- capability-plan [source [:ref :form/r] profile [:ref :form/r] overrides [:ref :form/r]] [:ref :linux.static.plan/result]
+  (let [effects (effect-ids (get-key source :effects))
+        target (lookup (targets) (get-key source :target))
+        raw-grant (get-key overrides :grant)
+        scope (get-key overrides :fs-scope)]
+    (if (not (good? effects)) effects
+      (let [missing (unhandled (value effects)
+                      (get3 profile :static-elf :capability-handlers :value)
+                      (get3 profile :static-elf :refused-capabilities :value))
+            grant (wire-vector (if (truthy? raw-grant) raw-grant (value effects)) :grant-malformed)]
+        (cond
+          (> (meta/value-count missing) 0) (fail :capability-without-handler missing)
+          (not (good? grant)) grant
+          (not (grant-subset? (value grant) (value effects))) (fail :grant-widens-effects (value grant))
+          (and (truthy? scope) (or (not= (meta/value-kind scope) :string) (not (canonical-scope? (string-of scope)))))
+          (fail :fs-scope-not-canonical scope)
+          (and (> (meta/value-count (value effects)) 0) (= (meta/value-kind target) :null))
+          (fail :not-linux-static (get-key source :target))
+          :else
+          (let [spawn (spawn-grant (get-key overrides :spawn) (value grant))]
+            (if (not (good? spawn)) spawn
+              (let [base (-> (meta/value-map)
+      (meta/value-map-insert (meta/value-keyword :effect-ids) (value effects))
+      (meta/value-map-insert (meta/value-keyword :grant) (value grant))
+      (meta/value-map-insert (meta/value-keyword :fs-scope) scope)
+      (meta/value-map-insert (meta/value-keyword :spawn) (value spawn)))]
+                (if (= (meta/value-count (value effects)) 0) (ok base)
+                  (let [handlers (handler-pair overrides (key-of (get-key target :isa)))]
+                    (if (not (good? handlers)) handlers
+                      (ok (put-key base :handler-code (value handlers))))))))))))))
+
+(defn- data-word? [name :keyword] :bool
+  (case name
+    :fuel-offset true :allow-bitmap-offset true :pair-used-pointer-offset true
+    :pairs-base-offset true :pair-validated-base-offset true
+    :vector-used-pointer-offset true :vectors-base-offset true :vector-items-base-offset true false))
+
+;; The reference sorted-map compares keyword names as UTF-16, on both hosts.
+;; Canonical strings use UTF-8 bytes; compare the corresponding code units.
+(defn- utf16-units [name :string] :vector-i64
+  (let [bytes (string-to-utf8 name) n (bytes-count bytes)]
+    (loop [index 0 out (vector-alloc 0)]
+      (if (>= index n) out
+        (let [a (bytes-at bytes index)
+              width (if (< a 128) 1 (if (< a 224) 2 (if (< a 240) 3 4)))
+              point
+              (if (= width 1) a
+                (if (= width 2)
+                  (+ (* (bit-and a 31) 64) (bit-and (bytes-at bytes (+ index 1)) 63))
+                  (if (= width 3)
+                    (+ (* (bit-and a 15) 4096) (* (bit-and (bytes-at bytes (+ index 1)) 63) 64)
+                       (bit-and (bytes-at bytes (+ index 2)) 63))
+                    (+ (* (bit-and a 7) 262144) (* (bit-and (bytes-at bytes (+ index 1)) 63) 4096)
+                       (* (bit-and (bytes-at bytes (+ index 2)) 63) 64) (bit-and (bytes-at bytes (+ index 3)) 63)))))
+              next (if (< point 65536) (vector-conj out point)
+                     (let [rest (- point 65536)]
+                       (vector-conj (vector-conj out (+ 55296 (quot rest 1024))) (+ 56320 (bit-and rest 1023)))))]
+          (recur (+ index width) next))))))
+
+(defn- compare-names [a :string b :string] :i64
+  (let [x (utf16-units a) y (utf16-units b)
+        xn (vector-count x) yn (vector-count y)]
+    (loop [index 0]
+      (if (or (>= index xn) (>= index yn)) (- xn yn)
+        (let [difference (- (vector-at x index) (vector-at y index))]
+          (if (not= difference 0) difference (recur (+ index 1))))))))
+
+(defn- sort-keyed-map [m [:ref :form/r]] [:ref :form/r]
+  (loop [remaining m out (meta/value-map)]
+    (if (= (meta/value-count remaining) 0) out
+      (let [best (loop [index 1 selected 0]
+                   (if (>= index (meta/value-count remaining)) selected
+                     (let [a (keyword-name (key-of (item (entry remaining index) 0)))
+                           b (keyword-name (key-of (item (entry remaining selected) 0)))]
+                       (recur (+ index 1) (if (< (compare-names a b) 0) index selected)))))
+            pair (entry remaining best) key (item pair 0)
+            rest (loop [index 0 result (meta/value-map)]
+                   (if (>= index (meta/value-count remaining)) result
+                     (let [current (entry remaining index)]
+                       (recur (+ index 1)
+                              (if (= index best) result (put result (item current 0) (item current 1)))))))]
+        (recur rest (put out key (item pair 1)))))))
+
+(defn slot-names [context [:ref :form/r]] [:ref :linux.static.plan/result]
+  (if (not= (meta/value-kind context) :map) (fail :context-abi-shape context)
+    (loop [index 0 out (meta/value-map)]
+      (if (>= index (meta/value-count context)) (ok (sort-keyed-map out))
+        (let [pair (entry context index) key (item pair 0) offset (item pair 1)]
+          (if (not= (meta/value-kind key) :keyword) (fail :context-abi-key key)
+            (let [name (keyword-name (key-of key)) length (string-length name)]
+              (if (and (>= length 7) (string=? (string-substring name (- length 7) length) "-offset")
+                       (not (data-word? (key-of key))))
+                (if (= length 7) (fail :context-abi-key key)
+                  (if (or (not (i64-document? offset)) (< (i64-of offset) 0)) (fail :context-abi-offset pair)
+                    (recur (+ index 1)
+                           (put out (meta/value-keyword (keyword-from-string (string-substring name 0 (- length 7)))) offset))))
+                (recur (+ index 1) out)))))))))
+
+(defn- admitted-slots [raw [:ref :form/r]] [:ref :linux.static.plan/result]
+  (let [parsed (sequence-vector raw :native-profile-incomplete)]
+    (if (not (good? parsed)) parsed
+      (loop [index 0 out (meta/value-vector)]
+        (if (>= index (meta/value-count (value parsed))) (ok out)
+          (let [slot (item (value parsed) index)]
+            (cond
+              (not= (meta/value-kind slot) :keyword) (fail :native-profile-incomplete (field :admitted-slots))
+              (not (meta/value-set-contains? (implemented-slots) slot)) (fail :admitted-slot-unimplemented slot)
+              :else (recur (+ index 1) (if (contains-value? out slot) out (meta/value-vector-conj out slot))))))))))
+
+(defn- exit-codes [exits [:ref :form/r] traps [:ref :form/r] handlers? :bool] [:ref :linux.static.plan/result]
+  (let [required (-> (meta/value-vector)
+      (meta/value-vector-conj (meta/value-keyword :ok))
+      (meta/value-vector-conj (meta/value-keyword :trap/signal))
+      (meta/value-vector-conj (meta/value-keyword :budget/fuel))
+      (meta/value-vector-conj (meta/value-keyword :budget/cells))
+      (meta/value-vector-conj (meta/value-keyword :budget/bytes))
+      (meta/value-vector-conj (get-key traps :slot))
+      (meta/value-vector-conj (get-key traps :fuel))
+      (meta/value-vector-conj (get-key traps :cells))
+      (meta/value-vector-conj (get-key traps :bytes)))
+        all (if handlers? (meta/value-vector-conj required (meta/value-keyword :capability/refused)) required)]
+    (loop [index 0]
+      (if (>= index (meta/value-count all)) (ok exits)
+        (let [outcome (item all index)]
+          (if (not (i64-document? (lookup exits outcome))) (fail :exit-code-missing outcome)
+            (recur (+ index 1))))))))
+
+(defn- vector-slots? [admitted [:ref :form/r]] :bool
+  (loop [index 0]
+    (if (>= index (meta/value-count admitted)) false
+      (if (meta/value-set-contains? (vectors/supported-slots) (item admitted index)) true (recur (+ index 1))))))
+
+(defn- bytes-slots? [admitted [:ref :form/r]] :bool
+  (loop [index 0]
+    (if (>= index (meta/value-count admitted)) false
+      (if (meta/value-set-contains? (vectors/supported-byte-slots) (item admitted index)) true (recur (+ index 1))))))
+(defn- byte-value-traps [static [:ref :form/r] bytes? :bool] [:ref :linux.static.plan/result]
+  (if (not bytes?) (ok (meta/value-vector))
+    (let [names (get2 static :bytes-value-traps :value)]
+      (if (or (not= (meta/value-kind names) :vector) (not= (meta/value-count names) 11))
+        (fail :native-profile-incomplete (field :bytes-value-traps))
+        (loop [i 0]
+          (if (= i 11) (ok names)
+            (if (= (meta/value-kind (item names i)) :keyword) (recur (+ i 1))
+              (fail :native-profile-incomplete (field :bytes-value-traps)))))))))
+
+(defn- budgets [profile [:ref :form/r] overrides [:ref :form/r] vectors? :bool bytes? :bool] [:ref :linux.static.plan/result]
+  (let [raw-cells (get-key overrides :cells) raw-bytes (get-key overrides :bytes)
+        cells (if (truthy? raw-cells) raw-cells (get3 profile :cells :default :value))
+        cells-max (get3 profile :cells :pair-arena-max :value)
+        bytes (if (truthy? raw-bytes) raw-bytes (get3 profile :bytes :default :value))
+        bytes-max (get3 profile :bytes :max :value)
+        raw-vectors (get-key overrides :vectors) raw-items (get-key overrides :vector-items)
+        table (if (truthy? raw-vectors) raw-vectors (get3 profile :cells :vectors :value))
+        table-max (get3 profile :cells :vectors :max)
+        items (if (truthy? raw-items) raw-items (get3 profile :cells :vector-items :value))
+        items-max (get3 profile :cells :vector-items :max)
+        limit (get3 profile :cells :vector-items :per-vector-max)
+        byte-limit (get2 profile :bytes :value-max) string-limit (get2 profile :bytes :string-value-max)]
+    (cond
+      (not (i64-document? cells-max)) (fail :native-profile-incomplete (field :pair-arena-max))
+      (not (i64-document? bytes-max)) (fail :native-profile-incomplete (field :bytes-max))
+      (or (not (i64-document? cells)) (< (i64-of cells) 1) (> (i64-of cells) (i64-of cells-max)))
+      (fail :cells-outside-profile cells)
+      (or (not (i64-document? bytes)) (< (i64-of bytes) 1) (> (i64-of bytes) (i64-of bytes-max)))
+      (fail :bytes-outside-profile bytes)
+      (and vectors? (or (not (i64-document? table-max)) (not (i64-document? items-max))
+                       (not (i64-document? limit)) (< (i64-of table-max) 1)
+                       (< (i64-of items-max) 1) (< (i64-of limit) 1)))
+      (fail :native-profile-incomplete (field :vector-bounds))
+      (and vectors? (or (not (i64-document? table)) (< (i64-of table) 1) (> (i64-of table) (i64-of table-max))))
+      (fail :vectors-outside-profile table)
+      (and vectors? (or (not (i64-document? items)) (< (i64-of items) 1) (> (i64-of items) (i64-of items-max))))
+      (fail :vector-items-outside-profile items)
+      (and (not vectors?) (or (truthy? raw-vectors) (truthy? raw-items)))
+      (fail :vector-slots-not-admitted (field :vectors))
+      (and bytes? (or (not (i64-document? byte-limit)) (< (i64-of byte-limit) 1) (> (i64-of byte-limit) 65536)
+                     (not (i64-document? string-limit)) (< (i64-of string-limit) 1) (> (i64-of string-limit) 65536)))
+      (fail :native-profile-incomplete (field :byte-value-bounds))
+      :else (ok (-> (meta/value-map)
+      (meta/value-map-insert (meta/value-keyword :cells) cells)
+      (meta/value-map-insert (meta/value-keyword :bytes) bytes)
+      (meta/value-map-insert (meta/value-keyword :vectors) (if vectors? table (meta/value-i64 0)))
+      (meta/value-map-insert (meta/value-keyword :vector-items) (if vectors? items (meta/value-i64 0)))
+      (meta/value-map-insert (meta/value-keyword :vector-item-limit) (if vectors? limit (meta/value-i64 0)))
+      (meta/value-map-insert (meta/value-keyword :byte-value-limit) (if bytes? byte-limit (meta/value-i64 0)))
+      (meta/value-map-insert (meta/value-keyword :string-value-limit) (if bytes? string-limit (meta/value-i64 0))))))))
+
+(defn- slot-plan [names [:ref :form/r] admitted [:ref :form/r] handlers? :bool] [:ref :form/r]
+  (loop [index 0 out (meta/value-map)]
+    (if (>= index (meta/value-count names)) out
+      (let [pair (entry names index) slot (item pair 0)]
+        (recur (+ index 1)
+               (put out slot
+                    (-> (meta/value-map)
+      (meta/value-map-insert (meta/value-keyword :offset) (item pair 1))
+      (meta/value-map-insert (meta/value-keyword :admitted?) (meta/value-bool (and (contains-value? admitted slot)
+                                     (or (not= (key-of slot) :typed-cap-call) handlers?)))))))))))
+
+(defn plan [source [:ref :form/r] profile [:ref :form/r] overrides [:ref :form/r]] [:ref :linux.static.plan/result]
+  (let [static (get-key profile :static-elf)
+        context (get-key source :context-abi)
+        fuel (get2 source :fuel-abi :initial)
+        traps (-> (meta/value-map)
+      (meta/value-map-insert (meta/value-keyword :fuel) (get2 profile :fuel :trap))
+      (meta/value-map-insert (meta/value-keyword :cells) (get2 profile :cells :trap))
+      (meta/value-map-insert (meta/value-keyword :bytes) (get2 profile :bytes :trap))
+      (meta/value-map-insert (meta/value-keyword :slot) (get-key static :unimplemented-slot-trap)))]
+    (cond
+      (not= (meta/value-kind static) :map) (fail :native-profile-incomplete (field :static-elf))
+      (or (not= (meta/value-kind (get-key traps :fuel)) :keyword)
+          (not= (meta/value-kind (get-key traps :cells)) :keyword)
+          (not= (meta/value-kind (get-key traps :bytes)) :keyword)
+          (not= (meta/value-kind (get-key traps :slot)) :keyword))
+      (fail :native-profile-incomplete (field :trap-names))
+      (or (not (i64-document? (get-key context :version))) (not= (i64-of (get-key context :version)) 11))
+      (fail :context-abi-version (get-key context :version))
+      (not (i64-document? fuel)) (fail :native-profile-incomplete (field :initial-fuel))
+      :else
+      (let [names (slot-names context)
+            admitted (admitted-slots (get2 static :admitted-slots :value))
+            byte-slots (and (good? admitted) (bytes-slots? (value admitted)))
+            values (byte-value-traps static byte-slots)
+            limits (budgets profile overrides (and (good? admitted) (vector-slots? (value admitted))) byte-slots)]
+        (cond
+          (not (good? limits)) limits
+          (not (good? names)) names
+          (not (good? admitted)) admitted
+          (not (good? values)) values
+          :else
+          (let [caps (capability-plan source profile overrides)]
+            (if (not (good? caps)) caps
+              (let [handlers? (> (meta/value-count (get-key (value caps) :effect-ids)) 0)
+                    exits (exit-codes (get2 static :exit-codes :value) traps handlers?)]
+                (if (not (good? exits)) exits
+                  (ok (meta/value-merge (meta/value-merge (value caps) (value limits))
+                         (-> (meta/value-map)
+      (meta/value-map-insert (meta/value-keyword :metered?) (meta/value-bool (not (meta/value-equal? (get2 source :limits :fuel-metering) (meta/value-keyword :off)))))
+      (meta/value-map-insert (meta/value-keyword :handlers?) (meta/value-bool handlers?))
+      (meta/value-map-insert (meta/value-keyword :fuel) fuel)
+      (meta/value-map-insert (meta/value-keyword :trap-names) traps)
+      (meta/value-map-insert (meta/value-keyword :exit-codes) (value exits))
+      (meta/value-map-insert (meta/value-keyword :bytes-value-traps) (value values))
+      (meta/value-map-insert (meta/value-keyword :slots) (slot-plan (value names) (value admitted) handlers?))
+      (meta/value-map-insert (meta/value-keyword :context-abi) context)))))))))))))
+
+(defn- checked-align [n :i64 alignment :i64] [:ref :linux.static.plan/result]
+  (if (or (< n 0) (< alignment 1)) (fail :layout-overflow (meta/value-i64 n))
+    (let [remainder (- n (* (quot n alignment) alignment))
+          extra (if (= remainder 0) 0 (- alignment remainder))]
+      (if (> extra (- 9223372036854775807 n)) (fail :layout-overflow (meta/value-i64 n))
+        (ok (meta/value-i64 (+ n extra)))))))
+
+(defn- append-region [layout [:ref :form/r] name :keyword size :i64] [:ref :linux.static.plan/result]
+  (let [end (i64-of (get-key layout :end))]
+    (if (or (< size 0) (> size (- 9223372036854775807 end)))
+      (fail :layout-overflow (field name))
+      (ok (put-key (put-key layout name (meta/value-i64 end)) :end (meta/value-i64 (+ end size)))))))
+
+(defn- append-regions [initial [:ref :linux.static.plan/result] regions [:ref :form/r]] [:ref :linux.static.plan/result]
+  (loop [index 0 current initial]
+    (if (or (not (good? current)) (>= index (meta/value-count regions))) current
+      (let [pair (item regions index)]
+        (recur (+ index 1) (append-region (value current) (key-of (item pair 0)) (i64-of (item pair 1))))))))
+
+(defn- layout-start [text-size :i64] [:ref :linux.static.plan/result]
+  (if (or (< text-size 0) (> text-size (- 9223372036854775807 4096)))
+    (fail :layout-overflow (field :text-size))
+    (let [aligned (checked-align (+ 4096 text-size) 4096)]
+      (if (not (good? aligned)) aligned
+        (let [offset (i64-of (value aligned))]
+          (if (> offset (- 9223372036854775807 4198400)) (fail :layout-overflow (field :data))
+            (ok (-> (meta/value-map)
+      (meta/value-map-insert (meta/value-keyword :text-offset) (meta/value-i64 4096))
+      (meta/value-map-insert (meta/value-keyword :text) (meta/value-i64 4198400))
+      (meta/value-map-insert (meta/value-keyword :data-offset) (meta/value-i64 offset))
+      (meta/value-map-insert (meta/value-keyword :data) (meta/value-i64 (+ 4194304 offset)))
+      (meta/value-map-insert (meta/value-keyword :end) (meta/value-i64 (+ 4198400 offset)))))))))))
+
+(defn- scratch-layout [layout [:ref :form/r] bytes :i64] [:ref :linux.static.plan/result]
+  (let [names (checked-align bytes 16)
+        entries (+ 2 (quot bytes 3))]
+    (cond
+      (not (good? names)) names
+      (> entries (quot 9223372036854775807 24)) (fail :layout-overflow (field :index))
+      :else
+      (let [index (checked-align (* 24 entries) 16)]
+        (if (not (good? index)) index
+          (append-regions (ok layout)
+            (-> (meta/value-vector)
+      (meta/value-vector-conj (-> (meta/value-vector)
+      (meta/value-vector-conj (meta/value-keyword :decision-context))
+      (meta/value-vector-conj (meta/value-i64 512))))
+      (meta/value-vector-conj (-> (meta/value-vector)
+      (meta/value-vector-conj (meta/value-keyword :buf-a))
+      (meta/value-vector-conj (meta/value-i64 4096))))
+      (meta/value-vector-conj (-> (meta/value-vector)
+      (meta/value-vector-conj (meta/value-keyword :buf-b))
+      (meta/value-vector-conj (meta/value-i64 4096))))
+      (meta/value-vector-conj (-> (meta/value-vector)
+      (meta/value-vector-conj (meta/value-keyword :buf-c))
+      (meta/value-vector-conj (meta/value-i64 4096))))
+      (meta/value-vector-conj (-> (meta/value-vector)
+      (meta/value-vector-conj (meta/value-keyword :cwd))
+      (meta/value-vector-conj (meta/value-i64 4096))))
+      (meta/value-vector-conj (-> (meta/value-vector)
+      (meta/value-vector-conj (meta/value-keyword :dents))
+      (meta/value-vector-conj (meta/value-i64 32768))))
+      (meta/value-vector-conj (-> (meta/value-vector)
+      (meta/value-vector-conj (meta/value-keyword :stat-buf))
+      (meta/value-vector-conj (meta/value-i64 256))))
+      (meta/value-vector-conj (-> (meta/value-vector)
+      (meta/value-vector-conj (meta/value-keyword :answer))
+      (meta/value-vector-conj (meta/value-i64 256))))
+      (meta/value-vector-conj (-> (meta/value-vector)
+      (meta/value-vector-conj (meta/value-keyword :tokens))
+      (meta/value-vector-conj (meta/value-i64 256))))
+      (meta/value-vector-conj (-> (meta/value-vector)
+      (meta/value-vector-conj (meta/value-keyword :probe))
+      (meta/value-vector-conj (meta/value-i64 16))))
+      (meta/value-vector-conj (-> (meta/value-vector)
+      (meta/value-vector-conj (meta/value-keyword :spawn-io))
+      (meta/value-vector-conj (meta/value-i64 64))))
+      (meta/value-vector-conj (-> (meta/value-vector)
+      (meta/value-vector-conj (meta/value-keyword :root-real))
+      (meta/value-vector-conj (meta/value-i64 4096))))
+      (meta/value-vector-conj (-> (meta/value-vector)
+      (meta/value-vector-conj (meta/value-keyword :output-control))
+      (meta/value-vector-conj (meta/value-i64 5120))))
+      (meta/value-vector-conj (-> (meta/value-vector)
+      (meta/value-vector-conj (meta/value-keyword :names))
+      (meta/value-vector-conj (value names))))
+      (meta/value-vector-conj (-> (meta/value-vector)
+      (meta/value-vector-conj (meta/value-keyword :index))
+      (meta/value-vector-conj (value index)))))))))))
+
+(defn- hash-layout [current [:ref :linux.static.plan/result] source-plan [:ref :form/r]]
+  [:ref :linux.static.plan/result]
+  (if (not (good? current)) current
+    (let [raw (get-key source-plan :grant)
+          grant (wire-vector (if (= (meta/value-kind raw) :null) (meta/value-vector) raw) :grant-malformed)]
+      (cond
+        (not (good? grant)) grant
+        (not (contains-value? (value grant) (meta/value-i64 3))) current
+        (not (bool-of (get-key source-plan :handlers?))) (fail :layout-input (field :grant))
+        :else (append-region (value current) :hash-workspace (sha256/workspace-bytes))))))
+
+(defn image-layout [text-size :i64 source-plan [:ref :form/r]] [:ref :linux.static.plan/result]
+  (let [cells (get-key source-plan :cells) bytes (get-key source-plan :bytes)
+        table (get-key source-plan :vectors) items (get-key source-plan :vector-items)
+        handlers (get-key source-plan :handlers?)]
+    (cond
+      (or (not (i64-document? cells)) (not (i64-document? bytes)) (< (i64-of cells) 0) (< (i64-of bytes) 0)
+          (not= (meta/value-kind handlers) :bool))
+      (fail :layout-input source-plan)
+      (> (i64-of cells) (quot 9223372036854775807 16)) (fail :layout-overflow (field :pairs))
+      (or (not (i64-document? table)) (not (i64-document? items)) (< (i64-of table) 0) (< (i64-of items) 0))
+      (fail :layout-input (field :vectors))
+      (> (i64-of table) (quot 9223372036854775807 16)) (fail :layout-overflow (field :vectors))
+      (> (i64-of items) (quot 9223372036854775807 8)) (fail :layout-overflow (field :vector-items))
+      :else
+      (let [start (layout-start text-size) valid (checked-align (i64-of cells) 16)]
+        (cond
+          (not (good? start)) start
+          (not (good? valid)) valid
+          :else
+          (let [regions (append-regions start
+                          (-> (meta/value-vector)
+      (meta/value-vector-conj (-> (meta/value-vector)
+      (meta/value-vector-conj (meta/value-keyword :alt))
+      (meta/value-vector-conj (meta/value-i64 16384))))
+      (meta/value-vector-conj (-> (meta/value-vector)
+      (meta/value-vector-conj (meta/value-keyword :pairs))
+      (meta/value-vector-conj (meta/value-i64 (* 16 (i64-of cells))))))
+      (meta/value-vector-conj (-> (meta/value-vector)
+      (meta/value-vector-conj (meta/value-keyword :valid))
+      (meta/value-vector-conj (value valid))))
+      (meta/value-vector-conj (-> (meta/value-vector)
+      (meta/value-vector-conj (meta/value-keyword :kgraph))
+      (meta/value-vector-conj (meta/value-i64 98304))))
+      (meta/value-vector-conj (-> (meta/value-vector)
+      (meta/value-vector-conj (meta/value-keyword :vectors))
+      (meta/value-vector-conj (meta/value-i64 (* 16 (i64-of table))))))
+      (meta/value-vector-conj (-> (meta/value-vector)
+      (meta/value-vector-conj (meta/value-keyword :vector-items))
+      (meta/value-vector-conj (meta/value-i64 (* 8 (i64-of items))))))
+      (meta/value-vector-conj (-> (meta/value-vector)
+      (meta/value-vector-conj (meta/value-keyword :pool))
+      (meta/value-vector-conj bytes)))))]
+            (if (not (good? regions)) regions
+              (let [end (checked-align (i64-of (get-key (value regions) :end)) 16)]
+                (if (not (good? end)) end
+                  (let [aligned (put-key (value regions) :end (value end))
+                        scratch (if (bool-of handlers) (scratch-layout aligned (i64-of bytes)) (ok aligned))
+                        all (hash-layout scratch source-plan)]
+                    (if (not (good? all)) all
+                      (ok (put-key (meta/value-dissoc (value all) (meta/value-keyword :end)) :memory-size
+                            (meta/value-i64 (- (i64-of (get-key (value all) :end))
+                                             (i64-of (get-key (value all) :data)))))))))))))))))

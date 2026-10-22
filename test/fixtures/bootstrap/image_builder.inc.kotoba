@@ -1,0 +1,58 @@
+;; Internal full-v11 native framing test. Append to an exact linux-static
+;; snapshot with bootstrap-plan and bootstrap-fs aliases; export only main.
+;; Args: scope, C1 raw, C3 raw, guest raw, output, main-byte-offset, mode (compiler, pure or hash).
+;; This fixture does not admit a public artifact/profile or replace package's
+;; seal/verifier gates. Every filesystem operation requires an FS2 answer.
+(defn- bootstrap-arg [index :i64] :string
+  (typed-cap-call :cli/args :string :string (string-from-i64 index)))
+(defn- bootstrap-decimal [text :string] :i64
+  (if (= (string-byte-length text) 0) -1
+    (loop [index 0 value 0]
+      (if (= index (string-byte-length text)) value
+        (let [digit (- (string-code-point-at text index) 48)]
+          (if (or (< digit 0) (> digit 9) (> value 922337203685477580)
+                  (and (= value 922337203685477580) (> digit 7))) -1
+            (recur (+ index 1) (+ (* value 10) digit))))))))
+(defn- bootstrap-read [path :string] [:result :bytes :document]
+  (let [request (bootstrap-fs/request 0 path "")]
+    (if (not (result-ok?-of [:result :string :document] request))
+      (result-err-of [:result :bytes :document]
+        (result-error-of [:result :string :document] request (document-null)))
+      (bootstrap-fs/answer-bytes
+        (typed-cap-call :fs/app-data :string :bytes
+          (result-value-of [:result :string :document] request ""))))))
+(defn- bootstrap-exists [path :string] :bool
+  (let [request (bootstrap-fs/request 3 path "")]
+    (if (not (result-ok?-of [:result :string :document] request)) false
+      (let [answer (bootstrap-fs/answer (typed-cap-call :fs/app-data :string :string
+                     (result-value-of [:result :string :document] request "")))]
+        (and (result-ok?-of [:result :string :document] answer)
+             (string=? (result-value-of [:result :string :document] answer "") "1"))))))
+(defn- bootstrap-write [bytes :vector-i64 path :string] :i64
+  (let [request (bootstrap-fs/request-bytes 1 path (bytes-from-vector-i64 bytes))]
+    (if (not (result-ok?-of [:result :bytes :document] request)) 4
+      (let [answer (bootstrap-fs/answer-bytes (typed-cap-call :fs/app-data-bytes :bytes :bytes
+                     (result-value-of [:result :bytes :document] request (bytes-empty))))]
+        (if (and (result-ok?-of [:result :bytes :document] answer) (bootstrap-exists path)) 0 4)))))
+(defn main [] :i64
+  (let [c1 (bootstrap-read (bootstrap-arg 1)) c3 (bootstrap-read (bootstrap-arg 2))
+        guest (bootstrap-read (bootstrap-arg 3)) offset (bootstrap-decimal (bootstrap-arg 5)) mode (bootstrap-arg 6)]
+    (if (or (not (result-ok?-of [:result :bytes :document] c1))
+            (not (result-ok?-of [:result :bytes :document] c3))
+            (not (result-ok?-of [:result :bytes :document] guest)) (< offset 0)
+            (not (or (string=? mode "compiler") (string=? mode "pure") (string=? mode "hash")))) 3
+      (let [source-plan (if (string=? mode "pure") (bootstrap-plan/pure-plan (bootstrap-arg 0))
+                        (if (string=? mode "hash")
+                          (bootstrap-plan/hash-plan (bootstrap-arg 0)
+                            (result-value-of [:result :bytes :document] c1 (bytes-empty))
+                            (result-value-of [:result :bytes :document] c3 (bytes-empty)))
+                          (bootstrap-plan/compiler-plan (bootstrap-arg 0)
+                          (result-value-of [:result :bytes :document] c1 (bytes-empty))
+                          (result-value-of [:result :bytes :document] c3 (bytes-empty)))))
+            code (vector-i64-from-bytes (result-value-of [:result :bytes :document] guest (bytes-empty)))]
+        (if (or (>= offset (vector-count code)) (not= (bit-and offset 3) 0)) 3
+          (let [built (build :aarch64 source-plan code offset)]
+            (if (not= (record-get [:ref :linux.static.image/build] built :error) :ok) 1
+              (let [framed (frame :aarch64 built)]
+                (if (not (good? framed)) 2
+                  (bootstrap-write (bytes-of framed) (bootstrap-arg 4)))))))))))

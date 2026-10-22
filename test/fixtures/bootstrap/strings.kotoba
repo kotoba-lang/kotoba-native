@@ -1,0 +1,50 @@
+;; Runtime fixture for both loaderless Linux targets. Exit 0 is success.
+;; This file is not a receipt that either target has been built or run.
+(ns bootstrap.strings (:export [main point order]))
+
+;; Public dynamic entries let the native ABI harness invoke the helpers on
+;; runtime handles, independently of folding/inlining the literal checks.
+(defn point [text :string index :i64] :i64 (string-code-point-at text index))
+(defn order [a :string b :string] :i64 (string-compare a b))
+
+(defn- code-points [] :bool
+  (and (= (string-code-point-at "A" 0) 65)
+       (= (string-code-point-at "\u0000" 0) 0)
+       (= (string-code-point-at "é" 0) 233)
+       (= (string-code-point-at "߿" 0) 2047)
+       (= (string-code-point-at "ࠀ" 0) 2048)
+       (= (string-code-point-at "퟿" 0) 55295)
+       (= (string-code-point-at "" 0) 57344)
+       (= (string-code-point-at "￿" 0) 65535)
+       (= (string-code-point-at "𐀀" 0) 65536)
+       (= (string-code-point-at "􏿿" 0) 1114111)
+       (= (string-code-point-at "日é" 3) 233)
+       (= (string-code-point-at "😀x" 4) 120)))
+
+(defn- views [] :bool
+  (let [pooled (string-concat "prefix:" "日é😀:suffix")
+        view (string-substring pooled 7 16)]
+    (and (= (string-code-point-at view 0) 26085)
+         (= (string-code-point-at view 3) 233)
+         (= (string-code-point-at view 5) 128512)
+         (= (string-compare view "日é😀") 0)
+         (= (string-compare (string-substring "xéy" 1 3) "é") 0))))
+
+(defn- ordering [] :bool
+  (and (= (string-compare "" "") 0)
+       (= (string-compare "" "a") -1)
+       (= (string-compare "a" "") 1)
+       (= (string-compare "ab" "abc") -1)
+       (= (string-compare "abc" "ab") 1)
+       (= (string-compare "abc" "abc") 0)
+       (= (string-compare "a" "b") -1)
+       (= (string-compare "b" "a") 1)
+       (= (string-compare "a\u0000b" "a\u0000c") -1)
+       (= (string-compare "a\u0000b" "a") 1)
+       (= (string-compare "é" "日") -1)
+       (= (string-compare "퟿" "") -1)
+       (= (string-compare "𐀀" "") 1)
+       (= (string-compare "" "𐀀") -1)))
+
+(defn main [] :i64
+  (if (and (code-points) (views) (ordering)) 0 1))

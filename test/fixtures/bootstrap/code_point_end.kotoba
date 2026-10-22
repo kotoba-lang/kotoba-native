@@ -1,0 +1,4 @@
+;; The exclusive upper bound differs from substring's legal empty end view.
+(ns bootstrap.code-point-end (:export [main]))
+(defn- index [] :i64 3)
+(defn main [] :i64 (string-code-point-at "日" (index)))

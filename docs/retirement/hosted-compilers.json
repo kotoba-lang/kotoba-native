@@ -1,0 +1,201 @@
+{
+  "format": "kotoba.hosted-compiler-retirement.v1",
+  "repository": "native",
+  "preservedCommit": "0ee380c35bdca5e4711ace590fd443c01bc60259",
+  "nativeCompilerQualified": false,
+  "recovery": "git show <preservedCommit>:<path>",
+  "files": [
+    {
+      "path": "nbb.edn",
+      "reason": "hosted compiler execution configuration",
+      "action": "remove",
+      "bytes": 3602,
+      "sha256": "eaa53130c1a0ef683add0537165892cd6943887ef5c19c3f102fecf1a32f5ef1",
+      "gitBlob": "2da48815c3afb3c7cee1155178cec13a6a375f5a"
+    },
+    {
+      "path": "run-tests.cljk",
+      "reason": "hosted compiler execution configuration",
+      "action": "remove",
+      "bytes": 8696,
+      "sha256": "5983b82efb4735dc0d190d8482e0c578891f151dce39e5a722d50df15246ff17",
+      "gitBlob": "31f09146e35cbb1cb7afbba27787136142b62d53"
+    },
+    {
+      "path": "scripts/aarch64-constant-selector-benchmark.cljk",
+      "reason": "hosted compiler operational/test runner",
+      "action": "remove",
+      "bytes": 1417,
+      "sha256": "a2f763b3f01dc33a8637abe5ca4a78fe7c8a0c20499ed76f570adc612ee0f6ad",
+      "gitBlob": "2da433d56d7cec6326392f82918afb3859b39442"
+    },
+    {
+      "path": "scripts/aiueos-store-answer-audit.cljk",
+      "reason": "hosted compiler operational/test runner",
+      "action": "remove",
+      "bytes": 7521,
+      "sha256": "4fcf3a209f6778cca90f778d03fcf68faf965e9fa4627f10ee71e8ef79584804",
+      "gitBlob": "070ed37daa88d1a8e8dbcb409f245d03e29c5536"
+    },
+    {
+      "path": "scripts/isr-qemu-fixture.cljk",
+      "reason": "hosted compiler operational/test runner",
+      "action": "remove",
+      "bytes": 5579,
+      "sha256": "573fe52b1e67e1826f083ac3107ad14067ae1051ee1b23cb342b93273da7951a",
+      "gitBlob": "8cbce805c624d0a479b94e7cda4024d9e4888638"
+    },
+    {
+      "path": "scripts/store-answer-qemu-fixture.cljk",
+      "reason": "hosted compiler operational/test runner",
+      "action": "remove",
+      "bytes": 5977,
+      "sha256": "959155a9f2fccb5163473b4b2f6107cbe6007f4fc1f7dcab9bbccb2d2c578232",
+      "gitBlob": "35e18b0ef882cd1ef686e42bac6421b72aa7ad8a"
+    },
+    {
+      "path": "src/kotoba/native/aarch64.cljk",
+      "reason": "hosted compiler implementation",
+      "action": "remove",
+      "bytes": 91017,
+      "sha256": "e69513f2336aae033887a5f2887162a2612a89563e22f6b450bc768012a60c0f",
+      "gitBlob": "a26634ceaca1a7a15a5750621a0206fe8b2ad7b2"
+    },
+    {
+      "path": "src/kotoba/native/affine.cljk",
+      "reason": "hosted compiler implementation",
+      "action": "remove",
+      "bytes": 10297,
+      "sha256": "cf56b6cf90a4b53999adaee67d316c9c3b06e95f820a5ec5d09e5f5dfe1b41d7",
+      "gitBlob": "7693137e4c4d3b4d7d2c42cf212551718dfffaff"
+    },
+    {
+      "path": "src/kotoba/native/aggregate_abi.cljk",
+      "reason": "hosted compiler implementation",
+      "action": "remove",
+      "bytes": 18621,
+      "sha256": "2d683c645f522f0369fde64ab715edc4b51970b0fba1c110856ec4aad2737c50",
+      "gitBlob": "a5e484e42c1bb366c9eb1165465f07970faeab4a"
+    },
+    {
+      "path": "src/kotoba/native/document.cljk",
+      "reason": "hosted compiler implementation",
+      "action": "remove",
+      "bytes": 49531,
+      "sha256": "7553b904e4db3c96068a3469b95ef9b73c7d77b65cd3ce265eff1bd1bc786ce3",
+      "gitBlob": "42a581054c890067f09dc26a843097f5366427cd"
+    },
+    {
+      "path": "src/kotoba/native/elf64.clj.cljk",
+      "reason": "hosted compiler implementation",
+      "action": "remove",
+      "bytes": 133527,
+      "sha256": "669ae8bbcc16c94d7cbfc12d44bfbfb965fce37b65c3e9cf4ec7adb5f13b8ec7",
+      "gitBlob": "8a25d0eff74c772b7970d982f43e18419e604065"
+    },
+    {
+      "path": "src/kotoba/native/elf64.cljc.cljk",
+      "reason": "hosted compiler implementation",
+      "action": "remove",
+      "bytes": 135497,
+      "sha256": "2c4ee57331749781df6a9fced6bcf14f946d84b2bebc7cbdd767611a3f811a8a",
+      "gitBlob": "363faa53fa662f5bbf74c1dc11d583966d016082"
+    },
+    {
+      "path": "src/kotoba/native/image_scratch.cljk",
+      "reason": "hosted compiler implementation",
+      "action": "remove",
+      "bytes": 3302,
+      "sha256": "531c1b5eef9245bfbaa6ea54ae36bb31908476ec63bda554cd57ffe3fb26ae1b",
+      "gitBlob": "2740d91af8f11908a6d9748e4611f98d776e78a1"
+    },
+    {
+      "path": "src/kotoba/native/interrupt_abi.cljk",
+      "reason": "hosted compiler implementation",
+      "action": "remove",
+      "bytes": 49383,
+      "sha256": "208e424d8414c80ad38d99dd441bcb63f3d98a6536fe5af4633671ce8812d755",
+      "gitBlob": "93fd01a73140a47b489aaf7ee8ea4bf903891b69"
+    },
+    {
+      "path": "src/kotoba/native/keyword_equality.cljk",
+      "reason": "hosted compiler implementation",
+      "action": "remove",
+      "bytes": 4991,
+      "sha256": "6a9579df165cfe9a0d432126a312a0ffecf10030c72a4740c42f879cba070c08",
+      "gitBlob": "5c0e464dfd0f0e5cfd1f36177598ffffaf7602fc"
+    },
+    {
+      "path": "src/kotoba/native/linux_static.cljk",
+      "reason": "hosted compiler implementation",
+      "action": "remove",
+      "bytes": 154604,
+      "sha256": "71f890227f4a790ceed16869ace4c38981b1364b79a5776a43fed471178919a1",
+      "gitBlob": "0ab7132ae38f4fd6fb75b107909c1854559160cf"
+    },
+    {
+      "path": "src/kotoba/native/machine_ir.cljk",
+      "reason": "hosted compiler implementation",
+      "action": "remove",
+      "bytes": 518960,
+      "sha256": "5fbd5cf0fb68bdd3c5a1db97aad2a10936db9b2bca109640b5f44f46a70e06e3",
+      "gitBlob": "8e742321d03b73ebcb06b382476eeb3c6ec381ac"
+    },
+    {
+      "path": "src/kotoba/native/macho.cljk",
+      "reason": "hosted compiler implementation",
+      "action": "remove",
+      "bytes": 1725,
+      "sha256": "a521b30fb3e5ef15f8b13c2a55a87f6a574c0925de398594795f83b11505f20e",
+      "gitBlob": "d5f20fcd8a0fc3769f236538c94fd99cb1cf281f"
+    },
+    {
+      "path": "src/kotoba/native/peephole.cljk",
+      "reason": "hosted compiler implementation",
+      "action": "remove",
+      "bytes": 2537,
+      "sha256": "6ebc1bae9549f7ed11d3077df47d1f5b507c81ae39163d33545a789b467a27fc",
+      "gitBlob": "45e8f724bad119904d2f03afbd8670b809ff38c0"
+    },
+    {
+      "path": "src/kotoba/native/string_index.cljk",
+      "reason": "hosted compiler implementation",
+      "action": "remove",
+      "bytes": 6082,
+      "sha256": "55a581ec9429d8d64845e8edd6dda4770700283befbb831d0e5acad5d6dd7268",
+      "gitBlob": "e80215b1e3eb7e9c973720f6ab6ee588eadb1e52"
+    },
+    {
+      "path": "src/kotoba/native/string_search.cljk",
+      "reason": "hosted compiler implementation",
+      "action": "remove",
+      "bytes": 7175,
+      "sha256": "46044daa28bb4ba8e61642e4e7b3e07ddc1e6dad3a8a9384df8eef22e4d1281c",
+      "gitBlob": "0ce8e16495a6a7bfc58b236bcd98b8beba92bb9d"
+    },
+    {
+      "path": "src/kotoba/native/typed_map.cljk",
+      "reason": "hosted compiler implementation",
+      "action": "remove",
+      "bytes": 6868,
+      "sha256": "aba165dd901bd0a32d8cf9c072ca05d4db996e29c34a99adf6273886bbf1d2c9",
+      "gitBlob": "355d2e34286d0158fc728f7b2bcb034bf69871b1"
+    },
+    {
+      "path": "src/kotoba/native/vector_region.cljk",
+      "reason": "hosted compiler implementation",
+      "action": "remove",
+      "bytes": 6640,
+      "sha256": "72879d36bca9d16e6e3629f673fbe49567f65696bd389dd92016b670b740eaf5",
+      "gitBlob": "0ce0819dab7c1727eac146597b8fed97ce8d3be1"
+    },
+    {
+      "path": "src/kotoba/native/x86_64.cljk",
+      "reason": "hosted compiler implementation",
+      "action": "remove",
+      "bytes": 130935,
+      "sha256": "6e3057c6e4786a31858d3d608fed2f75ade2706921bb6beaf5e74d7bf9fde7ea",
+      "gitBlob": "2741f28de53954b74fa2ba4295354df3e7931354"
+    }
+  ]
+}

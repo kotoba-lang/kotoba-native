@@ -1,0 +1,7 @@
+{
+  "preservedCommit": "0ee380c35bdca5e4711ace590fd443c01bc60259",
+  "retiredFilesVerified": 24,
+  "protectedFilesUnchanged": 74,
+  "nativeExecutionVerified": false,
+  "verificationScope": "repository maintenance audit; not compiler generation or native execution"
+}

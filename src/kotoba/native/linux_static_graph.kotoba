@@ -1,0 +1,77 @@
+;; Bounded v11 KGraph slots used by keyword interning. Compiler IR labels use
+;; strings and do not consume this guest arena. The 4096-datom bound is fixed.
+(ns kotoba.native.linux-static-graph
+  {:kotoba/export [supported-slots routine]}
+  (:require [kotoba.artifact.data :as meta]
+            [kotoba.native.linux-static-assembler :as asm]
+            [kotoba.native.linux-static-io :as io])
+  (:schemas {:linux.static.graph/result
+             [:record :linux.static.graph/result
+              [[:code [:list [:ref :linux.static/instruction]]]
+               [:bindings [:ref :form/r]] [:error :keyword]]]}))
+
+(defn supported-slots [] [:ref :form/r]
+  (-> (meta/value-set)
+      (meta/value-set-conj (meta/value-keyword :kgraph-assert))
+      (meta/value-set-conj (meta/value-keyword :kgraph-get))))
+(defn- empty-code [] [:list [:ref :linux.static/instruction]]
+  (typed-list-new [:list [:ref :linux.static/instruction]]))
+(defn- ins [out [:list [:ref :linux.static/instruction]] op :keyword aux :keyword d :keyword s :keyword
+            b :keyword n :i64 target :string] [:list [:ref :linux.static/instruction]]
+  (typed-list-conj [:list [:ref :linux.static/instruction]] out
+    (asm/instruction op aux d s b :none n target (vector-alloc 0))))
+(defn- mark [out [:list [:ref :linux.static/instruction]] label :string] [:list [:ref :linux.static/instruction]]
+  (ins out :label :none :none :none :none 0 label))
+(defn- li [out [:list [:ref :linux.static/instruction]] d :keyword n :i64] [:list [:ref :linux.static/instruction]]
+  (ins out :li :none d :none :none n ""))
+(defn- mem [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword b :keyword n :i64]
+  [:list [:ref :linux.static/instruction]] (ins out op :none d :none b n ""))
+(defn- alu [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword s :keyword]
+  [:list [:ref :linux.static/instruction]] (ins out :alu op d s :none 0 ""))
+(defn- imm [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword n :i64]
+  [:list [:ref :linux.static/instruction]] (ins out :alui op d :none :none n ""))
+(defn- branch [out [:list [:ref :linux.static/instruction]] condition :keyword label :string]
+  [:list [:ref :linux.static/instruction]]
+  (ins out (if (= condition :always) :b :bcc) condition :none :none :none 0 label))
+(defn- pointer [out [:list [:ref :linux.static/instruction]] base :i64] [:list [:ref :linux.static/instruction]]
+  ;; t0=index; t1=base+index*24. Only caller-saved temporaries are modified.
+  (-> out (ins :mov :none :t1 :t0 :none 0 "")
+          (ins :shli :none :t1 :none :none 3 "")
+          (ins :mov :none :t2 :t0 :none 0 "")
+          (ins :shli :none :t2 :none :none 4 "")
+          (alu :add :t1 :t2) (li :t2 base) (alu :add :t1 :t2)))
+(defn- start [name :string] [:list [:ref :linux.static/instruction]]
+  (-> (empty-code) (ins :align :none :none :none :none 16 "") (mark name)
+      (mem :ld :t0 :ctx 0) (imm :cmp :t0 11) (branch :ne "ls/bad")
+      (mem :ld :t0 :ctx (io/state-offset :kgraph-used))
+      (imm :cmp :t0 4096) (branch :hi "ls/bad")))
+(defn- assertion [base :i64] [:list [:ref :linux.static/instruction]]
+  (-> (start "ls.kgraph/assert") (imm :cmp :t0 4096) (branch :hs "ls/trap-kgraph")
+      (pointer base) (mem :st :a1 :t1 0) (mem :st :a2 :t1 8) (mem :st :a3 :t1 16)
+      (imm :add :t0 1) (mem :st :t0 :ctx (io/state-offset :kgraph-used))
+      (li :t0 1) (ins :mov :none :ret :t0 :none 0 "")
+      (ins :ret :none :none :none :none 0 "")))
+(defn- lookup-code [base :i64] [:list [:ref :linux.static/instruction]]
+  ;; Search backwards, preserving append-only last-write-wins semantics.
+  (-> (start "ls.kgraph/get") (mark "ls.kgraph/lookup")
+      (imm :cmp :t0 0) (branch :eq "ls.kgraph/missing") (imm :sub :t0 1)
+      (pointer base) (mem :ld :t2 :t1 0) (alu :cmp :t2 :a1) (branch :ne "ls.kgraph/lookup")
+      (mem :ld :t2 :t1 8) (alu :cmp :t2 :a2) (branch :ne "ls.kgraph/lookup")
+      (mem :ld :ret :t1 16) (ins :ret :none :none :none :none 0 "")
+      (mark "ls.kgraph/missing") (li :ret -9223372036854775808)
+      (ins :ret :none :none :none :none 0 "")))
+(defn- get-i64 [value [:ref :form/r] key :keyword] :i64
+  (let [node (option-value-of [:option [:ref :form/r]]
+               (meta/value-get value (meta/value-keyword key)) (meta/value-null))]
+    (option-value-of [:option :i64] (meta/value-i64-value node) -1)))
+(defn routine [context [:ref :form/r] layout [:ref :form/r] slot :keyword] [:ref :linux.static.graph/result]
+  (let [base (get-i64 layout :kgraph) data (get-i64 layout :data) size (get-i64 layout :memory-size)
+        name (if (= slot :kgraph-assert) "ls.kgraph/assert" "ls.kgraph/get")]
+    (if (or (not (meta/value-set-contains? (supported-slots) (meta/value-keyword slot)))
+            (not= (get-i64 context :kgraph-capacity) 4096)
+            (< data 1) (< size 98304) (> size (- 9223372036854775807 data))
+            (< base (+ data 4096)) (> base (- (+ data size) 98304)) (not= (bit-and base 15) 0))
+      (record-new [:ref :linux.static.graph/result] (empty-code) (meta/value-map) :kgraph-layout)
+      (record-new [:ref :linux.static.graph/result]
+        (if (= slot :kgraph-assert) (assertion base) (lookup-code base))
+        (meta/value-map-insert (meta/value-map) (meta/value-keyword slot) (meta/value-string name)) :ok))))

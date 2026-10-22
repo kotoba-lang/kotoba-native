@@ -187,7 +187,11 @@
          :git/sha "9b53a444cfe5550af6b76eef494b4190b5e4e461"}
         io.github.kotoba-lang/artifact
         {:git/url "https://github.com/kotoba-lang/artifact.git"
-         :git/sha "af43fc8fa43edb12361828e26456f75b12ab40be"}}
+         ;; Owning main carries canonical core.kotoba, identical to the core
+         ;; selected by Amu's root. Its extra C-loader identity pin is separate.
+         ;; Source/API review is recorded in docs/linux-static-artifact-pin.md;
+         ;; native digest/provider qualification remains open.
+         :git/sha "b6e3ab59611e747dcc9a72c4152cb59384951190"}}
  :aliases {:test {:extra-paths ["test"]
                   :extra-deps {io.github.cognitect-labs/test-runner
                                {:git/url "https://github.com/cognitect-labs/test-runner.git"
