@@ -1,5 +1,10 @@
 # Canonical Linux-static scope, path and parent mechanism
 
+Update: [complete scope-absence work](linux-static-scope-absence.md) adds
+explicit scope-denial state, full-span NUL refusal, root-scope metadata and
+all-component no-symlink resolution. Initial source digest/counts below are
+provenance, not the current revision's admission or runtime evidence.
+
 Tracking: [JUN-201](https://linear.app/kotobalabs/issue/JUN-201),
 [JUN-200](https://linear.app/kotobalabs/issue/JUN-200).
 
@@ -69,17 +74,17 @@ boundaries retain the reference's decisions rather than adding a local policy.
 
 The normalized path is compared with both sealed and kernel root spellings,
 only when owning op 43 admits that spelling. C1 op 8 receives prefix equality,
-the next byte and normalized length. Its boundary rules remain authoritative,
-including root and exact-prefix cases; this patch does not claim a broader
-acceptance or substitute an inline allow rule. The admitted spelling length
+the next byte, normalized length and the actual admitted root length. The
+owning C1 update handles scope `/` using that length; no inline allow rule
+replaces it. The admitted spelling length
 is stored separately for each buffer arm, and the root itself yields dot as
 its relative path. No matching/admitted root transfers to the caller's failure.
 
 ## Rooted opening and mutation parents
 
 Every normal open uses the captured descriptor and a 24-byte open_how with
-RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS (10), preserving kernel enforcement
-against resolution outside that descriptor. See the
+RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS (14), requesting kernel enforcement
+against resolution outside that descriptor and through intermediate symlinks. See the
 [kernel flag definitions](https://github.com/torvalds/linux/blob/master/include/uapi/linux/openat2.h)
 and [openat2 manual](https://man7.org/linux/man-pages/man2/openat2.2.html).
 There is no openat fallback if openat2 is unavailable or refuses a path.

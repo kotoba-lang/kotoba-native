@@ -523,7 +523,7 @@
         empty (typed-list-new [:list [:ref :linux.static.fs/fragment]])]
     (-> empty
         (add-source :resolve-a (paths/resolve-path isa source-plan layout "fs-path-a" :ls.fs/path-failed b :len-a :rel-a))
-        (add-source :resolve-c (paths/resolve-path isa source-plan layout "fs-rename-path" :ls/bad c :len-c :rel-c))
+        (add-source :resolve-c (paths/resolve-path isa source-plan layout "fs-rename-path" :ls.fs/path-failed c :len-c :rel-c))
         (add-source :parent-mkdir (paths/open-parent isa source-plan layout "fs-parent-mkdir" 8 b :len-a :pfd :x0 :ls.fs/mutate-8-no-parent))
         (add-source :parent-unlink (paths/open-parent isa source-plan layout "fs-parent-unlink" 9 b :len-a :pfd :x0 :ls.fs/mutate-9-no-parent))
         (add-source :parent-rmdir (paths/open-parent isa source-plan layout "fs-parent-rmdir" 10 b :len-a :pfd :x0 :ls.fs/mutate-10-no-parent))
@@ -575,7 +575,16 @@
                 dispatch (loop [form 0 code parsed]
                            (if (= form 16) (branch code :always :ls/bad)
                              (recur (+ form 1) (-> code (load :t0 :form) (imm :cmp :t0 form) (branch :eq (form-label form))))))
-                path-failed (-> dispatch (mark :ls.fs/path-failed) (load :t0 :form) (imm :cmp :t0 3) (branch :ne :ls/bad)
+                failed (-> dispatch (mark :ls.fs/path-failed) (load :t0 :path-denied)
+                           (imm :cmp :t0 1) (branch :eq :ls.fs/scope-absent)
+                           ;; Preserve the previous EXISTS false for an invalid path;
+                           ;; other malformed/unavailable paths remain terminal.
+                           (load :t0 :form) (imm :cmp :t0 3) (branch :ne :ls/bad)
+                           (branch :always :ls.fs/scope-false) (mark :ls.fs/scope-absent))
+                absent (-> (hd failed cfg 48 (io/state-field :form) (io/literal 0) (io/literal 0) (io/literal 0))
+                           (imm :cmp :t0 1) (branch :eq :ls.fs/scope-false)
+                           (imm :cmp :t0 0) (branch :ne :ls/bad))
+                path-failed (-> (answer absent cfg :ls.fs/zero 0) (mark :ls.fs/scope-false)
                                 (answer cfg :ls.fs/zero 1))
                 code (-> path-failed (read-form cfg) (write-form cfg 1) (write-form cfg 2) (exists-form cfg)
                          (range-form cfg) (metadata-form cfg 5) (metadata-form cfg 6) (chmod-form cfg)

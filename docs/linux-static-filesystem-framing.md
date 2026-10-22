@@ -102,9 +102,11 @@ operations remain nontransactional when a later failure occurs.
 C1 grants, root/path normalization, openat2 no-follow/beneath confinement,
 descriptor ownership and actual operation bodies remain required. This
 framing change does not establish their runtime behavior. In particular,
-the existing generic path-failed branch answers false only for EXISTS and
-otherwise traps; reconcile its non-EXISTS out-of-scope behavior with the
-catalog's absent-without-existence-leak contract before qualification.
+the [complete scope-absence source](linux-static-scope-absence.md) now
+distinguishes C1 scope denial from invalid state and supplies all sixteen
+absent answers through new owning decision op 48. Both rename operands are
+checked before target access. Actual no-leak/kernel behavior and the newly
+compiled matching decision artifact remain unqualified.
 
 Amu's paired complete six-export fs-tree source uses this protocol, typed
 errors, recursive parents and no-follow deletion, including root file/link

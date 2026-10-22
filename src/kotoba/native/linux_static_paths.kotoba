@@ -69,7 +69,8 @@
                     prefix :string spelling :i64 length-key :keyword admitted :keyword]
   [:list [:ref :linux.static/instruction]]
   (let [choice (-> (hd out cfg 43 (io/literal spelling) (io/literal 0) (io/literal 0) (io/literal 0))
-                   (imm :cmp :t0 1) (branch :ne (tag prefix "spelling-skip")))
+                   (imm :cmp :t0 0) (branch :eq (tag prefix "spelling-skip"))
+                   (imm :cmp :t0 1) (branch :ne :ls/bad))
         length (if (= spelling 0) (li choice :t0 (record-get [:ref :linux.static.paths/config] cfg :root-length))
                  (load choice :t0 :root-real-len))
         before (-> length (imm :cmp :t0 0) (branch :eq (tag prefix "spelling-skip"))
@@ -87,8 +88,9 @@
                      (byte-op :ldb :t1 :s4 :a3) (mark (tag prefix "next-done")) (store :t1 :x4))
         decided (io/decision-fragment compared (record-get [:ref :linux.static.paths/config] cfg :data)
                   :ls.cap/c1-decide (io/literal 8) (io/register :t2) (io/state-field :x4)
-                  (io/state-field length-key) (io/literal 0))]
-    (-> decided (imm :cmp :t0 1) (branch :eq admitted) (mark (tag prefix "spelling-skip")))))
+                  (io/state-field length-key) (io/state-field (root-key length-key)))]
+    (-> decided (imm :cmp :t0 1) (branch :eq admitted)
+        (imm :cmp :t0 0) (branch :ne :ls/bad) (mark (tag prefix "spelling-skip")))))
 
 (defn- normalize [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.paths/config]
                   prefix :string target :i64]
@@ -130,12 +132,21 @@
 (defn- resolve-code [cfg [:ref :linux.static.paths/config] prefix :string fail :keyword
                      target :i64 length-key :keyword relative-key :keyword]
   [:list [:ref :linux.static/instruction]]
-  (let [first (-> (empty-code) (imm :cmp :s2 0) (branch :lt :ls/bad) (li :t2 0)
+  (let [first (-> (empty-code) (li :t0 0) (store :t0 :path-denied)
+                  (imm :cmp :s2 0) (branch :lt :ls/bad) (li :t2 0)
                   (imm :cmp :s2 0) (branch :eq (tag prefix "first-done"))
                   (li :t0 0) (byte-op :ldb :t1 :s1 :t0) (imm :cmp :t1 47) (branch :ne (tag prefix "first-done"))
                   (li :t2 1) (mark (tag prefix "first-done")))
         planned (-> (hd first cfg 14 (io/register :s2) (io/register :t2) (io/state-field :cwd-len) (io/literal 0))
-                    (imm :cmp :t0 0) (branch :eq fail) (li :s3 (record-get [:ref :linux.static.paths/config] cfg :buf-a))
+                    (imm :cmp :t0 0) (branch :eq fail)
+                    ;; The whole admitted span must be a native path, including a
+                    ;; rename destination. A NUL must not truncate normalization.
+                    (mov :s4 :t0) (li :t0 0) (mark (tag prefix "no-nul"))
+                    (alu :cmp :t0 :s2) (branch :hs (tag prefix "no-nul-done"))
+                    (byte-op :ldb :t1 :s1 :t0) (imm :cmp :t1 0) (branch :eq :ls/bad)
+                    (imm :add :t0 1) (branch :always (tag prefix "no-nul"))
+                    (mark (tag prefix "no-nul-done")) (mov :t0 :s4)
+                    (li :s3 (record-get [:ref :linux.static.paths/config] cfg :buf-a))
                     (imm :cmp :t0 1) (branch :eq (tag prefix "absolute"))
                     (imm :cmp :t0 2) (branch :ne :ls/bad) (load :s4 :cwd-len)
                     (li :t2 (record-get [:ref :linux.static.paths/config] cfg :cwd)))
@@ -150,7 +161,10 @@
                        (load :t0 :root-fd) (imm :cmp :t0 0) (branch :lt fail))
         sealed (prefix-root normalized cfg (string-concat prefix "-sealed") 0 length-key (tag prefix "admitted"))
         resolved (prefix-root sealed cfg (string-concat prefix "-real") 1 length-key (tag prefix "admitted"))]
-    (-> resolved (branch :always fail) (mark (tag prefix "admitted"))
+    ;; Only failure of both real C1 scope-prefix decisions is an absent path.
+    ;; Invalid spans, unavailable cwd/root and inconsistent state keep flag zero.
+    (-> resolved (li :t0 1) (store :t0 :path-denied) (branch :always fail)
+        (mark (tag prefix "admitted"))
         (li :t2 target) (load :t0 (root-key length-key)) (alu :add :t2 :t0) (load :t1 :x4)
         (imm :cmp :t1 47) (branch :ne (tag prefix "relative-slash")) (imm :add :t2 1)
         (mark (tag prefix "relative-slash")) (li :t0 0) (byte-op :ldb :t1 :t2 :t0)
@@ -161,7 +175,9 @@
   [:list [:ref :linux.static/instruction]]
   (let [saved (io/operand-fragment (empty-code) :a4 relative)
         how (-> saved (li :t1 flags) (store :t1 :how) (li :t1 mode) (store :t1 :how-mode)
-                (li :t1 10) (store :t1 :how-resolve))]
+                ;; BENEATH | NO_MAGICLINKS | NO_SYMLINKS: reject interior links
+                ;; too; O_NOFOLLOW alone only protects the final component.
+                (li :t1 14) (store :t1 :how-resolve))]
     (sys how cfg :openat2 (io/state-field :root-fd) (io/register :a4)
       (io/literal (+ (record-get [:ref :linux.static.paths/config] cfg :data) (io/state-offset :how))) (io/literal 24))))
 

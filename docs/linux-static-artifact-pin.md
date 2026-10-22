@@ -55,7 +55,7 @@ draft/unmerged. Their source presence is not provider availability.
 
 The current static graph reader includes fourteen native modules (including
 the complete filesystem framing module), owning candidate ELF64 and this
-exact canonical artifact core: 16 sources, 33 schemas, 554 imported calls,
+exact canonical artifact core: 16 sources, 33 schemas, 558 imported calls,
 439 record uses and 585 explicit type argument positions, with no
 source-contract findings. The hash capability remains
 explicitly unqualified. Artifact/core's 200-line/22-function source inventory
