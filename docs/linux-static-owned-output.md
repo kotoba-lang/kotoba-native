@@ -90,7 +90,12 @@ inputs/observations for the native fault harness. They include phases 0..4,
 probe/stat/identity/unlink/rmdir/close failures, Linux EINTR, no double-close,
 published missing members and recursive cleanup. They have not been compiled
 or executed, and no consuming native fault harness is currently qualified.
-Their close masks denote actual syscall attempts, not OS teardown on exit.
+Each vector includes the exact entry descriptor mask and created-member count;
+the successful probe is opened during cleanup. Normal completed publication
+has no live member FD, whereas interrupted staging may still own one. Close
+masks denote actual syscall attempts, not OS teardown on exit. The two-member
+vectors require attempts at both canonical names even if the first unlink
+fails; they never authorize removing unrelated or published target paths.
 Fault injection must preserve real Linux close consumption; returning a fake
 EIO without consuming the FD is not an equivalent oracle. The stage-close
 case also requires the original fatal diagnostic/exit to survive cleanup.
