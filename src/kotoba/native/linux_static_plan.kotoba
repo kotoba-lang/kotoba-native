@@ -208,6 +208,7 @@
   (document-set (document-keyword :pair-new) (document-keyword :pair-first) (document-keyword :pair-second)
                  (document-keyword :string-equal) (document-keyword :string-concat)
                  (document-keyword :string-substring) (document-keyword :string-index-of)
+                 (document-keyword :string-code-point-at) (document-keyword :string-compare)
                  (document-keyword :vector-new-empty) (document-keyword :vector-conj)
                  (document-keyword :vector-count) (document-keyword :vector-at)
                  (document-keyword :vector-assoc) (document-keyword :vector-alloc)

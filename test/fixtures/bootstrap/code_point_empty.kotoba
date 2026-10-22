@@ -1,0 +1,3 @@
+;; Required terminal refusal: no scalar starts at byte 0 of an empty string.
+(ns bootstrap.code-point-empty (:export [main]))
+(defn main [] :i64 (string-code-point-at "" 0))

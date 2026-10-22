@@ -1,0 +1,5 @@
+;; A byte in the middle of a valid scalar is not a code-point boundary.
+(ns bootstrap.code-point-continuation (:export [main]))
+(defn- index [] :i64 1)
+(defn main [] :i64
+  (string-code-point-at (string-substring (string-concat "x" "日y") 1 4) (index)))
