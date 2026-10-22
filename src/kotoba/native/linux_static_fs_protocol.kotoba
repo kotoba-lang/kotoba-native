@@ -91,18 +91,26 @@
 (defn answer-routine [data :i64 context :document] [:ref :linux.static.fs.protocol/result]
   "One shared finish routine acknowledges every V2 answer, including empty data."
   (let [reader (strings/read-string-fragment context "fs-protocol-answer")
+        raw-reader (strings/read-span-fragment context "fs-protocol-answer-raw")
         pair (strings/pool-pair-fragment context)]
     (cond
       (not= (record-get [:ref :linux.static.strings/result] reader :error) :ok)
       (record-new [:ref :linux.static.fs.protocol/result] (empty-code)
         (record-get [:ref :linux.static.strings/result] reader :error))
+      (not= (record-get [:ref :linux.static.strings/result] raw-reader :error) :ok)
+      (record-new [:ref :linux.static.fs.protocol/result] (empty-code)
+        (record-get [:ref :linux.static.strings/result] raw-reader :error))
       (not= (record-get [:ref :linux.static.strings/result] pair :error) :ok)
       (record-new [:ref :linux.static.fs.protocol/result] (empty-code)
         (record-get [:ref :linux.static.strings/result] pair :error))
       :else
       (let [start (-> (empty-code) (mark :ls.fs-protocol/finish) (load :t0 :fs-frame)
                       (imm :cmp :t0 0) (branch :eq :ls.cap/finish) (load :s1 :res))
-            read (-> (join start (record-get [:ref :linux.static.strings/result] reader :code))
+            selected (-> start (load :t0 :xk) (imm :cmp :t0 1) (branch :eq :ls.fs-protocol/read-text))
+            raw (-> (join selected (record-get [:ref :linux.static.strings/result] raw-reader :code))
+                    (branch :always :ls.fs-protocol/read-ready) (mark :ls.fs-protocol/read-text))
+            read (-> (join raw (record-get [:ref :linux.static.strings/result] reader :code))
+                     (mark :ls.fs-protocol/read-ready)
                      (mov :s1 :s2) (mov :s2 :s3)
                      (li :t0 9223372036854775802) (alu :cmp :s2 :t0) (branch :hi :ls/trap-bytes)
                      (imm :add :s2 5))

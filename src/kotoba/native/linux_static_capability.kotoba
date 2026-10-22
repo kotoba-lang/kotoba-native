@@ -1,10 +1,11 @@
-;; Canonical C3 call gate, native SHA-256 and physical startup cwd binding.
+;; Canonical C3 call gate, native SHA-256, physical cwd and raw FS2 boundary.
 ;; Sealed decision text and common trap paths remain required externals.
 ;; Source candidate only: does not enable the owning wire-3/wire-40 profile.
 (ns kotoba.native.linux-static-capability
   {:kotoba/export [routine]}
   (:require [kotoba.native.linux-static-assembler :as asm]
             [kotoba.native.linux-static-strings :as strings]
+            [kotoba.native.linux-static-vectors :as vectors]
             [kotoba.native.linux-static-io :as io]
             [kotoba.native.linux-static-paths :as paths]
             [kotoba.native.linux-static-browse :as browse]
@@ -15,7 +16,7 @@
   (:schemas
    {:linux.static.capability/config
     [:record :linux.static.capability/config
-     [[:data :i64] [:allow :i64] [:workspace :i64] [:cwd :i64]]]
+     [[:data :i64] [:allow :i64] [:workspace :i64] [:cwd :i64] [:raw? :bool]]]
     :linux.static.capability/result
     [:record :linux.static.capability/result
      [[:code [:list [:ref :linux.static/instruction]]]
@@ -101,13 +102,30 @@
                   (li :ctx 0) (mem :ld :a1 :s0 1128) (mem :ld :a2 :s0 1136) (li :a3 0) (li :a4 0))
         provider (-> (decision-call kinds data :ls.cap/c1-decide)
                      (li :ctx 0) (mov :a1 :t0) (mem :ld :a2 :s0 1128) (li :a3 0) (li :a4 0))]
-    (-> (decision-call provider data :ls.cap/h-decide) (mem :st :t0 :s0 1176)
-        (imm :cmp :t0 0) (branch :eq :ls.cap/no-handler)
-        ;; These twelve handler mechanisms use the string representation.
-        ;; Equal non-string kinds do not authorize interpreting an integer
-        ;; payload as a string, including provider-0 entropy/spawn/cwd routes.
-        (mem :ld :t0 :s0 1136) (imm :cmp :t0 1) (branch :ne :ls/bad)
-        (mov :ctx :s0) (mem :ld :s1 :s0 1152))))
+    (let [handler (-> (decision-call provider data :ls.cap/h-decide) (mem :st :t0 :s0 1176)
+                      (imm :cmp :t0 0) (branch :eq :ls.cap/no-handler))
+        ;; Discriminators name full request/result contracts, not primitive
+        ;; type codes. Only fs/app-data handler 7 accepts bytes-v1 (8) and
+        ;; string-bytes-v1 (9); all other mechanisms remain string/string.
+          kind (if (record-get [:ref :linux.static.capability/config] cfg :raw?)
+                 (-> handler (mem :ld :t0 :s0 1136) (imm :cmp :t0 1) (branch :eq :ls.cap/kind-ready)
+                     (mem :ld :t1 :s0 1176) (imm :cmp :t1 7) (branch :ne :ls/bad)
+                     (imm :cmp :t0 8) (branch :eq :ls.cap/kind-ready)
+                     (imm :cmp :t0 9) (branch :ne :ls/bad) (mark :ls.cap/kind-ready))
+                 (-> handler (mem :ld :t0 :s0 1136) (imm :cmp :t0 1) (branch :ne :ls/bad)))]
+      (-> kind (mov :ctx :s0) (mem :ld :s1 :s0 1152)))))
+
+(defn- request-code [cfg [:ref :linux.static.capability/config]
+                     text [:list [:ref :linux.static/instruction]] raw [:list [:ref :linux.static/instruction]]]
+  [:list [:ref :linux.static/instruction]]
+  (let [code (if (not (record-get [:ref :linux.static.capability/config] cfg :raw?))
+               (join (begin cfg) text)
+               (let [selected (-> (begin cfg) (mem :ld :t0 :s0 1136) (imm :cmp :t0 8)
+                                   (branch :eq :ls.cap/bytes-request))
+                     textual (branch (join selected text) :always :ls.cap/request-ready)
+                     binary (join (mark textual :ls.cap/bytes-request) raw)]
+                 (mark binary :ls.cap/request-ready)))]
+    (-> code (mem :st :s2 :s0 1160) (mem :st :s3 :s0 1168))))
 
 (defn- dispatch-label [id :i64] :keyword
   (case id
@@ -163,11 +181,20 @@
     ;; Common finish resolves and validates the returned UTF-8 string.
     (-> (join charge intern) (mem :st :t0 :s0 1184) (branch :always :ls.cap/finish))))
 
-(defn- finish [out [:list [:ref :linux.static/instruction]]
-               result-reader [:list [:ref :linux.static/instruction]]]
+(defn- finish [out [:list [:ref :linux.static/instruction]] raw? :bool
+               result-reader [:list [:ref :linux.static/instruction]]
+               raw-reader [:list [:ref :linux.static/instruction]]
+               raw-writer [:list [:ref :linux.static/instruction]]]
   [:list [:ref :linux.static/instruction]]
-  (let [loaded (-> out (mark :ls.cap/finish) (mov :ctx :s0) (mem :ld :s1 :s0 1184))]
-    (-> (join loaded result-reader) (mov :t0 :s1) (simple :restore-lr)
+  (let [loaded (-> out (mark :ls.cap/finish) (mov :ctx :s0) (mem :ld :s1 :s0 1184))
+        text (if (not raw?) (join loaded result-reader)
+               (let [selected (-> loaded (mem :ld :t0 :s0 1144) (imm :cmp :t0 1)
+                                   (branch :eq :ls.cap/string-result))
+                     span (-> (join selected raw-reader) (mov :s1 :s2) (mov :s2 :s3))
+                     raw (-> (join span raw-writer) (mov :s1 :t0) (branch :always :ls.cap/result-ready))
+                     text (join (mark raw :ls.cap/string-result) result-reader)]
+                 (mark text :ls.cap/result-ready)))]
+    (-> text (mov :t0 :s1) (simple :restore-lr)
         (unary :pop :s4) (unary :pop :s3) (unary :pop :s2) (unary :pop :s1) (unary :pop :s0)
         (mov :ret :t0) (simple :ret))))
 
@@ -225,8 +252,16 @@
   (let [error (configuration-error source-plan layout)]
     (if (not= error :ok) (failure error)
       (let [context (lookup source-plan :context-abi)
+            raw? (and (> (i64-of (lookup source-plan :byte-value-limit)) 0)
+                      (> (i64-of (lookup source-plan :vectors)) 0)
+                      (> (i64-of (lookup source-plan :vector-items)) 0))
             request (strings/read-string-fragment context "cap-request")
             answer (strings/read-string-fragment context "cap-result")
+            byte-request (if raw? (vectors/read-bytes-fragment context (i64-of (lookup layout :data)) "cap-request-bytes")
+                           (record-new [:ref :linux.static.vectors/result] (empty-code) (document-map) :ok))
+            raw-answer (strings/read-span-fragment context "cap-result-raw")
+            byte-answer (if raw? (vectors/intern-bytes-fragment context "cap-result-bytes")
+                          (record-new [:ref :linux.static.vectors/result] (empty-code) (document-map) :ok))
             intern (strings/intern-string-fragment context "cap-intern")
             cwd-intern (strings/intern-string-fragment context "cap-cwd-intern")
             providers (io/routines isa source-plan layout)
@@ -240,6 +275,12 @@
           (failure (record-get [:ref :linux.static.strings/result] request :error))
           (not= (record-get [:ref :linux.static.strings/result] answer :error) :ok)
           (failure (record-get [:ref :linux.static.strings/result] answer :error))
+          (not= (record-get [:ref :linux.static.vectors/result] byte-request :error) :ok)
+          (failure (record-get [:ref :linux.static.vectors/result] byte-request :error))
+          (not= (record-get [:ref :linux.static.strings/result] raw-answer :error) :ok)
+          (failure (record-get [:ref :linux.static.strings/result] raw-answer :error))
+          (not= (record-get [:ref :linux.static.vectors/result] byte-answer :error) :ok)
+          (failure (record-get [:ref :linux.static.vectors/result] byte-answer :error))
           (not= (record-get [:ref :linux.static.strings/result] intern :error) :ok)
           (failure (record-get [:ref :linux.static.strings/result] intern :error))
           (not= (record-get [:ref :linux.static.strings/result] cwd-intern :error) :ok)
@@ -261,14 +302,16 @@
                 cfg (record-new [:ref :linux.static.capability/config]
                       (i64-of (lookup layout :data)) (i64-of (lookup context :allow-bitmap-offset))
                       (if hash? (i64-of (lookup layout :hash-workspace)) 0)
-                      (i64-of (lookup layout :cwd)))
-                requested (-> (join (begin cfg) (record-get [:ref :linux.static.strings/result] request :code))
-                              (mem :st :s2 :s0 1160) (mem :st :s3 :s0 1168))
+                      (i64-of (lookup layout :cwd)) raw?)
+                requested (request-code cfg (record-get [:ref :linux.static.strings/result] request :code)
+                            (record-get [:ref :linux.static.vectors/result] byte-request :code))
                 gate (dispatch requested hash?)
                 provider (if hash? (hash-body gate cfg (record-get [:ref :linux.static.strings/result] intern :code)) gate)
                 with-cwd (cwd-body provider cfg
                            (record-get [:ref :linux.static.strings/result] cwd-intern :code))
-                completed (finish with-cwd (record-get [:ref :linux.static.strings/result] answer :code))
+                completed (finish with-cwd raw? (record-get [:ref :linux.static.strings/result] answer :code)
+                            (record-get [:ref :linux.static.strings/result] raw-answer :code)
+                            (record-get [:ref :linux.static.vectors/result] byte-answer :code))
                 kernel (if hash? (join completed (sha256/routine)) completed)
                 handlers (join (join kernel (record-get [:ref :linux.static.io/result] providers :code))
                            (record-get [:ref :linux.static.browse/result] directory :code))

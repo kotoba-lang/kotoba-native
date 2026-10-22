@@ -1,7 +1,7 @@
 ;; Complete vector-i64/vector-f64 arena mechanism, also used by bytes values.
 ;; Canonical source candidate. This does not itself admit bytes capabilities.
 (ns kotoba.native.linux-static-vectors
-  {:kotoba/export [supported-slots supported-byte-slots routine]}
+  {:kotoba/export [supported-slots supported-byte-slots routine read-bytes-fragment intern-bytes-fragment]}
   (:require [kotoba.native.linux-static-assembler :as asm]
             [kotoba.native.linux-static-io :as io]
             [kotoba.native.linux-static-strings :as strings])
@@ -290,6 +290,78 @@
 (defn- i64-of [d :document] :i64 (option-value-of [:option :i64] (document-i64-value d) -1))
 (defn- offset? [d :document] :bool
   (let [n (i64-of d)] (and (= (document-kind d) :i64) (>= n 8) (<= n 504) (= (bit-and n 7) 0))))
+(defn- configuration-error [context :document] :keyword
+  (let [used (lookup context :vector-used-pointer-offset) table (lookup context :vectors-base-offset)
+        items (lookup context :vector-items-base-offset)]
+    (cond
+      (not (document-equal? (lookup context :version) (document-i64 11))) :context-abi-version
+      (not (and (offset? used) (offset? table) (offset? items)
+                (not (document-equal? used table)) (not (document-equal? used items))
+                (not (document-equal? table items)))) :vector-context-offset
+      :else :ok)))
+(defn- configuration [context :document] [:ref :linux.static.vectors/config]
+  (record-new [:ref :linux.static.vectors/config]
+    (i64-of (lookup context :vectors-base-offset)) (i64-of (lookup context :vector-items-base-offset))))
+
+;; Inline C3 request fragment: s0=context, s1=bytes handle -> s2=raw pool
+;; pointer, s3=length. All words are checked before allocation/copy; no UTF8
+;; condition is imposed. Pool use obtains the existing sealed op-6 decision.
+;; Existing vector/item windows and per-value limits are checked in full.
+(defn read-bytes-fragment [context :document data :i64 prefix :string] [:ref :linux.static.vectors/result]
+  (let [error (configuration-error context)]
+    (cond
+      (not= error :ok) (record-new [:ref :linux.static.vectors/result] (empty-code) (document-map) error)
+      (or (<= data 0) (not= (bit-and data 4095) 0) (> data 9223372036854771711))
+      (record-new [:ref :linux.static.vectors/result] (empty-code) (document-map) :data-base)
+      :else
+      (let [cfg (configuration context)
+            checked (-> (resolve (-> (empty-code) (mov :ctx :s0) (mov :a1 :s1)) cfg)
+                        (load :t0 :byte-value-limit) (alu :cmp :t5 :t0) (branch :hi (value-label 10)))
+            items (byte-items checked prefix (value-label 9))
+            ;; Keep descriptor facts across the sealed decision call. Six
+            ;; saved words retain the stack alignment on either ISA.
+            saved (-> items (unary :push :t3) (unary :push :t4) (unary :push :t5)
+                      (unary :push :t6) (unary :push :t7) (unary :push :t8))
+            charged (-> (io/decision-fragment saved data :ls.cap/h-decide (io/literal 6)
+                          (io/state-field :pool-used) (io/register :t5) (io/state-field :bytes) (io/literal 0))
+                        (unary :pop :t8) (unary :pop :t7) (unary :pop :t6)
+                        (unary :pop :t5) (unary :pop :t4) (unary :pop :t3)
+                        (mov :ctx :s0) (imm :cmp :t0 1) (branch :ne :ls/trap-bytes))
+            room (-> charged (load :t7 :pool-used) (load :t0 :bytes)
+                     (alu :cmp :t7 :t0) (branch :hi :ls/trap-bytes) (alu :sub :t0 :t7)
+                     (alu :cmp :t5 :t0) (branch :hi :ls/trap-bytes)
+                     (load :s2 :pool-base) (alu :add :s2 :t7) (mov :s3 :t5)
+                     (mov :t2 :t4) (shl :t2 3) (alu :add :t2 :t6) (li :t0 0))
+            copied (-> room (mark (tag prefix "raw-copy")) (alu :cmp :t0 :t5)
+                       (branch :hs (tag prefix "raw-copied")) (mem :ld :t1 :t2 0)
+                       (byte-op :stb :t1 :s2 :t0) (imm :add :t2 8) (imm :add :t0 1)
+                       (branch :always (tag prefix "raw-copy")) (mark (tag prefix "raw-copied"))
+                       (alu :add :t7 :t5) (store :t7 :pool-used))]
+        (record-new [:ref :linux.static.vectors/result] copied (document-map) :ok)))))
+
+;; Inline C3 result fragment: s0=context, s1=trusted raw source pointer,
+;; s2=length -> t0=new bytes handle. The caller must have proved a stable
+;; source window disjoint from the fresh vector tail. The complete span is
+;; copied into byte WORDS; no string pair or UTF8 cache is used/published.
+(defn intern-bytes-fragment [context :document prefix :string] [:ref :linux.static.vectors/result]
+  (let [error (configuration-error context)]
+    (if (not= error :ok)
+      (record-new [:ref :linux.static.vectors/result] (empty-code) (document-map) error)
+      (let [cfg (configuration context)
+            checked (-> (empty-code) (mov :ctx :s0) (imm :cmp :s2 0) (branch :lt :ls/bad)
+                        (mov :t5 :s2) (load :t0 :byte-value-limit)
+                        (alu :cmp :t5 :t0) (branch :hi (value-label 10))
+                        (load :t0 :vector-item-limit) (alu :cmp :t5 :t0) (branch :hi :ls/bad))
+            room (-> (table-room (item-room checked :t5)) (mov :t4 :t7)
+                     (mem :ld :t6 :ctx (record-get [:ref :linux.static.vectors/config] cfg :items))
+                     (mov :t3 :t7) (shl :t3 3) (alu :add :t3 :t6) (li :t0 0))
+            copied (-> room (mark (tag prefix "raw-copy")) (alu :cmp :t0 :t5)
+                       (branch :hs (tag prefix "raw-copied")) (byte-op :ldb :t1 :s1 :t0)
+                       (mem :st :t1 :t3 0) (imm :add :t3 8) (imm :add :t0 1)
+                       (branch :always (tag prefix "raw-copy")) (mark (tag prefix "raw-copied"))
+                       (alu :add :t7 :t5) (store :t7 :vector-item-used))]
+        (record-new [:ref :linux.static.vectors/result] (intern copied cfg) (document-map) :ok)))))
+
 (defn routine [context :document slot :keyword] [:ref :linux.static.vectors/result]
   (let [used (lookup context :vector-used-pointer-offset) table (lookup context :vectors-base-offset)
         items (lookup context :vector-items-base-offset)

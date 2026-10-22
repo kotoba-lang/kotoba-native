@@ -2,7 +2,8 @@
 ;; Canonical IR source candidate; not admitted, generated or executed yet.
 (ns kotoba.native.linux-static-strings
   {:kotoba/export [supported-slots external-labels routine routines
-                   read-string-fragment intern-string-fragment pool-pair-fragment validated-pool-pair-fragment]}
+                   read-string-fragment read-span-fragment utf8-span-fragment
+                   intern-string-fragment pool-pair-fragment validated-pool-pair-fragment]}
   (:require [kotoba.native.linux-static-assembler :as asm])
   (:schemas
    {:linux.static.strings/config
@@ -113,17 +114,14 @@
   (-> out (byte-op :ldb a p i) (mov b a) (imm :and b 192)
       (imm :cmp b 128) (branch :ne :ls/bad)))
 
-(defn- validate [out [:list [:ref :linux.static/instruction]]
-                 cfg [:ref :linux.static.strings/config] prefix :string
-                 h :keyword p :keyword n :keyword i :keyword a :keyword b :keyword v :keyword]
+(defn- validate-span [out [:list [:ref :linux.static/instruction]] prefix :string
+                      p :keyword n :keyword i :keyword a :keyword b :keyword v :keyword]
   [:list [:ref :linux.static/instruction]]
-  (let [done (tag prefix "valid") scan (tag prefix "utf8")
+  (let [scan (tag prefix "utf8")
         three (tag prefix "utf8-3") four (tag prefix "utf8-4")
         e0 (tag prefix "utf8-e0") ed (tag prefix "utf8-ed")
         f0 (tag prefix "utf8-f0") f4 (tag prefix "utf8-f4") ok (tag prefix "utf8-ok")
-        first (-> out (mem :ld v :ctx (record-get [:ref :linux.static.strings/config] cfg :validated))
-                  (mov i h) (imm :sub i 1) (byte-op :ldb a v i) (imm :cmp a 0) (branch :ne done)
-                  (li i 0) (mark scan) (alu :cmp i n) (branch :hs ok)
+        first (-> out (li i 0) (mark scan) (alu :cmp i n) (branch :hs ok)
                   (byte-op :ldb a p i) (imm :add i 1)
                   (imm :cmp a 127) (branch :ls scan) (imm :cmp a 194) (branch :lo :ls/bad)
                   (imm :cmp a 223) (branch :hi three)
@@ -144,7 +142,17 @@
                  (imm :add i 1))
         last (imm (continuation tail p i b v) :add i 1)]
     (-> (continuation last p i b v) (imm :add i 1) (branch :always scan)
-        (mark ok) (mem :ld v :ctx (record-get [:ref :linux.static.strings/config] cfg :validated))
+        (mark ok))))
+
+(defn- validate [out [:list [:ref :linux.static/instruction]]
+                 cfg [:ref :linux.static.strings/config] prefix :string
+                 h :keyword p :keyword n :keyword i :keyword a :keyword b :keyword v :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (let [done (tag prefix "valid")
+        cached (-> out (mem :ld v :ctx (record-get [:ref :linux.static.strings/config] cfg :validated))
+                   (mov i h) (imm :sub i 1) (byte-op :ldb a v i) (imm :cmp a 0) (branch :ne done))
+        checked (validate-span cached prefix p n i a b v)]
+    (-> checked (mem :ld v :ctx (record-get [:ref :linux.static.strings/config] cfg :validated))
         (mov i h) (imm :sub i 1) (li a 1) (byte-op :stb a v i) (mark done))))
 
 (defn- pair-new [out [:list [:ref :linux.static/instruction]]
@@ -346,6 +354,23 @@
   (generate context :all))
 
 ;; Inline C3 fragments, not callable guest slots. The owner has saved s0..s4.
+;; Raw internal pool pairs are not strings. This resolves an already admitted
+;; handle/window without consulting or setting the UTF8 validation cache.
+;; Only an explicitly typed byte result path may use this fragment.
+(defn read-span-fragment [context :document prefix :string] [:ref :linux.static.strings/result]
+  (let [error (configuration-error context)]
+    (if (not= error :ok) (failure error)
+      (record-new [:ref :linux.static.strings/result]
+        (resolve-string (mov (empty-code) :ctx :s0) (configuration context)
+          prefix :s1 :s2 :s3 :t0 :t1) (document-map) :ok))))
+
+;; s1/s2 is a trusted bounded byte window, e.g. the framed path portion of a
+;; checked bytes request. Validate only that span; no cache bit is published
+;; for the containing arbitrary-byte value. No pointer authority is granted.
+(defn utf8-span-fragment [prefix :string] [:ref :linux.static.strings/result]
+  (record-new [:ref :linux.static.strings/result]
+    (validate-span (empty-code) prefix :s1 :s2 :t0 :t1 :t2 :t3) (document-map) :ok))
+
 ;; read: s0=context, s1=handle -> s2=pointer/s3=length after full UTF-8 checks.
 (defn read-string-fragment [context :document prefix :string] [:ref :linux.static.strings/result]
   (let [error (configuration-error context)]

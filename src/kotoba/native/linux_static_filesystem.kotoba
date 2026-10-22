@@ -549,11 +549,14 @@
     (if (not= error :ok) (failure error)
       (let [sources (source-fragments isa source-plan layout) source-error (source-error sources)
             pair (strings/pool-pair-fragment (lookup source-plan :context-abi))
+            path-utf8 (strings/utf8-span-fragment "fs-raw-path")
             frame (protocol/request-fragment :app-data :ls.fs/legacy-request)]
         (cond
           (not= source-error :ok) (failure source-error)
           (not= (record-get [:ref :linux.static.strings/result] pair :error) :ok)
           (failure (record-get [:ref :linux.static.strings/result] pair :error))
+          (not= (record-get [:ref :linux.static.strings/result] path-utf8 :error) :ok)
+          (failure (record-get [:ref :linux.static.strings/result] path-utf8 :error))
           (not= (record-get [:ref :linux.static.fs.protocol/result] frame :error) :ok)
           (failure (record-get [:ref :linux.static.fs.protocol/result] frame :error))
           :else
@@ -570,8 +573,16 @@
                            (li :t2 0) (mark :ls.fs/framed-occurrence))
                 checked (-> (hd framed cfg 17 (io/state-field :form) (io/register :t2) (io/literal 0) (io/literal 0))
                             (imm :cmp :t0 1) (branch :ne :ls/bad) (branch :always :ls.fs/request-ready)
-                            (mark :ls.fs/legacy-request) (tokens cfg) (mark :ls.fs/request-ready))
-                parsed (fragment checked cfg :resolve-a)
+                            ;; Raw contracts require FS2; ambiguous legacy
+                            ;; token framing remains only on the old text API.
+                            (mark :ls.fs/legacy-request) (load :t0 :rk) (imm :cmp :t0 1) (branch :ne :ls/bad)
+                            (tokens cfg) (mark :ls.fs/request-ready))
+                typed (-> (hd checked cfg 49 (io/state-field :rk) (io/state-field :form) (io/literal 0) (io/literal 0))
+                          (imm :cmp :t0 1) (branch :ne :ls/bad)
+                          (load :t0 :rk) (imm :cmp :t0 8) (branch :ne :ls.fs/path-utf8-ready))
+                path-checked (-> (join typed (record-get [:ref :linux.static.strings/result] path-utf8 :code))
+                                 (mark :ls.fs/path-utf8-ready))
+                parsed (fragment path-checked cfg :resolve-a)
                 dispatch (loop [form 0 code parsed]
                            (if (= form 16) (branch code :always :ls/bad)
                              (recur (+ form 1) (-> code (load :t0 :form) (imm :cmp :t0 form) (branch :eq (form-label form))))))
