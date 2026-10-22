@@ -1,0 +1,203 @@
+{
+  "kind": "native-vector-growth-and-five-counter-scopes",
+  "qualified": false,
+  "parentCommit": "86c691e4775a54e64155fe3310a24bbf43ebd397",
+  "compiler": {
+    "bytes": 2713952,
+    "sha256": "aca405b65c0313aee4b672a5c5c65839b6fe7e941aeaf957865c81da50b3843f"
+  },
+  "packagerContainer": {
+    "bytes": 1230737,
+    "sha256": "00c5f34ebc4493970cad404a9f9fc2307491b175b3dfa33dfe0a103db4b25df9"
+  },
+  "packager": {
+    "bytes": 1370464,
+    "sha256": "01d16edcfb23d2015c925a44796bdbcab16e87be48f77e4f007590794d064a0a"
+  },
+  "sourceLock": {
+    "bytes": 6518,
+    "sha256": "511e8729c7cb8a6bde52811934551ddcd8460a03b9439e71cec03a3c8691e845"
+  },
+  "sourceFiles": {
+    "kind": "explicit native framing fixture source, not public admission",
+    "nativeBase": "86c691e4775a54e64155fe3310a24bbf43ebd397",
+    "entryComposition": "canonical linux_static plus named bootstrap fixture; only main export and bootstrap plan/FS2 aliases",
+    "files": [
+      {
+        "path": "kotoba/artifact/data.kotoba",
+        "sha256": "02b9aba659025c354aa824ff4989eed0e490413f6b5120c639d0d04e5b2c788c"
+      },
+      {
+        "path": "kotoba/artifact/form_seal.kotoba",
+        "sha256": "ac1eea5f846f3e5508f8aaca40247424f37e5f88a2a5289a2af1cda282f86591"
+      },
+      {
+        "path": "kotoba/compiler/filesystem_wire.kotoba",
+        "sha256": "88a1a0b6a0093d4557ed9c9c39d53b791b9c868988257c688724b5641e69bb4e"
+      },
+      {
+        "path": "kotoba/compiler/io_buffer.kotoba",
+        "sha256": "0dfb31f001ef52b15a34b3ff17038bbede0e19e9d1e6e778e5a8781c1fffea7b"
+      },
+      {
+        "path": "kotoba/form.kotoba",
+        "sha256": "0165182115e18c5802a32660f19ed75c15aaa683881ad52040c104dfc27959f5"
+      },
+      {
+        "path": "kotoba/native/bootstrap_compiler_plan.kotoba",
+        "sha256": "39f3bd864674949ac94eacb6076050620f49f695c068294de0d13ac9bc2d7ef5"
+      },
+      {
+        "path": "kotoba/native/linux_static.kotoba",
+        "sha256": "e6c0410e0806c974f204ddd5b49873fa7fa26b320e9d6460d275c96626091d22"
+      },
+      {
+        "path": "kotoba/native/linux_static_arena.kotoba",
+        "sha256": "b236422bbfdda39eff9de3401ea14fce27dad282ebf275b16df569646e90a059"
+      },
+      {
+        "path": "kotoba/native/linux_static_assembler.kotoba",
+        "sha256": "2e89caa53f7b6618046b5e12af0267afcde75407f3ffca30c239938ae4d5a4fb"
+      },
+      {
+        "path": "kotoba/native/linux_static_browse.kotoba",
+        "sha256": "d04b0a17810ed6c8f81253066b197bedd5cd2d2ce808eb9a39455000dabece21"
+      },
+      {
+        "path": "kotoba/native/linux_static_capability.kotoba",
+        "sha256": "2946d691e2c994efa3dfca471d401a1017c4ca3dcaaa33d95c152de28575be66"
+      },
+      {
+        "path": "kotoba/native/linux_static_context.kotoba",
+        "sha256": "0f1f2496bf01a83b9f813bd6784696e802f34c7c0265cd4c3d166b9fc9bc0d7f"
+      },
+      {
+        "path": "kotoba/native/linux_static_filesystem.kotoba",
+        "sha256": "9ad3222e9d5aab26a0dabf27f7ed1b9bfca2d66bf28eed3136450167de551c69"
+      },
+      {
+        "path": "kotoba/native/linux_static_fs_protocol.kotoba",
+        "sha256": "376c13eecfe0fe0fd35b81991bd04648318051e5129fbb3cebf49eee82dadadb"
+      },
+      {
+        "path": "kotoba/native/linux_static_graph.kotoba",
+        "sha256": "00ea5188146d7b19da186aeb7c08bb894f0d116736adb30449a2032924833ced"
+      },
+      {
+        "path": "kotoba/native/linux_static_io.kotoba",
+        "sha256": "ba73ccefb75004e477833738b7788205eda7c72339775c85151306756a192c8e"
+      },
+      {
+        "path": "kotoba/native/linux_static_output.kotoba",
+        "sha256": "887946f6413bc983db0fd37e28dabe75760a6b5facab830e409e80044bf67831"
+      },
+      {
+        "path": "kotoba/native/linux_static_paths.kotoba",
+        "sha256": "4f5c8aff951c254aa7ddc612df8e692980b2dc25b29d821f239cab367951eb29"
+      },
+      {
+        "path": "kotoba/native/linux_static_plan.kotoba",
+        "sha256": "17e91737732cc749c6a85e15eb1de6631ccb212ab32fbae3962d88147cf5ddfe"
+      },
+      {
+        "path": "kotoba/native/linux_static_prelude.kotoba",
+        "sha256": "8839c9de1ac22af5fc05a14c3aae7631e65c85b12b660a79fa087595cbb039a0"
+      },
+      {
+        "path": "kotoba/native/linux_static_sha256.kotoba",
+        "sha256": "e4e0a8c5cd764afb5d58f5923b84d68c9d4af3d6f6d78949b82d39e56f043cbd"
+      },
+      {
+        "path": "kotoba/native/linux_static_spawn.kotoba",
+        "sha256": "260bcb5afb796452fe068c9ad2aa9750f31689175cad3b7cd4c021cf2d607159"
+      },
+      {
+        "path": "kotoba/native/linux_static_strings.kotoba",
+        "sha256": "b9bb3ea0f400fab7e31da9768d7b9af6522e18bb243b640697f9749eeefedc31"
+      },
+      {
+        "path": "kotoba/native/linux_static_vectors.kotoba",
+        "sha256": "89a56cb15bd1c6c0d5ec0c41f014adbf4a1d69f4b2a8c9e15e8d644bb0b82014"
+      },
+      {
+        "path": "kotoba/object/elf64.kotoba",
+        "sha256": "898ac7a77018f496c46c0673666ea0876a3a643aa805b2c66e308f71c3691f1a"
+      }
+    ]
+  },
+  "unitSource": {
+    "bytes": 2619,
+    "sha256": "b0b006f33f01ba5d12dc1d83572247eaee56d97ea50894638b8e3eda4ce321d5"
+  },
+  "unitContainer": {
+    "bytes": 4903,
+    "sha256": "be432e00589ca3b80f5bbf4325081fc269faa0275f9d8f1c0511aece1543cde7"
+  },
+  "unitCases": [
+    {
+      "symbol": "main",
+      "mode": "pure",
+      "nativeExit": 0
+    },
+    {
+      "symbol": "fork-main",
+      "mode": "pure",
+      "nativeExit": 0
+    },
+    {
+      "symbol": "views-main",
+      "mode": "pure",
+      "nativeExit": 0
+    },
+    {
+      "symbol": "rollback-main",
+      "mode": "pure",
+      "nativeExit": 0
+    },
+    {
+      "symbol": "exact-fit-main",
+      "mode": "vector20",
+      "nativeExit": 0
+    },
+    {
+      "symbol": "exact-fit-main",
+      "mode": "vector18",
+      "nativeExit": 72
+    }
+  ],
+  "scopeCases": [
+    {
+      "symbol": "main",
+      "exit": 0,
+      "stderr": ""
+    },
+    {
+      "symbol": "deep-main",
+      "exit": 0,
+      "stderr": ""
+    },
+    {
+      "symbol": "overflow-main",
+      "exit": 70,
+      "stderr": "KEXE_TRAP {:kind :signal :signal :SIGILL}\n"
+    },
+    {
+      "symbol": "unscoped-main",
+      "exit": 72,
+      "stderr": "KEXE_TRAP {:kind :budget :reason :probe/cells :arena :vectors}\n"
+    }
+  ],
+  "full19ExitZero": 19,
+  "unchangedGuestLimits": {
+    "cells": 4194304,
+    "vectors": 1048576,
+    "vectorItems": 134217728
+  },
+  "remaining": [
+    "full historical corpus migration",
+    "generic abort/recur cleanup",
+    "owning main and resolver/Definition CID",
+    "current parent quote-reader integration",
+    "public target/profile/seal/CLI and x86_64-linux-static controller"
+  ]
+}

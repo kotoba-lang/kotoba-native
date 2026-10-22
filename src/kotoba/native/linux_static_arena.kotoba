@@ -1,5 +1,5 @@
 ;; Structural scalar arena-scope, context ABI v6/v11. Preserve the original
-;; 256-deep LIFO bound and the four allocator checkpoints. No grants/effects.
+;; 256-deep LIFO bound and allocator/growth-region checkpoints. No grants/effects.
 (ns kotoba.native.linux-static-arena
   {:kotoba/export [supported-slots routine]}
   (:require [kotoba.artifact.data :as meta] [kotoba.native.linux-static-assembler :as asm]
@@ -21,9 +21,9 @@
 (defn- branch [out [:list [:ref :linux.static/instruction]] condition :keyword target :string]
   [:list [:ref :linux.static/instruction]] (ins out :bcc condition :none :none :none 0 target))
 (defn- counter [index :i64] :i64
-  (io/state-offset (case index 0 :pair-used 1 :pool-used 2 :vector-used :vector-item-used)))
+  (io/state-offset (case index 0 :pair-used 1 :pool-used 2 :vector-used 3 :vector-item-used :vector-region-used)))
 (defn- position [out [:list [:ref :linux.static/instruction]] base :i64] [:list [:ref :linux.static/instruction]]
-  (-> out (ins :mov :none :t1 :t0 :none 0 "") (ins :shli :none :t1 :none :none 5 "")
+  (-> out (ins :mov :none :t1 :t0 :none 0 "") (ins :shli :none :t1 :none :none 6 "")
       (ins :li :none :t2 :none :none base "") (ins :alu :add :t1 :t2 :none 0 "")))
 (defn- start [name :string] [:list [:ref :linux.static/instruction]]
   (-> (empty-code) (ins :align :none :none :none :none 16 "")
@@ -36,18 +36,18 @@
 (defn- enter-code [base :i64] [:list [:ref :linux.static/instruction]]
   (let [begin (position (-> (start "ls.arena/enter") (imm :cmp :t0 256) (branch :hs "ls/bad")) base)
         saved (loop [index 0 out begin]
-                (if (= index 4) out
+                (if (= index 5) out
                   (recur (+ index 1) (-> out (mem :ld :t2 :ctx (counter index)) (mem :st :t2 :t1 (* index 8))))))]
     (done (imm saved :add :t0 1))))
 (defn- leave-code [base :i64] [:list [:ref :linux.static/instruction]]
   (let [begin (position (-> (start "ls.arena/leave") (imm :cmp :t0 0) (branch :eq "ls/bad")
                             (imm :cmp :t0 256) (branch :hi "ls/bad") (imm :sub :t0 1)) base)
         checked (loop [index 0 out begin]
-                  (if (= index 4) out
+                  (if (= index 5) out
                     (recur (+ index 1) (-> out (mem :ld :t2 :t1 (* index 8)) (mem :ld :t3 :ctx (counter index))
                                            (ins :alu :cmp :t2 :t3 :none 0 "") (branch :hi "ls/bad")))))
         restored (loop [index 0 out checked]
-                   (if (= index 4) out
+                   (if (= index 5) out
                      (recur (+ index 1) (-> out (mem :ld :t2 :t1 (* index 8)) (mem :st :t2 :ctx (counter index))))))]
     ;; No counter or depth changes until every checkpoint has been validated.
     (done restored)))
@@ -60,9 +60,9 @@
         pool (get-i64 layout :pool) bytes (get-i64 source-plan :bytes)
         name (if (= slot :arena-enter) "ls.arena/enter" "ls.arena/leave")]
     (if (or (not (meta/value-set-contains? (supported-slots) (meta/value-keyword slot)))
-            (not= (get-i64 context :version) 11) (< data 1) (< size 8192) (< pool data) (< bytes 0)
+            (not= (get-i64 context :version) 11) (< data 1) (< size 16384) (< pool data) (< bytes 0)
             (> size (- 9223372036854775807 data)) (> bytes (- 9223372036854775807 pool))
-            (< base (+ pool bytes)) (> base (- (+ data size) 8192)) (not= (bit-and base 15) 0))
+            (< base (+ pool bytes)) (> base (- (+ data size) 16384)) (not= (bit-and base 15) 0))
       (record-new [:ref :linux.static.arena/result] (empty-code) (meta/value-map) :arena-layout)
       (record-new [:ref :linux.static.arena/result] (if (= slot :arena-enter) (enter-code base) (leave-code base))
         (meta/value-map-insert (meta/value-map) (meta/value-keyword slot) (meta/value-string name)) :ok))))

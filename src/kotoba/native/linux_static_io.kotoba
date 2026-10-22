@@ -91,7 +91,7 @@
     :out-create 1848 :out-managed-member 1856 :out-message 1864
     :out-message-length 1872 :out-exit 1880
     :c1-code-base 1888 :c1-code-length 1896 :c3-code-base 1904 :c3-code-length 1912 :kgraph-used 1920
-    :arena-depth 1936 -1))
+    :arena-depth 1936 :vector-region-used 1944 :vector-region-map 1952 :vector-regions 1960 -1))
 
 (defn- load [out [:list [:ref :linux.static/instruction]] d :keyword key :keyword]
   [:list [:ref :linux.static/instruction]] (mem out :ld d :s0 (offset key)))

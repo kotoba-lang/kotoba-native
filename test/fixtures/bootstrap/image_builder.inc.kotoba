@@ -40,15 +40,20 @@
     (if (or (not (result-ok?-of [:result :bytes :document] c1))
             (not (result-ok?-of [:result :bytes :document] c3))
             (not (result-ok?-of [:result :bytes :document] guest)) (< offset 0)
-            (not (or (string=? mode "compiler") (string=? mode "pure") (string=? mode "hash")))) 3
-      (let [source-plan (if (string=? mode "pure") (bootstrap-plan/pure-plan (bootstrap-arg 0))
+            (not (or (string=? mode "compiler") (string=? mode "pure") (string=? mode "hash")
+                     (string=? mode "vector20") (string=? mode "vector18")))) 3
+      (let [source-plan (if (or (string=? mode "vector20") (string=? mode "vector18"))
+                         (-> (bootstrap-plan/pure-plan (bootstrap-arg 0))
+                             (meta/value-assoc (meta/value-keyword :vectors) (meta/value-i64 64))
+                             (meta/value-assoc (meta/value-keyword :vector-items) (meta/value-i64 (if (string=? mode "vector20") 20 18))))
+                         (if (string=? mode "pure") (bootstrap-plan/pure-plan (bootstrap-arg 0))
                         (if (string=? mode "hash")
                           (bootstrap-plan/hash-plan (bootstrap-arg 0)
                             (result-value-of [:result :bytes :document] c1 (bytes-empty))
                             (result-value-of [:result :bytes :document] c3 (bytes-empty)))
                           (bootstrap-plan/compiler-plan (bootstrap-arg 0)
                           (result-value-of [:result :bytes :document] c1 (bytes-empty))
-                          (result-value-of [:result :bytes :document] c3 (bytes-empty)))))
+                          (result-value-of [:result :bytes :document] c3 (bytes-empty))))))
             code (vector-i64-from-bytes (result-value-of [:result :bytes :document] guest (bytes-empty)))]
         (if (or (>= offset (vector-count code)) (not= (bit-and offset 3) 0)) 3
           (let [built (build :aarch64 source-plan code offset)]

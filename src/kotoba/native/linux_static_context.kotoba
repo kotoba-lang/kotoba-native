@@ -72,6 +72,9 @@
                  (word (io/state-offset :code-base) code-address) (word (io/state-offset :code-length) code-length)
                  (word (io/state-offset :pool-base) (i64-of (lookup layout :pool)))
                  (word (io/state-offset :arena-depth) 0)
+                 (word (io/state-offset :vector-region-used) 0)
+                 (word (io/state-offset :vector-region-map) (i64-of (lookup layout :vector-region-map)))
+                 (word (io/state-offset :vector-regions) (i64-of (lookup layout :vector-regions)))
                  (word (io/state-offset :sigaction) handler)
                  (word (+ (io/state-offset :sigaction) 8) 201326592)
                  (word (+ (io/state-offset :sigaction) 16) handler)
@@ -110,6 +113,8 @@
         slots (lookup source-plan :slots) grant (lookup source-plan :grant)
         alt (i64-of (lookup layout :alt)) pairs (i64-of (lookup layout :pairs))
         valid (i64-of (lookup layout :valid)) pool (i64-of (lookup layout :pool))
+        marks (i64-of (lookup layout :arena-marks)) region-map (i64-of (lookup layout :vector-region-map))
+        regions (i64-of (lookup layout :vector-regions))
         text (i64-of (lookup layout :text)) handler (address labels "ls/handler")]
     (cond
       (or (<= data 0) (not= (bit-and data 4095) 0) (< memory 4096)
@@ -128,7 +133,12 @@
           (not (span? items (* 8 item-count) (+ data 4096) (+ data memory)))
           (not (span? pool bytes (+ data 4096) (+ data memory)))
           (> (+ alt 16384) pairs) (> (+ pairs (* cells 16)) valid) (> (+ valid cells) table)
-          (> (+ table (* 16 table-count)) items) (> (+ items (* 8 item-count)) pool)) :arena-layout
+          (> (+ table (* 16 table-count)) items) (> (+ items (* 8 item-count)) pool)
+          (not (span? marks 16384 (+ data 4096) (+ data memory)))
+          (not (span? region-map (* 8 table-count) (+ data 4096) (+ data memory)))
+          (not (span? regions (* 16 table-count) (+ data 4096) (+ data memory)))
+          (> (+ pool bytes) marks) (> (+ marks 16384) region-map)
+          (> (+ region-map (* 8 table-count)) regions)) :arena-layout
       (or (not= (meta/value-kind slots) :map) (not= (meta/value-kind bindings) :map)
           (not= (meta/value-kind grant) :vector)) :context-input
       (and (true? (lookup source-plan :handlers?))

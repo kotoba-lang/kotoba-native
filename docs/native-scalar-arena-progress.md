@@ -1,6 +1,7 @@
 # Native scalar arena checkpoint candidate
 
-This extends the rooted native packager at `86c691e4`. The structural
+The initial checkpoint generation at `6ee15fd` extends the rooted native
+packager at `86c691e4`. The structural
 `arena-enter`/`arena-leave` slots retain ABI offsets 224/232 and the original
 256-deep LIFO bound. Enter snapshots pair, string-pool, vector-handle and
 vector-item use; leave validates every saved value before restoring any of
@@ -20,6 +21,27 @@ evidence JSON. The ordinary whole-MIR eight-component aggregate also exited
 This is an internal AArch64 CPU framing fixture, not public target/profile,
 seal, CLI, native controller or release admission. General abort/recur cleanup,
 the complete existing corpus and the large MIR resource gates remain open.
-The prior 19-workload correctness result belongs to the pre-arena compiler;
-the current successor still requires its own full19 rerun. No historical C,
-Node, JVM, CLJK or Python materializer build route was used for these runs.
+No historical C, Node, JVM, CLJK or Python materializer build route was used
+for these runs.
+
+## Growth-region successor
+
+The successor retains persistent vector prefixes and forks while reserving
+geometric tail room after an interleaved allocation. It uses a private
+per-handle region map and fill/capacity rows. A stale prefix forks by copying;
+views and new/recycled handles clear their region identity. If reservation
+cannot fit, the exact-size path remains available; actual exhaustion retains
+the original item-budget refusal. Guest cell/vector/item limits and grants
+are unchanged. Only bounded private metadata is added by image planning.
+
+Scopes now save five counters, including region-row use, in 256 records of
+64 bytes. All five values are checked before any restoration. Region map/row
+spans are derived and checked against the mapping before launch.
+
+[growth-correctness.json](evidence/native-arena-20261023/growth-correctness.json)
+records 16,385 interleaved appends, persistent forks, assoc/view/byte-view
+behavior, 600,000 region rollbacks, exact-size fallback with 20 item cells,
+and unchanged refusal with 18 cells. The original scope/depth/unscoped cases
+also pass on this generation. G5 freshly compiled all 19 correctness workloads
+and they all exited zero using this packager; no new timing score is claimed.
+MIR large/resource results are maintained with the owning MIR source receipt.
