@@ -6,6 +6,7 @@
             [kotoba.native.linux-static-strings :as strings]
             [kotoba.native.linux-static-vectors :as vectors]
             [kotoba.native.linux-static-capability :as capability]
+            [kotoba.native.linux-static-output :as owned-output]
             [kotoba.native.linux-static-io :as io])
   (:schemas
    {:linux.static.prelude/config
@@ -131,11 +132,40 @@
                  (io/literal (+ data (io/state-offset :sigaction))) (io/literal 0) (io/literal 8))
               (imm :cmp :t0 0) (branch :ne :ls/bad)))))))
 
-;; Both public and fatal output use explicit lengths and complete short writes.
+(defn- cleanup-message [] :string
+  "KEXE_TRAP {:kind :cleanup :reason :output-cleanup-incomplete}\n")
+(defn- cleanup-before-exit [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.prelude/config]
+                           prefix :string fd :i64]
+  [:list [:ref :linux.static/instruction]]
+  (if (not (true? (lookup (record-get [:ref :linux.static.prelude/config] cfg :plan) :handlers?))) out
+    (let [saved (-> out (li :s0 (record-get [:ref :linux.static.prelude/config] cfg :data))
+                    (mem :st :p1 :s0 (io/state-offset :out-message))
+                    (mem :st :p2 :s0 (io/state-offset :out-message-length))
+                    (mem :st :t5 :s0 (io/state-offset :out-exit))
+                    (append :call :none :none :none :none :none 0 :ls.output/cleanup)
+                    (mov :t0 :ret) (imm :cmp :t0 1) (branch :eq (tag prefix "cleanup-done")))
+          failed (if (= fd 1)
+                   (-> saved (li :t0 (exit-code cfg :capability/refused))
+                       (mem :st :t0 :s0 (io/state-offset :out-exit))) saved)
+          message (-> failed (la :p1 :ls.prelude/cleanup-message)
+                      (li :p2 (bytes-count (string-to-utf8 (cleanup-message))))
+                      (mark (tag prefix "cleanup-write")) (imm :cmp :p2 0) (branch :eq (tag prefix "cleanup-done")))
+          wrote (sys message cfg :write (io/literal 2) (io/register :p1) (io/register :p2) (io/literal 0))]
+      (-> wrote (imm :cmp :t0 -4) (branch :eq (tag prefix "cleanup-write"))
+          (imm :cmp :t0 0) (branch :le (tag prefix "cleanup-done"))
+          (alu :cmp :t0 :p2) (branch :hi (tag prefix "cleanup-done"))
+          (alu :add :p1 :t0) (alu :sub :p2 :t0) (branch :always (tag prefix "cleanup-write"))
+          (mark (tag prefix "cleanup-done"))
+          (mem :ld :p1 :s0 (io/state-offset :out-message))
+          (mem :ld :p2 :s0 (io/state-offset :out-message-length))
+          (mem :ld :t5 :s0 (io/state-offset :out-exit))))))
+
+;; Both public and fatal output use owned cleanup, then complete short writes.
 (defn- write-and-exit [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.prelude/config]
                        prefix :string fd :i64]
   [:list [:ref :linux.static/instruction]]
-  (let [start (-> out (mark (tag prefix "write")) (imm :cmp :p2 0) (branch :eq (tag prefix "exit")))
+  (let [start (-> (cleanup-before-exit out cfg prefix fd)
+                  (mark (tag prefix "write")) (imm :cmp :p2 0) (branch :eq (tag prefix "exit")))
         wrote (sys start cfg :write (io/literal fd) (io/register :p1) (io/register :p2) (io/literal 0))
         complete (-> wrote (imm :cmp :t0 -4) (branch :eq (tag prefix "write"))
                      (imm :cmp :t0 0) (branch :le (tag prefix "exit")) (alu :cmp :t0 :p2) (branch :hi (tag prefix "exit"))
@@ -232,6 +262,7 @@
                  (data-bytes :ls.prelude/vector-items-message (budget-message cfg :cells " :arena :vector-items"))
                  (data-bytes :ls.prelude/bytes-message (budget-message cfg :bytes " :arena :string-pool"))
                  (data-bytes :ls.prelude/no-handler-message (slot-message cfg :typed-cap-call))
+                 (data-bytes :ls.prelude/cleanup-message (cleanup-message))
                  (data-bytes :ls.prelude/unknown-message (signal-message 5)))
         signals (loop [index 0 code base]
                   (if (= index 5) code
@@ -314,17 +345,21 @@
         (if (not= (record-get [:ref :linux.static.prelude/slots] slots :error) :ok)
           (failure (record-get [:ref :linux.static.prelude/slots] slots :error))
           (if (true? (lookup source-plan :handlers?))
-            (let [caps (capability/routine isa source-plan layout)]
+            (let [caps (capability/routine isa source-plan layout)
+                  owned (owned-output/routine isa layout)]
               (if (not= (record-get [:ref :linux.static.capability/result] caps :error) :ok)
                 (failure (record-get [:ref :linux.static.capability/result] caps :error))
-                (let [body (-> (startup cfg) (join (record-get [:ref :linux.static.capability/result] caps :start))
+                (if (not= (record-get [:ref :linux.static.output/result] owned :error) :ok)
+                  (failure (record-get [:ref :linux.static.output/result] owned :error))
+                  (let [body (-> (startup cfg) (join (record-get [:ref :linux.static.capability/result] caps :start))
                                (guest-and-answer cfg) (signal-handler cfg) (trap-paths cfg)
                                (join (record-get [:ref :linux.static.prelude/slots] slots :code))
+                               (join (record-get [:ref :linux.static.output/result] owned :code))
                                (join (record-get [:ref :linux.static.capability/result] caps :code)) (constants cfg))]
                   (record-new [:ref :linux.static.prelude/result] body
                     (record-get [:ref :linux.static.prelude/slots] slots :bindings)
                     (document-set (document-keyword :ls/guest-main) (document-keyword :ls.cap/c1-cap)
-                      (document-keyword :ls.cap/c1-decide) (document-keyword :ls.cap/h-decide)) :ok))))
+                      (document-keyword :ls.cap/c1-decide) (document-keyword :ls.cap/h-decide)) :ok)))))
             (let [body (-> (startup cfg) (guest-and-answer cfg) (signal-handler cfg) (trap-paths cfg)
                            (join (record-get [:ref :linux.static.prelude/slots] slots :code)) (constants cfg))]
               (record-new [:ref :linux.static.prelude/result] body

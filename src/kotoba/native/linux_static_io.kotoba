@@ -86,7 +86,9 @@
     :chunk-index 1728 :chunk-pool 1736 :chunk-copied 1744
     :out-active 1752 :out-parent 1760 :out-directory 1768 :out-file 1776
     :out-count 1784 :out-path-length 1792 :out-name-length 1800 :out-index 1808
-    :out-failed 1816 :out-cleaning 1824 :out-probe 1832 :out-rmdir 1840 -1))
+    :out-failed 1816 :out-cleaning 1824 :out-probe 1832 :out-rmdir 1840
+    :out-create 1848 :out-managed-member 1856 :out-message 1864
+    :out-message-length 1872 :out-exit 1880 -1))
 
 (defn- load [out [:list [:ref :linux.static/instruction]] d :keyword key :keyword]
   [:list [:ref :linux.static/instruction]] (mem out :ld d :s0 (offset key)))

@@ -149,6 +149,21 @@
                   (mark :ls.output/member-invalid) (li :a1 -22) (mark :ls.output/member-done))]
     (end owned)))
 
+(defn- same-path [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.output/config]]
+  [:list [:ref :linux.static/instruction]]
+  (end (-> (begin out cfg :ls.output/same-path) (load :t0 :out-active)
+           (imm :cmp :t0 0) (branch :eq :ls.output/path-mismatch)
+           (load :s2 :out-path-length) (load :t0 :len-a) (alu :cmp :s2 :t0)
+           (branch :ne :ls.output/path-mismatch)
+           (li :s1 (record-get [:ref :linux.static.output/config] cfg :path))
+           (li :s3 (record-get [:ref :linux.static.output/config] cfg :space))
+           (li :t0 0) (mark :ls.output/path-next) (alu :cmp :t0 :s2)
+           (branch :hs :ls.output/path-match) (byte-op :ldb :t1 :s1 :t0) (byte-op :ldb :t2 :s3 :t0)
+           (alu :cmp :t1 :t2) (branch :ne :ls.output/path-mismatch)
+           (imm :add :t0 1) (branch :always :ls.output/path-next)
+           (mark :ls.output/path-match) (li :a1 1) (branch :always :ls.output/path-return)
+           (mark :ls.output/path-mismatch) (li :a1 0) (mark :ls.output/path-return))))
+
 (defn- cleanup [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.output/config]]
   [:list [:ref :linux.static/instruction]]
   (let [space (record-get [:ref :linux.static.output/config] cfg :space)
@@ -225,4 +240,4 @@
       (record-new [:ref :linux.static.output/result] (empty-code) :output-layout)
       (let [cfg (record-new [:ref :linux.static.output/config] isa data space path name)]
         (record-new [:ref :linux.static.output/result]
-          (-> (empty-code) (prepare cfg) (capture cfg) (member cfg) (cleanup cfg)) :ok)))))
+          (-> (empty-code) (prepare cfg) (capture cfg) (member cfg) (same-path cfg) (cleanup cfg)) :ok)))))
