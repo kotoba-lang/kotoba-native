@@ -83,7 +83,10 @@
     :vector-item-capacity 1672 :vector-item-limit 1680
     :byte-value-limit 1688 :string-value-limit 1696
     :chunk-outer-offset 1704 :chunk-outer-count 1712 :chunk-total 1720
-    :chunk-index 1728 :chunk-pool 1736 :chunk-copied 1744 -1))
+    :chunk-index 1728 :chunk-pool 1736 :chunk-copied 1744
+    :out-active 1752 :out-parent 1760 :out-directory 1768 :out-file 1776
+    :out-count 1784 :out-path-length 1792 :out-name-length 1800 :out-index 1808
+    :out-failed 1816 :out-cleaning 1824 :out-probe 1832 :out-rmdir 1840 -1))
 
 (defn- load [out [:list [:ref :linux.static/instruction]] d :keyword key :keyword]
   [:list [:ref :linux.static/instruction]] (mem out :ld d :s0 (offset key)))

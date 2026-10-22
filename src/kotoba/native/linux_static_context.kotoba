@@ -60,7 +60,11 @@
                  (word (+ (io/state-offset :sigaction) 8) 201326592)
                  (word (+ (io/state-offset :sigaction) 16) handler)
                  (word (io/state-offset :stack-t) (i64-of (lookup layout :alt)))
-                 (word (+ (io/state-offset :stack-t) 16) 16384))
+                 (word (+ (io/state-offset :stack-t) 16) 16384)
+                 (word (io/state-offset :out-active) 0) (word (io/state-offset :out-cleaning) 0)
+                 (word (io/state-offset :out-count) 0)
+                 (word (io/state-offset :out-parent) -1) (word (io/state-offset :out-directory) -1)
+                 (word (io/state-offset :out-file) -1) (word (io/state-offset :out-probe) -1))
         slots (lookup source-plan :slots)]
     (loop [index 0 words base]
       (if (>= index (document-count slots)) words

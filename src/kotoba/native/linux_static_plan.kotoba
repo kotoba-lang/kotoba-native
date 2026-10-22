@@ -568,6 +568,7 @@
               (document-vector (document-keyword :probe) (document-i64 16))
               (document-vector (document-keyword :spawn-io) (document-i64 64))
               (document-vector (document-keyword :root-real) (document-i64 4096))
+              (document-vector (document-keyword :output-control) (document-i64 5120))
               (document-vector (document-keyword :names) (value names))
               (document-vector (document-keyword :index) (value index)))))))))
 
