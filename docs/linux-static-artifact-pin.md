@@ -53,10 +53,11 @@ a real native capability. The owning route/profile proposals are
 [Kotoba #805](https://github.com/kotoba-lang/kotoba-lang/pull/805); both are
 draft/unmerged. Their source presence is not provider availability.
 
-The expanded static graph reader includes all thirteen native modules,
-owning candidate ELF64 and this exact canonical artifact core: 15 sources,
-32 schemas, 531 imported calls, 414 record uses and 556 explicit type argument
-positions, with no source-contract findings. The hash capability remains
+The current static graph reader includes fourteen native modules (including
+the complete filesystem framing module), owning candidate ELF64 and this
+exact canonical artifact core: 16 sources, 33 schemas, 554 imported calls,
+439 record uses and 585 explicit type argument positions, with no
+source-contract findings. The hash capability remains
 explicitly unqualified. Artifact/core's 200-line/22-function source inventory
 has balanced delimiters, matching call arities, known heads and no local
 data-as-function calls. These checks do not perform native type admission.
