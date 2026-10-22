@@ -1,0 +1,65 @@
+;; Internal build/frame CPU probe. Append to an exact snapshot of linux-static
+;; for this test only; this is not a public packager or artifact admission path.
+;; Args: plan EDN, raw code, main offset. Inputs remain unqualified bootstrap
+;; data. The public package function and all its seal/profile checks are intact.
+;; Requires the owning filesystem-wire module under alias bootstrap-fs.
+
+(defn- bootstrap-arg [index :i64] :string
+  (typed-cap-call :cli/args :string :string (string-from-i64 index)))
+
+(defn- bootstrap-decimal [text :string] :i64
+  (loop [index 0 value 0]
+    (if (= index (string-byte-length text)) value
+      (let [digit (- (string-code-point-at text index) 48)]
+        (if (or (< digit 0) (> digit 9) (> value 922337203685477580)) -1
+          (recur (+ index 1) (+ (* value 10) digit)))))))
+
+(defn- bootstrap-hex [n :i64] :i64
+  (if (< n 10) (+ n 48) (+ n 87)))
+
+(defn- bootstrap-line [bytes :vector-i64 index :i64 end :i64] :string
+  (let [size (* 2 (- end index))]
+    (loop [at index out (vector-alloc (+ size 1))]
+      (if (= at end)
+        (string-from-utf8 (bytes-from-vector-i64 (vector-assoc! out size 10)))
+        (let [byte (vector-at bytes at) offset (* 2 (- at index))]
+          (recur (+ at 1)
+            (vector-assoc! (vector-assoc! out offset (bootstrap-hex (quot byte 16)))
+              (+ offset 1) (bootstrap-hex (bit-and byte 15)))))))))
+
+(defn- bootstrap-read [path :string] [:result :bytes :document]
+  (let [request (bootstrap-fs/request 0 path "")]
+    (if (not (result-ok?-of [:result :string :document] request))
+      (result-err-of [:result :bytes :document]
+        (result-error-of [:result :string :document] request (document-null)))
+      (bootstrap-fs/answer-bytes
+        (typed-cap-call :fs/app-data :string :bytes
+          (result-value-of [:result :string :document] request ""))))))
+
+(defn- bootstrap-write [bytes :vector-i64] :i64
+  (loop [index 0]
+    (if (= index (vector-count bytes)) 0
+      (let [end (if (< (+ index 64) (vector-count bytes)) (+ index 64) (vector-count bytes))
+            wrote (typed-cap-call :io/write :string :string (bootstrap-line bytes index end))]
+        (recur end)))))
+
+(defn main [] :i64
+  (let [plan-path (bootstrap-arg 0) raw-path (bootstrap-arg 1)
+        offset (bootstrap-decimal (bootstrap-arg 2))
+        plan-read (bootstrap-read plan-path) code-read (bootstrap-read raw-path)]
+    (if (or (not (result-ok?-of [:result :bytes :document] plan-read))
+            (not (result-ok?-of [:result :bytes :document] code-read)))
+      (let [wrote (typed-cap-call :io/write :string :string "BOOTSTRAP_INPUT_REFUSED\n")] 3)
+      (let [source-plan (document-edn-read (string-from-utf8
+                          (result-value-of [:result :bytes :document] plan-read (bytes-empty))))
+            code (vector-i64-from-bytes (result-value-of [:result :bytes :document] code-read (bytes-empty)))
+            built (build :aarch64 source-plan code offset)]
+      (if (not= (record-get [:ref :linux.static.image/build] built :error) :ok)
+      (let [wrote (typed-cap-call :io/write :string :string
+                    (string-concat "BOOTSTRAP_BUILD_REFUSED "
+                      (string-concat (document-edn-print (document-keyword (record-get [:ref :linux.static.image/build] built :error)))
+                        (string-concat " " (string-concat (document-edn-print (record-get [:ref :linux.static.image/build] built :data)) "\n")))))] 1)
+      (let [framed (frame :aarch64 built)]
+        (if (not (good? framed))
+          (let [wrote (typed-cap-call :io/write :string :string "BOOTSTRAP_FRAME_REFUSED\n")] 2)
+          (bootstrap-write (bytes-of framed)))))))))

@@ -47,6 +47,30 @@ and qualification limits are in
 
 ## Bootstrap limitations and required next gates
 
+### Subsequent native FS2 execution
+
+The Amu draft now contains the mandatory-FS2 successor and actual native
+generation/workload records at commit
+`996cc5af061464518d85503cd51fd67fbb4201ae` (Amu #1428). That prototype ran
+check and byte-file compile with this runtime's current FS2 implementation,
+and its G1/G2 containers matched. All nineteen freshly compiled Embench
+programs returned `1` from their complete `bench-verify(1)` workload. This is
+prototype correctness, not a new timing score or final toolchain admission.
+
+An explicit internal `:command-i64` entry mode now preserves status 0..255
+as the process exit and performs owned-output cleanup without printing the
+status. Native experiments returned 0 for successful check and 1 for an
+unsupported target or unknown source symbol. The public planner/profile
+does not yet admit this mode. Ordinary program-value output is unchanged.
+
+The internal image-builder include fixture exercises the real build/frame
+functions on native CPU; it is not an alternate public package API. Its
+source closure and native execution still need completion. The full closure
+also exposed a three-argument `string-concat` in planning's set conversion;
+the source now uses the declared two-argument operation.
+
+### Admission still open
+
 Initial byte materialization used a disposable Python calculator of the
 canonical IR builders, outside the required toolchain. That is not an
 Amu-selfbuilt packager. Native regeneration of the complete builder and

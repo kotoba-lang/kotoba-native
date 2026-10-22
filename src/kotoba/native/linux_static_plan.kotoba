@@ -70,7 +70,7 @@
                        (option-value-of [:option :document] (document-list-at xs index) (document-null))))))
     :set (let [printed (document-edn-print xs)]
            (ok (document-edn-read
-                 (string-concat "[" (string-substring printed 2 (- (string-length printed) 1)) "]"))))
+                 (string-concat "[" (string-concat (string-substring printed 2 (- (string-length printed) 1)) "]")))))
     (fail reason xs)))
 
 (defn- contains-value? [xs :document x :document] :bool

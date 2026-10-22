@@ -173,11 +173,27 @@
     (-> (sys complete cfg :exit-group (io/register :t5) (io/literal 0) (io/literal 0) (io/literal 0))
         (append :trap :none :none :none :none :none 0 :none))))
 
+(defn- call-guest [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.prelude/config]]
+  [:list [:ref :linux.static/instruction]]
+  (-> out (li :a1 0) (li :a2 0) (li :a3 0) (li :a4 0) (li :ctx 0)
+      (li :gctx (record-get [:ref :linux.static.prelude/config] cfg :data))
+      (append :call :none :none :none :none :none 0 :ls/guest-main)))
+
+(defn- command-and-exit [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.prelude/config]]
+  [:list [:ref :linux.static/instruction]]
+  ;; Explicit internal command entry ABI. The public planner does not admit
+  ;; this mode yet. The ordinary program-value printer below remains unchanged.
+  ;; Out-of-domain status values trap; successful commands do not print "0".
+  (let [returned (-> (call-guest out cfg) (mov :t5 :ret)
+                    (imm :cmp :t5 0) (branch :lt :ls/bad)
+                    (imm :cmp :t5 255) (branch :gt :ls/bad)
+                    (li :p1 0) (li :p2 0))]
+    (write-and-exit returned cfg "command" 1)))
+
 (defn- guest-and-answer [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.prelude/config]]
   [:list [:ref :linux.static/instruction]]
   (let [data (record-get [:ref :linux.static.prelude/config] cfg :data)
-        printed (-> out (li :a1 0) (li :a2 0) (li :a3 0) (li :a4 0) (li :ctx 0) (li :gctx data)
-                    (append :call :none :none :none :none :none 0 :ls/guest-main)
+        printed (-> (call-guest out cfg)
                     (mov :t4 :ret) (li :t8 0) (li :t6 (+ data 687)) (li :t7 (+ data 688))
                     (li :t0 10) (li :t1 0) (byte-op :stb :t0 :t6 :t1)
                     (imm :cmp :t4 0) (branch :ge :ls.prelude/decimal) (li :t8 1) (append :neg :none :t4 :none :none :none 0 :none)
@@ -188,7 +204,9 @@
                     (imm :sub :t6 1) (li :t0 45) (li :t1 0) (byte-op :stb :t0 :t6 :t1)
                     (mark :ls.prelude/decimal-done) (alu :sub :t7 :t6)
                     (mov :p1 :t6) (mov :p2 :t7) (li :t5 (exit-code cfg :ok)))]
-    (write-and-exit printed cfg "answer" 1)))
+    (if (= (key-of (lookup (record-get [:ref :linux.static.prelude/config] cfg :plan) :entry-mode)) :command-i64)
+      (command-and-exit out cfg)
+      (write-and-exit printed cfg "answer" 1))))
 
 (defn- signal-handler [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.prelude/config]]
   [:list [:ref :linux.static/instruction]]
