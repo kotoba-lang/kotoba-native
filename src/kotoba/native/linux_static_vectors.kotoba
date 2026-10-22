@@ -1,9 +1,10 @@
 ;; Complete vector-i64/vector-f64 arena mechanism, also used by bytes values.
 ;; Canonical source candidate. This does not itself admit bytes capabilities.
 (ns kotoba.native.linux-static-vectors
-  {:kotoba/export [supported-slots routine]}
+  {:kotoba/export [supported-slots supported-byte-slots routine]}
   (:require [kotoba.native.linux-static-assembler :as asm]
-            [kotoba.native.linux-static-io :as io])
+            [kotoba.native.linux-static-io :as io]
+            [kotoba.native.linux-static-strings :as strings])
   (:schemas
    {:linux.static.vectors/config
     [:record :linux.static.vectors/config [[:table :i64] [:items :i64]]]
@@ -16,7 +17,12 @@
   (document-set (document-keyword :vector-new-empty) (document-keyword :vector-conj)
     (document-keyword :vector-count) (document-keyword :vector-at)
     (document-keyword :vector-assoc) (document-keyword :vector-alloc)
-    (document-keyword :vector-assoc-in-place) (document-keyword :vector-drop)))
+    (document-keyword :vector-assoc-in-place) (document-keyword :vector-drop)
+    (document-keyword :bytes-from-vector) (document-keyword :bytes-slice)
+    (document-keyword :bytes-concat) (document-keyword :string-from-utf8)))
+(defn supported-byte-slots [] :document
+  (document-set (document-keyword :bytes-from-vector) (document-keyword :bytes-slice)
+    (document-keyword :bytes-concat) (document-keyword :string-from-utf8)))
 (defn- empty-code [] [:list [:ref :linux.static/instruction]]
   (typed-list-new [:list [:ref :linux.static/instruction]]))
 (defn- append [out [:list [:ref :linux.static/instruction]] op :keyword aux :keyword
@@ -26,6 +32,8 @@
     (asm/instruction op aux d s b i n target (vector-alloc 0))))
 (defn- tag [slot :string suffix :string] :keyword
   (keyword-from-string (string-concat "ls.vectors/" (string-concat slot (string-concat "-" suffix)))))
+(defn- value-label [reason :i64] :keyword
+  (keyword-from-string (string-concat "ls.bytes/value-" (string-from-i64 reason))))
 (defn- mark [out [:list [:ref :linux.static/instruction]] label :keyword]
   [:list [:ref :linux.static/instruction]] (append out :label :none :none :none :none :none 0 label))
 (defn- li [out [:list [:ref :linux.static/instruction]] d :keyword n :i64]
@@ -34,6 +42,8 @@
   [:list [:ref :linux.static/instruction]] (append out :mov :none d s :none :none 0 :none))
 (defn- mem [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword b :keyword n :i64]
   [:list [:ref :linux.static/instruction]] (append out op :none d :none b :none n :none))
+(defn- byte-op [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword b :keyword i :keyword]
+  [:list [:ref :linux.static/instruction]] (append out op :none d :none b i 0 :none))
 (defn- load [out [:list [:ref :linux.static/instruction]] d :keyword key :keyword]
   [:list [:ref :linux.static/instruction]] (mem out :ld d :ctx (io/state-offset key)))
 (defn- store [out [:list [:ref :linux.static/instruction]] d :keyword key :keyword]
@@ -152,7 +162,108 @@
                     (alu :cmp :a2 :t5) (branch :hi :ls/bad))
         view (-> (table-room checked) (alu :add :t4 :a2) (alu :sub :t5 :a2))]
     (end (intern view cfg))))
-(defn- slot-code [cfg [:ref :linux.static.vectors/config] slot :keyword]
+
+;; Validate every item before allocation. String construction treats a word
+;; outside byte range as a malformed call; the vector->bytes conversion names
+;; bytes/item-out-of-range. No UTF8 condition is imposed on a bytes value.
+(defn- byte-items [out [:list [:ref :linux.static/instruction]] slot :string bad :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (-> out (mov :a4 :t4) (shl :a4 3) (alu :add :a4 :t6) (mov :t2 :a4) (li :t0 0)
+      (mark (tag slot "items")) (alu :cmp :t0 :t5) (branch :hs (tag slot "items-done"))
+      (mem :ld :t1 :t2 0) (imm :cmp :t1 255) (branch :hi bad)
+      (imm :add :t2 8) (imm :add :t0 1) (branch :always (tag slot "items"))
+      (mark (tag slot "items-done"))))
+(defn- from-vector-slot [cfg [:ref :linux.static.vectors/config]] [:list [:ref :linux.static/instruction]]
+  (let [start (-> (resolve (begin "bytes-from-vector") cfg)
+                  (load :t0 :byte-value-limit) (alu :cmp :t5 :t0) (branch :hi (value-label 10)))
+        checked (byte-items start "bytes-from-vector" (value-label 9))
+        copied (copy (table-room (item-room checked :t5)) "bytes-from-vector")
+        written (-> copied (mov :t4 :t7) (alu :add :t7 :t5) (store :t7 :vector-item-used))]
+    (end (intern written cfg))))
+(defn- bytes-slice-slot [cfg [:ref :linux.static.vectors/config]] [:list [:ref :linux.static/instruction]]
+  (let [checked (-> (resolve (begin "bytes-slice") cfg)
+                    (imm :cmp :a2 0) (branch :lt (value-label 11))
+                    (alu :cmp :a3 :a2) (branch :lt (value-label 11))
+                    (alu :cmp :a3 :t5) (branch :hi (value-label 11)))
+        view (-> (table-room checked) (alu :add :t4 :a2) (mov :t5 :a3) (alu :sub :t5 :a2))]
+    (end (intern view cfg))))
+(defn- bytes-concat-slot [cfg [:ref :linux.static.vectors/config]] [:list [:ref :linux.static/instruction]]
+  (let [left (-> (resolve (begin "bytes-concat") cfg) (mov :t7 :t4) (mov :t8 :t5) (mov :a1 :a2))
+        right (-> (resolve left cfg) (load :t0 :byte-value-limit)
+                  (alu :cmp :t8 :t0) (branch :hi (value-label 10)) (alu :sub :t0 :t8)
+                  (alu :cmp :t5 :t0) (branch :hi (value-label 10))
+                  (mov :a1 :t7) (mov :a2 :t8) (mov :a3 :t4) (mov :a4 :t5) (alu :add :t8 :t5))
+        room (-> (table-room (item-room right :t8)) (mov :t4 :a1) (mov :t5 :a2))
+        first-copy (-> (copy room "bytes-concat-left") (mov :a1 :t7)
+                       (alu :add :t7 :a2) (mov :t4 :a3) (mov :t5 :a4))
+        copied (-> (copy first-copy "bytes-concat-right") (mov :t4 :a1) (mov :t5 :t8)
+                   (mov :t0 :t4) (alu :add :t0 :t5) (store :t0 :vector-item-used))]
+    (end (intern copied cfg))))
+
+;; a4 addresses validated byte WORDS, t5 is their length. Preserve t4..t8.
+;; The second-byte category is decided before later-byte availability, so
+;; E0 80 names overlong even when the final continuation byte is missing.
+(defn- utf8-word [out [:list [:ref :linux.static/instruction]] d :keyword i :keyword]
+  [:list [:ref :linux.static/instruction]]
+  (-> out (mov :t3 i) (shl :t3 3) (alu :add :t3 :a4) (mem :ld d :t3 0)))
+(defn- utf8 [out [:list [:ref :linux.static/instruction]]] [:list [:ref :linux.static/instruction]]
+  (let [start (-> out (li :t0 0) (mark (tag "utf8" "scan"))
+                  (alu :cmp :t0 :t5) (branch :hs (tag "utf8" "done")))
+        first (-> (utf8-word start :t1 :t0) (imm :cmp :t1 128) (branch :lo (tag "utf8" "ascii"))
+                  (imm :cmp :t1 192) (branch :lo (value-label 1))
+                  (imm :cmp :t1 194) (branch :lo (value-label 2))
+                  (imm :cmp :t1 244) (branch :hi (value-label 3))
+                  (mov :a3 :t0) (imm :add :a3 1) (alu :cmp :a3 :t5) (branch :hs (value-label 4)))
+        second (-> (utf8-word first :t2 :a3) (mov :t3 :t2) (imm :and :t3 192)
+                   (imm :cmp :t3 128) (branch :ne (value-label 5))
+                   (li :a2 1) (imm :cmp :t1 224) (branch :lo (tag "utf8" "classed"))
+                   (li :a2 2) (imm :cmp :t1 240) (branch :lo (tag "utf8" "classed"))
+                   (li :a2 3) (mark (tag "utf8" "classed"))
+                   (imm :cmp :t1 224) (branch :ne (tag "utf8" "e0"))
+                   (imm :cmp :t2 160) (branch :lo (value-label 2)) (mark (tag "utf8" "e0"))
+                   (imm :cmp :t1 240) (branch :ne (tag "utf8" "f0"))
+                   (imm :cmp :t2 144) (branch :lo (value-label 2)) (mark (tag "utf8" "f0"))
+                   (imm :cmp :t1 237) (branch :ne (tag "utf8" "ed"))
+                   (imm :cmp :t2 160) (branch :hs (value-label 6)) (mark (tag "utf8" "ed"))
+                   (imm :cmp :t1 244) (branch :ne (tag "utf8" "f4"))
+                   (imm :cmp :t2 144) (branch :hs (value-label 7)) (mark (tag "utf8" "f4"))
+                   (li :a3 2) (mark (tag "utf8" "tail"))
+                   (alu :cmp :a3 :a2) (branch :hi (tag "utf8" "advance"))
+                   (mov :t2 :t0) (alu :add :t2 :a3) (alu :cmp :t2 :t5) (branch :hs (value-label 4)))
+        tail (-> (utf8-word second :t2 :t2) (imm :and :t2 192)
+                 (imm :cmp :t2 128) (branch :ne (value-label 5))
+                 (imm :add :a3 1) (branch :always (tag "utf8" "tail"))
+                 (mark (tag "utf8" "advance")) (alu :add :t0 :a2)
+                 (mark (tag "utf8" "ascii")) (imm :add :t0 1) (branch :always (tag "utf8" "scan"))
+                 (mark (tag "utf8" "done")))] tail))
+(defn- join [out [:list [:ref :linux.static/instruction]] more [:list [:ref :linux.static/instruction]]]
+  [:list [:ref :linux.static/instruction]]
+  (loop [i 0 code out]
+    (if (>= i (vector-count more)) code
+      (recur (+ i 1) (typed-list-conj [:list [:ref :linux.static/instruction]] code
+        (typed-list-nth [:list [:ref :linux.static/instruction]] more i))))))
+(defn- from-utf8-slot [cfg [:ref :linux.static.vectors/config] pair [:list [:ref :linux.static/instruction]]]
+  [:list [:ref :linux.static/instruction]]
+  (let [saved (-> (begin "string-from-utf8")
+                  (unary :push :s0) (unary :push :s1) (unary :push :s2) (unary :push :s3) (unary :push :s4))
+        start (-> (resolve saved cfg) (load :t0 :string-value-limit)
+                  (alu :cmp :t5 :t0) (branch :hi (value-label 8)))
+        checked (utf8 (byte-items start "string-from-utf8" :ls/bad))
+        room (-> checked (load :t7 :pool-used) (load :t0 :bytes)
+                 (alu :cmp :t7 :t0) (branch :hi :ls/bad) (alu :sub :t0 :t7)
+                 (alu :cmp :t5 :t0) (branch :hi :ls/trap-bytes)
+                 (load :t2 :pool-base) (alu :add :t2 :t7) (li :t0 0)
+                 (mark (tag "string-from-utf8" "copy"))
+                 (alu :cmp :t0 :t5) (branch :hs (tag "string-from-utf8" "copied")))
+        copied (-> (utf8-word room :t1 :t0) (byte-op :stb :t1 :t2 :t0)
+                   (imm :add :t0 1) (branch :always (tag "string-from-utf8" "copy"))
+                   (mark (tag "string-from-utf8" "copied"))
+                   (mov :t0 :t7) (alu :add :t0 :t5) (store :t0 :pool-used)
+                   (mov :s0 :ctx) (mov :s4 :t7) (unary :not :s4) (mov :s2 :t5))
+        published (-> (join copied pair) (unary :pop :s4) (unary :pop :s3)
+                      (unary :pop :s2) (unary :pop :s1) (unary :pop :s0))]
+    (end published)))
+(defn- slot-code [cfg [:ref :linux.static.vectors/config] slot :keyword pair [:list [:ref :linux.static/instruction]]]
   [:list [:ref :linux.static/instruction]]
   (case slot
     :vector-new-empty (allocate cfg "vector-new-empty" true)
@@ -163,6 +274,10 @@
     :vector-assoc (assoc-slot cfg false)
     :vector-assoc-in-place (assoc-slot cfg true)
     :vector-drop (drop-slot cfg)
+    :bytes-from-vector (from-vector-slot cfg)
+    :bytes-slice (bytes-slice-slot cfg)
+    :bytes-concat (bytes-concat-slot cfg)
+    :string-from-utf8 (from-utf8-slot cfg pair)
     (empty-code)))
 (defn- lookup [m :document key :keyword] :document
   (if (not= (document-kind m) :map) (document-null)
@@ -187,6 +302,12 @@
                 :else :ok)]
     (if (not= error :ok)
       (record-new [:ref :linux.static.vectors/result] (empty-code) (document-map) error)
-      (let [cfg (record-new [:ref :linux.static.vectors/config] (i64-of table) (i64-of items))]
-        (record-new [:ref :linux.static.vectors/result] (slot-code cfg slot)
-          (document-map (document-keyword slot) (document-keyword (tag (keyword-name slot) "entry"))) :ok)))))
+      (let [cfg (record-new [:ref :linux.static.vectors/config] (i64-of table) (i64-of items))
+            pair (if (= slot :string-from-utf8) (strings/validated-pool-pair-fragment context)
+                   (record-new [:ref :linux.static.strings/result] (empty-code) (document-map) :ok))]
+        (if (not= (record-get [:ref :linux.static.strings/result] pair :error) :ok)
+          (record-new [:ref :linux.static.vectors/result] (empty-code) (document-map)
+            (record-get [:ref :linux.static.strings/result] pair :error))
+          (record-new [:ref :linux.static.vectors/result]
+            (slot-code cfg slot (record-get [:ref :linux.static.strings/result] pair :code))
+            (document-map (document-keyword slot) (document-keyword (tag (keyword-name slot) "entry"))) :ok))))))

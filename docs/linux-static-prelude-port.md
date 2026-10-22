@@ -1,5 +1,8 @@
 # Canonical Linux-static prelude and context source
 
+Update: [bytes primitive composition](linux-static-bytes-port.md) extends the
+source to twenty slots, per-value byte/string limits and named value paths.
+
 Update: [complete vector arena composition](linux-static-vectors-port.md)
 adds actual vector pointers/counters/capacities, eight routines and distinct
 table/item exhaustion paths. Initial counts below are historical source data.

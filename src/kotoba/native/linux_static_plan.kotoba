@@ -212,6 +212,8 @@
                  (document-keyword :vector-count) (document-keyword :vector-at)
                  (document-keyword :vector-assoc) (document-keyword :vector-alloc)
                  (document-keyword :vector-assoc-in-place) (document-keyword :vector-drop)
+                 (document-keyword :bytes-from-vector) (document-keyword :bytes-slice)
+                 (document-keyword :bytes-concat) (document-keyword :string-from-utf8)
                  (document-keyword :typed-cap-call)))
 
 (defn- normalized-code [code :document] [:ref :linux.static.plan/result]
@@ -398,7 +400,21 @@
     (if (>= index (document-count admitted)) false
       (if (document-set-contains? (vectors/supported-slots) (item admitted index)) true (recur (+ index 1))))))
 
-(defn- budgets [profile :document overrides :document vectors? :bool] [:ref :linux.static.plan/result]
+(defn- bytes-slots? [admitted :document] :bool
+  (loop [index 0]
+    (if (>= index (document-count admitted)) false
+      (if (document-set-contains? (vectors/supported-byte-slots) (item admitted index)) true (recur (+ index 1))))))
+(defn- byte-value-traps [static :document bytes? :bool] [:ref :linux.static.plan/result]
+  (if (not bytes?) (ok (document-vector))
+    (let [names (get2 static :bytes-value-traps :value)]
+      (if (or (not= (document-kind names) :vector) (not= (document-count names) 11))
+        (fail :native-profile-incomplete (field :bytes-value-traps))
+        (loop [i 0]
+          (if (= i 11) (ok names)
+            (if (= (document-kind (item names i)) :keyword) (recur (+ i 1))
+              (fail :native-profile-incomplete (field :bytes-value-traps)))))))))
+
+(defn- budgets [profile :document overrides :document vectors? :bool bytes? :bool] [:ref :linux.static.plan/result]
   (let [raw-cells (get-key overrides :cells) raw-bytes (get-key overrides :bytes)
         cells (if (truthy? raw-cells) raw-cells (get3 profile :cells :default :value))
         cells-max (get3 profile :cells :pair-arena-max :value)
@@ -409,7 +425,8 @@
         table-max (get3 profile :cells :vectors :max)
         items (if (truthy? raw-items) raw-items (get3 profile :cells :vector-items :value))
         items-max (get3 profile :cells :vector-items :max)
-        limit (get3 profile :cells :vector-items :per-vector-max)]
+        limit (get3 profile :cells :vector-items :per-vector-max)
+        byte-limit (get2 profile :bytes :value-max) string-limit (get2 profile :bytes :string-value-max)]
     (cond
       (not (i64-document? cells-max)) (fail :native-profile-incomplete (field :pair-arena-max))
       (not (i64-document? bytes-max)) (fail :native-profile-incomplete (field :bytes-max))
@@ -427,10 +444,15 @@
       (fail :vector-items-outside-profile items)
       (and (not vectors?) (or (truthy? raw-vectors) (truthy? raw-items)))
       (fail :vector-slots-not-admitted (field :vectors))
+      (and bytes? (or (not (i64-document? byte-limit)) (< (i64-of byte-limit) 1)
+                     (not (i64-document? string-limit)) (< (i64-of string-limit) 1)))
+      (fail :native-profile-incomplete (field :byte-value-bounds))
       :else (ok (document-map (document-keyword :cells) cells (document-keyword :bytes) bytes
                   (document-keyword :vectors) (if vectors? table (document-i64 0))
                   (document-keyword :vector-items) (if vectors? items (document-i64 0))
-                  (document-keyword :vector-item-limit) (if vectors? limit (document-i64 0)))))))
+                  (document-keyword :vector-item-limit) (if vectors? limit (document-i64 0))
+                  (document-keyword :byte-value-limit) (if bytes? byte-limit (document-i64 0))
+                  (document-keyword :string-value-limit) (if bytes? string-limit (document-i64 0)))))))
 
 (defn- slot-plan [names :document admitted :document handlers? :bool] :document
   (loop [index 0 out (document-map)]
@@ -465,11 +487,14 @@
       :else
       (let [names (slot-names context)
             admitted (admitted-slots (get2 static :admitted-slots :value))
-            limits (budgets profile overrides (and (good? admitted) (vector-slots? (value admitted))))]
+            byte-slots (and (good? admitted) (bytes-slots? (value admitted)))
+            values (byte-value-traps static byte-slots)
+            limits (budgets profile overrides (and (good? admitted) (vector-slots? (value admitted))) byte-slots)]
         (cond
           (not (good? limits)) limits
           (not (good? names)) names
           (not (good? admitted)) admitted
+          (not (good? values)) values
           :else
           (let [caps (capability-plan source profile overrides)]
             (if (not (good? caps)) caps
@@ -484,6 +509,7 @@
                            (document-keyword :fuel) fuel
                            (document-keyword :trap-names) traps
                            (document-keyword :exit-codes) (value exits)
+                           (document-keyword :bytes-value-traps) (value values)
                            (document-keyword :slots) (slot-plan (value names) (value admitted) handlers?)
                            (document-keyword :context-abi) context))))))))))))
 

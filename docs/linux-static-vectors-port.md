@@ -1,5 +1,9 @@
 # Complete native vector arena source
 
+Update: [complete bytes primitives](linux-static-bytes-port.md) adds four
+operations and their real profile/prelude/failure composition. The original
+eight vector bodies remain; initial function/slot counts below are provenance.
+
 Tracking: [JUN-241](https://linear.app/kotobalabs/issue/JUN-241),
 [JUN-200](https://linear.app/kotobalabs/issue/JUN-200),
 [JUN-201](https://linear.app/kotobalabs/issue/JUN-201),

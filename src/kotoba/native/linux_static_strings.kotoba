@@ -2,7 +2,7 @@
 ;; Canonical IR source candidate; not admitted, generated or executed yet.
 (ns kotoba.native.linux-static-strings
   {:kotoba/export [supported-slots external-labels routine routines
-                   read-string-fragment intern-string-fragment pool-pair-fragment]}
+                   read-string-fragment intern-string-fragment pool-pair-fragment validated-pool-pair-fragment]}
   (:require [kotoba.native.linux-static-assembler :as asm])
   (:schemas
    {:linux.static.strings/config
@@ -381,4 +381,13 @@
     (if (not= error :ok) (failure error)
       (record-new [:ref :linux.static.strings/result]
         (pair-new (mov (empty-code) :ctx :s0) (configuration context) false :s4 :s2)
+        (document-map) :ok))))
+
+;; Same private span protocol as pool-pair-fragment. The owning primitive
+;; MUST have already checked canonical UTF8 before advancing the pool span.
+(defn validated-pool-pair-fragment [context :document] [:ref :linux.static.strings/result]
+  (let [error (configuration-error context)]
+    (if (not= error :ok) (failure error)
+      (record-new [:ref :linux.static.strings/result]
+        (pair-new (mov (empty-code) :ctx :s0) (configuration context) true :s4 :s2)
         (document-map) :ok))))
