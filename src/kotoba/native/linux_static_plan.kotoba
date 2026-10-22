@@ -444,8 +444,8 @@
       (fail :vector-items-outside-profile items)
       (and (not vectors?) (or (truthy? raw-vectors) (truthy? raw-items)))
       (fail :vector-slots-not-admitted (field :vectors))
-      (and bytes? (or (not (i64-document? byte-limit)) (< (i64-of byte-limit) 1)
-                     (not (i64-document? string-limit)) (< (i64-of string-limit) 1)))
+      (and bytes? (or (not (i64-document? byte-limit)) (< (i64-of byte-limit) 1) (> (i64-of byte-limit) 65536)
+                     (not (i64-document? string-limit)) (< (i64-of string-limit) 1) (> (i64-of string-limit) 65536)))
       (fail :native-profile-incomplete (field :byte-value-bounds))
       :else (ok (document-map (document-keyword :cells) cells (document-keyword :bytes) bytes
                   (document-keyword :vectors) (if vectors? table (document-i64 0))
