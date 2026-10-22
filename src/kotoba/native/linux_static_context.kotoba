@@ -2,7 +2,8 @@
 ;; Source candidate: document/span checks do not attest an artifact or mapping.
 (ns kotoba.native.linux-static-context
   {:kotoba/export [context-bytes initialized-size]}
-  (:require [kotoba.native.linux-static-assembler :as asm]
+  (:require [kotoba.artifact.data :as meta]
+            [kotoba.native.linux-static-assembler :as asm]
             [kotoba.native.linux-static-io :as io])
   (:schemas
    {:linux.static.context/word
@@ -15,39 +16,44 @@
 ;; within the planner's existing 4096-byte data page.
 (defn initialized-size [] :i64 2048)
 
-(defn- lookup [m :document key :keyword] :document
-  (if (not= (document-kind m) :map) (document-null)
+(defn- lookup [m [:ref :form/r] key :keyword] [:ref :form/r]
+  (if (not= (meta/value-kind m) :map) (meta/value-null)
     (loop [index 0]
-      (if (>= index (document-count m)) (document-null)
-        (let [pair (option-value-of [:option :document] (document-map-entry-at m index) (document-null))
-              k (option-value-of [:option :document] (document-vector-at pair 0) (document-null))]
-          (if (document-equal? k (document-keyword key))
-            (option-value-of [:option :document] (document-vector-at pair 1) (document-null)) (recur (+ index 1))))))))
-(defn- item [v :document index :i64] :document
-  (option-value-of [:option :document] (document-vector-at v index) (document-null)))
-(defn- entry [m :document index :i64] :document
-  (option-value-of [:option :document] (document-map-entry-at m index) (document-null)))
-(defn- i64-of [d :document] :i64 (option-value-of [:option :i64] (document-i64-value d) -1))
-(defn- key-of [d :document] :keyword (option-value-of [:option :keyword] (document-keyword-value d) :none))
-(defn- true? [d :document] :bool (document-equal? d (document-bool true)))
+      (if (>= index (meta/value-count m)) (meta/value-null)
+        (let [pair (option-value-of [:option [:ref :form/r]] (meta/value-map-entry-at m index) (meta/value-null))
+              k (option-value-of [:option [:ref :form/r]] (meta/value-vector-at pair 0) (meta/value-null))]
+          (if (meta/value-equal? k (meta/value-keyword key))
+            (option-value-of [:option [:ref :form/r]] (meta/value-vector-at pair 1) (meta/value-null)) (recur (+ index 1))))))))
+(defn- item [v [:ref :form/r] index :i64] [:ref :form/r]
+  (option-value-of [:option [:ref :form/r]] (meta/value-vector-at v index) (meta/value-null)))
+(defn- entry [m [:ref :form/r] index :i64] [:ref :form/r]
+  (option-value-of [:option [:ref :form/r]] (meta/value-map-entry-at m index) (meta/value-null)))
+(defn- i64-of [d [:ref :form/r]] :i64 (option-value-of [:option :i64] (meta/value-i64-value d) -1))
+(defn- key-of [d [:ref :form/r]] :keyword (option-value-of [:option :keyword] (meta/value-keyword-value d) :none))
+(defn- string-of [d [:ref :form/r]] :string (option-value-of [:option :string] (meta/value-string-value d) ""))
+(defn- true? [d [:ref :form/r]] :bool (meta/value-equal? d (meta/value-bool true)))
+(defn- component-code-size [code [:ref :form/r]] :i64
+  (if (= (meta/value-kind code) :bytes)
+    (bytes-count (option-value-of [:option :bytes] (meta/value-bytes-value code) (bytes-empty)))
+    (meta/value-count code)))
 (defn- abi-key [index :i64] :keyword
   (case index 0 :fuel-offset 1 :pair-used-pointer-offset 2 :pairs-base-offset 3 :pair-validated-base-offset
     4 :vector-used-pointer-offset 5 :vectors-base-offset 6 :vector-items-base-offset 7 :allow-bitmap-offset :none))
-(defn- address [labels [:list [:ref :linux.static/label]] name :keyword] :i64
+(defn- address [labels [:list [:ref :linux.static/label]] name :string] :i64
   (loop [index 0]
     (if (>= index (vector-count labels)) -1
       (let [label (typed-list-nth [:list [:ref :linux.static/label]] labels index)]
-        (if (= name (record-get [:ref :linux.static/label] label :name))
+        (if (string=? name (record-get [:ref :linux.static/label] label :name))
           (record-get [:ref :linux.static/label] label :address) (recur (+ index 1)))))))
 (defn- word [out [:list [:ref :linux.static.context/word]] offset :i64 value :i64]
   [:list [:ref :linux.static.context/word]]
   (typed-list-conj [:list [:ref :linux.static.context/word]] out
     (record-new [:ref :linux.static.context/word] offset value)))
-(defn- data-words [source-plan :document layout :document labels [:list [:ref :linux.static/label]]
-                   bindings :document code-address :i64 code-length :i64]
+(defn- data-words [source-plan [:ref :form/r] layout [:ref :form/r] labels [:list [:ref :linux.static/label]]
+                   bindings [:ref :form/r] code-address :i64 code-length :i64]
   [:list [:ref :linux.static.context/word]]
   (let [context (lookup source-plan :context-abi) data (i64-of (lookup layout :data))
-        handler (address labels :ls/handler)
+        handler (address labels "ls/handler")
         base (-> (typed-list-new [:list [:ref :linux.static.context/word]])
                  (word 0 11) (word (i64-of (lookup context :fuel-offset)) (i64-of (lookup source-plan :fuel)))
                  (word (i64-of (lookup context :pair-used-pointer-offset)) (+ data (io/state-offset :pair-used)))
@@ -78,23 +84,23 @@
         caps (if handlers?
                (-> base
                    (word (io/state-offset :dctx) (i64-of (lookup layout :decision-context)))
-                   (word (io/state-offset :c1-code-base) (address labels :ls.cap/c1-code-base))
+                   (word (io/state-offset :c1-code-base) (address labels "ls.cap/c1-code-base"))
                    (word (io/state-offset :c1-code-length)
-                     (document-count (lookup (lookup (lookup source-plan :handler-code) :decisions) :code)))
-                   (word (io/state-offset :c3-code-base) (address labels :ls.cap/h-code-base))
+                     (component-code-size (lookup (lookup (lookup source-plan :handler-code) :decisions) :code)))
+                   (word (io/state-offset :c3-code-base) (address labels "ls.cap/h-code-base"))
                    (word (io/state-offset :c3-code-length)
-                     (document-count (lookup (lookup (lookup source-plan :handler-code) :handlers) :code)))) base)
+                     (component-code-size (lookup (lookup (lookup source-plan :handler-code) :handlers) :code)))) base)
         slots (lookup source-plan :slots)]
     (loop [index 0 words caps]
-      (if (>= index (document-count slots)) words
+      (if (>= index (meta/value-count slots)) words
         (let [pair (entry slots index) slot (key-of (item pair 0)) description (item pair 1)]
           (recur (+ index 1) (word words (i64-of (lookup description :offset))
-            (address labels (key-of (lookup bindings slot))))))))))
+            (address labels (string-of (lookup bindings slot))))))))))
 
 (defn- span? [base :i64 size :i64 begin :i64 end :i64] :bool
   (and (>= base begin) (<= base end) (>= size 0) (<= size (- end base)) (= (bit-and base 15) 0)))
-(defn- configuration-error [source-plan :document layout :document labels [:list [:ref :linux.static/label]]
-                            bindings :document code-address :i64 code-length :i64] :keyword
+(defn- configuration-error [source-plan [:ref :form/r] layout [:ref :form/r] labels [:list [:ref :linux.static/label]]
+                            bindings [:ref :form/r] code-address :i64 code-length :i64] :keyword
   (let [data (i64-of (lookup layout :data)) memory (i64-of (lookup layout :memory-size))
         cells (i64-of (lookup source-plan :cells)) bytes (i64-of (lookup source-plan :bytes))
         table-count (i64-of (lookup source-plan :vectors)) item-count (i64-of (lookup source-plan :vector-items))
@@ -103,13 +109,13 @@
         slots (lookup source-plan :slots) grant (lookup source-plan :grant)
         alt (i64-of (lookup layout :alt)) pairs (i64-of (lookup layout :pairs))
         valid (i64-of (lookup layout :valid)) pool (i64-of (lookup layout :pool))
-        text (i64-of (lookup layout :text)) handler (address labels :ls/handler)]
+        text (i64-of (lookup layout :text)) handler (address labels "ls/handler")]
     (cond
       (or (<= data 0) (not= (bit-and data 4095) 0) (< memory 4096)
           (> memory (- 9223372036854775807 data))) :layout-input
-      (or (not (document-equal? (lookup context :version) (document-i64 11)))
+      (or (not (meta/value-equal? (lookup context :version) (meta/value-i64 11)))
           (< fuel 0) (< cells 0) (< bytes 0) (> cells (quot 9223372036854775807 16))
-          (not= (document-kind (lookup source-plan :metered?)) :bool)) :initial-values
+          (not= (meta/value-kind (lookup source-plan :metered?)) :bool)) :initial-values
       (or (< table-count 0) (< item-count 0)
           (> table-count (quot 9223372036854775807 16)) (> item-count (quot 9223372036854775807 8))) :vector-initial-values
       (or (<= text 0) (< code-address text) (< code-length 0) (> code-address data)
@@ -122,8 +128,8 @@
           (not (span? pool bytes (+ data 4096) (+ data memory)))
           (> (+ alt 16384) pairs) (> (+ pairs (* cells 16)) valid) (> (+ valid cells) table)
           (> (+ table (* 16 table-count)) items) (> (+ items (* 8 item-count)) pool)) :arena-layout
-      (or (not= (document-kind slots) :map) (not= (document-kind bindings) :map)
-          (not= (document-kind grant) :vector)) :context-input
+      (or (not= (meta/value-kind slots) :map) (not= (meta/value-kind bindings) :map)
+          (not= (meta/value-kind grant) :vector)) :context-input
       (and (true? (lookup source-plan :handlers?))
            (let [decisions (i64-of (lookup layout :decision-context))]
              (or (not (span? decisions 512 (+ data 4096) (+ data memory)))
@@ -135,24 +141,24 @@
                              (if (and (>= offset 8) (<= offset (- 512 size)) (= (bit-and offset 7) 0))
                                (recur (+ index 1)) false))))
             grant-valid? (loop [index 0]
-                           (if (>= index (document-count grant)) true
+                           (if (>= index (meta/value-count grant)) true
                              (let [id (item grant index)]
-                               (if (and (= (document-kind id) :i64) (>= (i64-of id) 0) (<= (i64-of id) 255))
+                               (if (and (= (meta/value-kind id) :i64) (>= (i64-of id) 0) (<= (i64-of id) 255))
                                  (recur (+ index 1)) false))))]
         (cond
           (not abi-valid?) :context-offset
           (not grant-valid?) :grant-input
           :else
           (loop [index 0]
-            (if (>= index (document-count slots)) :ok
+            (if (>= index (meta/value-count slots)) :ok
               (let [pair (entry slots index) slot (item pair 0) description (item pair 1)
                     offset (i64-of (lookup description :offset))
                     abi-name (keyword-from-string (string-concat (keyword-name (key-of slot)) "-offset"))
-                    binding (lookup bindings (key-of slot)) pointer (address labels (key-of binding))]
-                (if (and (= (document-kind slot) :keyword) (= (document-kind description) :map)
+                    binding (lookup bindings (key-of slot)) pointer (address labels (string-of binding))]
+                (if (and (= (meta/value-kind slot) :keyword) (= (meta/value-kind description) :map)
                          (>= offset 8) (<= offset 504) (= (bit-and offset 7) 0)
                          (= offset (i64-of (lookup context abi-name)))
-                         (= (document-kind binding) :keyword) (>= pointer text) (< pointer code-address))
+                         (= (meta/value-kind binding) :string) (>= pointer text) (< pointer code-address))
                   (recur (+ index 1)) :slot-binding)))))))))
 
 (defn- empty-owned-fd? [offset :i64 value :i64] :bool
@@ -179,9 +185,9 @@
                                                (typed-list-nth [:list [:ref :linux.static.context/word]] words previous) :offset))
                                  true (recur (+ previous 1)))))]
             (if duplicate? :context-word-overlap (recur (+ index 1)))))))))
-(defn- grant-byte [grant :document byte :i64] :i64
+(defn- grant-byte [grant [:ref :form/r] byte :i64] :i64
   (loop [index 0 value 0]
-    (if (>= index (document-count grant)) value
+    (if (>= index (meta/value-count grant)) value
       (let [id (i64-of (item grant index))]
         (recur (+ index 1)
           (if (= (quot id 8) byte) (bit-or value (i64-shift-left 1 (- id (* byte 8)))) value))))))
@@ -193,7 +199,7 @@
         (if (and (>= offset begin) (< offset (+ begin 8)))
           (bit-and (u64-shift-right (record-get [:ref :linux.static.context/word] word :value) (* 8 (- offset begin))) 255)
           (recur (+ index 1)))))))
-(defn- encode [words [:list [:ref :linux.static.context/word]] grant :document bitmap :i64] :vector-i64
+(defn- encode [words [:list [:ref :linux.static.context/word]] grant [:ref :form/r] bitmap :i64] :vector-i64
   (loop [offset 0 out (vector-alloc 0)]
     (if (= offset (initialized-size)) out
       (recur (+ offset 1) (vector-conj out
@@ -201,8 +207,8 @@
 (defn- failure [error :keyword] [:ref :linux.static.context/result]
   (record-new [:ref :linux.static.context/result] (vector-alloc 0) error))
 
-(defn context-bytes [source-plan :document layout :document labels [:list [:ref :linux.static/label]]
-                     bindings :document code-address :i64 code-length :i64] [:ref :linux.static.context/result]
+(defn context-bytes [source-plan [:ref :form/r] layout [:ref :form/r] labels [:list [:ref :linux.static/label]]
+                     bindings [:ref :form/r] code-address :i64 code-length :i64] [:ref :linux.static.context/result]
   (let [error (configuration-error source-plan layout labels bindings code-address code-length)]
     (if (not= error :ok) (failure error)
       (let [words (data-words source-plan layout labels bindings code-address code-length)

@@ -2,7 +2,8 @@
 ;; Canonical source candidate. This does not itself admit bytes capabilities.
 (ns kotoba.native.linux-static-vectors
   {:kotoba/export [supported-slots supported-byte-slots routine read-bytes-fragment read-chunks-fragment intern-bytes-fragment intern-chunks-fragment]}
-  (:require [kotoba.native.linux-static-assembler :as asm]
+  (:require [kotoba.artifact.data :as meta]
+            [kotoba.native.linux-static-assembler :as asm]
             [kotoba.native.linux-static-io :as io]
             [kotoba.native.linux-static-strings :as strings])
   (:schemas
@@ -11,58 +12,68 @@
     :linux.static.vectors/result
     [:record :linux.static.vectors/result
      [[:code [:list [:ref :linux.static/instruction]]]
-      [:bindings :document] [:error :keyword]]]}))
+      [:bindings [:ref :form/r]] [:error :keyword]]]}))
 
-(defn supported-slots [] :document
-  (document-set (document-keyword :vector-new-empty) (document-keyword :vector-conj)
-    (document-keyword :vector-count) (document-keyword :vector-at)
-    (document-keyword :vector-assoc) (document-keyword :vector-alloc)
-    (document-keyword :vector-assoc-in-place) (document-keyword :vector-drop)
-    (document-keyword :bytes-from-vector) (document-keyword :bytes-slice)
-    (document-keyword :bytes-concat) (document-keyword :string-from-utf8)))
-(defn supported-byte-slots [] :document
-  (document-set (document-keyword :bytes-from-vector) (document-keyword :bytes-slice)
-    (document-keyword :bytes-concat) (document-keyword :string-from-utf8)))
+(defn supported-slots [] [:ref :form/r]
+  (-> (meta/value-set)
+      (meta/value-set-conj (meta/value-keyword :vector-new-empty))
+      (meta/value-set-conj (meta/value-keyword :vector-conj))
+      (meta/value-set-conj (meta/value-keyword :vector-count))
+      (meta/value-set-conj (meta/value-keyword :vector-at))
+      (meta/value-set-conj (meta/value-keyword :vector-assoc))
+      (meta/value-set-conj (meta/value-keyword :vector-alloc))
+      (meta/value-set-conj (meta/value-keyword :vector-assoc-in-place))
+      (meta/value-set-conj (meta/value-keyword :vector-drop))
+      (meta/value-set-conj (meta/value-keyword :bytes-from-vector))
+      (meta/value-set-conj (meta/value-keyword :bytes-slice))
+      (meta/value-set-conj (meta/value-keyword :bytes-concat))
+      (meta/value-set-conj (meta/value-keyword :string-from-utf8))))
+(defn supported-byte-slots [] [:ref :form/r]
+  (-> (meta/value-set)
+      (meta/value-set-conj (meta/value-keyword :bytes-from-vector))
+      (meta/value-set-conj (meta/value-keyword :bytes-slice))
+      (meta/value-set-conj (meta/value-keyword :bytes-concat))
+      (meta/value-set-conj (meta/value-keyword :string-from-utf8))))
 (defn- empty-code [] [:list [:ref :linux.static/instruction]]
   (typed-list-new [:list [:ref :linux.static/instruction]]))
 (defn- append [out [:list [:ref :linux.static/instruction]] op :keyword aux :keyword
-               d :keyword s :keyword b :keyword i :keyword n :i64 target :keyword]
+               d :keyword s :keyword b :keyword i :keyword n :i64 target :string]
   [:list [:ref :linux.static/instruction]]
   (typed-list-conj [:list [:ref :linux.static/instruction]] out
     (asm/instruction op aux d s b i n target (vector-alloc 0))))
-(defn- tag [slot :string suffix :string] :keyword
-  (keyword-from-string (string-concat "ls.vectors/" (string-concat slot (string-concat "-" suffix)))))
-(defn- value-label [reason :i64] :keyword
-  (keyword-from-string (string-concat "ls.bytes/value-" (string-from-i64 reason))))
-(defn- mark [out [:list [:ref :linux.static/instruction]] label :keyword]
+(defn- tag [slot :string suffix :string] :string
+  (string-concat "ls.vectors/" (string-concat slot (string-concat "-" suffix))))
+(defn- value-label [reason :i64] :string
+  (string-concat "ls.bytes/value-" (string-from-i64 reason)))
+(defn- mark [out [:list [:ref :linux.static/instruction]] label :string]
   [:list [:ref :linux.static/instruction]] (append out :label :none :none :none :none :none 0 label))
 (defn- li [out [:list [:ref :linux.static/instruction]] d :keyword n :i64]
-  [:list [:ref :linux.static/instruction]] (append out :li :none d :none :none :none n :none))
+  [:list [:ref :linux.static/instruction]] (append out :li :none d :none :none :none n ""))
 (defn- mov [out [:list [:ref :linux.static/instruction]] d :keyword s :keyword]
-  [:list [:ref :linux.static/instruction]] (append out :mov :none d s :none :none 0 :none))
+  [:list [:ref :linux.static/instruction]] (append out :mov :none d s :none :none 0 ""))
 (defn- mem [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword b :keyword n :i64]
-  [:list [:ref :linux.static/instruction]] (append out op :none d :none b :none n :none))
+  [:list [:ref :linux.static/instruction]] (append out op :none d :none b :none n ""))
 (defn- byte-op [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword b :keyword i :keyword]
-  [:list [:ref :linux.static/instruction]] (append out op :none d :none b i 0 :none))
+  [:list [:ref :linux.static/instruction]] (append out op :none d :none b i 0 ""))
 (defn- load [out [:list [:ref :linux.static/instruction]] d :keyword key :keyword]
   [:list [:ref :linux.static/instruction]] (mem out :ld d :ctx (io/state-offset key)))
 (defn- store [out [:list [:ref :linux.static/instruction]] d :keyword key :keyword]
   [:list [:ref :linux.static/instruction]] (mem out :st d :ctx (io/state-offset key)))
 (defn- alu [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword s :keyword]
-  [:list [:ref :linux.static/instruction]] (append out :alu op d s :none :none 0 :none))
+  [:list [:ref :linux.static/instruction]] (append out :alu op d s :none :none 0 ""))
 (defn- imm [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword n :i64]
-  [:list [:ref :linux.static/instruction]] (append out :alui op d :none :none :none n :none))
+  [:list [:ref :linux.static/instruction]] (append out :alui op d :none :none :none n ""))
 (defn- shl [out [:list [:ref :linux.static/instruction]] d :keyword n :i64]
-  [:list [:ref :linux.static/instruction]] (append out :shli :none d :none :none :none n :none))
+  [:list [:ref :linux.static/instruction]] (append out :shli :none d :none :none :none n ""))
 (defn- unary [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword]
-  [:list [:ref :linux.static/instruction]] (append out op :none d :none :none :none 0 :none))
+  [:list [:ref :linux.static/instruction]] (append out op :none d :none :none :none 0 ""))
 (defn- simple [out [:list [:ref :linux.static/instruction]] op :keyword]
-  [:list [:ref :linux.static/instruction]] (append out op :none :none :none :none :none 0 :none))
-(defn- branch [out [:list [:ref :linux.static/instruction]] condition :keyword label :keyword]
+  [:list [:ref :linux.static/instruction]] (append out op :none :none :none :none :none 0 ""))
+(defn- branch [out [:list [:ref :linux.static/instruction]] condition :keyword label :string]
   [:list [:ref :linux.static/instruction]]
   (append out (if (= condition :always) :b :bcc) condition :none :none :none :none 0 label))
 (defn- begin [slot :string] [:list [:ref :linux.static/instruction]]
-  (-> (empty-code) (append :align :none :none :none :none :none 16 :none)
+  (-> (empty-code) (append :align :none :none :none :none :none 16 "")
       (mark (tag slot "entry"))
       (unary :push :t4) (unary :push :t5) (unary :push :t6)
       (unary :push :t7) (unary :push :t8) (simple :save-lr)))
@@ -74,30 +85,30 @@
 ;; within the used item window before any index/addition/address is trusted.
 (defn- resolve [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.vectors/config]]
   [:list [:ref :linux.static/instruction]]
-  (-> out (imm :cmp :a1 0) (branch :le :ls/bad)
+  (-> out (imm :cmp :a1 0) (branch :le "ls/bad")
       (load :t0 :vector-used) (load :t1 :vector-capacity)
-      (alu :cmp :t0 :t1) (branch :hi :ls/bad) (alu :cmp :a1 :t0) (branch :hi :ls/bad)
+      (alu :cmp :t0 :t1) (branch :hi "ls/bad") (alu :cmp :a1 :t0) (branch :hi "ls/bad")
       (mov :t1 :a1) (imm :sub :t1 1) (shl :t1 4)
       (mem :ld :t2 :ctx (record-get [:ref :linux.static.vectors/config] cfg :table))
       (alu :add :t1 :t2) (mem :ld :t4 :t1 0) (mem :ld :t5 :t1 8)
       (load :t0 :vector-item-used) (load :t1 :vector-item-capacity)
-      (alu :cmp :t0 :t1) (branch :hi :ls/bad)
-      (alu :cmp :t4 :t0) (branch :hi :ls/bad)
-      (alu :sub :t0 :t4) (alu :cmp :t5 :t0) (branch :hi :ls/bad)
-      (load :t0 :vector-item-limit) (alu :cmp :t5 :t0) (branch :hi :ls/bad)
+      (alu :cmp :t0 :t1) (branch :hi "ls/bad")
+      (alu :cmp :t4 :t0) (branch :hi "ls/bad")
+      (alu :sub :t0 :t4) (alu :cmp :t5 :t0) (branch :hi "ls/bad")
+      (load :t0 :vector-item-limit) (alu :cmp :t5 :t0) (branch :hi "ls/bad")
       (mem :ld :t6 :ctx (record-get [:ref :linux.static.vectors/config] cfg :items))))
 (defn- index [out [:list [:ref :linux.static/instruction]]] [:list [:ref :linux.static/instruction]]
-  (-> out (alu :cmp :a2 :t5) (branch :hs :ls/bad)))
+  (-> out (alu :cmp :a2 :t5) (branch :hs "ls/bad")))
 (defn- table-room [out [:list [:ref :linux.static/instruction]]] [:list [:ref :linux.static/instruction]]
   (-> out (load :t0 :vector-used) (load :t1 :vector-capacity)
-      (alu :cmp :t0 :t1) (branch :hs :ls/trap-vector-table)))
+      (alu :cmp :t0 :t1) (branch :hs "ls/trap-vector-table")))
 ;; EXTRA is nonnegative. Compare by subtraction, never wrapped used+extra.
 ;; The original component distinguishes the item pool from the handle table.
 (defn- item-room [out [:list [:ref :linux.static/instruction]] extra :keyword]
   [:list [:ref :linux.static/instruction]]
   (-> out (load :t7 :vector-item-used) (load :t0 :vector-item-capacity)
-      (alu :cmp :t7 :t0) (branch :hi :ls/bad) (alu :sub :t0 :t7)
-      (alu :cmp extra :t0) (branch :hi :ls/trap-vector-items)))
+      (alu :cmp :t7 :t0) (branch :hi "ls/bad") (alu :sub :t0 :t7)
+      (alu :cmp extra :t0) (branch :hi "ls/trap-vector-items")))
 ;; Publish only after all checks and item stores. t4/t5 are descriptor words;
 ;; no item is overwritten merely because a new handle shares its prefix.
 (defn- intern [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.vectors/config]]
@@ -123,8 +134,8 @@
 (defn- allocate [cfg [:ref :linux.static.vectors/config] slot :string empty? :bool]
   [:list [:ref :linux.static/instruction]]
   (let [start (if empty? (li (begin slot) :a1 0) (begin slot))
-        checked (-> start (imm :cmp :a1 0) (branch :lt :ls/bad)
-                    (load :t0 :vector-item-limit) (alu :cmp :a1 :t0) (branch :hi :ls/bad))
+        checked (-> start (imm :cmp :a1 0) (branch :lt "ls/bad")
+                    (load :t0 :vector-item-limit) (alu :cmp :a1 :t0) (branch :hi "ls/bad"))
         room (-> (table-room (item-room checked :a1))
                  (mov :t4 :t7) (mov :t5 :a1)
                  (mem :ld :t6 :ctx (record-get [:ref :linux.static.vectors/config] cfg :items))
@@ -136,7 +147,7 @@
     (end (intern room cfg))))
 (defn- conj-slot [cfg [:ref :linux.static.vectors/config]] [:list [:ref :linux.static/instruction]]
   (let [start (-> (resolve (begin "vector-conj") cfg)
-                  (load :t0 :vector-item-limit) (alu :cmp :t5 :t0) (branch :hs :ls/bad)
+                  (load :t0 :vector-item-limit) (alu :cmp :t5 :t0) (branch :hs "ls/bad")
                   (mov :t8 :t5) (imm :add :t8 1)
                   (load :t7 :vector-item-used) (mov :t0 :t4) (alu :add :t0 :t5)
                   (alu :cmp :t0 :t7) (branch :eq (tag "vector-conj" "tail")))
@@ -159,14 +170,14 @@
         (end (intern written cfg))))))
 (defn- drop-slot [cfg [:ref :linux.static.vectors/config]] [:list [:ref :linux.static/instruction]]
   (let [checked (-> (resolve (begin "vector-drop") cfg)
-                    (alu :cmp :a2 :t5) (branch :hi :ls/bad))
+                    (alu :cmp :a2 :t5) (branch :hi "ls/bad"))
         view (-> (table-room checked) (alu :add :t4 :a2) (alu :sub :t5 :a2))]
     (end (intern view cfg))))
 
 ;; Validate every item before allocation. String construction treats a word
 ;; outside byte range as a malformed call; the vector->bytes conversion names
 ;; bytes/item-out-of-range. No UTF8 condition is imposed on a bytes value.
-(defn- byte-items [out [:list [:ref :linux.static/instruction]] slot :string bad :keyword]
+(defn- byte-items [out [:list [:ref :linux.static/instruction]] slot :string bad :string]
   [:list [:ref :linux.static/instruction]]
   (-> out (mov :a4 :t4) (shl :a4 3) (alu :add :a4 :t6) (mov :t2 :a4) (li :t0 0)
       (mark (tag slot "items")) (alu :cmp :t0 :t5) (branch :hs (tag slot "items-done"))
@@ -248,10 +259,10 @@
                   (unary :push :s0) (unary :push :s1) (unary :push :s2) (unary :push :s3) (unary :push :s4))
         start (-> (resolve saved cfg) (load :t0 :string-value-limit)
                   (alu :cmp :t5 :t0) (branch :hi (value-label 8)))
-        checked (utf8 (byte-items start "string-from-utf8" :ls/bad))
+        checked (utf8 (byte-items start "string-from-utf8" "ls/bad"))
         room (-> checked (load :t7 :pool-used) (load :t0 :bytes)
-                 (alu :cmp :t7 :t0) (branch :hi :ls/bad) (alu :sub :t0 :t7)
-                 (alu :cmp :t5 :t0) (branch :hi :ls/trap-bytes)
+                 (alu :cmp :t7 :t0) (branch :hi "ls/bad") (alu :sub :t0 :t7)
+                 (alu :cmp :t5 :t0) (branch :hi "ls/trap-bytes")
                  (load :t2 :pool-base) (alu :add :t2 :t7) (li :t0 0)
                  (mark (tag "string-from-utf8" "copy"))
                  (alu :cmp :t0 :t5) (branch :hs (tag "string-from-utf8" "copied")))
@@ -279,27 +290,27 @@
     :bytes-concat (bytes-concat-slot cfg)
     :string-from-utf8 (from-utf8-slot cfg pair)
     (empty-code)))
-(defn- lookup [m :document key :keyword] :document
-  (if (not= (document-kind m) :map) (document-null)
+(defn- lookup [m [:ref :form/r] key :keyword] [:ref :form/r]
+  (if (not= (meta/value-kind m) :map) (meta/value-null)
     (loop [i 0]
-      (if (>= i (document-count m)) (document-null)
-        (let [pair (option-value-of [:option :document] (document-map-entry-at m i) (document-null))
-              k (option-value-of [:option :document] (document-vector-at pair 0) (document-null))]
-          (if (document-equal? k (document-keyword key))
-            (option-value-of [:option :document] (document-vector-at pair 1) (document-null)) (recur (+ i 1))))))))
-(defn- i64-of [d :document] :i64 (option-value-of [:option :i64] (document-i64-value d) -1))
-(defn- offset? [d :document] :bool
-  (let [n (i64-of d)] (and (= (document-kind d) :i64) (>= n 8) (<= n 504) (= (bit-and n 7) 0))))
-(defn- configuration-error [context :document] :keyword
+      (if (>= i (meta/value-count m)) (meta/value-null)
+        (let [pair (option-value-of [:option [:ref :form/r]] (meta/value-map-entry-at m i) (meta/value-null))
+              k (option-value-of [:option [:ref :form/r]] (meta/value-vector-at pair 0) (meta/value-null))]
+          (if (meta/value-equal? k (meta/value-keyword key))
+            (option-value-of [:option [:ref :form/r]] (meta/value-vector-at pair 1) (meta/value-null)) (recur (+ i 1))))))))
+(defn- i64-of [d [:ref :form/r]] :i64 (option-value-of [:option :i64] (meta/value-i64-value d) -1))
+(defn- offset? [d [:ref :form/r]] :bool
+  (let [n (i64-of d)] (and (= (meta/value-kind d) :i64) (>= n 8) (<= n 504) (= (bit-and n 7) 0))))
+(defn- configuration-error [context [:ref :form/r]] :keyword
   (let [used (lookup context :vector-used-pointer-offset) table (lookup context :vectors-base-offset)
         items (lookup context :vector-items-base-offset)]
     (cond
-      (not (document-equal? (lookup context :version) (document-i64 11))) :context-abi-version
+      (not (meta/value-equal? (lookup context :version) (meta/value-i64 11))) :context-abi-version
       (not (and (offset? used) (offset? table) (offset? items)
-                (not (document-equal? used table)) (not (document-equal? used items))
-                (not (document-equal? table items)))) :vector-context-offset
+                (not (meta/value-equal? used table)) (not (meta/value-equal? used items))
+                (not (meta/value-equal? table items)))) :vector-context-offset
       :else :ok)))
-(defn- configuration [context :document] [:ref :linux.static.vectors/config]
+(defn- configuration [context [:ref :form/r]] [:ref :linux.static.vectors/config]
   (record-new [:ref :linux.static.vectors/config]
     (i64-of (lookup context :vectors-base-offset)) (i64-of (lookup context :vector-items-base-offset))))
 
@@ -317,12 +328,12 @@
   (-> out (unary :pop :ctx) (unary :pop :s4) (unary :pop :s3)
       (unary :pop :s2) (unary :pop :s1) (unary :pop :s0)))
 
-(defn read-bytes-fragment [context :document data :i64 prefix :string] [:ref :linux.static.vectors/result]
+(defn read-bytes-fragment [context [:ref :form/r] data :i64 prefix :string] [:ref :linux.static.vectors/result]
   (let [error (configuration-error context)]
     (cond
-      (not= error :ok) (record-new [:ref :linux.static.vectors/result] (empty-code) (document-map) error)
+      (not= error :ok) (record-new [:ref :linux.static.vectors/result] (empty-code) (meta/value-map) error)
       (or (<= data 0) (not= (bit-and data 4095) 0) (> data 9223372036854771711))
-      (record-new [:ref :linux.static.vectors/result] (empty-code) (document-map) :data-base)
+      (record-new [:ref :linux.static.vectors/result] (empty-code) (meta/value-map) :data-base)
       :else
       (let [cfg (configuration context)
             checked (-> (resolve (mov (fragment-begin) :a1 :s1) cfg)
@@ -332,15 +343,15 @@
                       (unary :push :t6) (unary :push :t7) (unary :push :t8)
                       ;; h-decide's state operands use s0. t4 is already saved.
                       (mov :s0 :ctx))
-            charged (-> (io/decision-fragment saved data :ls.cap/h-decide (io/literal 6)
+            charged (-> (io/decision-fragment saved data "ls.cap/h-decide" (io/literal 6)
                           (io/state-field :pool-used) (io/register :t5) (io/state-field :bytes) (io/literal 0))
                         ;; Recover ctx BEFORE restoring t4, its x86 s0 alias.
                         (mov :ctx :s0) (unary :pop :t8) (unary :pop :t7) (unary :pop :t6)
                         (unary :pop :t5) (unary :pop :t4) (unary :pop :t3)
-                        (imm :cmp :t0 1) (branch :ne :ls/trap-bytes))
+                        (imm :cmp :t0 1) (branch :ne "ls/trap-bytes"))
             room (-> charged (load :t7 :pool-used) (load :t0 :bytes)
-                     (alu :cmp :t7 :t0) (branch :hi :ls/trap-bytes) (alu :sub :t0 :t7)
-                     (alu :cmp :t5 :t0) (branch :hi :ls/trap-bytes)
+                     (alu :cmp :t7 :t0) (branch :hi "ls/trap-bytes") (alu :sub :t0 :t7)
+                     (alu :cmp :t5 :t0) (branch :hi "ls/trap-bytes")
                      (load :a1 :pool-base) (alu :add :a1 :t7)
                      (mov :t2 :t4) (shl :t2 3) (alu :add :t2 :t6) (li :t0 0))
             copied (-> room (mark (tag prefix "raw-copy")) (alu :cmp :t0 :t5)
@@ -349,7 +360,7 @@
                        (branch :always (tag prefix "raw-copy")) (mark (tag prefix "raw-copied"))
                        (alu :add :t7 :t5) (store :t7 :pool-used) (mov :a2 :t5))
             code (-> (fragment-restore copied) (mov :s2 :a1) (mov :s3 :a2))]
-        (record-new [:ref :linux.static.vectors/result] code (document-map) :ok)))))
+        (record-new [:ref :linux.static.vectors/result] code (meta/value-map) :ok)))))
 
 (defn- chunk-handle [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.vectors/config]]
   [:list [:ref :linux.static/instruction]]
@@ -360,12 +371,12 @@
 ;; Outer list<bytes> -> ONE raw request span. Validate every inner window and
 ;; word before pool allocation. Two passes do not yield or invoke guest code;
 ;; the intervening sealed charge decision is pure and cannot mutate the list.
-(defn read-chunks-fragment [context :document data :i64 prefix :string] [:ref :linux.static.vectors/result]
+(defn read-chunks-fragment [context [:ref :form/r] data :i64 prefix :string] [:ref :linux.static.vectors/result]
   (let [error (configuration-error context)]
     (cond
-      (not= error :ok) (record-new [:ref :linux.static.vectors/result] (empty-code) (document-map) error)
+      (not= error :ok) (record-new [:ref :linux.static.vectors/result] (empty-code) (meta/value-map) error)
       (or (<= data 0) (not= (bit-and data 4095) 0) (> data 9223372036854771711))
-      (record-new [:ref :linux.static.vectors/result] (empty-code) (document-map) :data-base)
+      (record-new [:ref :linux.static.vectors/result] (empty-code) (meta/value-map) :data-base)
       :else
       (let [cfg (configuration context)
             outer (-> (resolve (mov (fragment-begin) :a1 :s1) cfg)
@@ -378,17 +389,17 @@
                       (li :t0 65536) (alu :cmp :t5 :t0) (branch :hi (value-label 10)))
             bytes (byte-items inner prefix (value-label 9))
             measured (-> bytes (load :t7 :chunk-total) (li :t0 9223372036854775807) (alu :sub :t0 :t5)
-                         (alu :cmp :t7 :t0) (branch :hi :ls/trap-bytes)
+                         (alu :cmp :t7 :t0) (branch :hi "ls/trap-bytes")
                          (alu :add :t7 :t5) (store :t7 :chunk-total)
                          (load :t0 :chunk-index) (imm :add :t0 1) (store :t0 :chunk-index)
                          (branch :always (tag prefix "validate")) (mark (tag prefix "validated"))
                          (load :t5 :chunk-total) (mov :s0 :ctx))
-            charged (-> (io/decision-fragment measured data :ls.cap/h-decide (io/literal 6)
+            charged (-> (io/decision-fragment measured data "ls.cap/h-decide" (io/literal 6)
                           (io/state-field :pool-used) (io/register :t5) (io/state-field :bytes) (io/literal 0))
-                        (mov :ctx :s0) (imm :cmp :t0 1) (branch :ne :ls/trap-bytes)
+                        (mov :ctx :s0) (imm :cmp :t0 1) (branch :ne "ls/trap-bytes")
                         (load :t5 :chunk-total) (load :t7 :pool-used) (load :t0 :bytes)
-                        (alu :cmp :t7 :t0) (branch :hi :ls/trap-bytes) (alu :sub :t0 :t7)
-                        (alu :cmp :t5 :t0) (branch :hi :ls/trap-bytes) (store :t7 :chunk-pool)
+                        (alu :cmp :t7 :t0) (branch :hi "ls/trap-bytes") (alu :sub :t0 :t7)
+                        (alu :cmp :t5 :t0) (branch :hi "ls/trap-bytes") (store :t7 :chunk-pool)
                         (li :t0 0) (store :t0 :chunk-index) (store :t0 :chunk-copied)
                         (mark (tag prefix "chunk")) (load :t0 :chunk-index) (load :t1 :chunk-outer-count)
                         (alu :cmp :t0 :t1) (branch :hs (tag prefix "done")))
@@ -405,19 +416,19 @@
                        (load :t5 :chunk-total) (load :t7 :chunk-pool) (alu :add :t7 :t5) (store :t7 :pool-used)
                        (load :a1 :pool-base) (load :t7 :chunk-pool) (alu :add :a1 :t7) (mov :a2 :t5))
             code (-> (fragment-restore copied) (mov :s2 :a1) (mov :s3 :a2))]
-        (record-new [:ref :linux.static.vectors/result] code (document-map) :ok)))))
+        (record-new [:ref :linux.static.vectors/result] code (meta/value-map) :ok)))))
 
 ;; s1/s2 is a trusted stable raw span, disjoint from the fresh item tail.
-(defn intern-bytes-fragment [context :document prefix :string] [:ref :linux.static.vectors/result]
+(defn intern-bytes-fragment [context [:ref :form/r] prefix :string] [:ref :linux.static.vectors/result]
   (let [error (configuration-error context)]
     (if (not= error :ok)
-      (record-new [:ref :linux.static.vectors/result] (empty-code) (document-map) error)
+      (record-new [:ref :linux.static.vectors/result] (empty-code) (meta/value-map) error)
       (let [cfg (configuration context)
             checked (-> (fragment-begin) (mov :a1 :s1) (mov :a2 :s2)
-                        (imm :cmp :a2 0) (branch :lt :ls/bad)
+                        (imm :cmp :a2 0) (branch :lt "ls/bad")
                         (mov :t5 :a2) (load :t0 :byte-value-limit)
                         (alu :cmp :t5 :t0) (branch :hi (value-label 10))
-                        (load :t0 :vector-item-limit) (alu :cmp :t5 :t0) (branch :hi :ls/bad))
+                        (load :t0 :vector-item-limit) (alu :cmp :t5 :t0) (branch :hi "ls/bad"))
             room (-> (table-room (item-room checked :t5)) (mov :t4 :t7)
                      (mem :ld :t6 :ctx (record-get [:ref :linux.static.vectors/config] cfg :items))
                      (mov :t3 :t7) (shl :t3 3) (alu :add :t3 :t6) (li :t0 0))
@@ -428,36 +439,36 @@
                        (alu :add :t7 :t5) (store :t7 :vector-item-used))
             published (mov (intern copied cfg) :a1 :t0)
             code (mov (fragment-restore published) :t0 :a1)]
-        (record-new [:ref :linux.static.vectors/result] code (document-map) :ok)))))
+        (record-new [:ref :linux.static.vectors/result] code (meta/value-map) :ok)))))
 
 ;; Return list<bytes> from ONE read/range span. Reserve K+1 descriptors and
 ;; N+K item words before stores. Inner chunks obey value bounds; aggregate
 ;; size uses the real run budgets. Counters publish only after all stores.
-(defn intern-chunks-fragment [context :document prefix :string] [:ref :linux.static.vectors/result]
+(defn intern-chunks-fragment [context [:ref :form/r] prefix :string] [:ref :linux.static.vectors/result]
   (let [error (configuration-error context)]
     (if (not= error :ok)
-      (record-new [:ref :linux.static.vectors/result] (empty-code) (document-map) error)
+      (record-new [:ref :linux.static.vectors/result] (empty-code) (meta/value-map) error)
       (let [cfg (configuration context)
             limit (-> (fragment-begin) (mov :a1 :s1) (mov :a2 :s2)
-                      (imm :cmp :a2 0) (branch :lt :ls/bad)
+                      (imm :cmp :a2 0) (branch :lt "ls/bad")
                       (load :a4 :byte-value-limit) (load :t0 :vector-item-limit)
                       (alu :cmp :a4 :t0) (branch :ls (tag prefix "limit")) (mov :a4 :t0)
-                      (mark (tag prefix "limit")) (imm :cmp :a4 0) (branch :le :ls/bad)
+                      (mark (tag prefix "limit")) (imm :cmp :a4 0) (branch :le "ls/bad")
                       (li :t0 65536) (alu :cmp :a4 :t0) (branch :ls (tag prefix "bounded")) (mov :a4 :t0)
                       (mark (tag prefix "bounded")) (li :a3 0) (mov :t6 :a2)
                       (mark (tag prefix "count")) (imm :cmp :t6 0) (branch :eq (tag prefix "counted"))
-                      (imm :add :a3 1) (load :t0 :vector-item-limit) (alu :cmp :a3 :t0) (branch :hi :ls/bad)
+                      (imm :add :a3 1) (load :t0 :vector-item-limit) (alu :cmp :a3 :t0) (branch :hi "ls/bad")
                       (alu :cmp :t6 :a4) (branch :ls (tag prefix "count-last"))
                       (alu :sub :t6 :a4) (branch :always (tag prefix "count"))
                       (mark (tag prefix "count-last")) (li :t6 0) (branch :always (tag prefix "count"))
                       (mark (tag prefix "counted")))
             room (-> limit (load :t4 :vector-used) (load :t0 :vector-capacity)
-                     (alu :cmp :t4 :t0) (branch :hi :ls/bad) (alu :sub :t0 :t4)
-                     (alu :cmp :a3 :t0) (branch :hs :ls/trap-vector-table)
+                     (alu :cmp :t4 :t0) (branch :hi "ls/bad") (alu :sub :t0 :t4)
+                     (alu :cmp :a3 :t0) (branch :hs "ls/trap-vector-table")
                      (load :t5 :vector-item-used) (load :t0 :vector-item-capacity)
-                     (alu :cmp :t5 :t0) (branch :hi :ls/bad) (alu :sub :t0 :t5)
-                     (alu :cmp :a2 :t0) (branch :hi :ls/trap-vector-items) (alu :sub :t0 :a2)
-                     (alu :cmp :a3 :t0) (branch :hi :ls/trap-vector-items)
+                     (alu :cmp :t5 :t0) (branch :hi "ls/bad") (alu :sub :t0 :t5)
+                     (alu :cmp :a2 :t0) (branch :hi "ls/trap-vector-items") (alu :sub :t0 :a2)
+                     (alu :cmp :a3 :t0) (branch :hi "ls/trap-vector-items")
                      (mem :ld :t7 :ctx (record-get [:ref :linux.static.vectors/config] cfg :table))
                      (mem :ld :t8 :ctx (record-get [:ref :linux.static.vectors/config] cfg :items))
                      (mov :t6 :t5) (alu :add :t6 :a3)
@@ -480,26 +491,27 @@
                        (mov :t1 :t5) (alu :sub :t1 :a3) (mem :st :t1 :t0 0) (mem :st :a3 :t0 8)
                        (store :t6 :vector-item-used) (imm :add :t4 1) (store :t4 :vector-used) (mov :a1 :t4))
             code (mov (fragment-restore copied) :t0 :a1)]
-        (record-new [:ref :linux.static.vectors/result] code (document-map) :ok)))))
+        (record-new [:ref :linux.static.vectors/result] code (meta/value-map) :ok)))))
 
-(defn routine [context :document slot :keyword] [:ref :linux.static.vectors/result]
+(defn routine [context [:ref :form/r] slot :keyword] [:ref :linux.static.vectors/result]
   (let [used (lookup context :vector-used-pointer-offset) table (lookup context :vectors-base-offset)
         items (lookup context :vector-items-base-offset)
         error (cond
-                (not (document-equal? (lookup context :version) (document-i64 11))) :context-abi-version
+                (not (meta/value-equal? (lookup context :version) (meta/value-i64 11))) :context-abi-version
                 (not (and (offset? used) (offset? table) (offset? items)
-                          (not (document-equal? used table)) (not (document-equal? used items))
-                          (not (document-equal? table items)))) :vector-context-offset
-                (not (document-set-contains? (supported-slots) (document-keyword slot))) :unknown-slot
+                          (not (meta/value-equal? used table)) (not (meta/value-equal? used items))
+                          (not (meta/value-equal? table items)))) :vector-context-offset
+                (not (meta/value-set-contains? (supported-slots) (meta/value-keyword slot))) :unknown-slot
                 :else :ok)]
     (if (not= error :ok)
-      (record-new [:ref :linux.static.vectors/result] (empty-code) (document-map) error)
+      (record-new [:ref :linux.static.vectors/result] (empty-code) (meta/value-map) error)
       (let [cfg (record-new [:ref :linux.static.vectors/config] (i64-of table) (i64-of items))
             pair (if (= slot :string-from-utf8) (strings/validated-pool-pair-fragment context)
-                   (record-new [:ref :linux.static.strings/result] (empty-code) (document-map) :ok))]
+                   (record-new [:ref :linux.static.strings/result] (empty-code) (meta/value-map) :ok))]
         (if (not= (record-get [:ref :linux.static.strings/result] pair :error) :ok)
-          (record-new [:ref :linux.static.vectors/result] (empty-code) (document-map)
+          (record-new [:ref :linux.static.vectors/result] (empty-code) (meta/value-map)
             (record-get [:ref :linux.static.strings/result] pair :error))
           (record-new [:ref :linux.static.vectors/result]
             (slot-code cfg slot (record-get [:ref :linux.static.strings/result] pair :code))
-            (document-map (document-keyword slot) (document-keyword (tag (keyword-name slot) "entry"))) :ok))))))
+            (-> (meta/value-map)
+      (meta/value-map-insert (meta/value-keyword slot) (meta/value-string (tag (keyword-name slot) "entry")))) :ok))))))

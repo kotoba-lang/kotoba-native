@@ -5,91 +5,97 @@
   {:kotoba/export [supported-slots external-labels routine routines
                    read-string-fragment read-span-fragment utf8-span-fragment
                    intern-string-fragment pool-pair-fragment validated-pool-pair-fragment]}
-  (:require [kotoba.native.linux-static-assembler :as asm])
+  (:require [kotoba.artifact.data :as meta]
+            [kotoba.native.linux-static-assembler :as asm])
   (:schemas
    {:linux.static.strings/config
     [:record :linux.static.strings/config [[:pairs :i64] [:validated :i64]]]
     :linux.static.strings/result
     [:record :linux.static.strings/result
      [[:code [:list [:ref :linux.static/instruction]]]
-      [:bindings :document] [:error :keyword]]]}))
+      [:bindings [:ref :form/r]] [:error :keyword]]]}))
 
-(defn supported-slots [] :document
-  (document-set (document-keyword :pair-new) (document-keyword :pair-first)
-    (document-keyword :pair-second) (document-keyword :string-equal)
-    (document-keyword :string-index-of) (document-keyword :string-substring)
-    (document-keyword :string-concat) (document-keyword :string-code-point-at)
-    (document-keyword :string-compare)))
+(defn supported-slots [] [:ref :form/r]
+  (-> (meta/value-set)
+      (meta/value-set-conj (meta/value-keyword :pair-new))
+      (meta/value-set-conj (meta/value-keyword :pair-first))
+      (meta/value-set-conj (meta/value-keyword :pair-second))
+      (meta/value-set-conj (meta/value-keyword :string-equal))
+      (meta/value-set-conj (meta/value-keyword :string-index-of))
+      (meta/value-set-conj (meta/value-keyword :string-substring))
+      (meta/value-set-conj (meta/value-keyword :string-concat))
+      (meta/value-set-conj (meta/value-keyword :string-code-point-at))
+      (meta/value-set-conj (meta/value-keyword :string-compare))))
 
-(defn external-labels [] :document
-  (document-map (document-keyword :bad) (document-keyword :ls/bad)
-                (document-keyword :cells) (document-keyword :ls/trap-cells)
-                (document-keyword :bytes) (document-keyword :ls/trap-bytes)))
+(defn external-labels [] [:ref :form/r]
+  (-> (meta/value-map)
+      (meta/value-map-insert (meta/value-keyword :bad) (meta/value-string "ls/bad"))
+      (meta/value-map-insert (meta/value-keyword :cells) (meta/value-string "ls/trap-cells"))
+      (meta/value-map-insert (meta/value-keyword :bytes) (meta/value-string "ls/trap-bytes"))))
 
 (defn- empty-code [] [:list [:ref :linux.static/instruction]]
   (typed-list-new [:list [:ref :linux.static/instruction]]))
 
 (defn- append [out [:list [:ref :linux.static/instruction]] op :keyword aux :keyword
-               d :keyword s :keyword b :keyword i :keyword n :i64 target :keyword]
+               d :keyword s :keyword b :keyword i :keyword n :i64 target :string]
   [:list [:ref :linux.static/instruction]]
   (typed-list-conj [:list [:ref :linux.static/instruction]] out
     (asm/instruction op aux d s b i n target (vector-alloc 0))))
 
-(defn- tag [prefix :string suffix :string] :keyword
-  (keyword-from-string
-    (string-concat (string-concat "ls.strings/" prefix) (string-concat "-" suffix))))
+(defn- tag [prefix :string suffix :string] :string
+  (string-concat (string-concat "ls.strings/" prefix) (string-concat "-" suffix)))
 
-(defn- mark [out [:list [:ref :linux.static/instruction]] label :keyword]
+(defn- mark [out [:list [:ref :linux.static/instruction]] label :string]
   [:list [:ref :linux.static/instruction]]
   (append out :label :none :none :none :none :none 0 label))
 
 (defn- li [out [:list [:ref :linux.static/instruction]] d :keyword n :i64]
   [:list [:ref :linux.static/instruction]]
-  (append out :li :none d :none :none :none n :none))
+  (append out :li :none d :none :none :none n ""))
 
 (defn- mov [out [:list [:ref :linux.static/instruction]] d :keyword s :keyword]
   [:list [:ref :linux.static/instruction]]
-  (append out :mov :none d s :none :none 0 :none))
+  (append out :mov :none d s :none :none 0 ""))
 
 (defn- mem [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword base :keyword offset :i64]
   [:list [:ref :linux.static/instruction]]
-  (append out op :none d :none base :none offset :none))
+  (append out op :none d :none base :none offset ""))
 
 (defn- byte-op [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword base :keyword index :keyword]
   [:list [:ref :linux.static/instruction]]
-  (append out op :none d :none base index 0 :none))
+  (append out op :none d :none base index 0 ""))
 
 (defn- alu [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword s :keyword]
   [:list [:ref :linux.static/instruction]]
-  (append out :alu op d s :none :none 0 :none))
+  (append out :alu op d s :none :none 0 ""))
 
 (defn- imm [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword n :i64]
   [:list [:ref :linux.static/instruction]]
-  (append out :alui op d :none :none :none n :none))
+  (append out :alui op d :none :none :none n ""))
 
 (defn- unary [out [:list [:ref :linux.static/instruction]] op :keyword d :keyword]
   [:list [:ref :linux.static/instruction]]
-  (append out op :none d :none :none :none 0 :none))
+  (append out op :none d :none :none :none 0 ""))
 
 (defn- shl [out [:list [:ref :linux.static/instruction]] d :keyword n :i64]
   [:list [:ref :linux.static/instruction]]
-  (append out :shli :none d :none :none :none n :none))
+  (append out :shli :none d :none :none :none n ""))
 
-(defn- branch [out [:list [:ref :linux.static/instruction]] condition :keyword target :keyword]
+(defn- branch [out [:list [:ref :linux.static/instruction]] condition :keyword target :string]
   [:list [:ref :linux.static/instruction]]
   (append out (if (= condition :always) :b :bcc) condition :none :none :none :none 0 target))
 
 (defn- simple [out [:list [:ref :linux.static/instruction]] op :keyword]
   [:list [:ref :linux.static/instruction]]
-  (append out op :none :none :none :none :none 0 :none))
+  (append out op :none :none :none :none :none 0 ""))
 
 ;; State offsets are the reference prelude's data-base-relative words.
 ;; ABI-dependent pair/validation base offsets come from the admitted context.
 (defn- check-handle [out [:list [:ref :linux.static/instruction]]
                      cfg [:ref :linux.static.strings/config] h :keyword p :keyword scratch :keyword]
   [:list [:ref :linux.static/instruction]]
-  (-> out (imm :cmp h 0) (branch :le :ls/bad)
-      (mem :ld scratch :ctx 512) (alu :cmp h scratch) (branch :hi :ls/bad)
+  (-> out (imm :cmp h 0) (branch :le "ls/bad")
+      (mem :ld scratch :ctx 512) (alu :cmp h scratch) (branch :hi "ls/bad")
       (mem :ld p :ctx (record-get [:ref :linux.static.strings/config] cfg :pairs))
       (mov scratch h) (imm :sub scratch 1) (shl scratch 4) (alu :add p scratch)))
 
@@ -101,20 +107,20 @@
   (let [pool (tag prefix "pool") done (tag prefix "resolved")
         first (-> (check-handle out cfg h p scratch1)
                   (mem :ld n p 8) (mem :ld p p 0)
-                  (imm :cmp n 0) (branch :lt :ls/bad)
+                  (imm :cmp n 0) (branch :lt "ls/bad")
                   (imm :cmp p 0) (branch :lt pool)
-                  (mem :ld scratch2 :ctx 568) (alu :cmp p scratch2) (branch :hi :ls/bad)
-                  (alu :sub scratch2 p) (alu :cmp n scratch2) (branch :hi :ls/bad)
+                  (mem :ld scratch2 :ctx 568) (alu :cmp p scratch2) (branch :hi "ls/bad")
+                  (alu :sub scratch2 p) (alu :cmp n scratch2) (branch :hi "ls/bad")
                   (mem :ld scratch2 :ctx 560) (alu :add p scratch2) (branch :always done))]
     (-> first (mark pool) (unary :not p)
-        (mem :ld scratch2 :ctx 520) (alu :cmp p scratch2) (branch :hi :ls/bad)
-        (alu :sub scratch2 p) (alu :cmp n scratch2) (branch :hi :ls/bad)
+        (mem :ld scratch2 :ctx 520) (alu :cmp p scratch2) (branch :hi "ls/bad")
+        (alu :sub scratch2 p) (alu :cmp n scratch2) (branch :hi "ls/bad")
         (mem :ld scratch2 :ctx 576) (alu :add p scratch2) (mark done))))
 
 (defn- continuation [out [:list [:ref :linux.static/instruction]] p :keyword i :keyword a :keyword b :keyword]
   [:list [:ref :linux.static/instruction]]
   (-> out (byte-op :ldb a p i) (mov b a) (imm :and b 192)
-      (imm :cmp b 128) (branch :ne :ls/bad)))
+      (imm :cmp b 128) (branch :ne "ls/bad")))
 
 (defn- validate-span [out [:list [:ref :linux.static/instruction]] prefix :string
                       p :keyword n :keyword i :keyword a :keyword b :keyword v :keyword]
@@ -125,22 +131,22 @@
         f0 (tag prefix "utf8-f0") f4 (tag prefix "utf8-f4") ok (tag prefix "utf8-ok")
         first (-> out (li i 0) (mark scan) (alu :cmp i n) (branch :hs ok)
                   (byte-op :ldb a p i) (imm :add i 1)
-                  (imm :cmp a 127) (branch :ls scan) (imm :cmp a 194) (branch :lo :ls/bad)
+                  (imm :cmp a 127) (branch :ls scan) (imm :cmp a 194) (branch :lo "ls/bad")
                   (imm :cmp a 223) (branch :hi three)
-                  (alu :cmp i n) (branch :hs :ls/bad))
+                  (alu :cmp i n) (branch :hs "ls/bad"))
         two (-> (continuation first p i b v) (imm :add i 1) (branch :always scan)
                 (mark three) (imm :cmp a 239) (branch :hi four)
-                (mov b n) (alu :sub b i) (imm :cmp b 2) (branch :lo :ls/bad))
+                (mov b n) (alu :sub b i) (imm :cmp b 2) (branch :lo "ls/bad"))
         third (-> (continuation two p i b v) (byte-op :ldb b p i)
-                  (imm :cmp a 224) (branch :ne e0) (imm :cmp b 160) (branch :lo :ls/bad) (mark e0)
-                  (imm :cmp a 237) (branch :ne ed) (imm :cmp b 160) (branch :hs :ls/bad) (mark ed)
+                  (imm :cmp a 224) (branch :ne e0) (imm :cmp b 160) (branch :lo "ls/bad") (mark e0)
+                  (imm :cmp a 237) (branch :ne ed) (imm :cmp b 160) (branch :hs "ls/bad") (mark ed)
                   (imm :add i 1))
         fourth (-> (continuation third p i b v) (imm :add i 1) (branch :always scan)
-                   (mark four) (imm :cmp a 244) (branch :hi :ls/bad)
-                   (mov b n) (alu :sub b i) (imm :cmp b 3) (branch :lo :ls/bad))
+                   (mark four) (imm :cmp a 244) (branch :hi "ls/bad")
+                   (mov b n) (alu :sub b i) (imm :cmp b 3) (branch :lo "ls/bad"))
         tail (-> (continuation fourth p i b v) (byte-op :ldb b p i)
-                 (imm :cmp a 240) (branch :ne f0) (imm :cmp b 144) (branch :lo :ls/bad) (mark f0)
-                 (imm :cmp a 244) (branch :ne f4) (imm :cmp b 144) (branch :hs :ls/bad) (mark f4)
+                 (imm :cmp a 240) (branch :ne f0) (imm :cmp b 144) (branch :lo "ls/bad") (mark f0)
+                 (imm :cmp a 244) (branch :ne f4) (imm :cmp b 144) (branch :hs "ls/bad") (mark f4)
                  (imm :add i 1))
         last (imm (continuation tail p i b v) :add i 1)]
     (-> (continuation last p i b v) (imm :add i 1) (branch :always scan)
@@ -161,7 +167,7 @@
                  cfg [:ref :linux.static.strings/config] validated? :bool first :keyword second :keyword]
   [:list [:ref :linux.static/instruction]]
   (-> out (mem :ld :t0 :ctx 512) (mem :ld :t1 :ctx 536)
-      (alu :cmp :t0 :t1) (branch :hs :ls/trap-cells)
+      (alu :cmp :t0 :t1) (branch :hs "ls/trap-cells")
       (mem :ld :t1 :ctx (record-get [:ref :linux.static.strings/config] cfg :pairs))
       (mov :t2 :t0) (shl :t2 4) (alu :add :t2 :t1)
       (mem :st first :t2 0) (mem :st second :t2 8)
@@ -171,7 +177,7 @@
 
 (defn- begin [out [:list [:ref :linux.static/instruction]] slot :string]
   [:list [:ref :linux.static/instruction]]
-  (-> out (append :align :none :none :none :none :none 16 :none)
+  (-> out (append :align :none :none :none :none :none 16 "")
       (mark (tag slot "entry"))
       (unary :push :t4) (unary :push :t5) (unary :push :t6)
       (unary :push :t7) (unary :push :t8) (simple :save-lr)))
@@ -205,7 +211,7 @@
   [:list [:ref :linux.static/instruction]]
   (let [first (resolve-string (begin out "string-index-of") cfg "idx-a" :a1 :t1 :t2 :t0 :t3)
         second (resolve-string first cfg "idx-b" :a2 :t4 :t5 :t0 :t3)
-        a (validate (-> second (imm :cmp :t5 0) (branch :le :ls/bad)) cfg "idx-a" :a1 :t1 :t2 :t0 :t3 :t6 :t7)
+        a (validate (-> second (imm :cmp :t5 0) (branch :le "ls/bad")) cfg "idx-a" :a1 :t1 :t2 :t0 :t3 :t6 :t7)
         b (validate a cfg "idx-b" :a2 :t4 :t5 :t0 :t3 :t6 :t7)]
     (-> b (alu :cmp :t5 :t2) (branch :gt (tag "idx" "none"))
         (mov :t8 :t2) (alu :sub :t8 :t5) (li :t0 0) (mark (tag "idx" "outer"))
@@ -225,12 +231,12 @@
   [:list [:ref :linux.static/instruction]]
   (let [resolved (resolve-string (mov (begin out "string-code-point-at") :t4 :a2)
                    cfg "cp" :a1 :t1 :t2 :t0 :t3)
-        bounded (-> resolved (imm :cmp :t4 0) (branch :lt :ls/bad)
-                    (alu :cmp :t4 :t2) (branch :hs :ls/bad))
+        bounded (-> resolved (imm :cmp :t4 0) (branch :lt "ls/bad")
+                    (alu :cmp :t4 :t2) (branch :hs "ls/bad"))
         checked (validate bounded cfg "cp" :a1 :t1 :t2 :t0 :t3 :t5 :t6)]
     (-> checked (alu :add :t1 :t4) (li :t4 0) (byte-op :ldb :t0 :t1 :t4)
         (imm :cmp :t0 127) (branch :ls (tag "string-code-point-at" "out"))
-        (imm :cmp :t0 194) (branch :lo :ls/bad)
+        (imm :cmp :t0 194) (branch :lo "ls/bad")
         (imm :cmp :t0 223) (branch :hi (tag "cp" "three"))
         (imm :and :t0 31) (li :t5 2) (branch :always (tag "cp" "decode"))
         (mark (tag "cp" "three")) (imm :cmp :t0 239) (branch :hi (tag "cp" "four"))
@@ -265,13 +271,13 @@
 (defn- substring-slot [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.strings/config]]
   [:list [:ref :linux.static/instruction]]
   (let [first (resolve-string (begin out "string-substring") cfg "sub" :a1 :t1 :t2 :t0 :t3)
-        cuts (-> first (imm :cmp :a2 0) (branch :lt :ls/bad)
-                 (alu :cmp :a3 :a2) (branch :lt :ls/bad) (alu :cmp :a3 :t2) (branch :gt :ls/bad))
+        cuts (-> first (imm :cmp :a2 0) (branch :lt "ls/bad")
+                 (alu :cmp :a3 :a2) (branch :lt "ls/bad") (alu :cmp :a3 :t2) (branch :gt "ls/bad"))
         valid (validate cuts cfg "sub" :a1 :t1 :t2 :t0 :t3 :t6 :t7)
         boundary (-> valid (alu :cmp :a2 :t2) (branch :hs (tag "sub" "start"))
-                     (byte-op :ldb :t3 :t1 :a2) (imm :and :t3 192) (imm :cmp :t3 128) (branch :eq :ls/bad)
+                     (byte-op :ldb :t3 :t1 :a2) (imm :and :t3 192) (imm :cmp :t3 128) (branch :eq "ls/bad")
                      (mark (tag "sub" "start")) (alu :cmp :a3 :t2) (branch :hs (tag "sub" "end"))
-                     (byte-op :ldb :t3 :t1 :a3) (imm :and :t3 192) (imm :cmp :t3 128) (branch :eq :ls/bad)
+                     (byte-op :ldb :t3 :t1 :a3) (imm :and :t3 192) (imm :cmp :t3 128) (branch :eq "ls/bad")
                      (mark (tag "sub" "end")))
         handle (-> (check-handle boundary cfg :a1 :t4 :t0) (mem :ld :t4 :t4 0)
                    (imm :cmp :t4 0) (branch :lt (tag "sub" "negative"))
@@ -290,8 +296,8 @@
 (defn- byte-room [out [:list [:ref :linux.static/instruction]] used :keyword capacity :keyword
                   extra :keyword scratch :keyword]
   [:list [:ref :linux.static/instruction]]
-  (-> out (alu :cmp used capacity) (branch :hi :ls/trap-bytes)
-      (mov scratch capacity) (alu :sub scratch used) (alu :cmp extra scratch) (branch :hi :ls/trap-bytes)))
+  (-> out (alu :cmp used capacity) (branch :hi "ls/trap-bytes")
+      (mov scratch capacity) (alu :sub scratch used) (alu :cmp extra scratch) (branch :hi "ls/trap-bytes")))
 
 (defn- concat-slot [out [:list [:ref :linux.static/instruction]] cfg [:ref :linux.static.strings/config]]
   [:list [:ref :linux.static/instruction]]
@@ -301,7 +307,7 @@
         b (validate a cfg "cat-b" :a2 :t4 :t5 :t0 :t3 :t6 :t7)
         handle (-> (check-handle b cfg :a1 :t6 :t0) (mem :ld :t6 :t6 0)
                    (li :t8 9223372036854775807) (alu :sub :t8 :t5)
-                   (alu :cmp :t2 :t8) (branch :hi :ls/trap-bytes)
+                   (alu :cmp :t2 :t8) (branch :hi "ls/trap-bytes")
                    (mov :t8 :t2) (alu :add :t8 :t5)
                    (mem :ld :t0 :ctx 520) (mem :ld :t3 :ctx 544)
                    (imm :cmp :t6 0) (branch :ge (tag "cat" "not-tail"))
@@ -320,32 +326,32 @@
                    (mark (tag "cat" "make")))]
     (end (pair-new copy-b cfg true :t6 :t8) "string-concat")))
 
-(defn- lookup [m :document key :keyword] :document
-  (if (not= (document-kind m) :map) (document-null)
+(defn- lookup [m [:ref :form/r] key :keyword] [:ref :form/r]
+  (if (not= (meta/value-kind m) :map) (meta/value-null)
     (loop [index 0]
-      (if (>= index (document-count m)) (document-null)
-        (let [pair (option-value-of [:option :document] (document-map-entry-at m index) (document-null))
-              k (option-value-of [:option :document] (document-vector-at pair 0) (document-null))]
-          (if (document-equal? k (document-keyword key))
-            (option-value-of [:option :document] (document-vector-at pair 1) (document-null))
+      (if (>= index (meta/value-count m)) (meta/value-null)
+        (let [pair (option-value-of [:option [:ref :form/r]] (meta/value-map-entry-at m index) (meta/value-null))
+              k (option-value-of [:option [:ref :form/r]] (meta/value-vector-at pair 0) (meta/value-null))]
+          (if (meta/value-equal? k (meta/value-keyword key))
+            (option-value-of [:option [:ref :form/r]] (meta/value-vector-at pair 1) (meta/value-null))
             (recur (+ index 1))))))))
 
-(defn- i64-of [d :document] :i64 (option-value-of [:option :i64] (document-i64-value d) -1))
+(defn- i64-of [d [:ref :form/r]] :i64 (option-value-of [:option :i64] (meta/value-i64-value d) -1))
 
 (defn- base-offset? [offset :i64] :bool
   (and (>= offset 0) (<= offset 504) (= (bit-and offset 7) 0)))
 
-(defn- bindings [] :document
-  (document-map
-    (document-keyword :pair-new) (document-keyword (tag "pair-new" "entry"))
-    (document-keyword :pair-first) (document-keyword (tag "pair-first" "entry"))
-    (document-keyword :pair-second) (document-keyword (tag "pair-second" "entry"))
-    (document-keyword :string-equal) (document-keyword (tag "string-equal" "entry"))
-    (document-keyword :string-index-of) (document-keyword (tag "string-index-of" "entry"))
-    (document-keyword :string-substring) (document-keyword (tag "string-substring" "entry"))
-    (document-keyword :string-concat) (document-keyword (tag "string-concat" "entry"))
-    (document-keyword :string-code-point-at) (document-keyword (tag "string-code-point-at" "entry"))
-    (document-keyword :string-compare) (document-keyword (tag "string-compare" "entry"))))
+(defn- bindings [] [:ref :form/r]
+  (-> (meta/value-map)
+      (meta/value-map-insert (meta/value-keyword :pair-new) (meta/value-string (tag "pair-new" "entry")))
+      (meta/value-map-insert (meta/value-keyword :pair-first) (meta/value-string (tag "pair-first" "entry")))
+      (meta/value-map-insert (meta/value-keyword :pair-second) (meta/value-string (tag "pair-second" "entry")))
+      (meta/value-map-insert (meta/value-keyword :string-equal) (meta/value-string (tag "string-equal" "entry")))
+      (meta/value-map-insert (meta/value-keyword :string-index-of) (meta/value-string (tag "string-index-of" "entry")))
+      (meta/value-map-insert (meta/value-keyword :string-substring) (meta/value-string (tag "string-substring" "entry")))
+      (meta/value-map-insert (meta/value-keyword :string-concat) (meta/value-string (tag "string-concat" "entry")))
+      (meta/value-map-insert (meta/value-keyword :string-code-point-at) (meta/value-string (tag "string-code-point-at" "entry")))
+      (meta/value-map-insert (meta/value-keyword :string-compare) (meta/value-string (tag "string-compare" "entry")))))
 
 (defn- slot-code [cfg [:ref :linux.static.strings/config] slot :keyword]
   [:list [:ref :linux.static/instruction]]
@@ -366,81 +372,82 @@
              (concat-slot (substring-slot (index-of-slot (equal-slot (pair-slots out cfg) cfg) cfg) cfg) cfg) cfg) cfg)
       out)))
 
-(defn- configuration-error [context :document] :keyword
+(defn- configuration-error [context [:ref :form/r]] :keyword
   (let [version (lookup context :version) pairs (lookup context :pairs-base-offset)
         validated (lookup context :pair-validated-base-offset)
         p (i64-of pairs) v (i64-of validated)]
     (cond
-      (or (not= (document-kind version) :i64) (not= (i64-of version) 11))
+      (or (not= (meta/value-kind version) :i64) (not= (i64-of version) 11))
       :context-abi-version
-      (or (not= (document-kind pairs) :i64) (not= (document-kind validated) :i64)
+      (or (not= (meta/value-kind pairs) :i64) (not= (meta/value-kind validated) :i64)
           (not (base-offset? p)) (not (base-offset? v)) (= p v))
       :context-base-offset
       :else :ok)))
 
-(defn- configuration [context :document] [:ref :linux.static.strings/config]
+(defn- configuration [context [:ref :form/r]] [:ref :linux.static.strings/config]
   (record-new [:ref :linux.static.strings/config]
     (i64-of (lookup context :pairs-base-offset))
     (i64-of (lookup context :pair-validated-base-offset))))
 
 (defn- failure [error :keyword] [:ref :linux.static.strings/result]
-  (record-new [:ref :linux.static.strings/result] (empty-code) (document-map) error))
+  (record-new [:ref :linux.static.strings/result] (empty-code) (meta/value-map) error))
 
-(defn- generate [context :document slot :keyword] [:ref :linux.static.strings/result]
+(defn- generate [context [:ref :form/r] slot :keyword] [:ref :linux.static.strings/result]
   (let [error (configuration-error context)]
     (if (not= error :ok) (failure error)
       (let [cfg (configuration context)
             all (bindings) entry (lookup all slot)]
-        (if (and (not= slot :all) (= (document-kind entry) :null))
+        (if (and (not= slot :all) (= (meta/value-kind entry) :null))
           (failure :unknown-slot)
           (record-new [:ref :linux.static.strings/result] (slot-code cfg slot)
-            (if (= slot :all) all (document-map (document-keyword slot) entry)) :ok))))))
+            (if (= slot :all) all (-> (meta/value-map)
+      (meta/value-map-insert (meta/value-keyword slot) entry))) :ok))))))
 
-(defn routine [context :document slot :keyword] [:ref :linux.static.strings/result]
+(defn routine [context [:ref :form/r] slot :keyword] [:ref :linux.static.strings/result]
   (if (= slot :all)
-    (record-new [:ref :linux.static.strings/result] (empty-code) (document-map) :unknown-slot)
+    (record-new [:ref :linux.static.strings/result] (empty-code) (meta/value-map) :unknown-slot)
     (generate context slot)))
 
-(defn routines [context :document] [:ref :linux.static.strings/result]
+(defn routines [context [:ref :form/r]] [:ref :linux.static.strings/result]
   (generate context :all))
 
 ;; Inline C3 fragments, not callable guest slots. The owner has saved s0..s4.
 ;; Raw internal pool pairs are not strings. This resolves an already admitted
 ;; handle/window without consulting or setting the UTF8 validation cache.
 ;; Only an explicitly typed byte result path may use this fragment.
-(defn read-span-fragment [context :document prefix :string] [:ref :linux.static.strings/result]
+(defn read-span-fragment [context [:ref :form/r] prefix :string] [:ref :linux.static.strings/result]
   (let [error (configuration-error context)]
     (if (not= error :ok) (failure error)
       (record-new [:ref :linux.static.strings/result]
         (resolve-string (mov (empty-code) :ctx :s0) (configuration context)
-          prefix :s1 :s2 :s3 :t0 :t1) (document-map) :ok))))
+          prefix :s1 :s2 :s3 :t0 :t1) (meta/value-map) :ok))))
 
 ;; s1/s2 is a trusted bounded byte window, e.g. the framed path portion of a
 ;; checked bytes request. Validate only that span; no cache bit is published
 ;; for the containing arbitrary-byte value. No pointer authority is granted.
 (defn utf8-span-fragment [prefix :string] [:ref :linux.static.strings/result]
   (record-new [:ref :linux.static.strings/result]
-    (validate-span (empty-code) prefix :s1 :s2 :t0 :t1 :t2 :t3) (document-map) :ok))
+    (validate-span (empty-code) prefix :s1 :s2 :t0 :t1 :t2 :t3) (meta/value-map) :ok))
 
 ;; read: s0=context, s1=handle -> s2=pointer/s3=length after full UTF-8 checks.
-(defn read-string-fragment [context :document prefix :string] [:ref :linux.static.strings/result]
+(defn read-string-fragment [context [:ref :form/r] prefix :string] [:ref :linux.static.strings/result]
   (let [error (configuration-error context)]
     (if (not= error :ok) (failure error)
       (let [cfg (configuration context)
             resolved (resolve-string (mov (empty-code) :ctx :s0) cfg prefix :s1 :s2 :s3 :t0 :t1)
             code (validate (mov resolved :ctx :s0) cfg prefix :s1 :s2 :s3 :t0 :t1 :t2 :t3)]
-        (record-new [:ref :linux.static.strings/result] code (document-map) :ok)))))
+        (record-new [:ref :linux.static.strings/result] code (meta/value-map) :ok)))))
 
 ;; intern: s0=context, s1=trusted source pointer, s2=length -> t0=handle.
 ;; The owning caller must first obtain op-6 byte-charge admission from its
 ;; sealed decision artifact and admit a stable source window disjoint from
 ;; the new pool tail. These arithmetic guards do not grant that authority.
 ;; The new handle starts unvalidated; C3's finish path validates its result.
-(defn intern-string-fragment [context :document prefix :string] [:ref :linux.static.strings/result]
+(defn intern-string-fragment [context [:ref :form/r] prefix :string] [:ref :linux.static.strings/result]
   (let [error (configuration-error context)]
     (if (not= error :ok) (failure error)
       (let [cfg (configuration context)
-            start (-> (mov (empty-code) :ctx :s0) (imm :cmp :s2 0) (branch :lt :ls/bad)
+            start (-> (mov (empty-code) :ctx :s0) (imm :cmp :s2 0) (branch :lt "ls/bad")
                       (mem :ld :t0 :ctx 520) (mem :ld :t1 :ctx 544))
             room (-> (byte-room start :t0 :t1 :s2 :t2)
                      (mov :s3 :t0) (mem :ld :t2 :ctx 576) (alu :add :t2 :s3))
@@ -448,22 +455,22 @@
                        (mov :t0 :s3) (alu :add :t0 :s2) (mem :st :t0 :ctx 520)
                        (mov :s4 :s3) (unary :not :s4) (mov :ctx :s0))
             code (pair-new copied cfg false :s4 :s2)]
-        (record-new [:ref :linux.static.strings/result] code (document-map) :ok)))))
+        (record-new [:ref :linux.static.strings/result] code (meta/value-map) :ok)))))
 
 ;; The caller has admitted and advanced the pool span, with s4=~offset and
 ;; s2=length. This allocates its unvalidated pair; C3 still validates return.
-(defn pool-pair-fragment [context :document] [:ref :linux.static.strings/result]
+(defn pool-pair-fragment [context [:ref :form/r]] [:ref :linux.static.strings/result]
   (let [error (configuration-error context)]
     (if (not= error :ok) (failure error)
       (record-new [:ref :linux.static.strings/result]
         (pair-new (mov (empty-code) :ctx :s0) (configuration context) false :s4 :s2)
-        (document-map) :ok))))
+        (meta/value-map) :ok))))
 
 ;; Same private span protocol as pool-pair-fragment. The owning primitive
 ;; MUST have already checked canonical UTF8 before advancing the pool span.
-(defn validated-pool-pair-fragment [context :document] [:ref :linux.static.strings/result]
+(defn validated-pool-pair-fragment [context [:ref :form/r]] [:ref :linux.static.strings/result]
   (let [error (configuration-error context)]
     (if (not= error :ok) (failure error)
       (record-new [:ref :linux.static.strings/result]
         (pair-new (mov (empty-code) :ctx :s0) (configuration context) true :s4 :s2)
-        (document-map) :ok))))
+        (meta/value-map) :ok))))

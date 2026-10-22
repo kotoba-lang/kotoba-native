@@ -101,3 +101,50 @@ and alias import, and public CLI success/refusal behavior remain open.
 Amu's public entrypoints remain unavailable until those gates pass. No main
 merge, Actions/protection change, shared WIP cleanup or service change is
 authorized by these experimental results.
+
+## Current all-native regeneration (supersedes the initial materialization limit)
+
+The earlier Python IR calculator is absent from the current rooted build
+chain. A reproduced Amu loaderless root builds the native runner and measured
+core; that compiler builds this canonical packager, which creates standalone
+compiler and FS2-only packager ELF images. The resulting compiler actually
+rebuilds its core to a byte-identical G4 container. All 19 full Embench
+verification workloads were freshly compiled, extracted, packaged natively
+and executed successfully, with empty guest effects/grants. No timing score
+or public target admission is implied.
+
+The ABI and build metadata now use `kotoba.artifact.data` typed Form values,
+with byte payloads for code. The guest document 32-item, 4096-node, depth-8
+and 64KiB limits remain intact; only fixed ELF headers cross the checked
+metadata-to-document bridge. Artifact's new Form API is a draft dependency.
+The actual native SHA-256 empty/abc vectors, seal acceptance and one-byte
+mutation refusal passed. This does not qualify its entire identity domain.
+
+IR label identities are now strings, compared by contents, rather than
+interned guest keywords. The old labels exhausted the 4096-datom KGraph arena.
+The arena bound was retained. Two native v11 providers were added for actual
+keyword interning: append-only KGraph assertion and last-write-wins lookup,
+with INT64_MIN for missing values. Native tests pass missing/update/attribute
+isolation and exactly 4096 entries; entry 4097 exits 72 with the KGraph arena
+reason. Count/entity-at retain their existing explicit unsupported bindings.
+
+Source fixtures: `test/fixtures/bootstrap/compiler_plan.kotoba`,
+`image_builder.inc.kotoba` and `context_sentinels.kotoba`. The compiler plan
+holds all 51 ABI fields and 36 slots. Compiler, pure and hash tests use
+separate explicit effect/grant sets; benchmark guests get no compiler
+filesystem/CLI authority. The updated sentinel fixture passed native compile
+and execution after the Form/text-label change.
+
+Amu's fresh receipt is
+`docs/evidence/native-bootstrap-20261022/native-rooted-19-correctness.json`.
+The current compiler ELF SHA-256 is
+`d95554d47c765450e4977768e58fb84fc21cd8ae9de29ed6abad34054335091c`;
+the passing FS2 packager is
+`9127fa447049e996a077560b7df016eef905ebb26f8ba4e5bb8f12c82a71b9e9`.
+Both execute directly as AArch64 Linux ELF without PT_INTERP/PT_DYNAMIC.
+
+Public profile/target/command admission, complete canonical upstream ports,
+locked imports/aliases, public CLI, full identity domain, whole authority/
+resource/race/cleanup corpus, controller and forbidden-process traces remain
+open. Neither this source checkpoint nor a small successful seal replaces
+those gates. PR #205 and Amu #1428 remain draft; Actions and WIP are preserved.

@@ -1,7 +1,8 @@
 ;; Complete canonical Linux-static packager composition. Unqualified source.
 (ns kotoba.native.linux-static
   {:kotoba/export [package plan targets image-layout slot-names implemented-slots]}
-  (:require [kotoba.artifact.core :as artifact]
+  (:require [kotoba.artifact.data :as meta]
+            [kotoba.artifact.form-seal :as artifact]
             [kotoba.object.elf64 :as elf]
             [kotoba.native.linux-static-plan :as planning]
             [kotoba.native.linux-static-assembler :as asm]
@@ -10,46 +11,48 @@
   (:schemas
    {:linux.static.image/result
     [:record :linux.static.image/result
-     [[:bytes :vector-i64] [:value :document] [:error :keyword] [:data :document]]]
+     [[:bytes :vector-i64] [:value [:ref :form/r]] [:error :keyword] [:data [:ref :form/r]]]]
     :linux.static.image/decisions
     [:record :linux.static.image/decisions
-     [[:bytes :vector-i64] [:labels [:list [:ref :linux.static/label]]] [:regions :document]
-      [:error :keyword] [:data :document]]]
+     [[:bytes :vector-i64] [:labels [:list [:ref :linux.static/label]]] [:regions [:ref :form/r]]
+      [:error :keyword] [:data [:ref :form/r]]]]
     :linux.static.image/build
     [:record :linux.static.image/build
-     [[:text :vector-i64] [:context :vector-i64] [:layout :document] [:details :document]
-      [:error :keyword] [:data :document]]]}))
+     [[:text :vector-i64] [:context :vector-i64] [:layout [:ref :form/r]] [:details [:ref :form/r]]
+      [:error :keyword] [:data [:ref :form/r]]]]}))
 
-(defn targets [] :document (planning/targets))
-(defn implemented-slots [] :document (planning/implemented-slots))
-(defn slot-names [abi :document] [:ref :linux.static.plan/result] (planning/slot-names abi))
-(defn plan [source :document profile :document overrides :document] [:ref :linux.static.plan/result]
+(defn targets [] [:ref :form/r] (planning/targets))
+(defn implemented-slots [] [:ref :form/r] (planning/implemented-slots))
+(defn slot-names [abi [:ref :form/r]] [:ref :linux.static.plan/result] (planning/slot-names abi))
+(defn plan [source [:ref :form/r] profile [:ref :form/r] overrides [:ref :form/r]] [:ref :linux.static.plan/result]
   (planning/plan source profile overrides))
-(defn image-layout [text-size :i64 source-plan :document] [:ref :linux.static.plan/result]
+(defn image-layout [text-size :i64 source-plan [:ref :form/r]] [:ref :linux.static.plan/result]
   (planning/image-layout text-size source-plan))
 (defn- text-base [] :i64 4198400)
 (defn- assembly-limit [] :i64 (- 9223372036854775807 (text-base)))
-(defn- lookup [m :document key :document] :document
-  (if (not= (document-kind m) :map) (document-null)
+(defn- lookup [m [:ref :form/r] key [:ref :form/r]] [:ref :form/r]
+  (if (not= (meta/value-kind m) :map) (meta/value-null)
     (loop [index 0]
-      (if (= index (document-count m)) (document-null)
-        (let [pair (option-value-of [:option :document] (document-map-entry-at m index) (document-null))]
-          (if (document-equal? (option-value-of [:option :document] (document-vector-at pair 0) (document-null)) key)
-            (option-value-of [:option :document] (document-vector-at pair 1) (document-null)) (recur (+ index 1))))))))
-(defn- get-key [m :document key :keyword] :document (lookup m (document-keyword key)))
-(defn- item [v :document index :i64] :document
-  (if (= (document-kind v) :list)
-    (option-value-of [:option :document] (document-list-at v index) (document-null))
-    (option-value-of [:option :document] (document-vector-at v index) (document-null))))
-(defn- i64-of [d :document] :i64 (option-value-of [:option :i64] (document-i64-value d) -1))
-(defn- key-of [d :document] :keyword (option-value-of [:option :keyword] (document-keyword-value d) :none))
-(defn- true? [d :document] :bool (document-equal? d (document-bool true)))
-(defn- detail [stage :keyword field :keyword] :document
-  (document-map (document-keyword :stage) (document-keyword stage) (document-keyword :field) (document-keyword field)))
+      (if (= index (meta/value-count m)) (meta/value-null)
+        (let [pair (option-value-of [:option [:ref :form/r]] (meta/value-map-entry-at m index) (meta/value-null))]
+          (if (meta/value-equal? (option-value-of [:option [:ref :form/r]] (meta/value-vector-at pair 0) (meta/value-null)) key)
+            (option-value-of [:option [:ref :form/r]] (meta/value-vector-at pair 1) (meta/value-null)) (recur (+ index 1))))))))
+(defn- get-key [m [:ref :form/r] key :keyword] [:ref :form/r] (lookup m (meta/value-keyword key)))
+(defn- item [v [:ref :form/r] index :i64] [:ref :form/r]
+  (if (= (meta/value-kind v) :list)
+    (option-value-of [:option [:ref :form/r]] (meta/value-list-at v index) (meta/value-null))
+    (option-value-of [:option [:ref :form/r]] (meta/value-vector-at v index) (meta/value-null))))
+(defn- i64-of [d [:ref :form/r]] :i64 (option-value-of [:option :i64] (meta/value-i64-value d) -1))
+(defn- key-of [d [:ref :form/r]] :keyword (option-value-of [:option :keyword] (meta/value-keyword-value d) :none))
+(defn- true? [d [:ref :form/r]] :bool (meta/value-equal? d (meta/value-bool true)))
+(defn- detail [stage :keyword field :keyword] [:ref :form/r]
+  (-> (meta/value-map)
+      (meta/value-map-insert (meta/value-keyword :stage) (meta/value-keyword stage))
+      (meta/value-map-insert (meta/value-keyword :field) (meta/value-keyword field))))
 (defn- ok [bytes :vector-i64] [:ref :linux.static.image/result]
-  (record-new [:ref :linux.static.image/result] bytes (document-null) :ok (document-null)))
-(defn- fail [error :keyword data :document] [:ref :linux.static.image/result]
-  (record-new [:ref :linux.static.image/result] (vector-alloc 0) (document-null) error data))
+  (record-new [:ref :linux.static.image/result] bytes (meta/value-null) :ok (meta/value-null)))
+(defn- fail [error :keyword data [:ref :form/r]] [:ref :linux.static.image/result]
+  (record-new [:ref :linux.static.image/result] (vector-alloc 0) (meta/value-null) error data))
 (defn- good? [r [:ref :linux.static.image/result]] :bool
   (= (record-get [:ref :linux.static.image/result] r :error) :ok))
 (defn- bytes-of [r [:ref :linux.static.image/result]] :vector-i64
@@ -86,37 +89,38 @@
     (let [r (from-elf more stage)] (if (good? r) (append-bytes out (bytes-of r)) r))))
 (defn- pad-result [out [:ref :linux.static.image/result] size :i64 stage :keyword] [:ref :linux.static.image/result]
   (if (not (good? out)) out (from-elf (elf/pad-to (bytes-of out) size) stage)))
-(defn- normalized-code [value :document field :keyword] [:ref :linux.static.image/result]
-  (if (= (document-kind value) :bytes)
-    (let [bytes (option-value-of [:option :bytes] (document-bytes-value value) (bytes-empty))]
-      (loop [index 0 out (vector-alloc 0)]
-        (if (= index (bytes-count bytes)) (ok out) (recur (+ index 1) (vector-conj out (bytes-at bytes index))))))
-    (if (not (or (= (document-kind value) :vector) (= (document-kind value) :list))) (fail :artifact-code (detail :code field))
-      (loop [index 0 out (vector-alloc 0)]
-        (if (= index (document-count value)) (ok out)
+(defn- normalized-code [value [:ref :form/r] field :keyword] [:ref :linux.static.image/result]
+  (if (= (meta/value-kind value) :bytes)
+    (let [bytes (option-value-of [:option :bytes] (meta/value-bytes-value value) (bytes-empty))]
+      (loop [index 0 out (vector-alloc (bytes-count bytes))]
+        (if (= index (bytes-count bytes)) (ok out)
+          (recur (+ index 1) (vector-assoc! out index (bytes-at bytes index))))))
+    (if (not (or (= (meta/value-kind value) :vector) (= (meta/value-kind value) :list))) (fail :artifact-code (detail :code field))
+      (loop [index 0 out (vector-alloc (meta/value-count value))]
+        (if (= index (meta/value-count value)) (ok out)
           (let [byte (item value index)]
-            (if (not= (document-kind byte) :i64) (fail :artifact-code (detail :code field))
-              (recur (+ index 1) (vector-conj out (bit-and (i64-of byte) 255))))))))))
-(defn- address [labels [:list [:ref :linux.static/label]] name :keyword] :i64
+            (if (not= (meta/value-kind byte) :i64) (fail :artifact-code (detail :code field))
+              (recur (+ index 1) (vector-assoc! out index (bit-and (i64-of byte) 255))))))))))
+(defn- address [labels [:list [:ref :linux.static/label]] name :string] :i64
   (loop [index 0]
     (if (= index (vector-count labels)) -1
       (let [row (typed-list-nth [:list [:ref :linux.static/label]] labels index)]
-        (if (= (record-get [:ref :linux.static/label] row :name) name)
+        (if (string=? (record-get [:ref :linux.static/label] row :name) name)
           (record-get [:ref :linux.static/label] row :address) (recur (+ index 1)))))))
 (defn- external-labels [labels [:list [:ref :linux.static/label]] main :i64] [:list [:ref :linux.static/label]]
-  (typed-list-conj [:list [:ref :linux.static/label]] labels (asm/label :ls/guest-main main)))
-(defn- add-label [labels [:list [:ref :linux.static/label]] name :keyword value :i64] [:list [:ref :linux.static/label]]
+  (typed-list-conj [:list [:ref :linux.static/label]] labels (asm/label "ls/guest-main" main)))
+(defn- add-label [labels [:list [:ref :linux.static/label]] name :string value :i64] [:list [:ref :linux.static/label]]
   (typed-list-conj [:list [:ref :linux.static/label]] labels (asm/label name value)))
-(defn- decision-fail [error :keyword data :document] [:ref :linux.static.image/decisions]
+(defn- decision-fail [error :keyword data [:ref :form/r]] [:ref :linux.static.image/decisions]
   (record-new [:ref :linux.static.image/decisions] (vector-alloc 0)
-    (typed-list-new [:list [:ref :linux.static/label]]) (document-vector) error data))
-(defn- symbol-offset [component :document name :string size :i64] :i64
-  (let [offset (lookup (get-key component :offsets) (document-symbol (symbol name)))]
-    (if (and (= (document-kind offset) :i64) (>= (i64-of offset) 0) (< (i64-of offset) size)) (i64-of offset) -1)))
-(defn- decision-text [source-plan :document code-end :i64] [:ref :linux.static.image/decisions]
+    (typed-list-new [:list [:ref :linux.static/label]]) (meta/value-vector) error data))
+(defn- symbol-offset [component [:ref :form/r] name :string size :i64] :i64
+  (let [offset (lookup (get-key component :offsets) (meta/value-symbol name))]
+    (if (and (= (meta/value-kind offset) :i64) (>= (i64-of offset) 0) (< (i64-of offset) size)) (i64-of offset) -1)))
+(defn- decision-text [source-plan [:ref :form/r] code-end :i64] [:ref :linux.static.image/decisions]
   (if (not (true? (get-key source-plan :handlers?)))
     (record-new [:ref :linux.static.image/decisions] (vector-alloc 0)
-      (typed-list-new [:list [:ref :linux.static/label]]) (document-vector) :ok (document-null))
+      (typed-list-new [:list [:ref :linux.static/label]]) (meta/value-vector) :ok (meta/value-null))
     (let [pair (get-key source-plan :handler-code) decisions (get-key pair :decisions) handlers (get-key pair :handlers)
           dr (normalized-code (get-key decisions :code) :decisions) hr (normalized-code (get-key handlers :code) :handlers)]
       (cond
@@ -133,20 +137,24 @@
             :else
             (let [bytes (join (join (join (zeros (- c1 code-end)) (bytes-of dr)) (zeros (- h dend))) (bytes-of hr))
                   labels (-> (typed-list-new [:list [:ref :linux.static/label]])
-                             (add-label :ls.cap/c1-code-base c1)
-                             (add-label :ls.cap/h-code-base h)
-                             (add-label :ls.cap/c1-cap (+ c1 cap))
-                             (add-label :ls.cap/c1-decide (+ c1 decide))
-                             (add-label :ls.cap/h-decide (+ h handle)))
-                  regions (document-vector
-                            (document-map (document-keyword :which) (document-keyword :decisions)
-                              (document-keyword :address) (document-i64 c1) (document-keyword :size) (document-i64 dsize))
-                            (document-map (document-keyword :which) (document-keyword :handlers)
-                              (document-keyword :address) (document-i64 h) (document-keyword :size) (document-i64 hsize)))]
-              (record-new [:ref :linux.static.image/decisions] bytes labels regions :ok (document-null)))))))))
-(defn- build-fail [error :keyword data :document] [:ref :linux.static.image/build]
-  (record-new [:ref :linux.static.image/build] (vector-alloc 0) (vector-alloc 0) (document-null) (document-null) error data))
-(defn- finish-build [isa :keyword source-plan :document layout :document guest :vector-i64 main-offset :i64
+                             (add-label "ls.cap/c1-code-base" c1)
+                             (add-label "ls.cap/h-code-base" h)
+                             (add-label "ls.cap/c1-cap" (+ c1 cap))
+                             (add-label "ls.cap/c1-decide" (+ c1 decide))
+                             (add-label "ls.cap/h-decide" (+ h handle)))
+                  regions (-> (meta/value-vector)
+      (meta/value-vector-conj (-> (meta/value-map)
+      (meta/value-map-insert (meta/value-keyword :which) (meta/value-keyword :decisions))
+      (meta/value-map-insert (meta/value-keyword :address) (meta/value-i64 c1))
+      (meta/value-map-insert (meta/value-keyword :size) (meta/value-i64 dsize))))
+      (meta/value-vector-conj (-> (meta/value-map)
+      (meta/value-map-insert (meta/value-keyword :which) (meta/value-keyword :handlers))
+      (meta/value-map-insert (meta/value-keyword :address) (meta/value-i64 h))
+      (meta/value-map-insert (meta/value-keyword :size) (meta/value-i64 hsize)))))]
+              (record-new [:ref :linux.static.image/decisions] bytes labels regions :ok (meta/value-null)))))))))
+(defn- build-fail [error :keyword data [:ref :form/r]] [:ref :linux.static.image/build]
+  (record-new [:ref :linux.static.image/build] (vector-alloc 0) (vector-alloc 0) (meta/value-null) (meta/value-null) error data))
+(defn- finish-build [isa :keyword source-plan [:ref :form/r] layout [:ref :form/r] guest :vector-i64 main-offset :i64
                      prelude-size :i64 decisions [:ref :linux.static.image/decisions]] [:ref :linux.static.image/build]
   (let [body (prelude/routine isa source-plan layout)
         code-address (+ (text-base) prelude-size) main-address (+ code-address main-offset)]
@@ -155,13 +163,14 @@
       (let [assembled (asm/assemble isa (text-base) (record-get [:ref :linux.static.prelude/result] body :code)
                         (external-labels (record-get [:ref :linux.static.image/decisions] decisions :labels) main-address) (assembly-limit))
             labels (record-get [:ref :linux.static/result] assembled :labels)
-            prelude (record-get [:ref :linux.static/result] assembled :bytes) entry (address labels :ls/start)]
+            prelude (record-get [:ref :linux.static/result] assembled :bytes) entry (address labels "ls/start")]
         (cond
           (not= (record-get [:ref :linux.static/result] assembled :error) :ok)
           (build-fail (record-get [:ref :linux.static/result] assembled :error)
-            (document-map (document-keyword :stage) (document-keyword :assembly-final)
-              (document-keyword :at) (document-i64 (record-get [:ref :linux.static/result] assembled :at))))
-          (or (not= (vector-count prelude) prelude-size) (not= (address labels :ls/text-end) code-address))
+            (-> (meta/value-map)
+      (meta/value-map-insert (meta/value-keyword :stage) (meta/value-keyword :assembly-final))
+      (meta/value-map-insert (meta/value-keyword :at) (meta/value-i64 (record-get [:ref :linux.static/result] assembled :at)))))
+          (or (not= (vector-count prelude) prelude-size) (not= (address labels "ls/text-end") code-address))
           (build-fail :prelude-size (detail :assembly-final :text-end))
           (or (< entry (text-base)) (>= entry code-address)) (build-fail :entry-span (detail :assembly-final :start))
           :else
@@ -172,19 +181,20 @@
               (record-new [:ref :linux.static.image/build]
                 (join (join prelude guest) (record-get [:ref :linux.static.image/decisions] decisions :bytes))
                 (record-get [:ref :linux.static.context/result] initialized :bytes) layout
-                (document-map (document-keyword :entry-address) (document-i64 entry)
-                  (document-keyword :main-address) (document-i64 main-address)
-                  (document-keyword :prelude-size) (document-i64 prelude-size)
-                  (document-keyword :code-size) (document-i64 (vector-count guest))
-                  (document-keyword :decision-regions) (record-get [:ref :linux.static.image/decisions] decisions :regions))
-                :ok (document-null)))))))))
-(defn- build-after-probe [isa :keyword source-plan :document guest :vector-i64 main-offset :i64 probe [:ref :linux.static/result]]
+                (-> (meta/value-map)
+      (meta/value-map-insert (meta/value-keyword :entry-address) (meta/value-i64 entry))
+      (meta/value-map-insert (meta/value-keyword :main-address) (meta/value-i64 main-address))
+      (meta/value-map-insert (meta/value-keyword :prelude-size) (meta/value-i64 prelude-size))
+      (meta/value-map-insert (meta/value-keyword :code-size) (meta/value-i64 (vector-count guest)))
+      (meta/value-map-insert (meta/value-keyword :decision-regions) (record-get [:ref :linux.static.image/decisions] decisions :regions)))
+                :ok (meta/value-null)))))))))
+(defn- build-after-probe [isa :keyword source-plan [:ref :form/r] guest :vector-i64 main-offset :i64 probe [:ref :linux.static/result]]
   [:ref :linux.static.image/build]
   (let [size (vector-count (record-get [:ref :linux.static/result] probe :bytes))
         code-address (checked-add (text-base) size) code-end (checked-add code-address (vector-count guest))]
     (cond
       (or (< code-address 0) (< code-end 0)) (build-fail :layout-overflow (detail :probe :code-end))
-      (not= (address (record-get [:ref :linux.static/result] probe :labels) :ls/text-end) code-address)
+      (not= (address (record-get [:ref :linux.static/result] probe :labels) "ls/text-end") code-address)
       (build-fail :prelude-size (detail :probe :text-end))
       :else
       (let [decisions (decision-text source-plan code-end)]
@@ -200,7 +210,7 @@
                     (record-get [:ref :linux.static.plan/result] layout :data))
                   (finish-build isa source-plan (record-get [:ref :linux.static.plan/result] layout :value)
                     guest main-offset size decisions))))))))))
-(defn- build [isa :keyword source-plan :document guest :vector-i64 main-offset :i64] [:ref :linux.static.image/build]
+(defn- build [isa :keyword source-plan [:ref :form/r] guest :vector-i64 main-offset :i64] [:ref :linux.static.image/build]
   (let [layout (planning/image-layout 0 source-plan)]
     (if (not= (record-get [:ref :linux.static.plan/result] layout :error) :ok)
       (build-fail (record-get [:ref :linux.static.plan/result] layout :error) (record-get [:ref :linux.static.plan/result] layout :data))
@@ -217,24 +227,33 @@
                         (external-labels (record-get [:ref :linux.static.image/decisions] decisions :labels) (text-base)) (assembly-limit))]
             (if (not= (record-get [:ref :linux.static/result] probe :error) :ok)
               (build-fail (record-get [:ref :linux.static/result] probe :error)
-                (document-map (document-keyword :stage) (document-keyword :assembly-probe)
-                  (document-keyword :at) (document-i64 (record-get [:ref :linux.static/result] probe :at))))
+                (-> (meta/value-map)
+      (meta/value-map-insert (meta/value-keyword :stage) (meta/value-keyword :assembly-probe))
+      (meta/value-map-insert (meta/value-keyword :at) (meta/value-i64 (record-get [:ref :linux.static/result] probe :at)))))
               (build-after-probe isa source-plan guest main-offset probe))))))))
 
 (defn- section [name-offset :i64 type :keyword flags :i64 address :i64 offset :i64 size :i64 alignment :i64]
   [:ref :kotoba.object.elf64/result]
   (elf/encode-section-header
-    (document-map (document-keyword :name-offset) (document-i64 name-offset) (document-keyword :type) (document-keyword type)
-      (document-keyword :flags) (document-i64 flags) (document-keyword :address) (document-i64 address)
-      (document-keyword :offset) (document-i64 offset) (document-keyword :size) (document-i64 size)
-      (document-keyword :alignment) (document-i64 alignment))))
-(defn- program-header [type :document flags :i64 offset :i64 address :i64 file-size :i64 memory-size :i64 alignment :i64]
+    (meta/value-to-document (-> (meta/value-map)
+      (meta/value-map-insert (meta/value-keyword :name-offset) (meta/value-i64 name-offset))
+      (meta/value-map-insert (meta/value-keyword :type) (meta/value-keyword type))
+      (meta/value-map-insert (meta/value-keyword :flags) (meta/value-i64 flags))
+      (meta/value-map-insert (meta/value-keyword :address) (meta/value-i64 address))
+      (meta/value-map-insert (meta/value-keyword :offset) (meta/value-i64 offset))
+      (meta/value-map-insert (meta/value-keyword :size) (meta/value-i64 size))
+      (meta/value-map-insert (meta/value-keyword :alignment) (meta/value-i64 alignment))))))
+(defn- program-header [type [:ref :form/r] flags :i64 offset :i64 address :i64 file-size :i64 memory-size :i64 alignment :i64]
   [:ref :kotoba.object.elf64/result]
   (elf/encode-program-header
-    (document-map (document-keyword :type) type (document-keyword :flags) (document-i64 flags)
-      (document-keyword :offset) (document-i64 offset) (document-keyword :virtual-address) (document-i64 address)
-      (document-keyword :file-size) (document-i64 file-size) (document-keyword :memory-size) (document-i64 memory-size)
-      (document-keyword :alignment) (document-i64 alignment))))
+    (meta/value-to-document (-> (meta/value-map)
+      (meta/value-map-insert (meta/value-keyword :type) type)
+      (meta/value-map-insert (meta/value-keyword :flags) (meta/value-i64 flags))
+      (meta/value-map-insert (meta/value-keyword :offset) (meta/value-i64 offset))
+      (meta/value-map-insert (meta/value-keyword :virtual-address) (meta/value-i64 address))
+      (meta/value-map-insert (meta/value-keyword :file-size) (meta/value-i64 file-size))
+      (meta/value-map-insert (meta/value-keyword :memory-size) (meta/value-i64 memory-size))
+      (meta/value-map-insert (meta/value-keyword :alignment) (meta/value-i64 alignment))))))
 (defn- utf8 [text :string] :vector-i64
   (let [bytes (string-to-utf8 text)]
     (loop [index 0 out (vector-alloc 0)]
@@ -255,14 +274,19 @@
           (< data-address 0) (> memory-size (- 9223372036854775807 data-address))) (fail :layout-input (detail :frame :regions))
       :else
       (let [header (elf/encode-header
-                     (document-map (document-keyword :type) (document-keyword :executable) (document-keyword :machine) (document-keyword machine)
-                       (document-keyword :entry) (get-key details :entry-address) (document-keyword :program-header-offset) (document-i64 64)
-                       (document-keyword :program-header-count) (document-i64 3) (document-keyword :section-header-offset) (document-i64 section-offset)
-                       (document-keyword :section-header-count) (document-i64 5) (document-keyword :section-name-index) (document-i64 4)))
+                     (meta/value-to-document (-> (meta/value-map)
+      (meta/value-map-insert (meta/value-keyword :type) (meta/value-keyword :executable))
+      (meta/value-map-insert (meta/value-keyword :machine) (meta/value-keyword machine))
+      (meta/value-map-insert (meta/value-keyword :entry) (get-key details :entry-address))
+      (meta/value-map-insert (meta/value-keyword :program-header-offset) (meta/value-i64 64))
+      (meta/value-map-insert (meta/value-keyword :program-header-count) (meta/value-i64 3))
+      (meta/value-map-insert (meta/value-keyword :section-header-offset) (meta/value-i64 section-offset))
+      (meta/value-map-insert (meta/value-keyword :section-header-count) (meta/value-i64 5))
+      (meta/value-map-insert (meta/value-keyword :section-name-index) (meta/value-i64 4)))))
             bytes (-> (from-elf header :header)
-                      (append-elf (program-header (document-keyword :load) 5 text-offset text-address (vector-count text) (vector-count text) 4096) :text-program)
-                      (append-elf (program-header (document-keyword :load) 6 data-offset data-address initialized-size memory-size 4096) :data-program)
-                      (append-elf (program-header (document-i64 1685382481) 6 0 0 0 0 16) :stack-program)
+                      (append-elf (program-header (meta/value-keyword :load) 5 text-offset text-address (vector-count text) (vector-count text) 4096) :text-program)
+                      (append-elf (program-header (meta/value-keyword :load) 6 data-offset data-address initialized-size memory-size 4096) :data-program)
+                      (append-elf (program-header (meta/value-i64 1685382481) 6 0 0 0 0 16) :stack-program)
                       (pad-result text-offset :before-text) (append-bytes text) (pad-result data-offset :before-data)
                       (append-bytes context) (append-bytes names) (pad-result section-offset :before-sections)
                       (append-bytes (zeros 64))
@@ -272,66 +296,82 @@
                       (append-elf (section 18 :strtab 0 0 names-offset (vector-count names) 1) :names-section))]
         (if (and (good? bytes) (not= (vector-count (bytes-of bytes)) end))
           (fail :image-size (detail :frame :end)) bytes)))))
-(defn- slot-states [slots :document] :document
-  (loop [index 0 out (document-map)]
-    (if (= index (document-count slots)) out
-      (let [pair (option-value-of [:option :document] (document-map-entry-at slots index) (document-null))]
-        (recur (+ index 1) (document-merge out (document-map (item pair 0)
-          (document-keyword (if (true? (get-key (item pair 1) :admitted?)) :implemented :traps)))))))))
-(defn- file-regions [regions :document] :document
-  (loop [index 0 out (document-vector)]
-    (if (= index (document-count regions)) out
+(defn- slot-states [slots [:ref :form/r]] [:ref :form/r]
+  (loop [index 0 out (meta/value-map)]
+    (if (= index (meta/value-count slots)) out
+      (let [pair (option-value-of [:option [:ref :form/r]] (meta/value-map-entry-at slots index) (meta/value-null))]
+        (recur (+ index 1) (meta/value-merge out (-> (meta/value-map)
+      (meta/value-map-insert (item pair 0) (meta/value-keyword (if (true? (get-key (item pair 1) :admitted?)) :implemented :traps))))))))))
+(defn- file-regions [regions [:ref :form/r]] [:ref :form/r]
+  (loop [index 0 out (meta/value-vector)]
+    (if (= index (meta/value-count regions)) out
       (let [row (item regions index) offset (+ 4096 (- (i64-of (get-key row :address)) (text-base)))]
-        (recur (+ index 1) (document-vector-conj out (document-merge row
-          (document-map (document-keyword :address) (document-i64 offset)))))))))
-(defn- metadata [source :document source-plan :document built [:ref :linux.static.image/build]] :document
+        (recur (+ index 1) (meta/value-vector-conj out (meta/value-merge row
+          (-> (meta/value-map)
+      (meta/value-map-insert (meta/value-keyword :address) (meta/value-i64 offset))))))))))
+(defn- metadata [source [:ref :form/r] source-plan [:ref :form/r] built [:ref :linux.static.image/build]] [:ref :form/r]
   (let [details (record-get [:ref :linux.static.image/build] built :details) layout (record-get [:ref :linux.static.image/build] built :layout)]
-    (document-map
-      (document-keyword :format) (document-keyword :elf64/v1) (document-keyword :target) (get-key source :target)
-      (document-keyword :entry) (document-keyword :_start) (document-keyword :entry-address) (get-key details :entry-address)
-      (document-keyword :source-entry) (get-key (get-key source :program) :entry) (document-keyword :main-address) (get-key details :main-address)
-      (document-keyword :text-offset) (get-key layout :text-offset) (document-keyword :prelude-size) (get-key details :prelude-size)
-      (document-keyword :code-offset) (document-i64 (+ (i64-of (get-key layout :text-offset)) (i64-of (get-key details :prelude-size))))
-      (document-keyword :code-size) (get-key details :code-size)
-      (document-keyword :data-offset) (get-key layout :data-offset) (document-keyword :data-address) (get-key layout :data)
-      (document-keyword :budgets) (document-map (document-keyword :cells) (get-key source-plan :cells)
-        (document-keyword :bytes) (get-key source-plan :bytes)
-        (document-keyword :vectors) (get-key source-plan :vectors)
-        (document-keyword :vector-items) (get-key source-plan :vector-items)
-        (document-keyword :vector-item-limit) (get-key source-plan :vector-item-limit)
-        (document-keyword :byte-value-limit) (get-key source-plan :byte-value-limit)
-        (document-keyword :string-value-limit) (get-key source-plan :string-value-limit))
-      (document-keyword :fuel) (document-map (document-keyword :initial) (get-key source-plan :fuel) (document-keyword :metered) (get-key source-plan :metered?))
-      (document-keyword :slots) (slot-states (get-key source-plan :slots))
-      (document-keyword :sections) (document-vector (document-keyword :text) (document-keyword :data) (document-keyword :bss) (document-keyword :shstrtab))
-      (document-keyword :imports) (document-vector) (document-keyword :interpreter) (document-null) (document-keyword :dynamic) (document-null)
-      (document-keyword :grant) (get-key source-plan :grant) (document-keyword :fs-scope) (get-key source-plan :fs-scope)
-      (document-keyword :spawn) (get-key source-plan :spawn)
-      (document-keyword :decision-code) (file-regions (get-key details :decision-regions)))))
-(defn- package-planned [source :document source-plan :document target :document code :vector-i64 main-offset :i64]
+    (-> (meta/value-map)
+      (meta/value-map-insert (meta/value-keyword :format) (meta/value-keyword :elf64/v1))
+      (meta/value-map-insert (meta/value-keyword :target) (get-key source :target))
+      (meta/value-map-insert (meta/value-keyword :entry) (meta/value-keyword :_start))
+      (meta/value-map-insert (meta/value-keyword :entry-address) (get-key details :entry-address))
+      (meta/value-map-insert (meta/value-keyword :source-entry) (get-key (get-key source :program) :entry))
+      (meta/value-map-insert (meta/value-keyword :main-address) (get-key details :main-address))
+      (meta/value-map-insert (meta/value-keyword :text-offset) (get-key layout :text-offset))
+      (meta/value-map-insert (meta/value-keyword :prelude-size) (get-key details :prelude-size))
+      (meta/value-map-insert (meta/value-keyword :code-offset) (meta/value-i64 (+ (i64-of (get-key layout :text-offset)) (i64-of (get-key details :prelude-size)))))
+      (meta/value-map-insert (meta/value-keyword :code-size) (get-key details :code-size))
+      (meta/value-map-insert (meta/value-keyword :data-offset) (get-key layout :data-offset))
+      (meta/value-map-insert (meta/value-keyword :data-address) (get-key layout :data))
+      (meta/value-map-insert (meta/value-keyword :budgets) (-> (meta/value-map)
+      (meta/value-map-insert (meta/value-keyword :cells) (get-key source-plan :cells))
+      (meta/value-map-insert (meta/value-keyword :bytes) (get-key source-plan :bytes))
+      (meta/value-map-insert (meta/value-keyword :vectors) (get-key source-plan :vectors))
+      (meta/value-map-insert (meta/value-keyword :vector-items) (get-key source-plan :vector-items))
+      (meta/value-map-insert (meta/value-keyword :vector-item-limit) (get-key source-plan :vector-item-limit))
+      (meta/value-map-insert (meta/value-keyword :byte-value-limit) (get-key source-plan :byte-value-limit))
+      (meta/value-map-insert (meta/value-keyword :string-value-limit) (get-key source-plan :string-value-limit))))
+      (meta/value-map-insert (meta/value-keyword :fuel) (-> (meta/value-map)
+      (meta/value-map-insert (meta/value-keyword :initial) (get-key source-plan :fuel))
+      (meta/value-map-insert (meta/value-keyword :metered) (get-key source-plan :metered?))))
+      (meta/value-map-insert (meta/value-keyword :slots) (slot-states (get-key source-plan :slots)))
+      (meta/value-map-insert (meta/value-keyword :sections) (-> (meta/value-vector)
+      (meta/value-vector-conj (meta/value-keyword :text))
+      (meta/value-vector-conj (meta/value-keyword :data))
+      (meta/value-vector-conj (meta/value-keyword :bss))
+      (meta/value-vector-conj (meta/value-keyword :shstrtab))))
+      (meta/value-map-insert (meta/value-keyword :imports) (meta/value-vector))
+      (meta/value-map-insert (meta/value-keyword :interpreter) (meta/value-null))
+      (meta/value-map-insert (meta/value-keyword :dynamic) (meta/value-null))
+      (meta/value-map-insert (meta/value-keyword :grant) (get-key source-plan :grant))
+      (meta/value-map-insert (meta/value-keyword :fs-scope) (get-key source-plan :fs-scope))
+      (meta/value-map-insert (meta/value-keyword :spawn) (get-key source-plan :spawn))
+      (meta/value-map-insert (meta/value-keyword :decision-code) (file-regions (get-key details :decision-regions))))))
+(defn- package-planned [source [:ref :form/r] source-plan [:ref :form/r] target [:ref :form/r] code :vector-i64 main-offset :i64]
   [:ref :linux.static.image/result]
   (let [built (build (key-of (get-key target :isa)) source-plan code main-offset)]
     (if (not= (record-get [:ref :linux.static.image/build] built :error) :ok)
       (fail (record-get [:ref :linux.static.image/build] built :error) (record-get [:ref :linux.static.image/build] built :data))
       (let [framed (frame (key-of (get-key target :machine)) built)]
         (if (not (good? framed)) framed
-          (record-new [:ref :linux.static.image/result] (bytes-of framed) (metadata source source-plan built) :ok (document-null)))))))
+          (record-new [:ref :linux.static.image/result] (bytes-of framed) (metadata source source-plan built) :ok (meta/value-null)))))))
 
-(defn package [source :document profile :document overrides :document] [:ref :linux.static.image/result]
+(defn package [source [:ref :form/r] profile [:ref :form/r] overrides [:ref :form/r]] [:ref :linux.static.image/result]
   (cond
-    (or (not= (document-kind source) :map) (not (artifact/valid-seal? source))) (fail :unsealed (detail :admission :artifact))
+    (or (not= (meta/value-kind source) :map) (not (artifact/valid-seal? source))) (fail :unsealed (detail :admission :artifact))
     :else
     (let [target (lookup (planning/targets) (get-key source :target))
           entry (get-key (get-key source :program) :entry) export (lookup (get-key source :exports) entry)]
       (cond
-        (not= (document-kind target) :map) (fail :not-linux-static (detail :admission :target))
-        (or (not= (document-kind export) :map) (not (document-equal? (get-key export :arity) (document-i64 0))))
+        (not= (meta/value-kind target) :map) (fail :not-linux-static (detail :admission :target))
+        (or (not= (meta/value-kind export) :map) (not (meta/value-equal? (get-key export :arity) (meta/value-i64 0))))
         (fail :entry-not-zero-arity (detail :admission :entry))
         :else
         (let [code (normalized-code (get-key source :code) :guest) offset (get-key export :offset)]
           (cond
             (not (good? code)) code
-            (or (not= (document-kind offset) :i64) (< (i64-of offset) 0) (>= (i64-of offset) (vector-count (bytes-of code))))
+            (or (not= (meta/value-kind offset) :i64) (< (i64-of offset) 0) (>= (i64-of offset) (vector-count (bytes-of code))))
             (fail :entry-span (detail :admission :offset))
             :else
             (let [source-plan (planning/plan source profile overrides)]

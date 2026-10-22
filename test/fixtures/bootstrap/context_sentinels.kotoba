@@ -1,52 +1,26 @@
 (ns bootstrap.context-sentinels
-  (:require [kotoba.native.linux-static-context :as context]
+  (:require [kotoba.artifact.data :as meta]
+            [kotoba.native.linux-static-context :as context]
             [kotoba.native.linux-static-assembler :as asm]
             [kotoba.native.linux-static-io :as io])
   (:export [main]))
 
 ;; Pure builder fixture. This supplies layout test data, not a sealed artifact
 ;; or an authority grant. Four initially unowned descriptors must encode -1.
-(defn- abi [] :document
-  (document-map
-    (document-keyword :version) (document-i64 11)
-    (document-keyword :fuel-offset) (document-i64 8)
-    (document-keyword :allow-bitmap-offset) (document-i64 16)
-    (document-keyword :pair-used-pointer-offset) (document-i64 288)
-    (document-keyword :pairs-base-offset) (document-i64 296)
-    (document-keyword :pair-validated-base-offset) (document-i64 304)
-    (document-keyword :vector-used-pointer-offset) (document-i64 312)
-    (document-keyword :vectors-base-offset) (document-i64 320)
-    (document-keyword :vector-items-base-offset) (document-i64 328)))
+(defn- abi [] [:ref :form/r]
+  (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map) (meta/value-keyword :version) (meta/value-i64 11)) (meta/value-keyword :fuel-offset) (meta/value-i64 8)) (meta/value-keyword :allow-bitmap-offset) (meta/value-i64 16)) (meta/value-keyword :pair-used-pointer-offset) (meta/value-i64 288)) (meta/value-keyword :pairs-base-offset) (meta/value-i64 296)) (meta/value-keyword :pair-validated-base-offset) (meta/value-i64 304)) (meta/value-keyword :vector-used-pointer-offset) (meta/value-i64 312)) (meta/value-keyword :vectors-base-offset) (meta/value-i64 320)) (meta/value-keyword :vector-items-base-offset) (meta/value-i64 328)))
 
-(defn- plan [fuel :i64] :document
-  (document-map
-    (document-keyword :context-abi) (abi)
-    (document-keyword :fuel) (document-i64 fuel)
-    (document-keyword :cells) (document-i64 2)
-    (document-keyword :bytes) (document-i64 16)
-    (document-keyword :vectors) (document-i64 2)
-    (document-keyword :vector-items) (document-i64 16)
-    (document-keyword :metered?) (document-bool false)
-    (document-keyword :slots) (document-map)
-    (document-keyword :grant) (document-vector)))
+(defn- plan [fuel :i64] [:ref :form/r]
+  (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map) (meta/value-keyword :context-abi) (abi)) (meta/value-keyword :fuel) (meta/value-i64 fuel)) (meta/value-keyword :cells) (meta/value-i64 2)) (meta/value-keyword :bytes) (meta/value-i64 16)) (meta/value-keyword :vectors) (meta/value-i64 2)) (meta/value-keyword :vector-items) (meta/value-i64 16)) (meta/value-keyword :metered?) (meta/value-bool false)) (meta/value-keyword :slots) (meta/value-map)) (meta/value-keyword :grant) (meta/value-vector)))
 
-(defn- layout [] :document
-  (document-map
-    (document-keyword :text) (document-i64 4198400)
-    (document-keyword :data) (document-i64 4202496)
-    (document-keyword :memory-size) (document-i64 65536)
-    (document-keyword :alt) (document-i64 4206592)
-    (document-keyword :pairs) (document-i64 4222976)
-    (document-keyword :valid) (document-i64 4223008)
-    (document-keyword :vectors) (document-i64 4223024)
-    (document-keyword :vector-items) (document-i64 4223056)
-    (document-keyword :pool) (document-i64 4223184)))
+(defn- layout [] [:ref :form/r]
+  (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map-insert (meta/value-map) (meta/value-keyword :text) (meta/value-i64 4198400)) (meta/value-keyword :data) (meta/value-i64 4202496)) (meta/value-keyword :memory-size) (meta/value-i64 65536)) (meta/value-keyword :alt) (meta/value-i64 4206592)) (meta/value-keyword :pairs) (meta/value-i64 4222976)) (meta/value-keyword :valid) (meta/value-i64 4223008)) (meta/value-keyword :vectors) (meta/value-i64 4223024)) (meta/value-keyword :vector-items) (meta/value-i64 4223056)) (meta/value-keyword :pool) (meta/value-i64 4223184)))
 
 (defn- build [fuel :i64] [:ref :linux.static.context/result]
   (let [labels (typed-list-conj [:list [:ref :linux.static/label]]
                  (typed-list-new [:list [:ref :linux.static/label]])
-                 (asm/label :ls/handler 4198400))]
-    (context/context-bytes (plan fuel) (layout) labels (document-map) 4198416 8)))
+                 (asm/label "ls/handler" 4198400))]
+    (context/context-bytes (plan fuel) (layout) labels (meta/value-map) 4198416 8)))
 
 (defn- empty-fd? [bytes :vector-i64 key :keyword] :bool
   (let [offset (io/state-offset key)]

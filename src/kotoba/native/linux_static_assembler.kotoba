@@ -1,5 +1,6 @@
 ;; Canonical typed port of linux_static.cljk's complete register-IR assembler.
 ;; Pure source candidate: no hosted encoder, FFI, C loader or assembler import.
+;; Labels use compiler-owned text, independent of the guest KGraph arena.
 ;; Native admission, byte parity and packager integration remain unqualified.
 (ns kotoba.native.linux-static-assembler
   {:kotoba/export [instruction label instruction-size assemble]}
@@ -7,10 +8,10 @@
    {:linux.static/instruction
     [:record :linux.static/instruction
      [[:op :keyword] [:aux :keyword] [:d :keyword] [:s :keyword]
-      [:b :keyword] [:i :keyword] [:n :i64] [:label :keyword]
+      [:b :keyword] [:i :keyword] [:n :i64] [:label :string]
       [:data :vector-i64]]]
     :linux.static/label
-    [:record :linux.static/label [[:name :keyword] [:address :i64]]]
+    [:record :linux.static/label [[:name :string] [:address :i64]]]
     :linux.static/layout
     [:record :linux.static/layout
      [[:labels [:list [:ref :linux.static/label]]] [:end :i64]
@@ -21,11 +22,11 @@
       [:error :keyword] [:at :i64]]]}))
 
 (defn instruction [op :keyword aux :keyword d :keyword s :keyword
-                   b :keyword i :keyword n :i64 target :keyword data :vector-i64]
+                   b :keyword i :keyword n :i64 target :string data :vector-i64]
   [:ref :linux.static/instruction]
   (record-new [:ref :linux.static/instruction] op aux d s b i n target data))
 
-(defn label [name :keyword address :i64] [:ref :linux.static/label]
+(defn label [name :string address :i64] [:ref :linux.static/label]
   (record-new [:ref :linux.static/label] name address))
 
 (defn- layout-result [labels [:list [:ref :linux.static/label]] end :i64
@@ -145,10 +146,10 @@
       (and (= isa :aarch64) (= op :lea-sp) (or (< n 0) (> n 4095))) :invalid-immediate
       :else :ok)))
 
-(defn- label-index [labels [:list [:ref :linux.static/label]] name :keyword] :i64
+(defn- label-index [labels [:list [:ref :linux.static/label]] name :string] :i64
   (loop [index 0]
     (if (>= index (vector-count labels)) -1
-      (if (= name (record-get [:ref :linux.static/label]
+      (if (string=? name (record-get [:ref :linux.static/label]
                              (typed-list-nth [:list [:ref :linux.static/label]] labels index) :name))
         index (recur (+ index 1))))))
 
