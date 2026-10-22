@@ -62,11 +62,11 @@
 (defn- compiler-slots [] [:ref :form/r]
 (-> (meta/value-map)
   (meta/value-map-insert (meta/value-keyword :arena-enter) (-> (meta/value-map)
-  (meta/value-map-insert (meta/value-keyword :admitted?) (meta/value-bool false))
+  (meta/value-map-insert (meta/value-keyword :admitted?) (meta/value-bool true))
   (meta/value-map-insert (meta/value-keyword :offset) (meta/value-i64 224))
 ))
   (meta/value-map-insert (meta/value-keyword :arena-leave) (-> (meta/value-map)
-  (meta/value-map-insert (meta/value-keyword :admitted?) (meta/value-bool false))
+  (meta/value-map-insert (meta/value-keyword :admitted?) (meta/value-bool true))
   (meta/value-map-insert (meta/value-keyword :offset) (meta/value-i64 232))
 ))
   (meta/value-map-insert (meta/value-keyword :bytes-concat) (-> (meta/value-map)

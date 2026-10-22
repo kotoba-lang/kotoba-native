@@ -52,7 +52,10 @@
             code (vector-i64-from-bytes (result-value-of [:result :bytes :document] guest (bytes-empty)))]
         (if (or (>= offset (vector-count code)) (not= (bit-and offset 3) 0)) 3
           (let [built (build :aarch64 source-plan code offset)]
-            (if (not= (record-get [:ref :linux.static.image/build] built :error) :ok) 1
+            (if (not= (record-get [:ref :linux.static.image/build] built :error) :ok)
+              (let [message (string-concat "bootstrap build refused: "
+                              (string-concat (meta/value-edn-print (meta/value-keyword (record-get [:ref :linux.static.image/build] built :error))) "\n"))
+                    printed (typed-cap-call :io/write-error :string :string message)] 1)
               (let [framed (frame :aarch64 built)]
                 (if (not (good? framed)) 2
                   (bootstrap-write (bytes-of framed) (bootstrap-arg 4)))))))))))

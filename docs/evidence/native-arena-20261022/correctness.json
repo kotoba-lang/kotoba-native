@@ -1,0 +1,66 @@
+{
+  "kind": "native-scalar-arena-checkpoint-correctness",
+  "qualified": false,
+  "baseNativeCommit": "86c691e4775a54e64155fe3310a24bbf43ebd397",
+  "compiler": {
+    "elfSHA256": "aca405b65c0313aee4b672a5c5c65839b6fe7e941aeaf957865c81da50b3843f",
+    "G5G6KseedSHA256": "bb94ca3692b4bf1f62fbdb3447a916aec48145dc3da3ab814e57421bd162042c",
+    "G5G6Identical": true
+  },
+  "packager": {
+    "elfSHA256": "7af552c57a662db65413535a196af7a81a0512b15e01790cea58a2e48122a0a8"
+  },
+  "checkpointFields": [
+    "pair-used",
+    "pool-used",
+    "vector-used",
+    "vector-item-used"
+  ],
+  "nestingLimit": 256,
+  "marksBytes": 8192,
+  "capabilityGrantsAdded": [],
+  "allocatorBudgetsChanged": false,
+  "tests": [
+    {
+      "entry": "main",
+      "exit": 0,
+      "output": "",
+      "offset": 856
+    },
+    {
+      "entry": "deep-main",
+      "exit": 0,
+      "output": "",
+      "offset": 1636
+    },
+    {
+      "entry": "overflow-main",
+      "exit": 70,
+      "output": "KEXE_TRAP {:kind :signal :signal :SIGILL}\n",
+      "offset": 1668
+    },
+    {
+      "entry": "unscoped-main",
+      "exit": 72,
+      "output": "KEXE_TRAP {:kind :budget :reason :probe/cells :arena :vectors}\n",
+      "offset": 1700
+    }
+  ],
+  "escapeSourceRefusal": {
+    "exit": 1,
+    "error": "E2104"
+  },
+  "mirOrdinaryAggregate": {
+    "exit": 0,
+    "kseedBytes": 847715,
+    "publicNames": 29,
+    "components": 8
+  },
+  "open": [
+    "large MIR vector append resource behavior",
+    "full original upstream corpus migration",
+    "current successor full19 rerun",
+    "public target/profile/seal/CLI and x86_64 CDCI qualification",
+    "complete general abort/recur cleanup conformance"
+  ]
+}
