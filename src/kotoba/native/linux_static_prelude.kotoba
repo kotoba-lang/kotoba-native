@@ -7,6 +7,7 @@
             [kotoba.native.linux-static-strings :as strings]
             [kotoba.native.linux-static-vectors :as vectors]
             [kotoba.native.linux-static-graph :as graph]
+            [kotoba.native.linux-static-arena :as arena]
             [kotoba.native.linux-static-capability :as capability]
             [kotoba.native.linux-static-output :as owned-output]
             [kotoba.native.linux-static-io :as io])
@@ -263,6 +264,12 @@
             (recur (+ index 1) code
               (meta/value-merge bindings (-> (meta/value-map)
       (meta/value-map-insert (meta/value-keyword slot) (meta/value-string "ls.cap/typed-cap-call")))))
+            (meta/value-set-contains? (arena/supported-slots) (meta/value-keyword slot))
+            (let [body (arena/routine context layout source-plan slot)]
+              (if (not= (record-get [:ref :linux.static.arena/result] body :error) :ok)
+                (slot-failure (record-get [:ref :linux.static.arena/result] body :error))
+                (recur (+ index 1) (join code (record-get [:ref :linux.static.arena/result] body :code))
+                  (meta/value-merge bindings (record-get [:ref :linux.static.arena/result] body :bindings)))))
             (meta/value-set-contains? (graph/supported-slots) (meta/value-keyword slot))
             (let [body (graph/routine context layout slot)]
               (if (not= (record-get [:ref :linux.static.graph/result] body :error) :ok)
@@ -362,7 +369,8 @@
                   (and (true? admitted) (not= (key-of slot) :typed-cap-call)
                        (not (meta/value-set-contains? (strings/supported-slots) slot))
                        (not (meta/value-set-contains? (vectors/supported-slots) slot))
-                       (not (meta/value-set-contains? (graph/supported-slots) slot))) :admitted-slot-unimplemented
+                       (not (meta/value-set-contains? (graph/supported-slots) slot))
+                       (not (meta/value-set-contains? (arena/supported-slots) slot))) :admitted-slot-unimplemented
                   :else (recur (+ index 1)))))))))))
 (defn- failure [error :keyword] [:ref :linux.static.prelude/result]
   (record-new [:ref :linux.static.prelude/result] (empty-code) (meta/value-map) (meta/value-set) error))

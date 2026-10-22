@@ -116,6 +116,10 @@
   (-> out (load :t0 :vector-used) (mov :t1 :t0) (shl :t1 4)
       (mem :ld :t2 :ctx (record-get [:ref :linux.static.vectors/config] cfg :table))
       (alu :add :t1 :t2) (mem :st :t4 :t1 0) (mem :st :t5 :t1 8)
+      ;; All constructors clear a recycled handle's optional growth region.
+      ;; Only conj attaches a region after publishing the fresh descriptor.
+      (mov :t1 :t0) (shl :t1 3) (load :t2 :vector-region-map)
+      (alu :add :t1 :t2) (li :t3 0) (mem :st :t3 :t1 0)
       (imm :add :t0 1) (store :t0 :vector-used)))
 ;; Copy t5 words from t4 to t7; the destination is the fresh arena tail.
 ;; Keep a1/a2/a3 and t4..t8 intact. Full f64 bit patterns are plain words here.
@@ -145,18 +149,58 @@
                  (branch :always (tag slot "zero")) (mark (tag slot "zeroed"))
                  (alu :add :t7 :t5) (store :t7 :vector-item-used))]
     (end (intern room cfg))))
+(defn- attach-region [out [:list [:ref :linux.static/instruction]]] [:list [:ref :linux.static/instruction]]
+  ;; t0=fresh handle; a3=1-based region. Descriptor words stay ABI-compatible.
+  (-> out (mov :t1 :t0) (imm :sub :t1 1) (shl :t1 3)
+      (load :t2 :vector-region-map) (alu :add :t1 :t2) (mem :st :a3 :t1 0)))
 (defn- conj-slot [cfg [:ref :linux.static.vectors/config]] [:list [:ref :linux.static/instruction]]
-  (let [start (-> (resolve (begin "vector-conj") cfg)
-                  (load :t0 :vector-item-limit) (alu :cmp :t5 :t0) (branch :hs "ls/bad")
-                  (mov :t8 :t5) (imm :add :t8 1)
-                  (load :t7 :vector-item-used) (mov :t0 :t4) (alu :add :t0 :t5)
-                  (alu :cmp :t0 :t7) (branch :eq (tag "vector-conj" "tail")))
-        interior (-> (copy (table-room (item-room start :t8)) "vector-conj")
-                     (mov :t4 :t7) (branch :always (tag "vector-conj" "append")))
-        tail (-> interior (mark (tag "vector-conj" "tail")) (li :a4 1))
-        room (-> (table-room (item-room tail :a4)) (mark (tag "vector-conj" "append")))
-        appended (-> (element room :t4 :t5) (mem :st :a2 :t1 0)
-                     (mov :t5 :t8) (mov :t0 :t4) (alu :add :t0 :t5) (store :t0 :vector-item-used))]
+  (let [start (table-room (-> (resolve (begin "vector-conj") cfg)
+                              (load :t0 :vector-item-limit) (alu :cmp :t5 :t0) (branch :hs "ls/bad")
+                              (mov :t8 :t5) (imm :add :t8 1)))
+        tracked (-> start
+                    (mov :t1 :a1) (imm :sub :t1 1) (shl :t1 3) (load :t2 :vector-region-map)
+                    (alu :add :t1 :t2) (mem :ld :a3 :t1 0) (imm :cmp :a3 0)
+                    (branch :eq (tag "vector-conj" "regular"))
+                    (load :t0 :vector-region-used) (load :t1 :vector-capacity)
+                    (alu :cmp :t0 :t1) (branch :hi "ls/bad") (alu :cmp :a3 :t0) (branch :hi "ls/bad")
+                    (mov :a4 :a3) (imm :sub :a4 1) (shl :a4 4) (load :t2 :vector-regions) (alu :add :a4 :t2)
+                    (mem :ld :t0 :a4 0) (mem :ld :t1 :a4 8)
+                    (alu :cmp :t0 :t1) (branch :hi "ls/bad")
+                    (load :t2 :vector-item-used) (alu :cmp :t1 :t2) (branch :hi "ls/bad")
+                    (mov :t3 :t4) (alu :add :t3 :t5) (alu :cmp :t3 :t0)
+                    (branch :ne (tag "vector-conj" "regular"))
+                    (alu :cmp :t0 :t1) (branch :hs (tag "vector-conj" "regular"))
+                    (mov :t2 :t0) (shl :t2 3) (alu :add :t2 :t6) (mem :st :a2 :t2 0)
+                    (imm :add :t0 1) (mem :st :t0 :a4 0) (mov :t5 :t8))
+        region-result (end (attach-region (intern tracked cfg)))
+        regular (-> region-result (mark (tag "vector-conj" "regular"))
+                    (load :t7 :vector-item-used) (mov :t0 :t4) (alu :add :t0 :t5)
+                    (alu :cmp :t0 :t7) (branch :eq (tag "vector-conj" "tail"))
+                    ;; Doubled capacity is optional. If it or its metadata
+                    ;; does not fit, use the exact old copy size, not a trap.
+                    (load :t0 :vector-item-capacity) (alu :sub :t0 :t7)
+                    (mov :a4 :t8) (shl :a4 1) (imm :cmp :a4 4)
+                    (branch :hs (tag "vector-conj" "capacity")) (li :a4 4)
+                    (mark (tag "vector-conj" "capacity"))
+                    (alu :cmp :a4 :t0) (branch :hi (tag "vector-conj" "exact"))
+                    (load :t0 :vector-region-used) (load :t1 :vector-capacity)
+                    (alu :cmp :t0 :t1) (branch :hs (tag "vector-conj" "exact"))
+                    (mov :a3 :t0) (imm :add :a3 1))
+        copied (copy regular "vector-conj-region")
+        new-region (-> (element copied :t7 :t5) (mem :st :a2 :t1 0)
+                       (mov :t2 :t7) (alu :add :t2 :t8) (mov :t3 :t7) (alu :add :t3 :a4)
+                       (mov :t1 :a3) (imm :sub :t1 1) (shl :t1 4) (load :t0 :vector-regions) (alu :add :t1 :t0)
+                       (mem :st :t2 :t1 0) (mem :st :t3 :t1 8)
+                       (store :t3 :vector-item-used) (store :a3 :vector-region-used)
+                       (mov :t4 :t7) (mov :t5 :t8))
+        reserved-result (end (attach-region (intern new-region cfg)))
+        exact (copy (item-room (mark reserved-result (tag "vector-conj" "exact")) :t8) "vector-conj-exact")
+        exact-value (-> (element exact :t7 :t5) (mem :st :a2 :t1 0)
+                        (mov :t4 :t7) (mov :t5 :t8) (mov :t0 :t7) (alu :add :t0 :t8) (store :t0 :vector-item-used))
+        exact-result (end (intern exact-value cfg))
+        tail (item-room (li (mark exact-result (tag "vector-conj" "tail")) :a4 1) :a4)
+        appended (-> (element tail :t4 :t5) (mem :st :a2 :t1 0)
+                     (mov :t5 :t8) (mov :t0 :t7) (imm :add :t0 1) (store :t0 :vector-item-used))]
     (end (intern appended cfg))))
 (defn- assoc-slot [cfg [:ref :linux.static.vectors/config] inplace? :bool]
   [:list [:ref :linux.static/instruction]]

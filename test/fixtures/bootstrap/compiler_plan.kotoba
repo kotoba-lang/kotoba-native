@@ -1,7 +1,7 @@
 ;; Internal full-v11 compiler framing fixture, not public profile/seal admission.
 ;; The 51-field ABI comes from the measured compiler handler metadata at
 ;; Amu afd2a94a:src/kotoba/compiler/linux_static_handlers.cljk, context version 11.
-;; All 36 slots remain present; the 14 unsupported slots retain trap bindings.
+;; All 36 slots remain present; unsupported slots retain trap bindings.
 (ns kotoba.native.bootstrap-compiler-plan
   (:require [kotoba.artifact.data :as meta])
   (:export [compiler-plan pure-plan hash-plan]))
@@ -62,11 +62,11 @@
 (defn- compiler-slots [] [:ref :form/r]
 (-> (meta/value-map)
   (meta/value-map-insert (meta/value-keyword :arena-enter) (-> (meta/value-map)
-  (meta/value-map-insert (meta/value-keyword :admitted?) (meta/value-bool false))
+  (meta/value-map-insert (meta/value-keyword :admitted?) (meta/value-bool true))
   (meta/value-map-insert (meta/value-keyword :offset) (meta/value-i64 224))
 ))
   (meta/value-map-insert (meta/value-keyword :arena-leave) (-> (meta/value-map)
-  (meta/value-map-insert (meta/value-keyword :admitted?) (meta/value-bool false))
+  (meta/value-map-insert (meta/value-keyword :admitted?) (meta/value-bool true))
   (meta/value-map-insert (meta/value-keyword :offset) (meta/value-i64 232))
 ))
   (meta/value-map-insert (meta/value-keyword :bytes-concat) (-> (meta/value-map)

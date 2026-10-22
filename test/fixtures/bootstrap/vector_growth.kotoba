@@ -1,0 +1,40 @@
+(ns kotoba.native.vector-growth-cases (:export [main fork-main views-main rollback-main exact-fit-main]))
+(defn- build [count :i64] :vector-i64
+  (loop [index 0 values (vector-alloc 0)]
+    (if (= index count) values
+      (let [next (vector-conj values index) other (vector-assoc! (vector-alloc 4) 0 index)]
+        (if (= (vector-at other 0) index) (recur (+ index 1) next) (do (vector-at [0] 1) (vector-alloc 0)))))))
+(defn main [] :i64
+  (let [values (build 16385)]
+    (if (and (= (vector-count values) 16385) (= (vector-at values 0) 0)
+             (= (vector-at values 8192) 8192) (= (vector-at values 16384) 16384)) 0 1)))
+(defn fork-main [] :i64
+  (let [base (build 128) left (vector-conj base 800001) right (vector-conj base 800002)
+        later (vector-conj left 800003) changed (vector-assoc later 0 99)]
+    (if (and (= (vector-count base) 128) (= (vector-at base 0) 0)
+             (= (vector-at left 128) 800001) (= (vector-at right 128) 800002)
+             (= (vector-at later 129) 800003) (= (vector-at later 0) 0) (= (vector-at changed 0) 99)) 0 1)))
+(defn views-main [] :i64
+  (let [base (build 128) view (vector-drop base 3) joined (vector-conj view 800004)
+        bytes (bytes-from-vector-i64 base) slice (bytes-slice bytes 2 6)
+        extended (vector-conj (vector-i64-from-bytes slice) 77)]
+    (if (and (= (vector-count joined) 126) (= (vector-at joined 0) 3) (= (vector-at joined 125) 800004)
+             (= (vector-count base) 128) (= (vector-at base 127) 127)
+             (= (bytes-count slice) 4) (= (bytes-at slice 0) 2) (= (bytes-at slice 3) 5)
+             (= (vector-count extended) 5) (= (vector-at extended 4) 77)) 0 1)))
+(defn rollback-main [] :i64
+  (let [base (build 128)
+        result (loop [index 0]
+                 (if (= index 600000) 0
+                   (if (arena-scope (let [next (vector-conj base index)] (= (vector-at next 128) index)))
+                     (recur (+ index 1)) 1)))
+        after (vector-conj base 900001)]
+    (if (and (= result 0) (= (vector-count base) 128) (= (vector-at base 127) 127)
+             (= (vector-at after 128) 900001)) 0 1)))
+;; With 20 item cells, doubled capacity does not fit but exact copies do.
+;; With 18 cells the final tail append must retain the item-budget refusal.
+(defn exact-fit-main [] :i64
+  (let [base (vector-assoc! (vector-alloc 8) 0 41) other (vector-assoc! (vector-alloc 1) 0 42)
+        next (vector-conj base 43) last (vector-conj next 44)]
+    (if (and (= (vector-at other 0) 42) (= (vector-count last) 10)
+             (= (vector-at base 0) 41) (= (vector-at next 8) 43) (= (vector-at last 9) 44)) 0 1)))

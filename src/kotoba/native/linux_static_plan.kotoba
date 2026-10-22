@@ -209,6 +209,8 @@
 
 (defn implemented-slots [] [:ref :form/r]
   (-> (meta/value-set)
+      (meta/value-set-conj (meta/value-keyword :arena-enter))
+      (meta/value-set-conj (meta/value-keyword :arena-leave))
       (meta/value-set-conj (meta/value-keyword :pair-new))
       (meta/value-set-conj (meta/value-keyword :pair-first))
       (meta/value-set-conj (meta/value-keyword :pair-second))
@@ -670,7 +672,7 @@
           (not (good? start)) start
           (not (good? valid)) valid
           :else
-          (let [regions (append-regions start
+          (let [base-regions (append-regions start
                           (-> (meta/value-vector)
       (meta/value-vector-conj (-> (meta/value-vector)
       (meta/value-vector-conj (meta/value-keyword :alt))
@@ -692,7 +694,13 @@
       (meta/value-vector-conj (meta/value-i64 (* 8 (i64-of items))))))
       (meta/value-vector-conj (-> (meta/value-vector)
       (meta/value-vector-conj (meta/value-keyword :pool))
-      (meta/value-vector-conj bytes)))))]
+      (meta/value-vector-conj bytes)))))
+                regions (if (good? base-regions)
+                          (append-regions base-regions
+                            (-> (meta/value-vector)
+                                (meta/value-vector-conj (-> (meta/value-vector) (meta/value-vector-conj (meta/value-keyword :arena-marks)) (meta/value-vector-conj (meta/value-i64 16384))))
+                                (meta/value-vector-conj (-> (meta/value-vector) (meta/value-vector-conj (meta/value-keyword :vector-region-map)) (meta/value-vector-conj (meta/value-i64 (* 8 (i64-of table))))))
+                                (meta/value-vector-conj (-> (meta/value-vector) (meta/value-vector-conj (meta/value-keyword :vector-regions)) (meta/value-vector-conj (meta/value-i64 (* 16 (i64-of table)))))))) base-regions)]
             (if (not (good? regions)) regions
               (let [end (checked-align (i64-of (get-key (value regions) :end)) 16)]
                 (if (not (good? end)) end
