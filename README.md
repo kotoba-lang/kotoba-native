@@ -1,5 +1,10 @@
 # kotoba-native
 
+> The CLJK/NBB compiler backend and its hosted runners are removed in this
+> candidate. Canonical `.kotoba` sources remain; no independent native
+> compiler or runtime execution is qualified yet. See
+> [retirement and source recovery](docs/hosted-compiler-retirement.md).
+
 Amu's native **綾** — checked KIR to x86_64/aarch64 machine code and ELF64.
 
 This is not a being. [`amu`](https://github.com/kotoba-lang/amu) weaves
@@ -318,17 +323,10 @@ another codec.
 - `kotoba-lang/kotoba-object`
 - `kotoba-lang/artifact`
 
-## Test
+## Test status
 
-```bash
-kbb --backend sci --classpath "src:resources:test" run-tests.cljk   # the whole suite, counted
-kbb -M:test                                                          # the same namespaces through the alias
-```
-
-No JVM anywhere in this path (ADR 0086, 2026-09-18). `run-tests.cljk` runs all
-37 test namespaces, refuses a test file it does not list, and counts the
-`known-red` deftests apart -- today the 18 x86-64 aiueos kernel-image tests
-that read what only the JVM twin `elf64.clj.cljk` lays (ADR 0036). They run
-and their failures print; a failure outside the list, or a listed test that
-passes, fails the run. The six coordinates the tests reach are declared in
-`nbb.edn` (same shas as `deps.edn`).
+The historical CLJK/NBB test runner and compiler are removed. Test inputs
+and expected/refusal corpora remain for migration to a real native harness.
+No native test run is claimed. The previous commands, namespace inventory
+and known-red accounting are available at the preserved commit recorded in
+[the retirement inventory](docs/retirement/hosted-compilers.json).
